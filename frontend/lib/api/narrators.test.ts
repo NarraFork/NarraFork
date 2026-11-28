@@ -26,7 +26,108 @@ describe("narrators API", () => {
 		}
 	});
 
-	test("modeltrace posts once to the encoded endpoint without a body", async () => {
+	test.each([
+		false,
+		true,
+	])("submission identity and authored document cross JSON/multipart transport (%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const requests: RequestInit[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				requests.push(init);
+				return Response.json({ id: "accepted" });
+			},
+		});
+		const document: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{
+							type: "narratorReference",
+							id: "atom",
+							narratorId: "stable-target",
+							label: "A title",
+						},
+					],
+				},
+			],
+		};
+		const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+		class TestXHR {
+			status = 200;
+			statusText = "OK";
+			responseText = '{"id":"accepted"}';
+			onload: (() => void) | null = null;
+			open() {}
+			setRequestHeader() {}
+			getAllResponseHeaders() {
+				return "Content-Type: application/json";
+			}
+			send(body: FormData) {
+				requests.push({ body });
+				queueMicrotask(() => this.onload?.());
+			}
+		}
+		Object.defineProperty(globalThis, "XMLHttpRequest", { configurable: true, value: TestXHR });
+		try {
+			await api.sendNarratorMessage(
+				"source",
+				"[@A title](nf-agent://open?id=stable-target)",
+				undefined,
+				multipart ? [new File(["note"], "notes.txt")] : undefined,
+				false,
+				undefined,
+				undefined,
+				[],
+				false,
+				"turn",
+				{ composerDocument: document, clientSubmissionId: "submission-id" },
+			);
+			const body = requests[0].body;
+			const data =
+				body instanceof FormData
+					? {
+							clientSubmissionId: body.get("clientSubmissionId"),
+							composerDocument: JSON.parse(String(body.get("composerDocument"))),
+						}
+					: JSON.parse(String(body));
+			expect(data.clientSubmissionId).toBe("submission-id");
+			expect(data.composerDocument).toEqual(document);
+		} finally {
+			if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+			else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+		}
+	});
+
+	test("receipt GET has one canonical encoded endpoint and no send side effects", async () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const calls: { url: string; init: RequestInit }[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				calls.push({ url: String(url), init });
+				return Response.json({ status: "accepted", id: "receipt" });
+			},
+		});
+		await api.getNarratorSubmissionReceipt("source/id", "submission/id");
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe("/api/narrators/source%2Fid/submissions/submission%2Fid");
+		expect(calls[0].init.method ?? "GET").toBe("GET");
+	});
+
+	test.each([
+		undefined,
+		{ fork: true, calibrate: true },
+	])("modeltrace posts once with options %j", async (options) => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
 			configurable: true,
@@ -39,11 +140,11 @@ describe("narrators API", () => {
 				return Response.json({ id: "trace-child" });
 			},
 		});
-		expect(await api.startModelTrace("n/a")).toEqual({ id: "trace-child" });
+		expect(await api.startModelTrace("n/a", options)).toEqual({ id: "trace-child" });
 		expect(requests).toHaveLength(1);
 		expect(requests[0].url).toBe("/api/narrators/n%2Fa/modeltrace");
 		expect(requests[0].init.method).toBe("POST");
-		expect(requests[0].init.body).toBeUndefined();
+		expect(requests[0].init.body).toBe(options ? JSON.stringify(options) : undefined);
 	});
 
 	test("modeltrace retry posts to the encoded child endpoint without a body", async () => {
@@ -64,6 +165,26 @@ describe("narrators API", () => {
 		expect(requests[0].url).toBe("/api/narrators/child%2Fa/modeltrace/retry");
 		expect(requests[0].init.method).toBe("POST");
 		expect(requests[0].init.body).toBeUndefined();
+	});
+
+	test("modeltrace calibration posts the result ID to the encoded child endpoint", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ id: "child/a" });
+			},
+		});
+		expect(await api.calibrateModelTrace("child/a", "result/a")).toEqual({ id: "child/a" });
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url).toBe("/api/narrators/child%2Fa/modeltrace/calibrate");
+		expect(requests[0].init.method).toBe("POST");
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({ resultId: "result/a" });
 	});
 
 	test("message and block deletions are always history-only", async () => {
@@ -680,6 +801,84 @@ describe("narrators API", () => {
 		expect(requests).toEqual([
 			{ url: "/api/narrators/n%2Fa%3F/buffer/m%2Fb%23/retry", method: "POST" },
 		]);
+	});
+
+	test.each([
+		undefined,
+		0,
+		7,
+	])("buffer edit lease transports optional expected revision %s and original token", async (expectedRevision) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const lease = {
+			ok: true as const,
+			token: "client-token",
+			expiresAt: 123_456,
+			leaseMs: 120_000,
+			contentRevision: 0,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json(init.method === "DELETE" ? { ok: true } : lease);
+			},
+		});
+		expect(
+			await api.beginBufferedMessageEdit("n/a?", "m/b#", "client-token", expectedRevision),
+		).toEqual(lease);
+		expect(await api.renewBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual(lease);
+		expect(await api.releaseBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual({
+			ok: true,
+		});
+		expect(requests.map(({ url }) => url)).toEqual(
+			Array(3).fill("/api/narrators/n%2Fa%3F/buffer/m%2Fb%23/edit"),
+		);
+		expect(requests.map(({ init }) => init.method)).toEqual(["POST", "PATCH", "DELETE"]);
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({
+			token: "client-token",
+			...(expectedRevision !== undefined ? { expectedRevision } : {}),
+		});
+		expect(JSON.parse(String(requests[1].init.body))).toEqual({ token: "client-token" });
+		expect(new Headers(requests[2].init.headers).get("X-Buffer-Edit-Token")).toBe("client-token");
+		expect(requests[2].init.keepalive).toBe(true);
+	});
+
+	test.each([
+		false,
+		true,
+	])("buffer save forwards edit token for JSON and binary uploads (multipart=%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		let saved: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				saved = init;
+				return Response.json({ ok: true });
+			},
+		});
+		const image = new File(["png"], "image.png", { type: "image/png" });
+		await api.updateBufferedMessage(
+			"n",
+			"m",
+			"draft",
+			{ newImages: multipart ? [image] : [] },
+			"edit-token",
+		);
+		expect(saved?.method).toBe("PATCH");
+		expect(new Headers(saved?.headers).get("X-Buffer-Edit-Token")).toBe("edit-token");
+		if (multipart) {
+			expect(saved?.body).toBeInstanceOf(FormData);
+			expect(new Headers(saved?.headers).has("Content-Type")).toBe(false);
+		} else {
+			expect(JSON.parse(String(saved?.body)).text).toBe("draft");
+		}
 	});
 
 	test("keeps the edit draft unless the request explicitly succeeds", () => {

@@ -111,6 +111,20 @@ describe.each([
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 	});
 
+	test("puts the utility instruction in the developer input prefix", async () => {
+		const req = await capture(run);
+		expect(req.body).not.toHaveProperty("instructions");
+		expect(req.body.input).toEqual([
+			{
+				type: "message",
+				id: expect.stringMatching(/^msg_nf_instructions_/),
+				role: "developer",
+				content: [{ type: "input_text", text: "You are a title generator." }],
+			},
+			{ role: "user", content: expect.any(String) },
+		]);
+	});
+
 	test("sends one correlated conversation identity across headers", async () => {
 		const req = await capture(run);
 

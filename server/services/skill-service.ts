@@ -3,6 +3,8 @@ import {
 	access,
 	lstat,
 	mkdir,
+	mkdtemp,
+	open,
 	readdir,
 	readFile,
 	realpath,
@@ -17,14 +19,23 @@ import { and, asc, count, eq, inArray, lt } from "drizzle-orm";
 import matter from "gray-matter";
 import { db } from "../db";
 import { narrators, projects, skillDirectoryCaches } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { getBuiltinSkillRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
-import { hotTimer } from "../lib/hot-safe";
+import { hotSafe, hotTimer } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
 import { resolveNarratorProjectId } from "./narrator-project";
+import {
+	replaceSkillDirectory,
+	snapshotSkillDefinition,
+	snapshotSkillDirectory,
+} from "./skill-directory-sync";
+import { type DownloadedSkillFile, validateImportedSkillPath } from "./skill-github-import";
+import { downloadSkillLink, isGitHubSkillDirectoryUrl } from "./skill-link-download";
+import { withSkillCreation } from "./skill-write-scope";
 
 export type SkillSource = "global" | "project" | "workspace";
 
@@ -37,6 +48,8 @@ export interface SkillInfo {
 	files: string[];
 	/** Whether this skill is disabled (SKILL.md.disabled) */
 	disabled?: boolean;
+	/** Set only for management APIs, not the narrator prompt. */
+	canUpdateFromUrl?: boolean;
 	/** Context source when loaded through narrator/workspace APIs. */
 	source?: SkillSource;
 	rootKind?: SkillSource;
@@ -176,6 +189,81 @@ async function resolveEntryType(
 	return null;
 }
 
+async function readSkillTextBounded(path: string, maxBytes: number): Promise<string | null> {
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, "r");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return null;
+		throw error;
+	}
+	try {
+		const info = await handle.stat();
+		if (!info.isFile()) return null;
+		const declared = Number(info.size);
+		if (!Number.isSafeInteger(declared) || declared < 0 || declared > maxBytes) {
+			logger.warn("Skill file exceeds the read limit", { path, maxBytes });
+			return null;
+		}
+		// Allocate the declared size, then read one extra byte so a growing file cannot
+		// be parsed from a short snapshot.
+		const buffer = new Uint8Array(declared);
+		let total = 0;
+		while (total < declared) {
+			const { bytesRead } = await handle.read(buffer, total, declared - total, total);
+			if (!bytesRead) break;
+			total += bytesRead;
+		}
+		const extra = new Uint8Array(1);
+		const more = await handle.read(extra, 0, 1, declared);
+		if (total !== declared || more.bytesRead > 0) {
+			logger.warn("Skill file changed while it was being read", { path });
+			return null;
+		}
+		try {
+			return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+		} catch {
+			logger.warn("Skill file is not valid UTF-8", { path });
+			return null;
+		}
+	} finally {
+		await handle.close();
+	}
+}
+
+type SkillYamlState = { anchor: string | null };
+// gray-matter exposes its safe YAML engine at runtime, but omits it from its types.
+const skillYaml = (
+	matter as typeof matter & {
+		engines: {
+			yaml: {
+				parse(
+					raw: string,
+					options: { listener(event: string, state: SkillYamlState): void },
+				): unknown;
+			};
+		};
+	}
+).engines.yaml;
+function parseSkillYaml(raw: string): Record<string, unknown> {
+	let nodes = 0;
+	const parsed = skillYaml.parse(raw, {
+		listener(event, state) {
+			// Stop at an anchor's parse boundary, before aliases can cause repeated
+			// merge work. Quoted text, comments and block scalars remain ordinary data.
+			if (++nodes > 40_000 || (event === "close" && state.anchor !== null)) {
+				throw new ValidationError(
+					"Skill YAML references exceed the parsing budget",
+					"SKILL_YAML_COMPLEXITY",
+				);
+			}
+		},
+	});
+	return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+		? (parsed as Record<string, unknown>)
+		: {};
+}
 /**
  * Load and parse a single SKILL.md (or SKILL.md.disabled), using cache if mtime hasn't changed.
  */
@@ -195,7 +283,11 @@ async function loadSkillCached(
 	}
 
 	// Cache miss or stale — read and parse
-	const raw = await readFile(skillFile, "utf-8");
+	const raw = await readSkillTextBounded(skillFile, 200_000);
+	if (raw === null) {
+		skillCache.delete(skillFile);
+		return null;
+	}
 	const parsed = parseSkillFile(raw, skillFile);
 	if (!parsed) {
 		skillCache.delete(skillFile);
@@ -231,9 +323,9 @@ const MAX_WALK_DEPTH = 5;
 
 /**
  * Recursively walk a directory tree looking for sub-directories that contain a
- * `SKILL.md` file.  When a `SKILL.md` is found the directory is treated as a
- * skill root and we do **not** recurse deeper (nested dirs are companion files,
- * not nested skills).
+ * `SKILL.md` file.  When `SKILL.md` or `SKILL.md.disabled` is present the directory
+ * is a skill root and we do **not** recurse deeper, even if the file cannot be
+ * loaded. Nested dirs are companion files, not nested skills.
  */
 async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): Promise<void> {
 	if (depth > MAX_WALK_DEPTH) return;
@@ -257,21 +349,20 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 
 		const childDir = join(dir, entry.name);
 		const skillFile = join(childDir, "SKILL.md");
-		const skill = await loadSkillCached(skillFile, childDir);
-		if (skill) {
-			skills.push(skill);
-			// Don't recurse into a skill directory — sub-dirs are companion files
-		} else {
-			// Check for disabled skill (SKILL.md.disabled)
-			const disabledFile = join(childDir, "SKILL.md.disabled");
-			const disabledSkill = await loadSkillCached(disabledFile, childDir, true);
-			if (disabledSkill) {
-				skills.push(disabledSkill);
-			} else {
-				// No SKILL.md here — keep looking deeper
-				await walkForSkills(childDir, skills, depth + 1);
-			}
+		// Presence owns the directory. An oversized, invalid, or non-UTF-8 definition
+		// stays a skill root so companion directories are not discovered as skills.
+		if ((await getMtimeMs(skillFile)) !== null) {
+			const skill = await loadSkillCached(skillFile, childDir);
+			if (skill) skills.push(skill);
+			continue;
 		}
+		const disabledFile = join(childDir, "SKILL.md.disabled");
+		if ((await getMtimeMs(disabledFile)) !== null) {
+			const disabledSkill = await loadSkillCached(disabledFile, childDir, true);
+			if (disabledSkill) skills.push(disabledSkill);
+			continue;
+		}
+		await walkForSkills(childDir, skills, depth + 1);
 	}
 }
 
@@ -353,7 +444,11 @@ function getSkillSearchDirs(basePath: string): string[] {
  */
 function parseSkillFile(raw: string, location: string): Omit<SkillInfo, "files"> | null {
 	try {
-		const { data, content } = matter(raw);
+		// Skills use YAML only. gray-matter also ships a JavaScript engine which
+		// evaluates tagged frontmatter; never let downloaded (or local) skills select it.
+		const normalized = raw.replace(/^\uFEFF/, "");
+		if (!/^---[\t ]*\r?\n/.test(normalized)) return null;
+		const { data, content } = matter(normalized, { engines: { yaml: parseSkillYaml } });
 		const name = typeof data.name === "string" ? data.name.trim() : "";
 		const description = typeof data.description === "string" ? data.description.trim() : "";
 		if (!name || !description) {
@@ -396,14 +491,16 @@ async function loadSkillSidecar(skillDir: string): Promise<{
 	const sidecarPath = join(skillDir, "agents", "openai.yaml");
 	let raw: string;
 	try {
-		raw = await readFile(sidecarPath, "utf-8");
+		const content = await readSkillTextBounded(sidecarPath, 200_000);
+		if (content === null) return null;
+		raw = content;
 	} catch {
 		return null; // no sidecar
 	}
 
 	let parsed: unknown;
 	try {
-		parsed = Bun.YAML.parse(raw);
+		parsed = parseSkillYaml(raw);
 	} catch (err) {
 		logger.warn("Failed to parse skill sidecar", { location: sidecarPath, error: String(err) });
 		return null;
@@ -698,16 +795,19 @@ async function discoverSkillFiles(rootPath: string): Promise<DiscoveryResult> {
 }
 
 async function getRootCache(root: SkillRootInfo) {
-	const rows = await db
-		.select()
-		.from(skillDirectoryCaches)
-		.where(
-			and(
-				eq(skillDirectoryCaches.rootKind, root.rootKind),
-				eq(skillDirectoryCaches.normalizedRootPath, root.normalizedRootPath),
-			),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select()
+			.from(skillDirectoryCaches)
+			.where(
+				and(
+					eq(skillDirectoryCaches.rootKind, root.rootKind),
+					eq(skillDirectoryCaches.normalizedRootPath, root.normalizedRootPath),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	return rows[0] ?? null;
 }
 
@@ -893,10 +993,13 @@ async function applyProjectRoutineSkillOverrides<T extends { name: string; locat
 	projectGitPath: string | null | undefined,
 ): Promise<T[]> {
 	if (!projectGitPath) return skills;
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.gitPath, projectGitPath),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.gitPath, projectGitPath),
+			columns: { chapterSettings: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	let config: unknown = project?.chapterSettings;
 	if (typeof config === "string") {
 		try {
@@ -965,20 +1068,26 @@ export async function loadSkillByNameForContext(
 }
 
 export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true, cwd: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true, cwd: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	// The same project resolution as ACL/traits: the explicit project, else the project the
 	// session's directory was indexed into.
 	const projectId = await resolveNarratorProjectId(narrator);
 	const project = projectId
-		? await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { gitPath: true },
-			})
+		? await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { gitPath: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: null;
 	const projectGitPath = project?.gitPath ?? null;
 	return {
@@ -1089,30 +1198,41 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 
 export async function cleanupSkillDirectoryCaches(): Promise<{ expired: number; lru: number }> {
 	const nowIso = new Date().toISOString();
-	const expiredRows = await db
-		.select({ id: skillDirectoryCaches.id })
-		.from(skillDirectoryCaches)
-		.where(lt(skillDirectoryCaches.expiresAt, nowIso));
+	const expiredRows = await readQuery(
+		db
+			.select({ id: skillDirectoryCaches.id })
+			.from(skillDirectoryCaches)
+			.where(lt(skillDirectoryCaches.expiresAt, nowIso)),
+		{ executionPolicy: "worker-required" },
+	);
 	if (expiredRows.length > 0) {
+		// The expiry is re-checked by the delete: an entry renewed after the read stays.
 		await db.delete(skillDirectoryCaches).where(
-			inArray(
-				skillDirectoryCaches.id,
-				expiredRows.map((row) => row.id),
+			and(
+				inArray(
+					skillDirectoryCaches.id,
+					expiredRows.map((row) => row.id),
+				),
+				lt(skillDirectoryCaches.expiresAt, nowIso),
 			),
 		);
 	}
 
-	const [{ value: total = 0 } = { value: 0 }] = await db
-		.select({ value: count() })
-		.from(skillDirectoryCaches);
+	const [{ value: total = 0 } = { value: 0 }] = await readQuery(
+		db.select({ value: count() }).from(skillDirectoryCaches),
+		{ executionPolicy: "worker-required" },
+	);
 	const overLimit = Math.max(0, total - MAX_SKILL_CACHE_ROOTS);
 	let lru = 0;
 	if (overLimit > 0) {
-		const rows = await db
-			.select({ id: skillDirectoryCaches.id })
-			.from(skillDirectoryCaches)
-			.orderBy(asc(skillDirectoryCaches.lastAccessedAt))
-			.limit(overLimit);
+		const rows = await readQuery(
+			db
+				.select({ id: skillDirectoryCaches.id })
+				.from(skillDirectoryCaches)
+				.orderBy(asc(skillDirectoryCaches.lastAccessedAt))
+				.limit(overLimit),
+			{ executionPolicy: "worker-required" },
+		);
 		if (rows.length > 0) {
 			await db.delete(skillDirectoryCaches).where(
 				inArray(
@@ -1188,7 +1308,7 @@ async function assertNoSymlinkAncestor(projectGitPath: string, targetPath: strin
 				throw new ValidationError("Project skill paths cannot contain symbolic links");
 			}
 		} catch (err) {
-			if (err instanceof ValidationError) throw err;
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 			// The remaining path does not exist yet, so it cannot already be a symlink.
 			return;
 		}
@@ -1209,104 +1329,432 @@ function buildSkillMd(name: string, description: string, content: string): strin
 	return `---\nname: "${name.replace(/"/g, '\\"')}"\ndescription: "${description.replace(/"/g, '\\"')}"\n---\n\n${content}\n`;
 }
 
+async function createSkillDirectoryExclusive(skillDir: string): Promise<void> {
+	try {
+		await mkdir(skillDir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new ValidationError(`Skill directory already exists: ${basename(skillDir)}`);
+		}
+		throw error;
+	}
+}
+
+export const SKILL_IMPORT_TIMEOUT_MS = 45_000;
+const importCapacity = hotSafe("narrafork.skill-import-capacity.v1", () => ({ active: 0 }));
+
+async function withRemoteSkillTask<T>(
+	parentSignal: AbortSignal | undefined,
+	body: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	parentSignal?.throwIfAborted();
+	if (importCapacity.active >= 2) {
+		throw new AppError(
+			"Two skill link requests are already running. Try again shortly.",
+			429,
+			"SKILL_IMPORT_BUSY",
+		);
+	}
+	importCapacity.active++;
+	const startedAt = performance.now();
+	const deadline = new AbortController();
+	const timer = setTimeout(() => deadline.abort(), SKILL_IMPORT_TIMEOUT_MS);
+	const signal = parentSignal ? AbortSignal.any([parentSignal, deadline.signal]) : deadline.signal;
+	let succeeded = false;
+	try {
+		const result = await body(signal);
+		succeeded = true;
+		return result;
+	} catch (error) {
+		// Recovery evidence is more important than an overlapping timeout/cancellation.
+		if (error instanceof AppError && error.code === "SKILL_SYNC_RECOVERY_REQUIRED") throw error;
+		if (deadline.signal.aborted)
+			throw new AppError(
+				"Skill import or sync timed out. Please try again.",
+				408,
+				"SKILL_IMPORT_TIMEOUT",
+			);
+		if (parentSignal?.aborted)
+			throw new AppError("Skill import or sync was cancelled.", 408, "SKILL_IMPORT_CANCELLED");
+		throw error;
+	} finally {
+		clearTimeout(timer);
+		importCapacity.active--;
+		const durationMs = Math.round(performance.now() - startedAt);
+		if (durationMs >= 5_000)
+			logger.warn("Slow GitHub skill import or sync", { durationMs, succeeded });
+	}
+}
+
+function parseDownloadedSkill(files: DownloadedSkillFile[]): Omit<SkillInfo, "files"> {
+	const entry = files.find((file) => file.path === "SKILL.md");
+	if (!entry || entry.bytes.byteLength > 200_000) {
+		throw new ValidationError("The skill directory must contain SKILL.md (at most 200 KB)");
+	}
+	let raw: string;
+	try {
+		raw = new TextDecoder("utf-8", { fatal: true }).decode(entry.bytes);
+	} catch {
+		throw new ValidationError("SKILL.md must be UTF-8 text");
+	}
+	const metadata = parseSkillFile(raw, "GitHub SKILL.md");
+	if (!metadata || metadata.name.length > 100 || metadata.description.length > 2_000) {
+		throw new ValidationError(
+			"SKILL.md requires YAML name (up to 100 characters) and description (up to 2000 characters)",
+		);
+	}
+	return metadata;
+}
+
+async function stageDownloadedSkill(
+	staging: string,
+	files: DownloadedSkillFile[],
+	signal: AbortSignal,
+	disabled = false,
+): Promise<SkillInfo> {
+	for (const file of files) {
+		signal.throwIfAborted();
+		validateImportedSkillPath(file.path);
+		if (file.path === "SKILL.md.disabled")
+			throw new ValidationError("The link contains a reserved skill file");
+		if (file.path === "agents/openai.yaml") {
+			if (file.bytes.byteLength > 200_000)
+				throw new ValidationError("Skill sidecar exceeds 200 KB");
+			parseSkillYaml(new TextDecoder("utf-8", { fatal: true }).decode(file.bytes));
+		}
+		const path = disabled && file.path === "SKILL.md" ? "SKILL.md.disabled" : file.path;
+		const destination = join(staging, ...path.split("/"));
+		await mkdir(dirname(destination), { recursive: true });
+		await writeFile(destination, file.bytes, {
+			flag: "wx",
+			mode: file.executable ? 0o755 : 0o644,
+			signal,
+		});
+	}
+	const prepared = await loadSkillCached(
+		join(staging, disabled ? "SKILL.md.disabled" : "SKILL.md"),
+		staging,
+		disabled,
+	);
+	if (!prepared) throw new ValidationError("The link must contain a valid SKILL.md");
+	return prepared;
+}
+
+function forgetSkillDirectory(skillDir: string): void {
+	skillCache.delete(join(skillDir, "SKILL.md"));
+	skillCache.delete(join(skillDir, "SKILL.md.disabled"));
+}
+
+async function invalidateInstalledSkills(projectGitPath: string | null): Promise<void> {
+	try {
+		await invalidateRootCache(projectGitPath ? "project" : "global", projectGitPath ?? homedir());
+		// A dotfiles project may share the global skills directory.
+		if (projectGitPath && canonical(projectGitPath) === getHomeDir())
+			await invalidateRootCache("global", homedir());
+	} catch (error) {
+		logger.warn("Skill installed but summary cache invalidation failed", { error: String(error) });
+	}
+}
+
+export async function describeSkillManagement(
+	projectGitPath: string | null,
+	skill: SkillInfo,
+): Promise<SkillInfo> {
+	const root = projectGitPath ?? getNarraforkHome();
+	const skillsDir = projectGitPath
+		? join(projectGitPath, projectSkillsRelativeDir)
+		: getGlobalSkillsDir();
+	let canUpdateFromUrl = false;
+	try {
+		const dir = dirname(skill.location);
+		const rel = relative(resolve(skillsDir), resolve(dir));
+		if (rel && !rel.startsWith(".") && isInsidePath(resolve(skillsDir), resolve(dir))) {
+			await assertNoSymlinkAncestor(root, skill.location);
+			const info = await lstat(skill.location);
+			canUpdateFromUrl = info.isFile() && !info.isSymbolicLink();
+		}
+	} catch {
+		// Scanning external directories remains supported, but never makes them writable by sync.
+	}
+	return { ...skill, canUpdateFromUrl };
+}
+async function importSkillFromUrl(
+	projectGitPath: string | null,
+	url: string,
+	parentSignal?: AbortSignal,
+): Promise<SkillInfo> {
+	return withRemoteSkillTask(parentSignal, async (signal) => {
+		const { files } = await downloadSkillLink(url, signal);
+		const metadata = parseDownloadedSkill(files);
+		const dirName = sanitizeSkillDirName(metadata.name);
+		if (!dirName || SKIP_DIRS.has(dirName))
+			throw new ValidationError("Invalid skill directory name");
+		validateImportedSkillPath(dirName);
+		const root = projectGitPath ?? getNarraforkHome();
+		const skillsDir = projectGitPath
+			? join(projectGitPath, projectSkillsRelativeDir)
+			: getGlobalSkillsDir();
+		return withSkillCreation(
+			skillsDir,
+			async () => {
+				signal.throwIfAborted();
+				const existing = projectGitPath
+					? await loadProjectSkills(projectGitPath)
+					: await loadGlobalSkills();
+				if (existing.some((s) => s.name.toLowerCase() === metadata.name.toLowerCase()))
+					throw new ValidationError(`Skill already exists: ${metadata.name}`);
+				const skillDir = join(skillsDir, dirName);
+				await assertNoSymlinkAncestor(root, skillDir);
+				await mkdir(skillsDir, { recursive: true });
+				const assertAbsent = async () => {
+					try {
+						await lstat(skillDir);
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+						throw error;
+					}
+					throw new ValidationError(`Skill directory already exists: ${dirName}`);
+				};
+				await assertAbsent();
+				const staging = await mkdtemp(join(skillsDir, ".import-"));
+				try {
+					const prepared = await stageDownloadedSkill(staging, files, signal);
+					await assertNoSymlinkAncestor(root, skillDir);
+					await assertAbsent();
+					signal.throwIfAborted();
+					await rename(staging, skillDir);
+					forgetSkillDirectory(skillDir);
+					await invalidateInstalledSkills(projectGitPath);
+					return { ...prepared, location: join(skillDir, "SKILL.md"), canUpdateFromUrl: true };
+				} finally {
+					forgetSkillDirectory(staging);
+					await rm(staging, { recursive: true, force: true }).catch((error) =>
+						logger.warn("Skill staging cleanup failed", { staging, error: String(error) }),
+					);
+				}
+			},
+			signal,
+		);
+	});
+}
+
+async function findManagedSkill(projectGitPath: string | null, name: string): Promise<SkillInfo> {
+	const skills = projectGitPath
+		? await loadProjectSkills(projectGitPath)
+		: await loadGlobalSkills();
+	const found = skills.find((skill) => skill.name === name);
+	if (!found) throw new NotFoundError("Skill", name);
+	const managed = await describeSkillManagement(projectGitPath, found);
+	if (!managed.canUpdateFromUrl)
+		throw new ValidationError(
+			"Only skills in this scope's NarraFork skills directory can be updated from a link",
+			"SKILL_SYNC_UNSUPPORTED",
+		);
+	return managed;
+}
+
+async function updateSkillFromUrl(
+	projectGitPath: string | null,
+	name: string,
+	url: string,
+	parentSignal?: AbortSignal,
+): Promise<SkillInfo> {
+	const root = projectGitPath ?? getNarraforkHome();
+	const skillsDir = projectGitPath
+		? join(projectGitPath, projectSkillsRelativeDir)
+		: getGlobalSkillsDir();
+	return withRemoteSkillTask(parentSignal, async (signal) => {
+		const wholeDirectory = isGitHubSkillDirectoryUrl(url);
+		// Validate the target before any network work. Capture a bounded identity/content
+		// snapshot so a local edit during download cannot be silently overwritten.
+		const initial = await withSkillCreation(
+			skillsDir,
+			async () => {
+				const skill = await findManagedSkill(projectGitPath, name);
+				const directory = dirname(skill.location);
+				const snapshot = wholeDirectory
+					? await snapshotSkillDirectory(directory, signal)
+					: await snapshotSkillDefinition(skill.location, signal);
+				return { skill, directory, snapshot };
+			},
+			signal,
+		);
+		const downloaded = await downloadSkillLink(url, signal);
+		const metadata = parseDownloadedSkill(downloaded.files);
+		if (metadata.name !== name)
+			throw new ValidationError(
+				"The linked skill name must match the existing skill",
+				"SKILL_UPDATE_NAME_MISMATCH",
+			);
+		await assertNoSymlinkAncestor(root, initial.directory);
+		const staging = await mkdtemp(join(skillsDir, ".update-"));
+		try {
+			const prepared = await stageDownloadedSkill(
+				staging,
+				downloaded.files,
+				signal,
+				initial.skill.disabled ?? false,
+			);
+			return await withSkillCreation(
+				skillsDir,
+				async () => {
+					const current = await findManagedSkill(projectGitPath, name);
+					await assertNoSymlinkAncestor(root, initial.directory);
+					const now = wholeDirectory
+						? await snapshotSkillDirectory(initial.directory, signal)
+						: await snapshotSkillDefinition(current.location, signal);
+					if (
+						current.location !== initial.skill.location ||
+						now.fingerprint !== initial.snapshot.fingerprint
+					)
+						throw new AppError(
+							"The skill changed while downloading. Refresh and try again.",
+							409,
+							"SKILL_UPDATE_CONFLICT",
+						);
+					signal.throwIfAborted();
+					if (downloaded.kind === "markdown") {
+						// Atomic single-file replacement: preserve all companion files and disabled state.
+						await rename(join(staging, basename(current.location)), current.location);
+					} else {
+						const result = await replaceSkillDirectory(staging, initial.directory, signal);
+						if (result.cleanupWarning)
+							logger.warn("Skill updated but backup cleanup failed", {
+								warning: result.cleanupWarning,
+							});
+					}
+					forgetSkillDirectory(initial.directory);
+					await invalidateInstalledSkills(projectGitPath);
+					if (downloaded.kind === "markdown") {
+						const updated = await loadSkillCached(
+							current.location,
+							initial.directory,
+							current.disabled ?? false,
+						);
+						if (updated) return { ...updated, canUpdateFromUrl: true };
+					}
+					return { ...prepared, location: current.location, canUpdateFromUrl: true };
+				},
+				signal,
+			);
+		} finally {
+			forgetSkillDirectory(staging);
+			await rm(staging, { recursive: true, force: true }).catch((error) =>
+				logger.warn("Skill staging cleanup failed", { staging, error: String(error) }),
+			);
+		}
+	});
+}
+
+export function updateGlobalSkillFromUrl(
+	name: string,
+	url: string,
+	signal?: AbortSignal,
+): Promise<SkillInfo> {
+	return updateSkillFromUrl(null, name, url, signal);
+}
+
+export function updateProjectSkillFromUrl(
+	projectGitPath: string,
+	name: string,
+	url: string,
+	signal?: AbortSignal,
+): Promise<SkillInfo> {
+	return updateSkillFromUrl(projectGitPath, name, url, signal);
+}
+export function importGlobalSkill(url: string, signal?: AbortSignal): Promise<SkillInfo> {
+	return importSkillFromUrl(null, url, signal);
+}
+
+export function importProjectSkill(
+	projectGitPath: string,
+	url: string,
+	signal?: AbortSignal,
+): Promise<SkillInfo> {
+	return importSkillFromUrl(projectGitPath, url, signal);
+}
 export async function createGlobalSkill(
 	name: string,
 	description: string,
 	content: string,
 ): Promise<SkillInfo> {
-	const dirName = sanitizeSkillDirName(name);
-	if (!dirName) throw new ValidationError("Invalid skill name");
-
-	const skillDir = join(getGlobalSkillsDir(), dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	// Check if directory already exists
-	try {
-		await access(skillDir);
-		throw new ValidationError(`Skill directory already exists: ${dirName}`);
-	} catch (err) {
-		if (err instanceof ValidationError) throw err;
-		// Directory doesn't exist — good
-	}
-
-	await mkdir(skillDir, { recursive: true });
-	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
-
-	// Invalidate cache
-	skillCache.delete(skillFile);
-	await invalidateRootCache("global", homedir());
-
-	const skill = await loadSkillCached(skillFile, skillDir);
-	if (!skill) throw new AppError("Failed to create skill — parse error", 500);
-	return skill;
+	return withSkillCreation(getGlobalSkillsDir(), async () => {
+		const dirName = sanitizeSkillDirName(name);
+		if (!dirName) throw new ValidationError("Invalid skill name");
+		const skillDir = join(getGlobalSkillsDir(), dirName);
+		const skillFile = join(skillDir, "SKILL.md");
+		await mkdir(dirname(skillDir), { recursive: true });
+		await createSkillDirectoryExclusive(skillDir);
+		await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+		skillCache.delete(skillFile);
+		await invalidateRootCache("global", homedir());
+		const skill = await loadSkillCached(skillFile, skillDir);
+		if (!skill) throw new AppError("Failed to create skill — parse error", 500);
+		return skill;
+	});
 }
 
+async function withSkillMutation<T>(
+	projectGitPath: string | null,
+	name: string,
+	body: (skill: SkillInfo) => Promise<T>,
+): Promise<T> {
+	const load = () => (projectGitPath ? loadProjectSkills(projectGitPath) : loadGlobalSkills());
+	const initial = (await load()).find((skill) => skill.name === name);
+	if (!initial) throw new NotFoundError("Skill", name);
+	const directory = dirname(initial.location);
+	// Both scopes scan several roots; select the actual root to share locks even
+	// when a custom global home points inside a project's .claude/skills directory.
+	const candidates = getSkillSearchDirs(projectGitPath ?? homedir())
+		.filter((root) => isInsidePath(resolve(root), resolve(directory)))
+		.sort((a, b) => b.length - a.length);
+	const skillsRoot = candidates[0] ?? dirname(directory);
+	return withSkillCreation(skillsRoot, async () => {
+		await assertNoSymlinkAncestor(skillsRoot, initial.location);
+		const current = (await load()).find((skill) => skill.name === name);
+		if (!current || current.location !== initial.location)
+			throw new AppError("The skill changed. Refresh and try again.", 409, "SKILL_UPDATE_CONFLICT");
+		return body(current);
+	});
+}
 export async function updateGlobalSkill(
 	currentName: string,
 	name: string,
 	description: string,
 	content: string,
 ): Promise<SkillInfo> {
-	// Find the existing skill among global skills to get its location
-	const globals = await loadGlobalSkills();
-	const existing = globals.find((s) => s.name === currentName);
-	if (!existing) throw new NotFoundError("Global skill", currentName);
-
-	const skillFile = existing.location;
-	const skillDir = dirname(skillFile);
-
-	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
-
-	// Invalidate cache
-	skillCache.delete(skillFile);
-	await invalidateRootCache("global", homedir());
-
-	const updated = await loadSkillCached(skillFile, skillDir);
-	if (!updated) throw new AppError("Failed to update skill — parse error", 500);
-	return updated;
+	return withSkillMutation(null, currentName, async (existing) => {
+		const skillFile = existing.location;
+		const skillDir = dirname(skillFile);
+		await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+		skillCache.delete(skillFile);
+		await invalidateRootCache("global", homedir());
+		const updated = await loadSkillCached(skillFile, skillDir, existing.disabled ?? false);
+		if (!updated) throw new AppError("Failed to update skill — parse error", 500);
+		return updated;
+	});
 }
 
 export async function deleteGlobalSkill(name: string): Promise<void> {
-	const globals = await loadGlobalSkills();
-	const existing = globals.find((s) => s.name === name);
-	if (!existing) throw new NotFoundError("Global skill", name);
-
-	const skillDir = dirname(existing.location);
-	skillCache.delete(existing.location);
-	await rm(skillDir, { recursive: true, force: true });
-	await invalidateRootCache("global", homedir());
+	return withSkillMutation(null, name, async (existing) => {
+		forgetSkillDirectory(dirname(existing.location));
+		await rm(dirname(existing.location), { recursive: true, force: true });
+		await invalidateRootCache("global", homedir());
+	});
 }
 
 export async function toggleGlobalSkill(name: string, enabled: boolean): Promise<SkillInfo> {
-	const globals = await loadGlobalSkills();
-	const existing = globals.find((s) => s.name === name);
-	if (!existing) throw new NotFoundError("Global skill", name);
-
-	const skillDir = dirname(existing.location);
-	const enabledPath = join(skillDir, "SKILL.md");
-	const disabledPath = join(skillDir, "SKILL.md.disabled");
-
-	if (enabled && existing.disabled) {
-		// Re-enable: SKILL.md.disabled → SKILL.md
-		await rename(disabledPath, enabledPath);
-		skillCache.delete(disabledPath);
+	return withSkillMutation(null, name, async (existing) => {
+		if (enabled === !existing.disabled) return existing;
+		const skillDir = dirname(existing.location);
+		const target = join(skillDir, enabled ? "SKILL.md" : "SKILL.md.disabled");
+		await rename(existing.location, target);
+		forgetSkillDirectory(skillDir);
 		await invalidateRootCache("global", homedir());
-		const skill = await loadSkillCached(enabledPath, skillDir, false);
+		const skill = await loadSkillCached(target, skillDir, !enabled);
 		if (!skill) throw new AppError("Failed to toggle skill", 500);
 		return skill;
-	}
-	if (!enabled && !existing.disabled) {
-		// Disable: SKILL.md → SKILL.md.disabled
-		await rename(enabledPath, disabledPath);
-		skillCache.delete(enabledPath);
-		await invalidateRootCache("global", homedir());
-		const skill = await loadSkillCached(disabledPath, skillDir, true);
-		if (!skill) throw new AppError("Failed to toggle skill", 500);
-		return skill;
-	}
-
-	// Already in the desired state
-	return existing;
+	});
 }
 
 // === Project skill CRUD (writes to <project>/.narrafork/skills/) ===
@@ -1317,34 +1765,24 @@ export async function createProjectSkill(
 	description: string,
 	content: string,
 ): Promise<SkillInfo> {
-	const dirName = sanitizeSkillDirName(name);
-	if (!dirName) throw new ValidationError("Invalid skill name");
-
-	const existingByName = await loadProjectSkillByName(projectGitPath, name);
-	if (existingByName) throw new ValidationError(`Project skill already exists: ${name}`);
-
-	const skillDir = join(projectGitPath, projectSkillsRelativeDir, dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	await assertNoSymlinkAncestor(projectGitPath, skillDir);
-	try {
-		await access(skillDir);
-		throw new ValidationError(`Skill directory already exists: ${dirName}`);
-	} catch (err) {
-		if (err instanceof ValidationError) throw err;
-		// Directory doesn't exist — good
-	}
-
-	await mkdir(skillDir, { recursive: true });
-	await assertPathInsideProject(projectGitPath, skillDir);
-	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
-
-	skillCache.delete(skillFile);
-	await invalidateRootCache("project", projectGitPath);
-
-	const skill = await loadSkillCached(skillFile, skillDir);
-	if (!skill) throw new AppError("Failed to create project skill — parse error", 500);
-	return skill;
+	return withSkillCreation(join(projectGitPath, projectSkillsRelativeDir), async () => {
+		const dirName = sanitizeSkillDirName(name);
+		if (!dirName) throw new ValidationError("Invalid skill name");
+		const existingByName = await loadProjectSkillByName(projectGitPath, name);
+		if (existingByName) throw new ValidationError(`Project skill already exists: ${name}`);
+		const skillDir = join(projectGitPath, projectSkillsRelativeDir, dirName);
+		const skillFile = join(skillDir, "SKILL.md");
+		await assertNoSymlinkAncestor(projectGitPath, skillDir);
+		await mkdir(dirname(skillDir), { recursive: true });
+		await createSkillDirectoryExclusive(skillDir);
+		await assertPathInsideProject(projectGitPath, skillDir);
+		await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+		skillCache.delete(skillFile);
+		await invalidateRootCache("project", projectGitPath);
+		const skill = await loadSkillCached(skillFile, skillDir);
+		if (!skill) throw new AppError("Failed to create project skill — parse error", 500);
+		return skill;
+	});
 }
 
 export async function updateProjectSkill(
@@ -1354,38 +1792,31 @@ export async function updateProjectSkill(
 	description: string,
 	content: string,
 ): Promise<SkillInfo> {
-	const existing = await loadProjectSkillByName(projectGitPath, currentName);
-	if (!existing) throw new NotFoundError("Project skill", currentName);
-
-	const duplicate =
-		name === currentName ? null : await loadProjectSkillByName(projectGitPath, name);
-	if (duplicate && duplicate.location !== existing.location) {
-		throw new ValidationError(`Project skill already exists: ${name}`);
-	}
-
-	const skillFile = existing.location;
-	const skillDir = dirname(skillFile);
-	await assertPathInsideProject(projectGitPath, skillFile);
-
-	await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
-
-	skillCache.delete(skillFile);
-	await invalidateRootCache("project", projectGitPath);
-
-	const updated = await loadSkillCached(skillFile, skillDir, existing.disabled ?? false);
-	if (!updated) throw new AppError("Failed to update project skill — parse error", 500);
-	return updated;
+	return withSkillMutation(projectGitPath, currentName, async (existing) => {
+		const duplicate =
+			name === currentName ? null : await loadProjectSkillByName(projectGitPath, name);
+		if (duplicate && duplicate.location !== existing.location)
+			throw new ValidationError(`Project skill already exists: ${name}`);
+		const skillFile = existing.location;
+		const skillDir = dirname(skillFile);
+		await assertPathInsideProject(projectGitPath, skillFile);
+		await writeFile(skillFile, buildSkillMd(name, description, content), "utf-8");
+		skillCache.delete(skillFile);
+		await invalidateRootCache("project", projectGitPath);
+		const updated = await loadSkillCached(skillFile, skillDir, existing.disabled ?? false);
+		if (!updated) throw new AppError("Failed to update project skill — parse error", 500);
+		return updated;
+	});
 }
 
 export async function deleteProjectSkill(projectGitPath: string, name: string): Promise<void> {
-	const existing = await loadProjectSkillByName(projectGitPath, name);
-	if (!existing) throw new NotFoundError("Project skill", name);
-
-	const skillDir = dirname(existing.location);
-	await assertPathInsideProject(projectGitPath, existing.location);
-	skillCache.delete(existing.location);
-	await rm(skillDir, { recursive: true, force: true });
-	await invalidateRootCache("project", projectGitPath);
+	return withSkillMutation(projectGitPath, name, async (existing) => {
+		const skillDir = dirname(existing.location);
+		await assertPathInsideProject(projectGitPath, existing.location);
+		forgetSkillDirectory(skillDir);
+		await rm(skillDir, { recursive: true, force: true });
+		await invalidateRootCache("project", projectGitPath);
+	});
 }
 
 export const skillService = {
@@ -1402,6 +1833,11 @@ export const skillService = {
 	cleanupSkillDirectoryCaches,
 	startSkillCacheCleanupTimer,
 	createGlobalSkill,
+	importGlobalSkill,
+	importProjectSkill,
+	updateGlobalSkillFromUrl,
+	updateProjectSkillFromUrl,
+	describeSkillManagement,
 	updateGlobalSkill,
 	deleteGlobalSkill,
 	toggleGlobalSkill,

@@ -5,11 +5,11 @@ import type {
 	LocalProviderCandidateSummary,
 	LocalProviderScanResponse,
 } from "@shared/local-provider-import";
+import type { AddProviderType } from "@shared/sourcing/presets";
 import { type Ref, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { AddProviderDraft } from "./provider-add-draft";
-import type { AddProviderType } from "./provider-presets";
 
 export const LOCAL_IMPORT_SOURCE_LABELS: Record<LocalImportSource, string> = {
 	claude: "Claude Code",

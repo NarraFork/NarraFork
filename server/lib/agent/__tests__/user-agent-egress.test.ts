@@ -901,7 +901,17 @@ describe("complete local wire captures", () => {
 						"live-3",
 					]);
 					const historyBody = wire.requests[2].body;
-					if (protocol === "responses") expect(historyBody.instructions).toBe("root instruction");
+					if (protocol === "responses") {
+						expect(historyBody.instructions).toBeUndefined();
+						expect(historyBody.input).toEqual(
+							expect.arrayContaining([
+								expect.objectContaining({
+									role: "developer",
+									content: [{ type: "input_text", text: "root instruction" }],
+								}),
+							]),
+						);
+					}
 					if (protocol === "codex") {
 						expect(historyBody.instructions).toBeUndefined();
 						expect(historyBody.max_output_tokens).toBeUndefined();

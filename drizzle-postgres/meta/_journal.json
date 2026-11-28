@@ -533,6 +533,83 @@
 			"when": 1794677338258,
 			"tag": "0075_plugin_overlay_preferences",
 			"breakpoints": true
+		},
+		{
+			"idx": 76,
+			"version": "7",
+			"when": 1794839178762,
+			"tag": "0076_project_teams",
+			"breakpoints": true
+		},
+		{
+			"idx": 77,
+			"version": "7",
+			"when": 1795279907818,
+			"tag": "0077_index_active_background_tasks",
+			"breakpoints": true
+		},
+		{
+			"idx": 78,
+			"version": "7",
+			"when": 1795283628623,
+			"tag": "0078_ask_in_passing_group_archive",
+			"breakpoints": true
+		},
+		{
+			"idx": 79,
+			"version": "7",
+			"when": 1795511646791,
+			"tag": "0079_watch_principal",
+			"breakpoints": true
+		},
+		{
+			"idx": 80,
+			"version": "7",
+			"when": 1795534873527,
+			"tag": "0080_recent_tab_team_project",
+			"breakpoints": true
+		},
+		{
+			"idx": 81,
+			"version": "7",
+			"when": 1795580959074,
+			"tag": "0081_subagent-alias-addressable-scope",
+			"breakpoints": true
+		},
+		{
+			"idx": 82,
+			"version": "7",
+			"when": 1795595730488,
+			"tag": "0082_communication_topology",
+			"breakpoints": true
+		},
+		{
+			"idx": 83,
+			"version": "7",
+			"when": 1795622211933,
+			"tag": "0083_terminal_executor_session",
+			"breakpoints": true
+		},
+		{
+			"idx": 84,
+			"version": "7",
+			"when": 1795626264812,
+			"tag": "0084_team_work_item_dependencies",
+			"breakpoints": true
+		},
+		{
+			"idx": 85,
+			"version": "7",
+			"when": 1795643457364,
+			"tag": "0085_background_task_executor_session",
+			"breakpoints": true
+		},
+		{
+			"idx": 86,
+			"version": "7",
+			"when": 1795748780390,
+			"tag": "0086_team_event_kind_index",
+			"breakpoints": true
 		}
   ]
 }

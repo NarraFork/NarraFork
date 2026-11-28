@@ -1,14 +1,18 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { SQLQueryBindings } from "bun:sqlite";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 for (const statement of [
 	"ALTER TABLE narrator_tool_calls ADD COLUMN execution_path_flavor TEXT",
 	"ALTER TABLE narrator_tool_calls ADD COLUMN canonical_file_path TEXT",
@@ -22,7 +26,7 @@ for (const statement of [
 	}
 }
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { narratorService } = await import("../narrator-service");
 const { narratorMessageQueries } = await import("../narrator-messages");
@@ -69,10 +73,10 @@ async function seedMessage(params: {
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("narrator model history projection", () => {
@@ -512,6 +516,406 @@ describe("narrator model history projection", () => {
 				},
 			}),
 		]);
+	});
+});
+
+// Capture the real generated query and bindings; EXPLAIN only this isolated test DB.
+async function traceReads<T>(run: () => Promise<T>) {
+	const queries: Array<{ query: string; params: SQLQueryBindings[]; rows: unknown[][] }> = [];
+	const prepare = sqlite.prepare.bind(sqlite);
+	const spy = spyOn(sqlite, "prepare").mockImplementation(
+		<T, P extends SQLQueryBindings | SQLQueryBindings[]>(query: string, bindings?: P) => {
+			const statement = prepare<T, P>(query, bindings);
+			const values = statement.values.bind(statement);
+			statement.values = (...params) => {
+				const rows = values(...params);
+				queries.push({ query, params, rows });
+				return rows;
+			};
+			return statement;
+		},
+	);
+	try {
+		return { result: await run(), queries };
+	} finally {
+		spy.mockRestore();
+	}
+}
+
+function queryPlan(query: string, params: SQLQueryBindings[]) {
+	return sqlite
+		.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${query}`)
+		.all(...params)
+		.map((row) => row.detail)
+		.join("\n");
+}
+
+describe("pending and child catch-up query equivalence", () => {
+	test("pending-first matches historical caller IDs, including shared/hidden refs and direct children only", async () => {
+		for (const id of ["caller", "source", "child", "grandchild", "foreign"]) {
+			await seedNarrator(id);
+		}
+		await db.update(narrators).set({ parentNarratorId: "caller" }).where(eq(narrators.id, "child"));
+		await db
+			.update(narrators)
+			.set({ parentNarratorId: "child" })
+			.where(eq(narrators.id, "grandchild"));
+		for (const [id, owner, name] of [
+			["shared-agent", "source", "Agent"],
+			["task", "caller", "Task"],
+			["send", "caller", "Send"],
+			["not-agent", "caller", "Read"],
+			["foreign-agent", "foreign", "Agent"],
+		]) {
+			await seedMessage({ id, narratorId: owner, seq: 1, role: "assistant" });
+			await db.insert(narratorToolCalls).values({
+				id: `tool-${id}`,
+				narratorId: owner,
+				messageId: id,
+				toolUseId: id,
+				toolName: name,
+				status: "success",
+				createdAt: now,
+			});
+		}
+		// Reused provider IDs in another session neither duplicate nor grant refs.
+		await db.insert(narratorToolCalls).values({
+			id: "foreign-duplicate",
+			narratorId: "foreign",
+			messageId: "foreign-agent",
+			toolUseId: "shared-agent",
+			toolName: "Agent",
+			status: "success",
+			createdAt: now,
+		});
+		// A COW/shared-prefix caller ref need not have the tool row's narratorId.
+		await db.insert(narratorMessageRefs).values({
+			id: "shared-ref",
+			narratorId: "caller",
+			messageId: "shared-agent",
+			seq: 2,
+			segmentCompactId: "hidden-segment",
+		});
+		for (const [id, owner, parent, status] of [
+			["own", "caller", "foreign-agent", "pending"],
+			["shared", "child", "shared-agent", "pending"],
+			["legacy-task", "child", "task", "pending"],
+			["legacy-send", "child", "send", "pending"],
+			["wrong-name", "child", "not-agent", "pending"],
+			["no-ref", "child", "foreign-agent", "pending"],
+			["not-direct", "grandchild", "shared-agent", "pending"],
+			["foreign-owner", "foreign", "shared-agent", "pending"],
+			["finished", "child", "shared-agent", "success"],
+		] as const) {
+			await seedMessage({
+				id,
+				narratorId: owner,
+				seq: 3,
+				role: "assistant",
+				parentToolUseId: parent,
+			});
+			await db.insert(narratorToolCalls).values({
+				id,
+				narratorId: owner,
+				messageId: id,
+				toolUseId: `permission-${id}`,
+				toolName: "Write",
+				status,
+				createdAt: now,
+			});
+		}
+		// Frozen old two-query shape: enumerate all visible Agent/Task/Send IDs first.
+		const oldIds = sqlite
+			.query<{ tool_use_id: string }, []>(`
+			SELECT t.tool_use_id FROM narrator_tool_calls t JOIN narrator_message_refs r
+			ON r.message_id=t.message_id AND r.narrator_id='caller'
+			WHERE t.tool_name IN ('Agent','Task','Send')`)
+			.all()
+			.map((row) => row.tool_use_id);
+		const expected = sqlite
+			.query<{ id: string }, string[]>(`
+			SELECT t.id FROM narrator_tool_calls t JOIN narrator_messages m ON m.id=t.message_id
+			JOIN narrators n ON n.id=t.narrator_id WHERE t.status='pending'
+			AND (t.narrator_id='caller' OR (n.parent_narrator_id='caller'
+			AND m.parent_tool_use_id IN (${oldIds.map(() => "?").join(",")})))
+			ORDER BY t.created_at`)
+			.all(...oldIds)
+			.map((row) => row.id)
+			.sort();
+		const { result, queries } = await traceReads(() =>
+			narratorService.getPendingPermissions("caller"),
+		);
+		expect(result.map((row) => row.id).sort()).toEqual(expected);
+		expect(expected).toEqual(["legacy-send", "legacy-task", "own", "shared"]);
+		const pending = queries.find((row) => row.query.includes('"permission_caller_tool"'));
+		expect(pending).toBeDefined();
+		if (!pending) throw new Error("missing pending query");
+		const plan = queryPlan(pending.query, pending.params);
+		expect(plan).toContain("idx_toolcalls_status_narrator_created");
+		expect(plan).toContain("idx_toolcalls_tool_use_id");
+		expect(plan).toContain("idx_narrator_refs_unique");
+		expect(queries.filter((row) => row.query.includes('from "narrator_tool_calls"'))).toHaveLength(
+			1,
+		);
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, "shared-ref"));
+		expect(
+			(await narratorService.getPendingPermissions("caller")).map((row) => row.id).sort(),
+		).toEqual(["legacy-send", "legacy-task", "own"]);
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, "ref-task"));
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, "ref-send"));
+		expect((await narratorService.getPendingPermissions("caller")).map((row) => row.id)).toEqual([
+			"own",
+		]);
+	});
+
+	test("zero pending does not first load historical Agent IDs", async () => {
+		await seedNarrator("caller");
+		await seedMessage({ id: "history", narratorId: "caller", seq: 1, role: "assistant" });
+		await db.insert(narratorToolCalls).values(
+			Array.from({ length: 128 }, (_, i) => ({
+				id: `history-${i}`,
+				narratorId: "caller",
+				messageId: "history",
+				toolUseId: `agent-${i}`,
+				toolName: "Agent",
+				status: "success" as const,
+				createdAt: now,
+			})),
+		);
+		const { result, queries } = await traceReads(() =>
+			narratorService.getPendingPermissions("caller"),
+		);
+		expect(result).toEqual([]);
+		const toolReads = queries.filter((row) => row.query.includes('from "narrator_tool_calls"'));
+		expect(toolReads).toHaveLength(1);
+		expect(toolReads[0].rows).toEqual([]);
+	});
+
+	for (const owners of [1, 100]) {
+		for (const statistics of ["none", "optimize", "analyze"] as const) {
+			test(`child lookup seeks with ${statistics} statistics, 10k history rows / ${owners} owners`, async () => {
+				for (let i = 0; i < owners; i++) await seedNarrator(`owner-${i}`);
+				sqlite.run(
+					`WITH RECURSIVE numbers(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM numbers WHERE x<9999)
+					INSERT INTO narrator_messages (id,narrator_id,role,content_json,created_at)
+					SELECT 'history-'||x,'owner-'||(x%?),'assistant','[]',? FROM numbers`,
+					[owners, now],
+				);
+				sqlite.run(
+					`WITH RECURSIVE numbers(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM numbers WHERE x<9999)
+					INSERT INTO narrator_message_refs (id,narrator_id,message_id,seq)
+					SELECT 'history-ref-'||x,'owner-'||(x%?),'history-'||x,x+1 FROM numbers`,
+					[owners],
+				);
+				await seedMessage({ id: "parent", narratorId: "owner-0", seq: 0, role: "assistant" });
+				const anchors = Array.from({ length: 8 }, (_, i) => ({ parentToolUseId: `anchor-${i}` }));
+				for (const anchor of anchors) {
+					await db.insert(narratorToolCalls).values({
+						id: anchor.parentToolUseId,
+						narratorId: "owner-0",
+						messageId: "parent",
+						toolUseId: anchor.parentToolUseId,
+						toolName: "Read",
+						status: "success",
+						createdAt: now,
+					});
+				}
+				try {
+					for (const childCount of [0, 2]) {
+						for (let i = 0; i < childCount; i++) {
+							await seedMessage({
+								id: `child-${i}`,
+								narratorId: "owner-0",
+								seq: 10001 + i,
+								role: "assistant",
+								parentToolUseId: `anchor-${i}`,
+							});
+						}
+						if (statistics === "optimize") {
+							sqlite.run("PRAGMA analysis_limit=1000");
+							// 0x10000 considers every table, including on a fresh connection.
+							sqlite.run("PRAGMA optimize=0x10002");
+						}
+						if (statistics === "analyze") {
+							sqlite.run("PRAGMA analysis_limit=0");
+							sqlite.run("ANALYZE");
+						}
+						if (statistics !== "none") {
+							expect(
+								sqlite
+									.query(
+										"SELECT stat FROM sqlite_stat1 WHERE idx='idx_messages_parent_tool_use_lookup'",
+									)
+									.get(),
+							).not.toBeNull();
+						}
+						const { result, queries } = await traceReads(() =>
+							narratorService.getMessagesAfter("owner-0", { childAnchors: anchors }, 1),
+						);
+						const childQuery = queries.find((row) =>
+							row.query.includes('cross join "narrator_message_refs"'),
+						);
+						if (!childQuery) throw new Error("missing child query");
+						const oldRows = sqlite
+							.query(`SELECT r.message_id,r.seq FROM narrator_message_refs r
+							JOIN narrator_messages m ON r.message_id=m.id WHERE ${anchors
+								.map(
+									() =>
+										"(r.narrator_id='owner-0' AND r.segment_compact_id IS NULL AND r.seq>-1 AND m.parent_tool_use_id=?)",
+								)
+								.join(" OR ")}
+							ORDER BY r.seq LIMIT 2`)
+							.values(...anchors.map((a) => a.parentToolUseId));
+						expect(childQuery.rows).toEqual(oldRows);
+						expect(childQuery.rows).toHaveLength(childCount);
+						expect(result.hitLimit).toBe(childCount > 1);
+						const plan = queryPlan(childQuery.query, childQuery.params);
+						expect(plan).toContain(
+							"SEARCH narrator_messages USING INDEX idx_messages_parent_tool_use_lookup (parent_tool_use_id=?)",
+						);
+						expect(plan).toContain("idx_narrator_refs_unique");
+						expect(plan).not.toContain("SCAN narrator_messages");
+					}
+				} finally {
+					// Do not leak fixture statistics into other tests using this connection.
+					if (statistics !== "none") {
+						sqlite.run("DELETE FROM sqlite_stat1");
+						sqlite.run("ANALYZE sqlite_schema");
+					}
+					sqlite.run("PRAGMA analysis_limit=0");
+				}
+			});
+		}
+	}
+
+	test("non-SQLite child query retains the unhinted query shape", async () => {
+		await seedNarrator("caller");
+		await seedMessage({ id: "parent", narratorId: "caller", seq: 0, role: "assistant" });
+		await db.insert(narratorToolCalls).values({
+			id: "anchor",
+			narratorId: "caller",
+			messageId: "parent",
+			toolUseId: "anchor",
+			toolName: "Read",
+			status: "success",
+			createdAt: now,
+		});
+		mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "postgres" }));
+		try {
+			const { queries } = await traceReads(() =>
+				narratorService.getMessagesAfter("caller", {
+					childAnchors: [{ parentToolUseId: "anchor" }],
+				}),
+			);
+			const childQuery = queries.find((row) =>
+				row.query.includes('cross join "narrator_message_refs"'),
+			);
+			if (!childQuery) throw new Error("missing child query");
+			expect(childQuery.query).not.toContain("INDEXED BY");
+			expect(childQuery.query).not.toContain('"parent_tool_use_id" in');
+		} finally {
+			mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+		}
+	});
+
+	test("indexed child catch-up preserves per-anchor seq, caller refs, global limit and cursor", async () => {
+		await seedNarrator("caller");
+		await seedNarrator("source");
+		await seedNarrator("foreign");
+		await seedMessage({ id: "parent", narratorId: "source", seq: 1, role: "assistant" });
+		for (const toolUseId of ["a", "b"]) {
+			await db.insert(narratorToolCalls).values({
+				id: `tool-${toolUseId}`,
+				narratorId: "source",
+				messageId: "parent",
+				toolUseId,
+				toolName: "Read",
+				status: "success",
+				createdAt: now,
+			});
+		}
+		await db
+			.insert(narratorMessageRefs)
+			.values({ id: "caller-parent", narratorId: "caller", messageId: "parent", seq: 1 });
+		for (const [id, parent, seq] of [
+			["a-old", "a", 2],
+			["b-new", "b", 3],
+			["a-new", "a", 4],
+			["b-old", "b", 5],
+			["b-last", "b", 6],
+			["hidden", "a", 7],
+		] as const) {
+			await seedMessage({
+				id,
+				narratorId: "source",
+				seq,
+				role: "assistant",
+				parentToolUseId: parent,
+			});
+			await db.insert(narratorMessageRefs).values({
+				id: `caller-${id}`,
+				narratorId: "caller",
+				messageId: id,
+				seq,
+				segmentCompactId: id === "hidden" ? "hidden-segment" : null,
+			});
+		}
+		await seedMessage({
+			id: "foreign-child",
+			narratorId: "foreign",
+			seq: 8,
+			role: "assistant",
+			parentToolUseId: "a",
+		});
+		const input = {
+			childAnchors: [
+				{ parentToolUseId: "a", narratorId: "source", lastMessageId: "a-old" },
+				{ parentToolUseId: "b", lastMessageId: "b-old" },
+			],
+		};
+		const { result, queries } = await traceReads(() =>
+			narratorService.getMessagesAfter("caller", input, 2),
+		);
+		const childQuery = queries.find((row) =>
+			row.query.includes('cross join "narrator_message_refs"'),
+		);
+		expect(childQuery).toBeDefined();
+		if (!childQuery) throw new Error("missing child query");
+		const oldRows = sqlite
+			.query(`SELECT r.message_id, r.seq FROM narrator_message_refs r
+			JOIN narrator_messages m ON r.message_id=m.id
+			WHERE (r.seq>2 AND r.segment_compact_id IS NULL AND m.parent_tool_use_id='a' AND r.narrator_id='caller')
+			OR (r.seq>5 AND r.segment_compact_id IS NULL AND m.parent_tool_use_id='b' AND r.narrator_id='caller')
+			ORDER BY r.seq LIMIT 3`)
+			.values();
+		expect(childQuery.rows).toEqual(oldRows);
+		expect(oldRows).toEqual([
+			["a-new", 4],
+			["b-last", 6],
+		]);
+		const plan = queryPlan(childQuery.query, childQuery.params);
+		expect(plan).toContain("idx_messages_parent_tool_use_lookup");
+		expect(plan).toContain("idx_narrator_refs_unique");
+		expect(plan).not.toContain("idx_narrator_refs_seq");
+		expect(result.hitLimit).toBe(false);
+		expect(result.orphanChildren.map((row) => row.id)).toEqual(["a-new", "b-last"]);
+		expect(result.cursor?.childAnchors).toEqual([
+			{ parentToolUseId: "a", narratorId: "source", lastMessageId: "a-new" },
+			{ parentToolUseId: "b", narratorId: "source", lastMessageId: "b-last" },
+		]);
+		expect((await narratorService.getMessagesAfter("caller", input, 1)).hitLimit).toBe(true);
+		if (!result.cursor) throw new Error("missing catch-up cursor");
+		const empty = await narratorService.getMessagesAfter("caller", result.cursor, 2);
+		expect(empty.hitLimit).toBe(false);
+		expect(empty.orphanChildren).toEqual([]);
+		expect(empty.cursor?.childAnchors).toEqual([
+			{ parentToolUseId: "a", narratorId: "caller", lastMessageId: "a-new" },
+			{ parentToolUseId: "b", narratorId: "caller", lastMessageId: "b-last" },
+		]);
+		const forged = await narratorService.getMessagesAfter("caller", {
+			childAnchors: [{ parentToolUseId: "a", narratorId: "foreign" }],
+		});
+		expect(forged.orphanChildren).toEqual([]);
 	});
 });
 

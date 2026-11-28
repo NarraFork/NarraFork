@@ -148,11 +148,11 @@ describe("WebDAV relay producer", () => {
 		expect(result.verification).toBe("pending-server-pull");
 		expect(result.snapshotCommitted).toBe(false);
 		expect(result.verified).toEqual([]);
-		expect(result.uploaded).toHaveLength(5);
+		expect(result.uploaded).toHaveLength(4);
 		expect(result.relay?.retention).toBe("COMPLETE");
 		expect(result.relay?.expiresAt).toBe("2026-10-22T12:00:00.000Z");
 		expect(github.httpCalls).toHaveLength(0);
-		expect(github.downloaded).toHaveLength(2);
+		expect(github.downloaded).toHaveLength(1);
 		expect(f.dav.requests.some((r) => r.method === "GET")).toBe(false);
 		const puts = f.dav.requests.filter((r) => r.method === "PUT");
 		expect(puts.at(-1)?.path).toContain("/ready/");
@@ -164,9 +164,9 @@ describe("WebDAV relay producer", () => {
 		)?.[1];
 		expect(payload?.length).toBe(manifest.payload.size);
 		expect(sha(payload as Uint8Array)).toBe(manifest.payload.sha256);
-		for (const bytes of github.raw.values())
+		for (const [name, bytes] of github.raw)
 			expect([...f.dav.objects.values()].some((actual) => Buffer.from(actual).equals(bytes))).toBe(
-				true,
+				name !== github.name,
 			);
 	});
 	test("payload is independent of signed ready bytes near the 1MiB limit", async () => {

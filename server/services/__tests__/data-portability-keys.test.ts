@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 // Provider keys in a data export: providers.json has none, the sealed file has all of them.
 const previousHome = process.env.NARRAFORK_HOME;
+const previousFetch = globalThis.fetch;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-portability-keys-"));
 process.env.NARRAFORK_HOME = testHome;
 
@@ -22,6 +23,7 @@ const { sealProviderKeys, SEALED_KEYS_ENTRY } = await import("../data-portabilit
 const archiver = (await import("archiver")).default;
 
 afterAll(() => {
+	globalThis.fetch = previousFetch;
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	try {
@@ -147,6 +149,51 @@ beforeEach(() => {
 });
 
 describe("provider keys in a data export", () => {
+	test("v3 multi-key NUG, TokenDance and Command Code pools survive settings saves and reload", async () => {
+		setProviders({
+			nugProviders: [nug("multi-nug", "multi-nug", "nug-first", "oauth-multi")],
+			tokendance: "td-first",
+		});
+		saveSettings({ ...settings, commandCode: { apiKey: "cc-first" } });
+		const store = getProviderKeyStore();
+		const groups = [
+			["multi-nug", "nug", "nug-first", "nug-second"],
+			["tokendance", "tokendance", "td-first", "td-second"],
+			["CommandCode", "command-code", "cc-first", "cc-second"],
+		] as const;
+		for (const [groupId, templateId, , second] of groups) {
+			const key = store.addGroupCredential(groupId, templateId, {
+				apiKey: second,
+				label: "backup",
+			});
+			store.update(key.id, { disabled: true, network: { proxy: { mode: "direct" } } });
+		}
+		const zip = await readFile(
+			(await exportData(providersOnly, { passphrase: PASSPHRASE })).zipPath,
+		);
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "multi-key-v3.zip");
+		expect(preview.version).toBe(3);
+		await applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE });
+		const assertPools = () => {
+			for (const [groupId, , first, second] of groups) {
+				const keys = store.listGroup(groupId);
+				expect(keys.map((key) => key.apiKey)).toEqual([first, second]);
+				expect(keys[1]?.label).toBe("backup");
+				expect(keys[1]?.disabled).toBe(true);
+				expect(keys[1]?.network).toEqual({ proxy: { mode: "direct" } });
+			}
+		};
+		assertPools();
+		for (let i = 0; i < 2; i++) {
+			saveSettings(structuredClone(settings));
+			assertPools();
+			reloadSettings();
+			assertPools();
+		}
+		expect(settings.nugProviders?.[0]?.oauthClientSecret).toBe("oauth-multi");
+	});
+
 	test("old v1/v2 archives with inline NUG OAuth secrets remain importable", async () => {
 		for (const version of [1, 2]) {
 			setProviders({});
@@ -222,7 +269,7 @@ describe("provider keys in a data export", () => {
 		}
 	});
 
-	test("providers.json carries no key; the archive is version 2 with sealed keys", async () => {
+	test("providers.json carries no key; the archive is version 3 with sealed credentials", async () => {
 		const zip = await exportFromSource();
 		const preview = await previewImport(toArrayBuffer(zip), "keys.zip");
 		const stored = getPreview(preview.token);
@@ -240,14 +287,73 @@ describe("provider keys in a data export", () => {
 			// The sealed file is ciphertext; no key appears in it either.
 			expect(stored.sealedKeys ?? "").not.toContain(secret);
 		}
-		expect(stored.version).toBe(2);
-		expect(stored.sealedKeyCount).toBe(5);
+		expect(stored.version).toBe(3);
+		expect(stored.sealedKeyCount).toBe(7);
 		expect((stored.providers.nugProviders as Array<Record<string, unknown>>)[0]).not.toHaveProperty(
 			"oauthClientSecret",
 		);
 		expect(
 			(stored.providers.customApiProviders as Array<Record<string, unknown>>)[0],
 		).not.toHaveProperty("quotaAccessToken");
+		const { openBundle } = await import("../../lib/credential-transfer/bundle");
+		const opened = await openBundle(stored.sealedKeys ?? "", PASSPHRASE);
+		expect(opened.items.map((item) => item.kind)).toEqual([
+			"credential",
+			"credential",
+			"credential",
+			"group-secrets",
+			"credential",
+			"group-secrets",
+			"credential",
+		]);
+		for (const item of opened.items) {
+			const data = item.data as {
+				credential?: { id?: string };
+				group: Record<string, unknown>;
+			};
+			expect(data.credential?.id).toBeUndefined();
+			expect(data.group).not.toHaveProperty("apiKey");
+			expect(data.group).not.toHaveProperty("quotaAccessToken");
+			expect(data.group).not.toHaveProperty("oauthClientSecret");
+		}
+	});
+
+	test("a fresh default TokenDance config does not block its v3 credential", async () => {
+		const zip = await exportFromSource();
+		setProviders({});
+		saveSettings({
+			...settings,
+			tokendance: { apiKey: "", disabled: false, generation: 0 },
+		});
+		const preview = await previewImport(toArrayBuffer(zip), "default-tokendance.zip");
+		await applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE });
+		expect(settings.tokendance?.apiKey).toBe("td-secret");
+		expect(getProviderKeyStore().firstGroupKey("tokendance")).toBe("td-secret");
+	});
+
+	test("Command Code uses the same v3 credential entry and round-trips", async () => {
+		setProviders({});
+		saveSettings({
+			...settings,
+			commandCode: { apiKey: "cc-secret", baseUrl: "https://cc.example" },
+		});
+		const zip = await readFile(
+			(await exportData(providersOnly, { passphrase: PASSPHRASE })).zipPath,
+		);
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "command-code.zip");
+		const result = await applyImport(preview.token, {
+			conflictDefault: "skip",
+			passphrase: PASSPHRASE,
+		});
+		expect(settings.commandCode?.apiKey).toBe("cc-secret");
+		expect(settings.commandCode?.baseUrl).toBe("https://cc.example");
+		expect(
+			getProviderKeyStore()
+				.listGroup("CommandCode")
+				.map((key) => key.apiKey),
+		).toEqual(["cc-secret"]);
+		expect(result.keysImported).toBe(1);
 	});
 
 	test("without a passphrase, providers go out without keys and the archive stays version 1", async () => {
@@ -389,6 +495,25 @@ describe("provider keys in a data export", () => {
 		});
 		expect(settings.customApiProviders?.[0]).not.toHaveProperty("quotaAccessToken");
 		expect(keysOf(quotaKeyOwner("clear-relay"))).toEqual([]);
+	});
+
+	test("clearing providers also removes Codex and every model credential", async () => {
+		globalThis.fetch = (async () => {
+			throw new Error("Unexpected network request in clear-provider test");
+		}) as unknown as typeof fetch;
+		setProviders({
+			customApiProviders: [
+				apiProvider("clear-all", "clearall", "clear-key", "https://clear.example/v1", "clear-site"),
+			],
+		});
+		const { getCodexManager } = await import("../../lib/codex-manager");
+		const manager = getCodexManager();
+		manager.importCredentials([{ refreshToken: "clear-refresh", email: "clear@example.com" }]);
+		expect(manager.snapshot().entries).toHaveLength(1);
+		await clearData("providers");
+		expect(manager.snapshot().entries).toEqual([]);
+		expect(getProviderKeyStore().listGroup("clear-all")).toEqual([]);
+		expect(getProviderKeyStore().groupSecrets("clear-all")).toEqual({});
 	});
 
 	test("a wrong or missing passphrase writes nothing; sessions alone need none", async () => {

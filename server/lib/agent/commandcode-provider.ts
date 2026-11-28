@@ -6,6 +6,7 @@
  * OpenAIProvider，不写新适配器，只注入凭据与 base。
  */
 
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { getCachedCommandCodeModel } from "../commandcode-models";
 import {
@@ -38,22 +39,29 @@ export interface CommandCodeProviderSettings {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	/** 工具返回图片的去处（Chat Completions 通道），见 shared/tool-result-images.ts。 */
+	toolResultImages?: ToolResultImagesMode;
 }
 
 /** 未登录或已停用时返回 undefined，由上层给出可读提示。 */
 export function buildCommandCodeProvider(
 	model: string,
 	config?: CommandCodeProviderSettings,
+	/** A pool-selected key never consults settings or CLI authentication. */
+	apiKey?: string,
 ): ProviderAdapter | undefined {
 	if (config?.disabled) return undefined;
-	const auth = resolveCommandCodeToken(config?.apiKey);
-	if (!auth.credential) return undefined;
+	const token =
+		apiKey === undefined
+			? resolveCommandCodeToken(config?.apiKey).credential?.token
+			: apiKey.trim();
+	if (!token) return undefined;
 	const bare = bareCommandCodeModelId(model);
 	const shared = {
 		id: "CommandCode",
 		name: "Command Code",
 		prefix: COMMAND_CODE_PREFIX,
-		apiKey: auth.credential.token,
+		apiKey: token,
 		defaultModel: bare || model,
 		baseUrl: commandCodeProviderBase(config?.baseUrl),
 		proxy: config?.proxy,
@@ -75,5 +83,6 @@ export function buildCommandCodeProvider(
 	return new OpenAIProvider({
 		...shared,
 		apiMode: endpoint === "responses" ? "responses" : "completions",
+		toolResultImages: config?.toolResultImages,
 	});
 }

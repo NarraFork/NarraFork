@@ -9,9 +9,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 // Captured before the mock replaces it: `mock.module` is process-wide, so leaving
 // the in-memory schema installed would hand it to every later test file in the
 // same run (the knowledge suites then fail on their missing FTS tables).
@@ -61,7 +64,8 @@ beforeEach(() => {
 
 // Hand the real module back so subsequent test files in this run see the DB they
 // set up themselves.
-afterAll(() => {
+afterAll(async () => {
+	await fixture.close();
 	mock.module("../../db", () => realDbModule);
 });
 

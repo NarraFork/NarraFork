@@ -33,6 +33,7 @@ import {
 	getDefaultLocalFileChangeRuntime,
 	type LocalFileChangeRuntime,
 } from "./file-change-runtime";
+import { assertFileHistoryEnabledForDevice } from "./file-history-policy";
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
 import { boundedStoredBody } from "./narrator-body-reads";
 import { resolveNarratorProjectId } from "./narrator-project";
@@ -62,6 +63,7 @@ import {
 	type RevertPlannerRequest,
 	RevertPlannerService,
 } from "./revert-planner-service";
+import { readCommittedRevertSelectionBody } from "./revert-selection-service";
 import {
 	type RevertTransactionRequest,
 	RevertTransactionService,
@@ -108,6 +110,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		signal: AbortSignal;
 	}) {
 		const context = await this.narrator(input.principal, input.narratorId, input.signal);
+		assertFileHistoryEnabledForDevice(LOCAL_DEVICE_ID);
 		// Also reverify for a zero-file plan. Its no_dispatch history is not a reason to
 		// skip the source/namespace checks needed before publishing complete manifests.
 		await verifiedNamespace(input.signal);
@@ -179,6 +182,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				"UNSUPPORTED_BACKEND",
 				"Only the verified local backend supports this preview",
 			);
+		assertFileHistoryEnabledForDevice(identity.deviceId);
 		if (identity.objectRole !== "referent")
 			throw new RevertPlannerError(
 				"UNSUPPORTED_OBJECT",
@@ -216,7 +220,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		const initialContext = await this.fileContext(input);
 		const { runtime, namespace } = await verifiedNamespace(input.signal);
 		const identity = Object.freeze({ ...input.identity });
-		const scope = runtime.evidence.getScope(identity.scopeId);
+		const scope = await runtime.evidence.getScope(identity.scopeId, { signal: input.signal });
 		if (!scope) throw stale("Recorded scope is unavailable");
 		const assertCurrent = async ({ signal }: { signal: AbortSignal }) => {
 			const context = await this.fileContext({ ...input, identity, signal });
@@ -225,7 +229,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			const liveNamespace = await verifiedNamespace(signal);
 			if (liveNamespace.namespace.sourceInstanceId !== namespace.sourceInstanceId)
 				throw stale("Recorded history source changed");
-			const live = runtime.evidence.getScope(identity.scopeId);
+			const live = await runtime.evidence.getScope(identity.scopeId, { signal });
 			if (
 				!live ||
 				live.sourceInstanceId !== namespace.sourceInstanceId ||
@@ -358,15 +362,19 @@ let cached:
 	  }
 	| undefined;
 async function services(signal: AbortSignal) {
+	// This adapter always executes on the trusted local backend, even when the
+	// narrator's default device is remote or an old plan contains mixed targets.
+	assertFileHistoryEnabledForDevice(LOCAL_DEVICE_ID);
 	const { runtime, namespace } = await verifiedNamespace(signal);
 	if (!cached || cached.runtime !== runtime || cached.namespace !== namespace) {
-		const namespaceKey = namespace.catalog.getBudget()?.namespaceKey;
+		const namespaceKey = (await namespace.catalog.readBudget({ signal }))?.namespaceKey;
 		if (!namespaceKey) throw stale("Evidence namespace metadata is missing");
 		cached = {
 			runtime,
 			namespace,
 			planner: new RevertPlannerService(db, {
 				access,
+				readInspectionBody: readCommittedRevertSelectionBody,
 				blobStore: namespace.store,
 				blobCatalog: namespace.catalog,
 				generation: namespace.generation,
@@ -480,6 +488,7 @@ export async function prepareLocalRevertPlan(request: RevertPlannerRequest) {
 	const signal = request.signal ?? AbortSignal.timeout(FILE_CHANGE_LIMITS.planLifetimeMs);
 	try {
 		await access.owner(request.principal, request.narratorId, signal);
+		assertFileHistoryEnabledForDevice(LOCAL_DEVICE_ID);
 		const current = db
 			.select({ messageVersion: narrators.messageVersion })
 			.from(narrators)
@@ -511,7 +520,7 @@ export async function getLocalRevertPlan(
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
 	const { plans } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId, { signal });
 	signal.throwIfAborted();
 	return { plan, executable: false as const };
 }
@@ -523,7 +532,7 @@ export async function listLocalRevertPlanFiles(
 ) {
 	const owner = await access.owner(principal, narratorId, options.signal);
 	const { plans } = await services(options.signal);
-	const page = plans.listFiles(owner, planId, options);
+	const page = await plans.readFilePage(owner, planId, options);
 	// Stored paths are sensitive too. A preview created before file permission revocation
 	// must not leak target identities under the weaker GET/read-only narrator gate.
 	for (const item of page.items) {
@@ -556,6 +565,7 @@ export async function prepareLocalRevertAction(
 	signal: AbortSignal,
 ) {
 	await access.owner(principal, narratorId, signal);
+	assertFileHistoryEnabledForDevice(LOCAL_DEVICE_ID);
 	try {
 		// Subagents are revert roots too: users work in them directly. Their selection
 		// covers only their own history (plus anything they delegated), and admission
@@ -719,7 +729,7 @@ export async function prepareLocalRevertAction(
 		// advisory: they never widen the refused plan or soften the safety gate.
 		let blockers =
 			unavailable === "pending_operations" || unavailable === "incomplete_coverage"
-				? collectRevertBlockers(narratorId, code)
+				? await collectRevertBlockers(narratorId, code)
 				: undefined;
 		if (unavailable === "pending_operations" && (!blockers || blockers.length === 0)) {
 			// Name live narrator activity without exposing arbitrary error paths.
@@ -763,9 +773,10 @@ export async function applyLocalRevertPlan(
 	signal: AbortSignal,
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
+	assertFileHistoryEnabledForDevice(LOCAL_DEVICE_ID);
 	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId, { signal });
 	if (plan.planHash !== input.planHash)
 		throw new RevertPlannerError("ACTION_MISMATCH", "Confirmed plan changed");
 	if (plan.status === "prepared" && plan.expired)
@@ -790,7 +801,7 @@ export async function applyLocalRevertPlan(
 			: () => {};
 	let execution: ReturnType<RevertTransactionService["execute"]>;
 	try {
-		const admissionPlan = plans.getSummary(owner, planId);
+		const admissionPlan = await plans.getSummary(owner, planId, { signal });
 		if (admissionPlan.status === "prepared" && admissionPlan.expired)
 			throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
 		execution = transactions.execute({ principal, narratorId, planId, ...input, signal });

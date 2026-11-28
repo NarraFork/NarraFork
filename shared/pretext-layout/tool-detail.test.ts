@@ -636,16 +636,170 @@ describe("classifyToolDetail — webSearch", () => {
 		expect(out.format).toBe("markdown");
 		expect(metaTexts(d)).toEqual(["how to"]);
 	});
-	it("returns error when no output", () => {
-		const d = bodyOfKind(
-			classifyToolDetail({
+	it("returns error when a search actually failed with no result", () => {
+		for (const status of ["fail", "error"]) {
+			const d = bodyOfKind(
+				classifyToolDetail({
+					previewId: "classifier-fixture",
+					toolName: "WebSearch",
+					category: "webSearch",
+					status,
+					inputJson: { query: "cats" },
+				}),
+				"error",
+			);
+			expect(d.kind).toBe("error");
+			expect(d.text).toBe("Web search failed");
+		}
+	});
+
+	it("shows the failure text when the tool returned one", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "WebSearch",
+			category: "webSearch",
+			status: "fail",
+			inputJson: { query: "cats" },
+			outputJson: "Web search failed: timeout",
+		});
+		expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+		expect((sectionBody(d, "output") as ToolCappedDetail).text).toBe("Web search failed: timeout");
+	});
+
+	it("paints a failure event that carries no result as failed", () => {
+		for (const outputJson of [
+			{ status: "failed" },
+			{ error_code: "unavailable" },
+			{ content: { type: "web_search_tool_result_error", error_code: "unavailable" } },
+			{ error: { message: "upstream closed" } },
+		]) {
+			const d = bodyOfKind(
+				classifyToolDetail({
+					previewId: "classifier-fixture",
+					toolName: "WebSearch",
+					category: "webSearch",
+					status: "running",
+					inputJson: { query: "cats" },
+					outputJson,
+				}),
+				"error",
+			);
+			expect(d.text).toBe("Web search failed");
+		}
+	});
+
+	it("does not treat an in-progress search as a failure", () => {
+		for (const status of ["running", "pending", "initializing", undefined]) {
+			const d = classifyToolDetail({
 				previewId: "classifier-fixture",
 				toolName: "WebSearch",
 				category: "webSearch",
-			}),
-			"error",
-		);
-		expect(d.kind).toBe("error");
+				status,
+				inputJson: { query: "cats" },
+			});
+			expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+			expect(metaTexts(d)).toEqual(["cats"]);
+		}
+	});
+
+	it("does not treat an empty interim payload as a failure", () => {
+		for (const outputJson of [
+			"",
+			"   ",
+			{},
+			[],
+			null,
+			{ _text: "" },
+			{ _metadata: { channelId: "web" } },
+			{ results: null },
+		]) {
+			const d = classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "WebSearch",
+				category: "webSearch",
+				status: "running",
+				inputJson: { query: "cats" },
+				outputJson,
+			});
+			expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+			expect(d?.sections.some((section) => section.key === "output.main")).toBe(false);
+		}
+	});
+
+	it("does not treat a pending tool result as a failure", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "WebSearch",
+			category: "webSearch",
+			status: "pending",
+		});
+		expect(d).toBeNull();
+	});
+
+	it("does not treat a stream event that arrives before the result as a failure", () => {
+		for (const outputJson of [
+			{ type: "web_search_call", status: "in_progress", id: "ws_1" },
+			{ type: "response.web_search_call.searching", status: "searching", query: "cats" },
+			{ type: "web_search_call", status: "completed", query: "cats" },
+			{ status: "searching", query: "cats" },
+			{
+				type: "content_block_start",
+				content_block: { type: "server_tool_use", name: "web_search" },
+			},
+			{ type: "web_search_tool_result" },
+		]) {
+			const d = classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "WebSearch",
+				category: "webSearch",
+				status: "running",
+				inputJson: { query: "cats" },
+				outputJson,
+			});
+			expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+			expect(d?.sections.some((section) => section.key === "output.main")).toBe(false);
+			expect(metaTexts(d)).toEqual(["cats"]);
+		}
+	});
+
+	it("reads an in-flight stream preview from metadata instead of failing", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "WebSearch",
+			category: "webSearch",
+			status: "running",
+			inputJson: { query: "cats" },
+			metadata: { _streamingOutput: { type: "web_search_call", status: "searching" } },
+		});
+		expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+		expect(metaTexts(d)).toEqual(["cats"]);
+	});
+
+	it("uses the stream event query while the tool input has none yet", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "WebSearch",
+			category: "webSearch",
+			status: "running",
+			outputJson: { type: "web_search_call", status: "searching", queries: ["cats", "kittens"] },
+		});
+		expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
+		expect(metaTexts(d)).toEqual(["cats, kittens"]);
+	});
+
+	it("still renders an empty result list once the search has settled", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "WebSearch",
+			category: "webSearch",
+			status: "success",
+			inputJson: { query: "cats" },
+			outputJson: JSON.stringify({ results: [] }),
+		});
+		const body = asSections(d).sections.find((section) => section.body.kind === "structured")
+			?.body as ToolStructuredDetail;
+		expect(body.entries).toEqual([]);
+		expect(d?.sections.some((section) => section.body.kind === "error")).toBe(false);
 	});
 });
 
@@ -760,6 +914,93 @@ describe("classifyToolDetail — agent/generic", () => {
 			inputJson: "in",
 		});
 		expect(asSections(d).kind).toBe("sections");
+	});
+	it("draws a count-based bar for a running generic tool and drops it once terminal", () => {
+		const metadata = {
+			_streamingOutput: "[2/3] indexing batch-2…",
+			_structuredProgress: { completed: 1, total: 3, currentItem: "batch-2" },
+		};
+		const running = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata,
+			}),
+		);
+		expect(running.sections.map((part) => part.key)).toEqual([
+			"meta.progress",
+			"input.arguments",
+			"output.main",
+		]);
+		const bar = running.sections[0]?.body;
+		expect(bar?.kind).toBe("meta-rows");
+		const row = bar?.kind === "meta-rows" ? bar.rows[0] : undefined;
+		expect(row?.progress?.figures).toEqual(["1/3", "batch-2"]);
+		expect(row?.progress?.ratio).toBeCloseTo(1 / 3);
+		const done = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "success",
+				inputJson: { action: "start" },
+				outputJson: "{}",
+				metadata,
+			}),
+		);
+		expect(done.sections.map((part) => part.key)).not.toContain("meta.progress");
+	});
+	it("draws no bar for a running generic tool without renderable progress", () => {
+		const d = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata: { _structuredProgress: { completed: 0 } },
+			}),
+		);
+		expect(d.sections.map((part) => part.key)).not.toContain("meta.progress");
+	});
+	it("draws the completed count when a running generic tool has a non-positive total", () => {
+		const d = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata: { _structuredProgress: { completed: 5, total: 0 } },
+			}),
+		);
+		expect(d.sections.map((part) => part.key)).toContain("meta.progress");
+		const bar = d.sections.find((part) => part.key === "meta.progress")?.body;
+		expect(bar?.kind).toBe("meta-rows");
+		const row = bar?.kind === "meta-rows" ? bar.rows[0] : undefined;
+		expect(row?.progress?.figures).toEqual(["5"]);
+		expect(row?.progress?.ratio).toBeNull();
+	});
+});
+
+describe("Watch registration display", () => {
+	it("renders a settled registration receipt, not a live wait or output counter", () => {
+		const d = classifyToolDetail({
+			previewId: "watch-registration",
+			toolName: "Watch",
+			category: "watch",
+			status: "success",
+			inputJson: { type: "agent", id: "worker", timeout: 600000 },
+			outputJson: { _text: "Observation registered; results notify automatically." },
+			metadata: { kind: "watch", type: "agent", status: "watching", _streamingOutput: "123" },
+			labels: { watchRegistered: "已登记观察" },
+		});
+		expect(metaBadgeLabels(d)).toEqual(["agent", "已登记观察"]);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toContain("Observation registered");
+		expect(metaIdentities(d)).toEqual([]);
 	});
 });
 

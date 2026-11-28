@@ -11,15 +11,19 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const {
 	agentLabelFromNarrator,
+	agentMarkdownReference,
 	agentResultTag,
 	clearAgentLabelMemo,
 	resolveAgentLabel,
@@ -29,9 +33,10 @@ const { clearAliasRegistry, registerTaskAlias, SUBAGENT_ALIAS_TRAIT_PREFIX } = a
 	"../subagent-alias"
 );
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 const PARENT = "label-parent";
@@ -194,8 +199,38 @@ describe("resolveAgentLabel (only an id in hand)", () => {
 	});
 });
 
+describe("agentMarkdownReference", () => {
+	test("links to the real narrator id, never the addressing alias", () => {
+		expect(agentMarkdownReference(AGENT_ID, "Run tests")).toBe(
+			`[Run tests](nf-agent://open?id=${AGENT_ID})`,
+		);
+	});
+
+	test("escapes Markdown and HTML in the label and keeps the reference on one line", () => {
+		expect(
+			agentMarkdownReference(AGENT_ID, "  Task [x](y) \\ *bold* `code` <b>\nnext\r\nline  "),
+		).toBe(
+			String.raw`[Task \[x\]\(y\) \\ \*bold\* \`code\` \<b\> next line](nf-agent://open?id=${AGENT_ID})`,
+		);
+	});
+
+	test("uses a readable fallback for an empty title", () => {
+		expect(agentMarkdownReference(AGENT_ID, " \n ")).toBe(
+			`[${shortAgentId(AGENT_ID)}](nf-agent://open?id=${AGENT_ID})`,
+		);
+	});
+});
+
 describe("agentResultTag", () => {
-	test("wraps the readable label, not a nanoid", () => {
-		expect(agentResultTag("run-tests")).toBe("<subagent_id>run-tests</subagent_id>\n\n");
+	test("preserves the alias tag and adds a reference with the real narrator id", () => {
+		expect(agentResultTag("run-tests", AGENT_ID, "Run tests")).toBe(
+			`<subagent_id>run-tests</subagent_id>\n\n[Run tests](nf-agent://open?id=${AGENT_ID})\n\n`,
+		);
+	});
+
+	test("uses the alias as the link label when there is no title", () => {
+		expect(agentResultTag("worker", AGENT_ID)).toBe(
+			`<subagent_id>worker</subagent_id>\n\n[worker](nf-agent://open?id=${AGENT_ID})\n\n`,
+		);
 	});
 });

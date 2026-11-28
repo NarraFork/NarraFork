@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { normalizeLegacyUltra } from "@shared/reasoning-effort";
 import { getInstallationId } from "../installation-id";
 import { markInstructionsInput } from "./input-characters";
 
@@ -18,9 +19,9 @@ import { markInstructionsInput } from "./input-characters";
  * deterministically from the conversation id — stable across every request of
  * a conversation without threading extra state.
  *
- * Still omitted: `turn_id`. It is genuinely per-turn in the real client, and
- * the volatile turn-metadata blob it pairs with is not sent either (see
- * buildCodexEmulationHeaders).
+ * `turn_id` is attached by callers only when they hold an explicit logical
+ * ProviderTurnContext; it is not a stable conversation identity. The volatile
+ * turn-metadata blob remains omitted (see buildCodexEmulationHeaders).
  */
 export interface CodexRequestIdentity {
 	conversationId: string;
@@ -118,10 +119,20 @@ export function applyCodexStableRequestFields(
 	body: Record<string, unknown>,
 	options: {
 		identity: CodexRequestIdentity;
-		reasoningEffort: string;
+		/** Diagnostic forks keep the parent's input IDs while isolating their wire identity. */
+		instructionsConversationId?: string;
+		reasoningEffort?: string;
 	},
 ): void {
-	applyCodexInstructionsInput(body, options.identity);
+	applyCodexInstructionsInput(
+		body,
+		options.instructionsConversationId === undefined
+			? options.identity
+			: {
+					...options.identity,
+					conversationId: options.instructionsConversationId,
+				},
+	);
 	body.prompt_cache_key = options.identity.conversationId;
 	body.tool_choice = "auto";
 	// Parallel tool calls stay ON. `false` belongs to the responses-lite contract
@@ -130,8 +141,9 @@ export function applyCodexStableRequestFields(
 	// tools. Sending `false` outside that contract has no upstream justification and
 	// silently degrades every Codex turn to one tool call at a time.
 	body.parallel_tool_calls = true;
+	const effort = normalizeLegacyUltra(options.reasoningEffort);
 	body.reasoning = {
-		effort: options.reasoningEffort,
+		...(effort !== undefined ? { effort } : {}),
 		// Without an explicit summary mode the Responses API emits no
 		// reasoning_summary_text events, and encrypted_content is opaque — the
 		// narrator's visible thinking would go blank across all three transports.

@@ -3,7 +3,8 @@ import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { projects, remoteDevices } from "../db/schema";
-import { AppError } from "../lib/errors";
+import { readQueryFirst } from "../db/worker-read";
+import { AppError, catalogError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf } from "../lib/narrator-access";
@@ -158,8 +159,17 @@ export async function authorizeGitTarget(
 	c: Context,
 	source: { narratorId: string },
 	need: "read" | "write",
+	discoveryMode?: "metadata",
 ): Promise<GitWorkspaceTarget> {
-	return authorizeGitTargetForPrincipal(narratorPrincipalOf(c), source, need, c.req.raw.signal);
+	return authorizeGitTargetForPrincipal(
+		narratorPrincipalOf(c),
+		source,
+		need,
+		c.req.raw.signal,
+		false,
+		false,
+		discoveryMode === "metadata",
+	);
 }
 
 /** Shared by HTTP and authenticated workspace WebSocket subscriptions. */
@@ -170,7 +180,48 @@ export async function authorizeGitTargetForPrincipal(
 	signal: AbortSignal,
 	cachedDiscovery = false,
 	recoverWorktreeList = false,
+	metadataDiscovery: boolean | GitWorkspaceTarget = false,
 ): Promise<GitWorkspaceTarget> {
+	if (signal.aborted) {
+		await loadNarratorForAccess(source.narratorId, principal, need, {
+			deadlineAt: Date.now() + 30_000,
+			executionPolicy: "worker-required",
+		});
+		throw catalogError("GIT_REQUEST_CANCELLED");
+	}
+	const budget = new GitAccessScan(signal, 30_000);
+	let completed = false;
+	try {
+		const target = await budget.run(() =>
+			authorizeGitTargetWithinBudget(
+				principal,
+				source,
+				need,
+				signal,
+				budget,
+				cachedDiscovery,
+				recoverWorktreeList,
+				metadataDiscovery,
+			),
+		);
+		completed = true;
+		return target;
+	} finally {
+		budget.dispose(!completed);
+	}
+}
+
+async function authorizeGitTargetWithinBudget(
+	principal: NarratorPrincipal,
+	source: { narratorId: string },
+	need: "read" | "write",
+	requestSignal: AbortSignal,
+	budget: GitAccessScan,
+	cachedDiscovery = false,
+	recoverWorktreeList = false,
+	metadataDiscovery: boolean | GitWorkspaceTarget = false,
+): Promise<GitWorkspaceTarget> {
+	const signal = budget.signal;
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
 	let deviceClass: ExecutionDeviceClass | null = null;
@@ -179,22 +230,42 @@ export async function authorizeGitTargetForPrincipal(
 		policy: Awaited<ReturnType<typeof executionPolicyEngine.compile>> | null;
 	} = { context: null, policy: null };
 	let target: GitWorkspaceTarget;
-	const narrator = await loadNarratorForAccess(source.narratorId, principal, need);
-	canWrite = await canWriteNarrator(narrator, principal);
-	policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId);
+	const narrator = await loadNarratorForAccess(
+		source.narratorId,
+		principal,
+		need,
+		budget.readOptions(),
+	);
+	if (signal.aborted) throw catalogError("GIT_REQUEST_CANCELLED");
+	canWrite = await canWriteNarrator(narrator, principal, budget.readOptions());
+	policy = await resolveOAuthNarratorRuntimePolicy(
+		source.narratorId,
+		undefined,
+		budget.readOptions(),
+		narrator,
+	);
 	target = await resolveNarratorGitTarget(
 		source.narratorId,
 		signal,
 		async (initial) => {
 			if (initial.contextProjectId) {
-				const project = await loadProjectForAccess(initial.contextProjectId, principal, need);
-				canWrite &&= await hasProjectAccess(project, principal, "write");
+				const project = await loadProjectForAccess(
+					initial.contextProjectId,
+					principal,
+					need,
+					budget.readOptions(),
+				);
+				canWrite &&= await hasProjectAccess(project, principal, "write", budget.readOptions());
 			}
 			const id = initial.workspace.deviceId;
 			if (id !== "local") {
-				const device = await db.query.remoteDevices.findFirst({
-					where: eq(remoteDevices.id, id),
-				});
+				const device = await readQueryFirst(
+					db.query.remoteDevices.findMany({
+						limit: 1,
+						where: eq(remoteDevices.id, id),
+					}),
+					{ ...budget.readOptions(), executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (
 					!device ||
 					device.revokedAt ||
@@ -202,7 +273,7 @@ export async function authorizeGitTargetForPrincipal(
 						userId: principal.userId,
 						projectId: initial.contextProjectId,
 					}) ||
-					!(await resolveOAuthDeviceRuntimeAuthorization(device)).allowed
+					!(await resolveOAuthDeviceRuntimeAuthorization(device, budget.readOptions())).allowed
 				)
 					throw denied();
 			}
@@ -210,7 +281,9 @@ export async function authorizeGitTargetForPrincipal(
 				if (id === "local" ? !policy.allowLocalExecution : !policy.deviceIds.includes(id))
 					throw denied();
 				const binding =
-					id === "local" ? null : await integrationResourceBindingService.get("device", id);
+					id === "local"
+						? null
+						: await integrationResourceBindingService.get("device", id, budget.readOptions());
 				deviceClass =
 					id === "local"
 						? "host"
@@ -248,6 +321,8 @@ export async function authorizeGitTargetForPrincipal(
 				source.narratorId,
 				narratorExecution.context,
 				policy?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+				signal,
+				budget.readOptions(),
 			);
 			if (
 				!gitPathPolicyAllows(
@@ -268,6 +343,9 @@ export async function authorizeGitTargetForPrincipal(
 		},
 		cachedDiscovery && need === "read",
 		recoverWorktreeList && need === "read",
+		metadataDiscovery,
+		budget.readOptions(),
+		narrator,
 	);
 	const { workspace, backend } = target;
 	if (
@@ -279,11 +357,15 @@ export async function authorizeGitTargetForPrincipal(
 		return target;
 	}
 	const root = workspace.rootPath;
-	const scan = new GitAccessScan(signal);
+	const scan = budget;
+	scan.limitRemaining(5000);
 	try {
 		for (const project of await relatedProjects(target, scan, principal)) {
-			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
-			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
+			if (!(await scan.run(() => hasProjectAccess(project, principal, "read", scan.readOptions()))))
+				throw denied();
+			canWrite &&= await scan.run(() =>
+				hasProjectAccess(project, principal, "write", scan.readOptions()),
+			);
 		}
 		await scan.run(() => requireSafeLocalGitPath(target, root));
 		const context = narratorExecution.context;
@@ -304,6 +386,19 @@ export async function authorizeGitTargetForPrincipal(
 			canWrite &&= compiled.evaluatePath({ path: root, operation: "write" }).decision === "allow";
 		}
 		if (need === "write" && !canWrite) throw denied();
+		target.authorizeFilePaths = async (files, operation) => {
+			// The authorization scope is already disposed; subsequent use belongs to the request.
+			requestSignal.throwIfAborted();
+			if (operation === "write" && !canWrite) throw denied();
+			for (const file of files) {
+				const absolute = backend.paths.resolve(root, file);
+				if (
+					!backend.paths.contains(root, absolute) ||
+					!gitPathPolicyAllows(compiled, context, absolute, operation)
+				)
+					throw denied();
+			}
+		};
 		scan.check();
 		workspace.capabilities = target.worktreeListOnly
 			? { read: false, write: false }
@@ -312,7 +407,6 @@ export async function authorizeGitTargetForPrincipal(
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
 		redactDeniedTarget(target);
 	} finally {
-		scan.dispose();
 		const elapsedMs = Math.round(performance.now() - scan.started);
 		if (elapsedMs >= 1000)
 			logger.warn("Slow Git workspace access check", {
@@ -332,7 +426,35 @@ export async function authorizeGitDestinationForPrincipal(
 	need: "read" | "write",
 	signal: AbortSignal,
 ): Promise<GitWorkspaceTarget> {
-	const target = await authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal);
+	const budget = new GitAccessScan(signal, 30_000);
+	let completed = false;
+	try {
+		const target = await budget.run(() =>
+			authorizeGitDestinationWithinBudget(principal, narratorId, destination, need, signal, budget),
+		);
+		completed = true;
+		return target;
+	} finally {
+		budget.dispose(!completed);
+	}
+}
+
+async function authorizeGitDestinationWithinBudget(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	destination: string,
+	need: "read" | "write",
+	requestSignal: AbortSignal,
+	budget: GitAccessScan,
+): Promise<GitWorkspaceTarget> {
+	const signal = budget.signal;
+	const target = await authorizeGitTargetWithinBudget(
+		principal,
+		{ narratorId },
+		need,
+		requestSignal,
+		budget,
+	);
 	requireReadyGitTarget(target, need);
 	const backend = target.backend;
 	if (backend.kind !== "local") throw denied();
@@ -343,7 +465,11 @@ export async function authorizeGitDestinationForPrincipal(
 	)
 		throw denied();
 	await requireSafeLocalGitPath(target, destination);
-	const policy = await resolveOAuthNarratorRuntimePolicy(narratorId);
+	const policy = await resolveOAuthNarratorRuntimePolicy(
+		narratorId,
+		undefined,
+		budget.readOptions(),
+	);
 	const context: ExecutionTargetContext = {
 		backend,
 		paths: backend.paths,
@@ -363,6 +489,8 @@ export async function authorizeGitDestinationForPrincipal(
 		narratorId,
 		context,
 		policy?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
+		signal,
+		budget.readOptions(),
 	);
 	if (!gitPathPolicyAllows(compiled, context, destination, need)) throw denied();
 	const decision = compiled.evaluatePath({ path: destination, operation: need }).decision;
@@ -394,15 +522,13 @@ export async function authorizeGitDestinationForPrincipal(
 		// The source common directory was already authorized; don't treat it as a destination grant.
 		repositoryPath: undefined,
 	};
-	const scan = new GitAccessScan(signal);
-	try {
-		for (const project of await relatedProjects(scopedTarget, scan, principal)) {
-			if (!(await scan.run(() => hasProjectAccess(project, principal, need)))) throw denied();
-		}
-		scan.check();
-	} finally {
-		scan.dispose();
+	const scan = budget;
+	scan.limitRemaining(5000);
+	for (const project of await relatedProjects(scopedTarget, scan, principal)) {
+		if (!(await scan.run(() => hasProjectAccess(project, principal, need, scan.readOptions()))))
+			throw denied();
 	}
+	scan.check();
 	signal.throwIfAborted();
 	return target;
 }

@@ -83,7 +83,7 @@ function encodeRawCursor(createdAt: string): string {
 
 describe("usage history user filters and authorization", () => {
 	test("lifetime user totals are bounded and cursor-paginated", async () => {
-		const totals = mock(() => ({ records: [], hasMore: false, nextCursor: null, limit: 2 }));
+		const totals = mock(async () => ({ records: [], hasMore: false, nextCursor: null, limit: 2 }));
 		const routes = createUsageHistoryRoutes({
 			requireAuth: async (_c, next) => {
 				await next();

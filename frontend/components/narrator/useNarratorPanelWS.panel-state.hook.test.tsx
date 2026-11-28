@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { api } from "@frontend/lib/api";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
+import { ApiError, api } from "@frontend/lib/api";
+import { clearToken, confirmAuthUser, getAuthSnapshot, setToken } from "@frontend/lib/api/client";
 import type {
 	NarratorPanelStateOptions,
 	NarratorPanelStateResponse,
@@ -7,38 +9,46 @@ import type {
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
 import { notifications } from "@mantine/notifications";
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
-import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import {
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+	QueryObserver,
+	useQuery,
+} from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
+import { quotaSnapshotsReadKey } from "../../hooks/useQuotaSnapshots";
+import { runtimeSettingsQueryKey } from "../../hooks/useRuntimeSettings";
+import { useNugQuota } from "./model/use-nug-quota";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
 import { findPendingForKey } from "./vlist/vlist-permission-match";
 
-type QuotaSettings = {
-	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
-};
 let quotaProviderId: string | null = null;
-let balanceSnapshot: ProviderBalanceSnapshot | undefined;
-let quotaDisplay: ReturnType<typeof customApiBalanceDisplayFor>;
-function subscriptionSnapshot(): ProviderBalanceSnapshot {
-	return {
-		generation: "g1",
-		status: "supported",
-		adapter: "sub2api",
-		balance: {
-			scope: "subscription",
-			unlimited: false,
-			amounts: [{ unit: "USD", window: "daily", total: 10, used: 2, remaining: 8 }],
+let nugProvider: { id: string; generation?: number } | null = null;
+let nugEnabled = true;
+let nugInfo: ReturnType<typeof useNugQuota> = null;
+const quotaData: QuotaSnapshotsResponse = {
+	entries: [
+		{
+			groupId: "p1",
+			prefix: "provider",
+			templateId: "custom",
+			credentialId: "key1",
+			source: "probe",
+			snapshot: {
+				fetchedAt: 1,
+				scope: "subscription",
+				windows: [{ kind: "weekly", usedRatio: 0.2, resetsAt: null }],
+				balances: [],
+			},
 		},
-		fetchedAt: 1,
-		attemptedAt: 1,
-		error: null,
-	};
-}
+	],
+};
 
 let root: Root;
 let host: HTMLElement;
@@ -53,6 +63,11 @@ const originals = new Map<string, PropertyDescriptor | undefined>();
 const managerOriginals = new Map<string, PropertyDescriptor | undefined>();
 const restores: Array<() => void> = [];
 const connections = new Set<(connected: boolean, isReconnect: boolean) => void>();
+const recoveries = new Set<() => void>();
+let observeDetails = false;
+let observedDetailId: string | undefined;
+let detailReads = 0;
+let childReads = 0;
 const listeners = new Map<number, (frame: Record<string, unknown>) => void>();
 let nextListenerId = 0;
 
@@ -98,27 +113,51 @@ function cancelable<T>(promise: Promise<T>, signal?: AbortSignal) {
 }
 function Harness() {
 	current = useNarratorPanelWS({ narratorId, narratorStatus, isAtBottomRef: { current: true } });
+	return observeDetails ? <DetailObservers /> : null;
+}
+function DetailObservers() {
+	const id = observedDetailId ?? narratorId;
+	useQuery({
+		queryKey: ["narrators", id],
+		queryFn: async () => {
+			detailReads++;
+			return qc.getQueryData(["narrators", id]) ?? { id };
+		},
+	});
+	useQuery({
+		queryKey: ["narrators", id, "tasks", "current"],
+		queryFn: async () => {
+			childReads++;
+			return [];
+		},
+	});
 	return null;
 }
 function QuotaHarness() {
-	const { data: settings } = useQuery<QuotaSettings>({
-		queryKey: ["settings"],
-		queryFn: async () => ({ customApiQuotas: {} }),
-		enabled: false,
-	});
-	quotaDisplay = customApiBalanceDisplayFor({
-		providerId: quotaProviderId,
-		pushedQuotas: settings?.customApiQuotas,
-		snapshot: balanceSnapshot,
-	});
 	current = useNarratorPanelWS({
 		narratorId,
 		narratorStatus,
 		isAtBottomRef: { current: true },
-		customApiProviderId: quotaProviderId ?? undefined,
-		quotaProviderKey: quotaProviderId ?? undefined,
-		initialQuotaBalance: quotaDisplay.pushedQuota?.quotaBalance ?? null,
-		initialDetailedQuotaBalance: quotaDisplay.pushedQuota?.detailedQuotaBalance ?? null,
+		quotaProviderKey: quotaProviderId,
+	});
+	return null;
+}
+function NugQuotaHarness() {
+	nugInfo = useNugQuota(
+		"nug:model",
+		nugProvider ? [{ ...nugProvider, prefix: "nug" }] : [],
+		nugEnabled,
+	);
+	current = useNarratorPanelWS({
+		narratorId,
+		narratorStatus,
+		isAtBottomRef: { current: true },
+		quotaProviderKey: JSON.stringify(nugProvider),
+		quotaReadScope: {
+			groupId: nugProvider?.id,
+			cachedOnly: true,
+			expectedGeneration: nugProvider?.generation,
+		},
 	});
 	return null;
 }
@@ -127,7 +166,7 @@ const render = () =>
 		root.render(
 			<QueryClientProvider client={qc}>
 				<I18nextProvider i18n={instance}>
-					{quotaProviderId ? <QuotaHarness /> : <Harness />}
+					{nugProvider ? <NugQuotaHarness /> : quotaProviderId ? <QuotaHarness /> : <Harness />}
 				</I18nextProvider>
 			</QueryClientProvider>,
 		),
@@ -146,13 +185,29 @@ const retryTick = () =>
 		await new Promise((resolve) => setTimeout(resolve, 275));
 	});
 
+function bindUser(token: string, id = "u1") {
+	const generation = setToken(token);
+	confirmAuthUser(generation, id);
+	seedCurrentUser(qc, generation, { id });
+	return generation;
+}
+
 beforeEach(async () => {
 	const { window } = parseHTML("<html><body></body></html>");
+	const tokens = new Map<string, string>();
 	for (const [key, value] of Object.entries({
 		window,
 		document: window.document,
 		navigator: window.navigator,
-		localStorage: { getItem: () => null },
+		localStorage: {
+			getItem: (key: string) => tokens.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				tokens.set(key, value);
+			},
+			removeItem: (key: string) => {
+				tokens.delete(key);
+			},
+		},
 		IS_REACT_ACT_ENVIRONMENT: true,
 	})) {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -185,6 +240,12 @@ beforeEach(async () => {
 		spyOn(narratorWSManager, "removeListener").mockImplementation((handle) => {
 			listeners.delete(handle._id);
 		}),
+		spyOn(narratorWSManager, "onControlPlaneRecovery").mockImplementation((callback) => {
+			recoveries.add(callback);
+			return () => {
+				recoveries.delete(callback);
+			};
+		}),
 		spyOn(narratorWSManager, "onConnectionChange").mockImplementation((callback) => {
 			connections.add(callback);
 			return () => {
@@ -196,15 +257,26 @@ beforeEach(async () => {
 	narratorId = "n1";
 	narratorStatus = "waiting";
 	quotaProviderId = null;
-	balanceSnapshot = undefined;
+	nugProvider = null;
+	nugEnabled = true;
+	nugInfo = null;
 	connected = false;
 	listeners.clear();
 	connections.clear();
+	recoveries.clear();
+	observeDetails = false;
+	observedDetailId = undefined;
+	detailReads = 0;
+	childReads = 0;
 	notifyManager.setScheduler(queueMicrotask);
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
-	qc.setQueryData(["auth", "me"], { id: "u1" });
+	bindUser("quota-token");
+	const me = spyOn(api, "me").mockImplementation(
+		async () => qc.getQueryData<{ id: string }>(["auth", "me"]) ?? { id: "u1" },
+	);
+	restores.push(() => me.mockRestore());
 	instance = i18next.createInstance();
 	await instance
 		.use(initReactI18next)
@@ -301,94 +373,97 @@ describe("upstream timed wait notifications with the real WS hook", () => {
 	});
 });
 
-describe("pushed custom API quota precedence with the real WS hook", () => {
-	test("a live push replaces the subscription and survives subsequent auto-balance polling", async () => {
+describe("shared quota snapshots with the real WS hook", () => {
+	test("quota pushes invalidate snapshots without injecting unscoped text or writing legacy caches", async () => {
 		quotaProviderId = "p1";
-		const snapshot = subscriptionSnapshot();
-		balanceSnapshot = snapshot;
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
+		const settings = { customApiQuotas: {} };
+		const nug = { p1: { balance: 3 } };
+		qc.setQueryData(["settings"], settings);
+		qc.setQueryData(["admin", "settings"], settings);
+		qc.setQueryData(["nug", "quotas"], nug);
+		qc.setQueryData(quotaSnapshotsReadKey(), quotaData);
 		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(snapshot);
-		expect(current.quotaBalance).toBeNull();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "75%",
+			detailedQuotaBalance: "private upstream text",
+		});
+		expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(true);
+		expect(qc.getQueryData(quotaSnapshotsReadKey())).toEqual(quotaData);
+		expect(qc.getQueryData(["settings"])).toEqual(settings);
+		expect(qc.getQueryData(["admin", "settings"])).toEqual(settings);
+		expect(qc.getQueryData(["nug", "quotas"])).toEqual(nug);
+	});
 
-		const pushed = {
-			quotaBalance: "站点额度 75%",
-			detailedQuotaBalance: "专用套餐\n日 USD 0.004\n周 USD 1",
-		};
-		await event({ type: "quota_balance", ...pushed });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toMatchObject(pushed);
-
-		balanceSnapshot = { ...snapshot, fetchedAt: 2 };
+	test("queued quota and payment frames cannot cross A→B→A even with the same token", async () => {
+		setToken("quota-old");
+		restores.push(() => clearToken());
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
+		const old = [...listeners.values()];
+		// The queued frame still belongs to the socket opened with the old credential.
+		const connection = spyOn(narratorWSManager, "getConnectionCredentialIdentity").mockReturnValue(
+			narratorWSManager.getCredentialIdentity(),
+		);
+		try {
+			await act(async () => {
+				setToken("quota-new");
+				bindUser("quota-old");
+			});
+			await render();
+			qc.setQueryData(quotaSnapshotsReadKey(), quotaData);
+			await act(async () => {
+				for (const listener of old) {
+					listener({ narratorId, type: "quota_balance", quotaBalance: "old" });
+					listener({ narratorId, type: "payment_required", providerId: "old", balance: 0 });
+				}
+			});
+			expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(false);
+			expect(current.paymentRequired).toBeNull();
+		} finally {
+			connection.mockRestore();
+		}
+		await event({ type: "quota_balance", quotaBalance: "current" });
+		expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(true);
+	});
 
-		await event({ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "已耗尽" });
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe("0");
-		expect(current.detailedQuotaBalance).toBe("已耗尽");
+	test("quota frames from an outdated socket credential stay isolated", async () => {
+		await render();
+		qc.setQueryData(quotaSnapshotsReadKey(), quotaData);
+		const connection = spyOn(narratorWSManager, "getConnectionCredentialIdentity").mockReturnValue(
+			(narratorWSManager.getCredentialIdentity() ?? 0) + 1,
+		);
+		try {
+			await event({ type: "quota_balance", quotaBalance: "old socket" });
+			expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(false);
+		} finally {
+			connection.mockRestore();
+		}
+	});
 
+	test("null pushes still re-read snapshots, never erase the credential probe", async () => {
+		qc.setQueryData(quotaSnapshotsReadKey(), quotaData);
+		await render();
 		await event({ type: "quota_balance", quotaBalance: null, detailedQuotaBalance: null });
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
+		expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(true);
+		expect(qc.getQueryData(quotaSnapshotsReadKey())).toEqual(quotaData);
 	});
 
-	test("cached pushes win on mount and never leak when switching providers", async () => {
-		quotaProviderId = "p1";
-		balanceSnapshot = subscriptionSnapshot();
-		const pushed = {
-			quotaBalance: "Cached site plan",
-			detailedQuotaBalance: "Cached site details",
-		};
-		qc.setQueryData(["settings"], { customApiQuotas: { p1: pushed } });
+	test("a subagent's quota frame never invalidates this panel's snapshot", async () => {
+		qc.setQueryData(quotaSnapshotsReadKey(), quotaData);
 		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-
-		quotaProviderId = "p2";
-		await render();
-		expect<ProviderBalanceSnapshot | null>(quotaDisplay.subscriptionSnapshot).toBe(balanceSnapshot);
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
-
-		quotaProviderId = "p1";
-		await render();
-		expect(quotaDisplay.subscriptionSnapshot).toBeNull();
-		expect(current.quotaBalance).toBe(pushed.quotaBalance);
-		expect(current.detailedQuotaBalance).toBe(pushed.detailedQuotaBalance);
-	});
-});
-
-describe("quota isolation between a main agent and its subagent side by side", () => {
-	test("a subagent's quota frame never reaches this panel's balance or its provider cache", async () => {
-		quotaProviderId = "p1";
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
-		await render();
-		expect(current.quotaBalance).toBeNull();
-
 		await event({
 			type: "quota_balance",
 			quotaBalance: "subagent balance",
 			detailedQuotaBalance: "subagent details",
 			isSubagent: true,
 		});
-
-		expect(current.quotaBalance).toBeNull();
-		expect(current.detailedQuotaBalance).toBeNull();
-		expect(qc.getQueryData<QuotaSettings>(["settings"])?.customApiQuotas.p1).toBeUndefined();
+		expect(qc.getQueryState(quotaSnapshotsReadKey())?.isInvalidated).toBe(false);
+		expect(qc.getQueryData(quotaSnapshotsReadKey())).toEqual(quotaData);
 	});
 
 	test("a subagent's payment_required never arms this panel's recharge state", async () => {
 		quotaProviderId = "p1";
-		qc.setQueryData(["settings"], { customApiQuotas: {} });
 		await render();
-
 		await event({
 			type: "payment_required",
 			providerId: "p1",
@@ -397,19 +472,485 @@ describe("quota isolation between a main agent and its subagent side by side", (
 			resumeAction: "retry",
 			isSubagent: true,
 		});
+		expect(current.paymentRequired).toBeNull();
+	});
 
+	test("payment-required still arms recharge and resets when the provider changes", async () => {
+		quotaProviderId = "p1";
+		await render();
+		await event({
+			type: "payment_required",
+			providerId: "p1",
+			balance: 0,
+			required: 5,
+			resumeAction: "continue",
+		});
+		expect(current.paymentRequired).toMatchObject({
+			providerId: "p1",
+			balance: 0,
+			required: 5,
+			resumeAction: "continue",
+		});
+		quotaProviderId = "p2";
+		await render();
 		expect(current.paymentRequired).toBeNull();
 	});
 });
 
+describe("scoped unified NUG snapshots with the real panel", () => {
+	const result = (balance: number): QuotaSnapshotsResponse => ({
+		entries: [
+			{
+				groupId: "nug-current",
+				prefix: "nug",
+				templateId: "nug",
+				credentialId: "nug-key",
+				source: "probe",
+				supported: true,
+				snapshot: {
+					scope: "wallet",
+					fetchedAt: 1,
+					windows: [],
+					balances: [{ unit: "USD", remaining: balance }],
+				},
+			},
+		],
+	});
+	const remaining = () => nugInfo?.entries[0]?.snapshot?.balances[0]?.remaining;
+	async function waitForQuota(condition: () => boolean) {
+		for (let attempt = 0; attempt < 100; attempt++) {
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+			if (condition()) return;
+		}
+		throw new Error("scoped quota state did not settle");
+	}
+	function identify() {
+		bindUser("quota-token");
+		nugProvider = { id: "nug-current", generation: 7 };
+	}
+	function activeOtherIdentity(providerId: string, generation: number | undefined, auth: number) {
+		const key = quotaSnapshotsReadKey(
+			{ groupId: providerId, cachedOnly: true, expectedGeneration: generation },
+			auth,
+		);
+		const snapshot: QuotaSnapshotsResponse = {
+			entries: result(3).entries.map((entry) => ({ ...entry, groupId: providerId })),
+		};
+		qc.setQueryData(key, snapshot);
+		const identity = { key, reads: 0, snapshot };
+		const observer = new QueryObserver(qc, {
+			queryKey: key,
+			queryFn: async () => {
+				identity.reads++;
+				return snapshot;
+			},
+			staleTime: Infinity,
+		});
+		restores.push(observer.subscribe(() => {}));
+		return identity;
+	}
+	test("real HTTP quota bursts refresh only the active provider/runtime/auth identity without cancelling", async () => {
+		const oldAuth = getAuthSnapshot().generation;
+		setToken("other-token");
+		identify();
+		const auth = getAuthSnapshot().generation;
+		const others = [
+			activeOtherIdentity("nug-other", 7, auth),
+			activeOtherIdentity("nug-current", 6, auth),
+			activeOtherIdentity("nug-current", 7, oldAuth),
+			activeOtherIdentity("nug-current", undefined, auth),
+		];
+		let delayed = false;
+		const pending = deferred<Response>();
+		const requests: Array<{ url: string; signal?: AbortSignal | null }> = [];
+		const http = spyOn(globalThis, "fetch").mockImplementation((async (
+			url: unknown,
+			init?: RequestInit,
+		) => {
+			requests.push({ url: String(url), signal: init?.signal });
+			return delayed && requests.length === 2 ? pending.promise : Response.json(result(7));
+		}) as typeof fetch);
+		restores.push(() => http.mockRestore());
+		await render();
+		await waitForQuota(() => remaining() === 7);
+		expect(requests).toHaveLength(1);
+		delayed = true;
+		await act(async () => {
+			for (let index = 0; index < 20; index++)
+				for (const listener of listeners.values())
+					listener({ narratorId, type: "quota_balance", quotaBalance: `pushed-${index}` });
+		});
+		expect(requests).toHaveLength(2);
+		expect(requests[1].signal?.aborted).toBe(false);
+		await act(async () => pending.resolve(Response.json(result(6))));
+		await waitForQuota(() => requests.length === 3 && remaining() === 7);
+		for (const request of requests) {
+			const url = new URL(request.url, "http://test");
+			expect(url.pathname).toBe("/api/quota-snapshots");
+			expect(url.searchParams.get("groupId")).toBe("nug-current");
+			expect(url.searchParams.get("cachedOnly")).toBe("true");
+			expect(url.searchParams.get("expectedGeneration")).toBe("7");
+			expect(request.signal?.aborted).toBe(false);
+		}
+		for (const other of others) {
+			expect(other.reads).toBe(0);
+			expect(qc.getQueryData(other.key)).toEqual(other.snapshot);
+			expect(qc.getQueryState(other.key)?.isInvalidated).toBe(false);
+		}
+	});
+	test("a legacy NUG identity without runtime generation never starts a quota read on a marker", async () => {
+		nugProvider = { id: "nug-current" };
+		const other = activeOtherIdentity("nug-current", 7, getAuthSnapshot().generation);
+		const http = spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected quota HTTP"));
+		restores.push(() => http.mockRestore());
+		await render();
+		await event({ type: "quota_balance", quotaBalance: "marker" });
+		expect(http).not.toHaveBeenCalled();
+		expect(other.reads).toBe(0);
+		expect(qc.getQueryState(other.key)?.isInvalidated).toBe(false);
+	});
+	test.each([
+		"narrator",
+		"provider",
+		"runtime generation",
+		"A→B→A",
+	])("%s changes reset payment state and retire queued quota/payment listeners", async (change) => {
+		identify();
+		const cached = spyOn(api, "quotaSnapshots").mockResolvedValue(result(3));
+		restores.push(() => cached.mockRestore());
+		await render();
+		await waitForQuota(() => remaining() === 3);
+		await event({ type: "payment_required", providerId: "nug-current", balance: 0 });
+		expect(current.paymentRequired?.providerId).toBe("nug-current");
+		const old = [...listeners.values()];
+		const oldNarrator = narratorId;
+		if (change === "narrator") narratorId = "n2";
+		else if (change === "provider") nugProvider = { id: "nug-other", generation: 7 };
+		else if (change === "runtime generation") nugProvider = { id: "nug-current", generation: 8 };
+		else
+			await act(async () => {
+				setToken("other-token");
+				bindUser("quota-token");
+			});
+		await render();
+		expect(current.paymentRequired).toBeNull();
+		const reads = cached.mock.calls.length;
+		await act(async () => {
+			for (const listener of old) {
+				listener({ narratorId: oldNarrator, type: "quota_balance", quotaBalance: "old" });
+				listener({ narratorId: oldNarrator, type: "payment_required", providerId: "nug-current" });
+			}
+		});
+		expect(cached).toHaveBeenCalledTimes(reads);
+		expect(current.paymentRequired).toBeNull();
+	});
+	test("ordinary quota values preserve an armed payment state and do not replace its listener", async () => {
+		identify();
+		const cached = spyOn(api, "quotaSnapshots").mockResolvedValue(result(3));
+		restores.push(() => cached.mockRestore());
+		await render();
+		await waitForQuota(() => remaining() === 3);
+		await event({ type: "payment_required", providerId: "nug-current", balance: 0 });
+		const listenerIds = [...listeners.keys()];
+		cached.mockResolvedValue(result(7));
+		await event({ type: "quota_balance", quotaBalance: "7" });
+		await waitForQuota(() => remaining() === 7);
+		expect(current.paymentRequired).toMatchObject({ providerId: "nug-current", balance: 0 });
+		expect([...listeners.keys()]).toEqual(listenerIds);
+	});
+	test("hidden NUG makes no request; active reads and WS refresh stay cached-only and scoped", async () => {
+		identify();
+		qc.setQueryData(quotaSnapshotsReadKey(), result(99));
+		const cached = spyOn(api, "quotaSnapshots").mockResolvedValue(result(3));
+		restores.push(() => cached.mockRestore());
+		nugEnabled = false;
+		await render();
+		expect(cached).not.toHaveBeenCalled();
+		nugEnabled = true;
+		await render();
+		await waitForQuota(() => remaining() === 3);
+		expect(
+			cached.mock.calls.every(
+				([options]) =>
+					options?.groupId === "nug-current" &&
+					options.cachedOnly === true &&
+					options.expectedGeneration === 7,
+			),
+		).toBe(true);
+		cached.mockResolvedValue(result(7));
+		await event({ type: "quota_balance", quotaBalance: "not a credential-scoped value" });
+		await waitForQuota(() => remaining() === 7);
+		expect(qc.getQueryData(quotaSnapshotsReadKey())).toEqual(result(99));
+	});
+	test("switching runtime generation cancels an old read and never borrows old Root data", async () => {
+		identify();
+		qc.setQueryData(quotaSnapshotsReadKey(), result(99));
+		const first = deferred<QuotaSnapshotsResponse>();
+		const second = deferred<QuotaSnapshotsResponse>();
+		const cached = spyOn(api, "quotaSnapshots").mockImplementation((options) =>
+			options?.expectedGeneration === 7 ? first.promise : second.promise,
+		);
+		restores.push(() => cached.mockRestore());
+		await render();
+		await waitForQuota(() => cached.mock.calls.length > 0);
+		const signal = cached.mock.calls[0]?.[0]?.signal;
+		nugProvider = { id: "nug-current", generation: 8 };
+		await render();
+		await waitForQuota(() =>
+			cached.mock.calls.some(([options]) => options?.expectedGeneration === 8),
+		);
+		expect(signal?.aborted).toBe(true);
+		expect(remaining()).toBeUndefined();
+		await act(async () => {
+			first.resolve(result(99));
+			second.resolve(result(8));
+		});
+		await waitForQuota(() => remaining() === 8);
+	});
+	test("a stale runtime response stays unknown and refreshes only current-auth runtime projections", async () => {
+		identify();
+		const authGeneration = getAuthSnapshot().generation;
+		const settingsKey = runtimeSettingsQueryKey(authGeneration);
+		const runtimeKey = ["model-catalog", "runtime", authGeneration, "n1"];
+		const otherSettings = runtimeSettingsQueryKey(authGeneration - 1);
+		const otherRuntime = ["model-catalog", "runtime", authGeneration - 1, "n1"];
+		for (const key of [settingsKey, runtimeKey, otherSettings, otherRuntime])
+			qc.setQueryData(key, { revision: 7 });
+		const cached = spyOn(api, "quotaSnapshots").mockRejectedValue(
+			new ApiError("generation changed", 409, { code: "MODEL_RUNTIME_STALE" }),
+		);
+		restores.push(() => cached.mockRestore());
+		await render();
+		await waitForQuota(() => qc.getQueryState(settingsKey)?.isInvalidated === true);
+		expect(remaining()).toBeUndefined();
+		expect(qc.getQueryState(runtimeKey)?.isInvalidated).toBe(true);
+		expect(qc.getQueryState(otherSettings)?.isInvalidated).toBe(false);
+		expect(qc.getQueryState(otherRuntime)?.isInvalidated).toBe(false);
+	});
+});
+
+describe("event-driven panel control plane", () => {
+	test("online waiting has no permission timer for sixty simulated seconds; offline/hidden recovery is bounded", async () => {
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+		const intervals = new Map<number, () => void>();
+		let nextId = 0;
+		const fakeInterval = ((callback: Parameters<typeof setInterval>[0], delay?: number) => {
+			expect(delay).toBe(5000);
+			intervals.set(++nextId, callback as () => void);
+			return nextId as unknown as ReturnType<typeof setInterval>;
+		}) as typeof setInterval;
+		const interval = spyOn(globalThis, "setInterval").mockImplementation(fakeInterval);
+		const clear = spyOn(globalThis, "clearInterval").mockImplementation((id) => {
+			intervals.delete(id as unknown as number);
+		});
+		restores.push(
+			() => interval.mockRestore(),
+			() => clear.mockRestore(),
+		);
+		const tick = () =>
+			act(async () => {
+				for (const callback of intervals.values()) callback();
+			});
+		connected = true;
+		await render();
+		for (let seconds = 0; seconds < 60; seconds += 5) await tick();
+		expect(intervals.size).toBe(0);
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await connection(false);
+		expect(intervals.size).toBe(1);
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await tick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		await act(async () => document.dispatchEvent(new window.Event("visibilitychange")));
+		expect(intervals.size).toBe(0);
+		await tick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+		await act(async () => document.dispatchEvent(new window.Event("visibilitychange")));
+		expect(intervals.size).toBe(1);
+		await connection(true);
+		expect(intervals.size).toBe(0);
+		expect(panelSpy).toHaveBeenCalledTimes(3);
+	});
+
+	test("foreground control-plane recovery starts one fresh reconciliation", async () => {
+		connected = true;
+		await render();
+		panelSpy.mockResolvedValue(page(permissions(1)));
+		await act(async () => {
+			for (const recover of recoveries) recover();
+		});
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]?.fresh).toBe(true);
+		expect(current.pendingPermissions).toHaveLength(1);
+	});
+
+	test("complete status patches clear errors and preserve unrelated fields without refetching detail or children", async () => {
+		connected = true;
+		observeDetails = true;
+		qc.setQueryData(["narrators", "n1"], {
+			id: "n1",
+			status: "waiting",
+			model: "keep-model",
+			errorMessage: "old error",
+			errorRetryable: true,
+			archivedWithNarratorId: "old",
+			updatedAt: "old-time",
+			messageCount: 1,
+		});
+		await render();
+		const baseline = detailReads;
+		const frame = {
+			type: "status_change",
+			status: "idle",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "committed-time",
+			messageCount: 17,
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+			backgroundWorkActive: false,
+		};
+		await event(frame);
+		await event(frame);
+		expect(qc.getQueryData(["narrators", "n1"])).toMatchObject({
+			status: "idle",
+			model: "keep-model",
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+			turnStartedAt: null,
+			updatedAt: "committed-time",
+			messageCount: 17,
+			backgroundWorkActive: false,
+		});
+		// The work-active hint is optional even in an authoritative persisted snapshot.
+		await event({
+			type: "status_change",
+			status: "archived",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "archive-time",
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: "parent",
+		});
+		expect(qc.getQueryData(["narrators", "n1"])).toMatchObject({
+			status: "archived",
+			updatedAt: "archive-time",
+			archivedWithNarratorId: "parent",
+			model: "keep-model",
+		});
+		expect(detailReads).toBe(baseline);
+		expect(childReads).toBe(1);
+	});
+
+	test("sparse status noise does not read; a legacy lifecycle edge recovers detail exactly once", async () => {
+		connected = true;
+		observeDetails = true;
+		qc.setQueryData(["narrators", "n1"], { id: "n1", status: "waiting", model: "keep" });
+		await render();
+		const baseline = detailReads;
+		for (const status of ["working", "waiting", "waiting", "working"])
+			await event({ type: "status_change", status });
+		expect(detailReads).toBe(baseline);
+		await event({ type: "status_change", status: "idle" });
+		await event({ type: "status_change", status: "idle" });
+		expect(detailReads).toBe(baseline + 1);
+		expect(childReads).toBe(1);
+	});
+
+	test("sparse subagent statuses merge labels and recover only real lifecycle boundaries", async () => {
+		connected = true;
+		observeDetails = true;
+		observedDetailId = "child";
+		qc.setQueryData(["narrators", "child"], { id: "child", status: "working", model: "keep" });
+		await render();
+		const baseline = detailReads;
+		for (const status of ["working", "waiting", "waiting", "working"])
+			await event({
+				type: "subagent_status_changed",
+				subagentNarratorId: "child",
+				status,
+				substatus: ["reasoning"],
+			});
+		expect(detailReads).toBe(baseline);
+		expect(qc.getQueryData(["narrators", "child"])).toMatchObject({
+			model: "keep",
+			substatus: ["reasoning"],
+		});
+		await event({
+			type: "subagent_status_changed",
+			subagentNarratorId: "child",
+			status: "idle",
+			substatus: [],
+		});
+		await event({ type: "subagent_status_changed", subagentNarratorId: "child", status: "idle" });
+		expect(detailReads).toBe(baseline + 1);
+		expect(childReads).toBe(1);
+		await event({
+			type: "subagent_status_changed",
+			subagentNarratorId: "uncached",
+			status: "idle",
+		});
+		expect(qc.getQueryData(["narrators", "uncached"])).toBeUndefined();
+	});
+
+	test("a sparse status never creates a fake complete narrator cache", async () => {
+		connected = true;
+		await render();
+		await event({ type: "status_change", status: "working" });
+		expect(qc.getQueryData(["narrators", "n1"])).toBeUndefined();
+	});
+});
+
 describe("mounted panel and real WS hook reconciliation", () => {
-	test("mounting on an already connected socket still starts a fresh post-subscription read", async () => {
+	test("mounting on an already connected socket starts one initial mount-scoped read", async () => {
 		connected = true;
 		panelSpy.mockResolvedValue(page(permissions(1)));
 		await render();
 		expect(panelSpy).toHaveBeenCalledTimes(1);
-		expect(panelSpy.mock.calls[0]?.[1]?.fresh).toBe(true);
+		expect(panelSpy.mock.calls[0]?.[1]?.fresh).toBe(false);
 		expect(current.pendingPermissions.map((item) => item.id)).toEqual(["p0"]);
+	});
+
+	test("online initial transport failure retries with a budget and stops after restoring permissions", async () => {
+		connected = true;
+		panelSpy
+			.mockRejectedValueOnce(new ApiError("temporarily unavailable", 503))
+			.mockResolvedValue(page(permissions(1)));
+		const pending = spyOn(api, "getPendingPermissions").mockRejectedValue(new TypeError("offline"));
+		const buffer = spyOn(api, "getBufferedMessages").mockRejectedValue(new TypeError("offline"));
+		restores.push(
+			() => pending.mockRestore(),
+			() => buffer.mockRestore(),
+		);
+		await render();
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(current.pendingPermissions.map((permission) => permission.id)).toEqual(["p0"]);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+	});
+
+	test("raw disconnect/reconnect batched in one act still starts a fresh read", async () => {
+		connected = true;
+		await render();
+		const readScope = current.readScope;
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			connected = false;
+			for (const update of connections) update(false, false);
+			connected = true;
+			for (const update of connections) update(true, true);
+		});
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]).toMatchObject({ fresh: true, readScope });
 	});
 
 	test("first connect removes permissions and buffer consumed during the disconnected REST-to-WS gap", async () => {
@@ -500,8 +1041,7 @@ describe("mounted panel and real WS hook reconciliation", () => {
 			await render();
 			await event({ type: "permission_resolved", requestId: "p0" });
 			panelSpy.mockResolvedValue(page([]));
-			if (switchKind === "account")
-				await act(async () => qc.setQueryData(["auth", "me"], { id: "u2" }));
+			if (switchKind === "account") await act(async () => bindUser("other-token", "u2"));
 			else {
 				narratorId = "n2";
 				await render();

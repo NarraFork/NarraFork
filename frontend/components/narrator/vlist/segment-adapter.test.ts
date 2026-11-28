@@ -14,6 +14,7 @@ import {
 	adaptSegment,
 	adaptSegments,
 	classifyContentBlock,
+	reasoningRunDisplayText,
 } from "./segment-adapter";
 
 // The subagent-card enrichment suite exercises measureSubagentCard, which drives
@@ -1983,6 +1984,22 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		// into the output slot, and it must never become the conclusion body.
 		expect(data.resultText).toBeUndefined();
 		expect(data.resultBody).toBeUndefined();
+	});
+
+	it("projects the exact Agent tool execution for the keyed run counter", () => {
+		expect(
+			subagentData({ toolName: "Agent", toolUseId: "agent", id: "row-pk", executionAttempt: 3 }),
+		).toMatchObject({ toolUseId: "agent", toolCallId: "row-pk", executionAttempt: 3 });
+		expect(
+			subagentData({
+				toolName: "Agent",
+				toolUseId: "agent",
+				id: "synthetic",
+				tcId: "receipt-pk",
+				executionAttempt: 4,
+			}),
+		).toMatchObject({ toolCallId: "receipt-pk", executionAttempt: 4 });
+		expect(subagentData({ toolName: "Agent", toolUseId: "agent" }).toolCallId).toBeUndefined();
 	});
 
 	it("omits the counter on a terminal card or a non-numeric stream", () => {
@@ -4359,26 +4376,50 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 		expect(folded).toEqual(expanded);
 	});
 
-	/**
-	 * A run translated only in part falls back to the original on both sides.
-	 *
-	 * Rendering half a run in each language would be worse than leaving it untranslated,
-	 * so the translation is all-or-nothing — and the two levels have to agree on that
-	 * verdict, or they are back to parsing different strings.
-	 */
-	it("falls back to the original when a run is only partly translated", async () => {
-		const partial = twoStepMessage("real-msg", [
+	it("pairs partially translated steps across LOD without dropping original source", async () => {
+		const blocks = [
 			{
 				type: "reasoning",
 				text: "**第一步**\n\n分析正文。",
-				translatedText: "**Step 1**\n\nOnly this.",
+				translatedText: "**Step 1**\n\nOnly this.\n\n**Detail**\n\nMore.",
 			},
 			{ type: "reasoning", text: "**第二步**\n\n继续分析。" },
-		]);
+		];
+		const partial = twoStepMessage("real-msg", blocks);
+		expect(reasoningRunDisplayText(blocks)).toBe(
+			"**Step 1**\n\nOnly this.\n\n**Detail**\n\nMore.\n\n**第二步**\n\n继续分析。",
+		);
 		const folded = await stepUnitIdsAt(2, partial);
 		const expanded = await stepUnitIdsAt(3, partial);
-		expect(folded).toEqual(["reason-real-msg-b0-s0", "reason-real-msg-b0-s1"]);
+		expect(folded).toEqual([
+			"reason-real-msg-b0-s0",
+			"reason-real-msg-b0-s1",
+			"reason-real-msg-b0-s2",
+		]);
 		expect(expanded).toEqual(folded);
+	});
+
+	it("uses validated parts in preference to stale whole-block translations", () => {
+		const block = {
+			type: "reasoning",
+			thinking: "first\n\nsecond",
+			translatedText: "stale whole-block translation",
+			translationGeneration: "g1",
+			translationParts: [
+				{
+					id: "p1",
+					generation: "g1",
+					start: 0,
+					end: 5,
+					sourceText: "first",
+					translatedText: "第一",
+				},
+			],
+		};
+		expect(reasoningRunDisplayText([block])).toBe("第一\n\nsecond");
+		expect(reasoningRunDisplayText([{ ...block, translationGeneration: "g2" }])).toBe(
+			block.thinking,
+		);
 	});
 
 	it("keeps the identity height-neutral at both levels", async () => {

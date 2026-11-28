@@ -180,5 +180,11 @@
 	"folderColorName_green": "绿",
 	"folderColorName_lime": "黄绿",
 	"folderColorName_yellow": "黄",
-	"folderColorName_orange": "橙"
+	"folderColorName_orange": "橙",
+	"pinToSidebar": "固定到侧栏",
+	"unpinFromSidebar": "从侧栏取消固定",
+	"pinToSidebarFailed": "固定到侧栏失败",
+	"unpinFromSidebarFailed": "从侧栏取消固定失败",
+	"recentTabCoordinatorLabel": "协调者",
+	"teamTabWaiting": "{{count}} 项等你处理"
 }

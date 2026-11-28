@@ -52,6 +52,9 @@ const SECRET_HOME_FILES: readonly string[] = [
 	"codex-credentials.json",
 	"provider-keys.json",
 	"search-provider-secrets.json",
+	"credentials.json", // unified model credentials (provider sourcing S1)
+	"credential-state.json", // per-credential runtime state: account usage, failure counters
+	"mcp-oauth.json", // OAuth tokens and client secrets of remote MCP servers
 	"secret.key", // decrypts every credential file (secret-store.ts)
 	"update-server.json",
 	"update-server-test.json",
@@ -74,6 +77,8 @@ const SECRET_HOME_DIRS: readonly string[] = [
 	"editor-native",
 	"editor-native-operations",
 	"image-generation-responses",
+	// Pre-migration copies of settings.json and the credential stores: same secrets, older bytes.
+	"credential-backups",
 	...PRIVATE_RECORDING_DIRS,
 ];
 
@@ -152,6 +157,25 @@ function normalizeSecretLeaf(name: string): string {
 	return leaf.toLowerCase();
 }
 
+/**
+ * Whether a path relative to a NarraFork home (split into segments) names a secret.
+ *
+ * Pure segment check with no filesystem access, so the file-reference service can
+ * apply the same list to `.narrafork/...` paths on remote devices, where host path
+ * semantics must not be used.
+ */
+export function isSecretHomeRelativePath(segments: readonly string[]): boolean {
+	const first = normalizeSecretLeaf(segments[0] ?? "");
+	if (!first) return false;
+	if (segments.length === 1) {
+		if (SECRET_HOME_FILES_LOWER.has(first)) return true;
+		return SECRET_HOME_PREFIXES_LOWER.some((prefix) => first.startsWith(prefix));
+	}
+	// A directory match covers everything beneath it: a token store's layout is the
+	// provider's business and may gain files this list has never heard of.
+	return SECRET_HOME_DIRS_LOWER.has(first);
+}
+
 /** Whether `target` is a secret leaf/prefix/dir directly under the NarraFork `home`. */
 function matchesSecretHomeLeaf(home: string, target: string): boolean {
 	// `isInsidePath` is the repo's own boundary check, so a symlinked or
@@ -163,18 +187,7 @@ function matchesSecretHomeLeaf(home: string, target: string): boolean {
 	// boundary check while its raw length no longer lines up with the home's.
 	const relative = relativePath(home, target);
 	if (!relative) return false;
-	const segments = relative.split(/[\\/]/);
-	const first = normalizeSecretLeaf(segments[0] ?? "");
-	if (!first) return false;
-
-	if (segments.length === 1) {
-		if (SECRET_HOME_FILES_LOWER.has(first)) return true;
-		if (SECRET_HOME_PREFIXES_LOWER.some((prefix) => first.startsWith(prefix))) return true;
-		return false;
-	}
-	// A directory match covers everything beneath it: a token store's layout is the
-	// provider's business and may gain files this list has never heard of.
-	return SECRET_HOME_DIRS_LOWER.has(first);
+	return isSecretHomeRelativePath(relative.split(/[\\/]/));
 }
 
 /**

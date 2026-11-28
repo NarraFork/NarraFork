@@ -1,5 +1,4 @@
 import type { GitLineStats } from "@shared/git-line-stats";
-
 /** Additive, shell-free Git management contract, mirrored by the Go executor. */
 export const FEATURE_GIT_WORKSPACE_V1 = "git.workspace.v1";
 export const FEATURE_GIT_WORKSPACE_WATCH_V1 = "git.workspace.watch.v1";

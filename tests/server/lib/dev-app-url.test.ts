@@ -8,7 +8,7 @@ import {
 	resolveAdvertisedAppUrl,
 } from "@server/lib/dev-app-url";
 
-const LISTEN = "http://localhost:7779";
+const LISTEN = "http://localhost:7778";
 
 describe("devFrontendOrigin", () => {
 	test("defaults to the Vite port", () => {
@@ -30,17 +30,19 @@ describe("devFrontendOrigin", () => {
 });
 
 describe("devAllBackendEnv", () => {
-	test("points the API at 7779 and advertises the frontend origin", () => {
-		const env = devAllBackendEnv({ PATH: "/usr/bin", VITE_PORT: "9000", PORT: "7778" });
+	test("points the API at 7778 and advertises the frontend origin", () => {
+		const env = devAllBackendEnv({ PATH: "/usr/bin", VITE_PORT: "9000", PORT: "9001" });
 		expect(env.PORT).toBe(DEV_ALL_BACKEND_PORT);
+		expect(env.PORT).toBe("7778");
 		expect(env[DEV_APP_URL_ENV]).toBe("http://localhost:9000");
 		expect(env.PATH).toBe("/usr/bin");
 		expect(env.VITE_PORT).toBe("9000");
 	});
 
 	test("uses the default frontend port when VITE_PORT is unset", () => {
-		expect(devAllBackendEnv({})[DEV_APP_URL_ENV]).toBe("http://localhost:7778");
-		expect(devAllBackendEnv({}).PORT).toBe("7779");
+		expect(DEFAULT_DEV_FRONTEND_PORT).toBe("41221");
+		expect(devAllBackendEnv({})[DEV_APP_URL_ENV]).toBe("http://localhost:41221");
+		expect(devAllBackendEnv({}).PORT).toBe("7778");
 	});
 });
 
@@ -54,9 +56,9 @@ describe("resolveAdvertisedAppUrl", () => {
 		expect(
 			resolveAdvertisedAppUrl({
 				listenUrl: LISTEN,
-				devAppUrl: "http://localhost:7778",
+				devAppUrl: "http://localhost:41221",
 			}),
-		).toBe("http://localhost:7778");
+		).toBe("http://localhost:41221");
 	});
 
 	test("accepts an IPv6 loopback origin and drops a trailing slash", () => {

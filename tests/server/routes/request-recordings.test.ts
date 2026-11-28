@@ -1,10 +1,13 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RequestRecordingDetail, SavedRecording } from "@shared/request-recording";
 import { Hono } from "hono";
-import { AppError, NotFoundError } from "../../../server/lib/errors";
+import { buildAppErrorResponse } from "../../../server/lib/app-error-response";
+import { resetDbWorkerPoolForTest, shutdownDbWorkerPool } from "../../../server/lib/db-worker/pool";
+import { NotFoundError } from "../../../server/lib/errors";
+import { WorkerHandle } from "../../../server/lib/worker-runtime/lifecycle";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const home = mkdtempSync(join(tmpdir(), "narrafork-recording-routes-"));
@@ -17,6 +20,9 @@ const { requireNarratorAccess } = await import("../../../server/lib/narrator-acc
 const { db } = await import("../../../server/db");
 const { aclGrants, apiRequests, narrators, users } = await import("../../../server/db/schema");
 const { generateId } = await import("../../../server/lib/id");
+const { sqliteAuthSessionStore } = await import(
+	"../../../server/services/auth/sqlite-session-store"
+);
 
 const OWNER = "recording-owner";
 const VIEWER = "recording-viewer";
@@ -79,7 +85,8 @@ beforeAll(async () => {
 	});
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await shutdownDbWorkerPool();
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(home, { recursive: true, force: true });
@@ -168,11 +175,7 @@ function fixture(
 		await next();
 	});
 	app.onError(
-		(error) =>
-			new Response(JSON.stringify({ error: error.message }), {
-				status: error instanceof AppError ? error.statusCode : 500,
-				headers: { "Content-Type": "application/json" },
-			}),
+		(error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: error.message }, 500),
 	);
 	app.route("/narrators", routes);
 	return {
@@ -234,7 +237,8 @@ describe("request recording HTTP contracts and ACL", () => {
 		const lookup = mock(lookupApiRequestMetadata);
 		const f = fixture(VIEWER, lookup);
 		f.detail.apiRequestId = apiId;
-		const response = await f.request("GET", "/requests/request-a");
+		const controller = new AbortController();
+		const response = await f.request("GET", "/requests/request-a", ID, controller.signal);
 		expect(response.status).toBe(200);
 		const result = await response.json();
 		expect(result.apiRequest).toMatchObject({
@@ -247,12 +251,15 @@ describe("request recording HTTP contracts and ACL", () => {
 		expect(Buffer.byteLength(result.apiRequest.errorMessage)).toBeLessThanOrEqual(2048);
 		expect(result.apiRequest.rawDumpJson).toBeUndefined();
 		expect(JSON.stringify(result)).not.toContain("DO_NOT_EXPOSE_RAW_DUMP");
-		expect(lookup).toHaveBeenCalledWith(ID, apiId);
+		expect(lookup).toHaveBeenCalledWith(ID, apiId, expect.any(AbortSignal));
+		const metadataSignal = lookup.mock.calls[0]?.[2];
+		controller.abort();
+		expect(metadataSignal?.aborted).toBe(true);
 		f.detail.apiRequestId = foreignApiId;
 		const foreign = await (await f.request("GET", "/requests/request-a")).json();
 		expect(foreign.apiRequest).toBeUndefined();
 		expect(foreign.requestPreview).toBe("request");
-		expect(lookup).toHaveBeenCalledWith(ID, foreignApiId);
+		expect(lookup).toHaveBeenCalledWith(ID, foreignApiId, expect.any(AbortSignal));
 		f.detail.apiRequestId = generateId();
 		expect(
 			(await (await f.request("GET", "/requests/request-a")).json()).apiRequest,
@@ -262,6 +269,95 @@ describe("request recording HTTP contracts and ACL", () => {
 		await f.request("GET", "/requests/request-a");
 		expect(lookup).not.toHaveBeenCalled();
 	});
+	test("file-backed metadata fails explicitly without a short-read Worker", async () => {
+		const apiId = generateId();
+		await db.insert(apiRequests).values({ id: apiId, narratorId: ID, createdAt: saved.createdAt });
+		const f = fixture();
+		f.detail.apiRequestId = apiId;
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		try {
+			const response = await f.request("GET", "/requests/request-a");
+			expect(response.status).toBe(503);
+			expect(await response.json()).toMatchObject({ code: "DATABASE_READ_UNAVAILABLE" });
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
+	test("a recording burst leaves room for auth and an aborted lookup never dispatches", async () => {
+		await resetDbWorkerPoolForTest();
+		const apiId = generateId();
+		await db.insert(apiRequests).values({ id: apiId, narratorId: ID, createdAt: saved.createdAt });
+		const firstDispatch = Promise.withResolvers<void>();
+		const dispatchGate = Promise.withResolvers<void>();
+		const sendOrder: string[] = [];
+		const aclReads: string[] = [];
+		const create = WorkerHandle.thread;
+		const spawn = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
+			const handle = create(entry, options);
+			const send = handle.resource.postMessage.bind(handle.resource);
+			spyOn(handle.resource, "postMessage").mockImplementation((message) => {
+				if (message.type === "task") {
+					const sql = message.params.sql;
+					if (sql.includes('"api_requests"')) sendOrder.push("recording");
+					else if (sql.includes('"users"')) sendOrder.push("auth");
+					else aclReads.push(sql);
+					if (sendOrder.length === 1 && aclReads.length === 0) {
+						firstDispatch.resolve();
+						void dispatchGate.promise.then(() => send(message));
+						return;
+					}
+				}
+				send(message);
+			});
+			return handle;
+		});
+		const jobs: Promise<unknown>[] = [];
+		const record = <T>(job: Promise<T>): Promise<T> => {
+			jobs.push(job.catch(() => {}));
+			return job;
+		};
+		try {
+			const first = record(lookupApiRequestMetadata(ID, apiId));
+			await Promise.race([firstDispatch.promise, first]);
+			const controller = new AbortController();
+			const cancelled = record(lookupApiRequestMetadata(ID, apiId, controller.signal));
+			const queued = Array.from({ length: 3 }, () => record(lookupApiRequestMetadata(ID, apiId)));
+			const auth = record(
+				Promise.all([
+					sqliteAuthSessionStore.findSessionState(OWNER),
+					sqliteAuthSessionStore.findSessionState(VIEWER),
+				]),
+			);
+			const f = fixture();
+			f.detail.apiRequestId = apiId;
+			const overflow = await f.request("GET", "/requests/request-a");
+			expect(overflow.status).toBe(503);
+			expect(await overflow.json()).toMatchObject({ code: "DATABASE_READ_UNAVAILABLE" });
+
+			controller.abort();
+			await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+			dispatchGate.resolve();
+			expect(await auth).toMatchObject([{ id: OWNER }, { id: VIEWER }]);
+			await Promise.all([first, ...queued]);
+			expect(aclReads).toHaveLength(1);
+			expect(aclReads[0]).toContain('"narrators"');
+			expect(sendOrder).toEqual([
+				"recording",
+				"auth",
+				"auth",
+				"recording",
+				"recording",
+				"recording",
+			]);
+		} finally {
+			dispatchGate.resolve();
+			await Promise.all(jobs);
+			await resetDbWorkerPoolForTest();
+			spawn.mockRestore();
+		}
+	}, 12_000);
 	test("read-only viewers can reuse existing exact completed evidence without a save call", async () => {
 		const f = fixture(VIEWER);
 		f.detail.savedRecording = { ...saved, partial: false };

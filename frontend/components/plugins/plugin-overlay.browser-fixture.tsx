@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { usePluginOverlayVisibility } from "../../hooks/usePluginOverlayVisibility";
+import { pluginKeys } from "../../hooks/usePlugins";
+import { setToken } from "../../lib/api/client";
 import i18n from "../../lib/i18n";
 import { mantineTheme } from "../../lib/mantine-theme";
 import pluginStrings from "../../locales/en/plugins.json";
@@ -33,6 +35,9 @@ declare global {
 	}
 }
 
+// The production UI preference query is scoped to an authenticated principal.
+// This credential is accepted only by the test's isolated loopback stub.
+setToken("fixture-user-token");
 const scenario = new URLSearchParams(location.search).get("scenario") ?? "normal";
 const records: PluginContributionRecord[] = Array.from(
 	{ length: scenario.startsWith("full") ? 2 : 1 },
@@ -53,9 +58,11 @@ const instanceId = (index = 0) => `overlay:${records[index].pluginId}:pet`;
 
 function Fixture() {
 	const runtime = usePluginUiRuntime();
-	const { setHidden } = usePluginOverlayVisibility();
+	const { setHidden, settled } = usePluginOverlayVisibility();
 	const [clicks, setClicks] = useState(0);
 	useEffect(() => {
+		// Hidden/cold-start checks must not race the initial scoped preference read.
+		if (!settled) return;
 		// Only drive public production operations; never write the bounds store or
 		// fake a session/port. Tests read state to verify the real lifecycle cleanup.
 		window.overlayFixture = {
@@ -76,7 +83,7 @@ function Fixture() {
 				bounds: Object.keys(pluginOverlayBoundsStore.getSnapshot()),
 			}),
 		};
-	}, [runtime, setHidden]);
+	}, [runtime, setHidden, settled]);
 	return (
 		<>
 			<button
@@ -102,12 +109,19 @@ await i18n.use(initReactI18next).init({
 });
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing overlay fixture root");
+const queryClient = new QueryClient({
+	defaultOptions: { queries: { staleTime: 5_000, retry: false } },
+});
+// This fixture supplies a ready contribution snapshot, unlike the cold-start suite.
+// Seed its Query owner too; the real overlay no longer has a separate fetch path.
+queryClient.setQueryData(
+	pluginKeys.uiContributions,
+	records.map(({ availability, ...record }) => ({ ...record, status: availability })),
+);
 createRoot(root).render(
 	<I18nextProvider i18n={i18n}>
 		<MantineProvider theme={mantineTheme} defaultColorScheme="dark">
-			<QueryClientProvider
-				client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
-			>
+			<QueryClientProvider client={queryClient}>
 				<PluginUiRuntimeProvider
 					resolveContribution={resolvePluginUiContribution}
 					defaultTimeoutMs={3_000}

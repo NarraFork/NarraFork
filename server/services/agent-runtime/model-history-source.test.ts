@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
+import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { modelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
 import {

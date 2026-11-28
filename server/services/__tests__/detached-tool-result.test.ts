@@ -137,18 +137,29 @@ describe("detached tool result durable settlement", () => {
 	test("retries a transient database lock without losing the original result", async () => {
 		await seed();
 		await markInterruptedToolCallsForMessage("owner", "message-owner");
-		const original = narratorPersistence.updateToolCallResult.bind(narratorPersistence);
-		const update = spyOn(narratorPersistence, "updateToolCallResult")
-			.mockImplementation(original)
-			.mockImplementationOnce(async () => {
-				throw new Error("SQLITE_BUSY: database is locked");
+		const version = (await owner())?.messageVersion ?? 0;
+		const originalTransaction = db.transaction.bind(db);
+		const transaction = spyOn(db, "transaction")
+			.mockImplementation(originalTransaction)
+			.mockImplementationOnce(() => {
+				throw Object.assign(new Error("SQLITE_BUSY: database is locked"), {
+					code: "SQLITE_BUSY",
+					errno: 5,
+				});
 			});
+		const update = spyOn(narratorPersistence, "updateToolCallResult");
+		toolChanges.length = 0;
 		try {
 			await persistDetachedToolResult("owner", result());
-			expect(update).toHaveBeenCalledTimes(2);
+			// Only the transaction retries; the settle and its notifications run once.
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(2);
 			expect(await row()).toMatchObject({ status: "success", outputJson: "actual durable result" });
+			expect((await owner())?.messageVersion).toBe(version + 1);
+			expect(toolChanges).toEqual(["owner"]);
 			expect(frames).toHaveLength(1);
 		} finally {
+			transaction.mockRestore();
 			update.mockRestore();
 		}
 	});
@@ -205,18 +216,49 @@ describe("detached tool result durable settlement", () => {
 
 	test("database lock retries are bounded and do not invent a successful result", async () => {
 		await seed();
-		const update = spyOn(narratorPersistence, "updateToolCallResult").mockImplementation(
-			async () => {
-				throw new Error("SQLITE_BUSY: database is locked");
-			},
-		);
+		const failure = Object.assign(new Error("SQLITE_BUSY: database is locked"), {
+			code: "SQLITE_BUSY",
+			errno: 5,
+		});
+		const transaction = spyOn(db, "transaction").mockImplementation(() => {
+			throw failure;
+		});
+		const update = spyOn(narratorPersistence, "updateToolCallResult");
+		toolChanges.length = 0;
 		try {
-			await expect(persistDetachedToolResult("owner", result())).rejects.toThrow("SQLITE_BUSY");
-			expect(update).toHaveBeenCalledTimes(3);
-			expect((await row())?.status).toBe("running");
+			await expect(persistDetachedToolResult("owner", result())).rejects.toBe(failure);
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(transaction).toHaveBeenCalledTimes(5);
+			expect(await row()).toMatchObject({ status: "running", outputJson: null });
+			expect((await owner())?.messageVersion).toBe(0);
+			expect(toolChanges).toEqual([]);
 			expect(frames).toEqual([]);
 		} finally {
+			transaction.mockRestore();
 			update.mockRestore();
+		}
+	});
+
+	test("a failed postcommit notification keeps the committed result and version without replay", async () => {
+		await seed();
+		const version = (await owner())?.messageVersion ?? 0;
+		const originalTransaction = db.transaction.bind(db);
+		const transaction = spyOn(db, "transaction").mockImplementation(originalTransaction);
+		const originalEmit = eventBus.emit.bind(eventBus);
+		const emit = spyOn(eventBus, "emit").mockImplementation(((event: { type: string }) => {
+			if (event.type === "narrator:tool_changed") throw new Error("listener failed");
+			return originalEmit(event as Parameters<typeof eventBus.emit>[0]);
+		}) as typeof eventBus.emit);
+		try {
+			await persistDetachedToolResult("owner", result());
+			expect(transaction).toHaveBeenCalledTimes(1);
+			expect(await row()).toMatchObject({ status: "success", outputJson: "actual durable result" });
+			// The version bump committed with the result, not in a later best-effort write.
+			expect((await owner())?.messageVersion).toBe(version + 1);
+			expect(frames).toHaveLength(1);
+		} finally {
+			emit.mockRestore();
+			transaction.mockRestore();
 		}
 	});
 

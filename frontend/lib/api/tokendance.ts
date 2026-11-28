@@ -1,14 +1,15 @@
 import type {
-	TokenDanceBalance,
 	TokenDanceCatalogModel,
 	TokenDanceDraftRestore,
 	TokenDanceDraftSnapshot,
+	TokenDanceLoginChoice,
 	TokenDanceOAuthComplete,
 	TokenDanceOAuthStart,
 	TokenDancePaymentCreate,
 	TokenDancePaymentSession,
 	TokenDancePublicConnection,
 } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import {
 	apiBase,
 	authorizedFetch,
@@ -34,10 +35,6 @@ function post<T>(path: string, data: unknown, options?: RequestOptions) {
 	});
 }
 export const tokendanceApi = {
-	tokenDanceBalance: (options?: RequestOptions) =>
-		request<TokenDanceBalance>("/tokendance/balance", transport(options, 32_768)),
-	tokenDanceRefreshBalance: (options?: RequestOptions) =>
-		post<TokenDanceBalance>("balance/refresh", {}, options),
 	tokenDanceCreatePayment: (data: TokenDancePaymentCreate, options?: RequestOptions) =>
 		post<{ session: TokenDancePaymentSession }>("payment/sessions", data, options),
 	tokenDancePaymentSession: (id: string, options?: RequestOptions) =>
@@ -46,7 +43,11 @@ export const tokendanceApi = {
 			transport(options, 32_768),
 		),
 	tokenDanceOAuthStart: (
-		data: { callbackUrl: string; draftSnapshot?: TokenDanceDraftSnapshot },
+		data: {
+			callbackUrl: string;
+			draftSnapshot?: TokenDanceDraftSnapshot;
+			loginChoice?: TokenDanceLoginChoice;
+		},
 		options?: RequestOptions,
 	) => post<TokenDanceOAuthStart>("oauth/start", data, options),
 	tokenDanceOAuthComplete: (data: { flowId: string; code: string }, options?: RequestOptions) =>
@@ -59,10 +60,14 @@ export const tokendanceApi = {
 		request<TokenDancePublicConnection>("/tokendance/connection", transport(options)),
 	tokenDanceRefreshModels: (options?: RequestOptions) =>
 		post<{ models: TokenDanceCatalogModel[] }>("models/refresh", {}, options),
-	tokenDanceUpdateConnection: (disabled: boolean, options?: RequestOptions) =>
+	tokenDanceUpdateConnection: (
+		disabled: boolean,
+		options?: RequestOptions,
+		toolResultImages?: ToolResultImagesMode,
+	) =>
 		request<TokenDancePublicConnection>("/tokendance/connection", {
 			method: "PATCH",
-			body: JSON.stringify({ disabled }),
+			body: JSON.stringify({ disabled, toolResultImages }),
 			...transport(options),
 		}),
 	tokenDanceDeleteConnection: async (options?: RequestOptions) => {

@@ -2,9 +2,11 @@ import { useCurrentUser } from "@frontend/hooks/useAuth";
 import {
 	useSwitchWorkspaceContext,
 	useWorkspaceContext,
+	workspaceContextKey,
 } from "@frontend/hooks/useWorkspaceContext";
 import { ApiError, api } from "@frontend/lib/api";
 import { formatLocaleDateTime } from "@frontend/lib/intl-format";
+import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import {
 	ActionIcon,
 	Alert,
@@ -21,21 +23,35 @@ import {
 	Textarea,
 	TextInput,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
-import { IconGitFork, IconSwitchHorizontal } from "@tabler/icons-react";
+import { IconGitFork, IconSwitchHorizontal, IconTrash } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
+import { useEditorPanelVisible } from "../narrator-panel-visibility";
+import { WorktreeRemovalDialog } from "./WorktreeRemovalDialog";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
 import { type WorktreeSort, worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
+import {
+	releaseWorktreeListPages,
+	retainWorktreeFirstPage,
+	WORKTREE_LIST_GC_MS,
+	WORKTREE_LIST_STALE_MS,
+	worktreeListQueryKey,
+} from "./worktree-query-cache";
 import {
 	draftFingerprint,
 	RECEIPT_SCOPE_LIMIT,
 	type ReceiptScope,
 	WorktreeReceiptStore,
 } from "./worktree-receipt-store";
+
+const subscribeCredentials = (listener: () => void) =>
+	narratorWSManager.onCredentialChange(listener);
+const credentialIdentity = () => narratorWSManager.getCredentialIdentity();
 
 const EMPTY_DRAFT: WorktreeDraft = {
 	name: "",
@@ -49,24 +65,38 @@ const EMPTY_DRAFT: WorktreeDraft = {
 export function NarratorWorktreeControls({
 	narratorId,
 	onRequirement,
+	canCreateWorktree,
 }: {
 	narratorId: string;
 	onRequirement?: (text: string) => void;
+	/** Existing authoritative Git probe, not the unopened list, owns create availability. */
+	canCreateWorktree?: boolean;
 }) {
 	const { data: user } = useCurrentUser();
-	const { data: context } = useWorkspaceContext(narratorId);
-	if (!user?.id || !context?.git) return null;
-	const scope: ReceiptScope = {
-		userId: user.id,
-		narratorId,
-		deviceId: context.deviceId,
-		repositoryKey: context.git.repositoryKey,
-	};
+	const { data: context, transitioning } = useWorkspaceContext(narratorId);
+	const owner = useRef<ReceiptScope | null>(null);
+	if (user?.id && context?.git) {
+		owner.current = {
+			userId: user.id,
+			narratorId,
+			deviceId: context.deviceId,
+			repositoryKey: context.git.repositoryKey,
+		};
+	} else if (
+		!transitioning ||
+		owner.current?.userId !== user?.id ||
+		owner.current?.narratorId !== narratorId
+	) {
+		owner.current = null;
+	}
+	const scope = owner.current;
+	if (!scope) return null;
 	return (
 		<ScopedWorktreeControls
 			key={JSON.stringify(scope)}
 			narratorId={narratorId}
 			onRequirement={onRequirement}
+			canCreateWorktree={canCreateWorktree}
 			scope={scope}
 		/>
 	);
@@ -75,13 +105,21 @@ export function NarratorWorktreeControls({
 function ScopedWorktreeControls({
 	narratorId,
 	onRequirement,
+	canCreateWorktree,
 	scope,
 }: {
 	narratorId: string;
 	onRequirement?: (text: string) => void;
+	canCreateWorktree?: boolean;
 	scope: ReceiptScope;
 }) {
 	const { t } = useTranslation("narrator");
+	const visible = useEditorPanelVisible();
+	const credential = useSyncExternalStore(
+		subscribeCredentials,
+		credentialIdentity,
+		credentialIdentity,
+	);
 	const contextQuery = useWorkspaceContext(narratorId);
 	const context = contextQuery.data;
 	const switchMutation = useSwitchWorkspaceContext(narratorId);
@@ -144,9 +182,18 @@ function ScopedWorktreeControls({
 		const instance: WorktreeFlow = new WorktreeFlow(
 			{
 				prepare: (input) => api.prepareNarratorWorktree(narratorId, input),
-				create: (input) => {
+				create: async (input) => {
 					assertActive();
-					return api.createNarratorWorktree(narratorId, input);
+					try {
+						return await api.createNarratorWorktree(narratorId, input);
+					} finally {
+						// Even an unknown receipt can have created a checkout. Mark display caches
+						// stale without starting a hidden list read or replaying old cursor chains.
+						void queryClient.invalidateQueries({
+							queryKey: ["narratorWorktrees"],
+							refetchType: "none",
+						});
+					}
 				},
 				persist: async (request, snapshot) => {
 					const fingerprint = await draftFingerprint(snapshot);
@@ -159,7 +206,15 @@ function ScopedWorktreeControls({
 					assertActive();
 					store.current?.remove(scope, id);
 				},
-				reconcile: (input) => api.reconcileNarratorWorktree(narratorId, input),
+				reconcile: async (input) => {
+					const result = await api.reconcileNarratorWorktree(narratorId, input);
+					if (result.outcome === "created")
+						void queryClient.invalidateQueries({
+							queryKey: ["narratorWorktrees"],
+							refetchType: "none",
+						});
+					return result;
+				},
 				switch: (path) => switchTo(path, "local"),
 				requestId: () => nanoid(),
 			},
@@ -257,6 +312,10 @@ function ScopedWorktreeControls({
 		if (attempt.flow.state.unknown) void attempt.flow.reconcile();
 	};
 	const [menuOpened, setMenuOpened] = useState(false);
+	// Removal is a second modal on top of the list: the row stays where the user found it.
+	const [removalPath, setRemovalPath] = useState<string | null>(null);
+	// The list modal stays open behind the confirmation, so the outcome belongs there.
+	const [removalNotice, setRemovalNotice] = useState<string>();
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
@@ -276,26 +335,31 @@ function ScopedWorktreeControls({
 			}) as const,
 		[debouncedSearch, sort, descending],
 	);
-	// Revisiting old conditions must not restore/refetch their entire cached cursor chain.
-	const listScope = useMemo(
-		() => ({
-			narratorId,
-			workspaceKey: context?.git?.workspaceKey,
-			query: listQuery,
-			generation: nanoid(),
-		}),
-		[narratorId, context?.git?.workspaceKey, listQuery],
-	);
+	const { userId: ownerUserId, deviceId: ownerDeviceId, repositoryKey: ownerRepositoryKey } = scope;
 	const listKey = useMemo(
-		() => [
-			"narratorWorktrees",
-			listScope.narratorId,
-			listScope.workspaceKey,
-			listScope.query,
-			listScope.generation,
+		() =>
+			worktreeListQueryKey(
+				{
+					userId: ownerUserId,
+					narratorId,
+					deviceId: ownerDeviceId,
+					repositoryKey: ownerRepositoryKey,
+				},
+				context?.git?.workspaceKey,
+				listQuery,
+				credential,
+			),
+		[
+			ownerUserId,
+			narratorId,
+			ownerDeviceId,
+			ownerRepositoryKey,
+			context?.git?.workspaceKey,
+			listQuery,
+			credential,
 		],
-		[listScope],
 	);
+	const listActive = canList && menuOpened && visible && search.trim() === debouncedSearch;
 	const worktrees = useInfiniteQuery({
 		queryKey: listKey,
 		initialPageParam: undefined as string | undefined,
@@ -305,12 +369,22 @@ function ScopedWorktreeControls({
 				cursor: pageParam,
 			}),
 		getNextPageParam: (page) => (page.hasMore ? (page.nextCursor ?? undefined) : undefined),
-		enabled: canList,
-		gcTime: 0, // Inactive generations have no reuse value; release their accumulated pages.
+		enabled: listActive,
+		gcTime: WORKTREE_LIST_GC_MS,
 		retry: false,
-		staleTime: 5_000,
+		staleTime: WORKTREE_LIST_STALE_MS,
+		refetchOnMount: false,
 		refetchOnWindowFocus: false,
 	});
+	useEffect(() => {
+		if (!listActive) void releaseWorktreeListPages(queryClient, listKey);
+	}, [listActive, listKey, queryClient]);
+	useEffect(
+		() => () => {
+			void releaseWorktreeListPages(queryClient, listKey);
+		},
+		[listKey, queryClient],
+	);
 	const firstPage = worktrees.data?.pages[0];
 	const visibleEntries = [
 		...new Map(
@@ -323,17 +397,17 @@ function ScopedWorktreeControls({
 	const cursorExpired =
 		worktrees.error instanceof ApiError && worktrees.error.data?.code === "WORKTREE_CURSOR_EXPIRED";
 	useEffect(() => {
-		if (cursorExpired) {
-			// Reset the entire chain: refetching old pageParams would reuse expired cursors.
+		if (listActive && cursorExpired) {
+			// A visible cursor failure needs a new snapshot; closed lists never recover in the background.
 			void queryClient.resetQueries({ queryKey: listKey, exact: true });
 		}
-	}, [cursorExpired, queryClient, listKey]);
+	}, [listActive, cursorExpired, queryClient, listKey]);
 	const [viewport, setViewport] = useState<HTMLDivElement | null>(null);
 	const sentinel = useRef<HTMLDivElement>(null);
 	useEffect(() => {
 		const target = sentinel.current;
 		if (
-			!menuOpened ||
+			!listActive ||
 			!viewport ||
 			!target ||
 			!worktrees.data ||
@@ -379,7 +453,7 @@ function ScopedWorktreeControls({
 			viewport.removeEventListener("scroll", check);
 		};
 	}, [
-		menuOpened,
+		listActive,
 		viewport,
 		worktrees.hasNextPage,
 		worktrees.isFetching,
@@ -389,6 +463,26 @@ function ScopedWorktreeControls({
 		search,
 		debouncedSearch,
 	]);
+	const openList = async (fresh = false) => {
+		const workspaceKey = context?.git?.workspaceKey;
+		const key = worktreeListQueryKey(scope, workspaceKey, { ...listQuery, search: "" }, credential);
+		await releaseWorktreeListPages(queryClient, key);
+		const savedError = queryClient.getQueryState(key)?.error;
+		if (savedError instanceof ApiError && savedError.data?.code === "WORKTREE_CURSOR_EXPIRED")
+			await queryClient.resetQueries({ queryKey: key, exact: true });
+		if (
+			!alive.current ||
+			current.current?.git?.workspaceKey !== workspaceKey ||
+			credentialIdentity() !== credential
+		)
+			return;
+		if (fresh)
+			void queryClient.invalidateQueries({ queryKey: key, exact: true, refetchType: "none" });
+		setSearch("");
+		setDebouncedSearch("");
+		setRemovalNotice(undefined);
+		setMenuOpened(true);
+	};
 	const formatTime = (timestamp: number | null | undefined) =>
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
@@ -397,9 +491,11 @@ function ScopedWorktreeControls({
 	const canCreate =
 		canSwitch &&
 		canList &&
-		firstPage?.capabilities.create === true &&
+		(canCreateWorktree ?? firstPage?.capabilities.create) === true &&
 		!pendingLimit &&
 		!storageError;
+	// Deleting needs the server-advertised capability, not just a clickable list.
+	const canRemove = canList && firstPage?.capabilities.delete === true;
 	const createDisabledReason = storageError
 		? t(storageError)
 		: pendingLimit
@@ -440,13 +536,7 @@ function ScopedWorktreeControls({
 						variant="subtle"
 						aria-label={t("worktree.switch")}
 						disabled={(!canSwitch && !canInspect) || switchMutation.isPending || state.busy}
-						onClick={() => {
-							setSearch("");
-							setMenuOpened(true);
-							// Reopening refreshes from page one, never replaying all saved cursors.
-							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
-								void queryClient.resetQueries({ queryKey: listKey, exact: true });
-						}}
+						onClick={() => void openList()}
 					>
 						<IconSwitchHorizontal size={15} />
 					</ActionIcon>
@@ -572,61 +662,84 @@ function ScopedWorktreeControls({
 						<ScrollArea.Autosize mah="45vh" type="auto" viewportRef={setViewport}>
 							<Stack gap={4}>
 								{visibleEntries.map((entry) => (
-									<Button
-										key={entry.path}
-										data-worktree-path={entry.path}
-										variant={entry.path === context?.cwd ? "light" : "subtle"}
-										fullWidth
-										justify="flex-start"
-										h="auto"
-										py="xs"
-										styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
-										title={`${context?.deviceId}: ${entry.path}`}
-										disabled={
-											!canSwitch ||
-											state.busy ||
-											switchMutation.isPending ||
-											entry.path === context?.cwd ||
-											entry.locked ||
-											entry.prunable
-										}
-										onClick={() =>
-											void switchTo(entry.path)
-												.then(() => setMenuOpened(false))
-												.catch(() => {})
-										}
-									>
-										<Group gap="xs" wrap="nowrap">
-											<Text size="sm" truncate>
-												{entry.branch
-													? worktreeLabel(entry)
-													: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+									<Group key={entry.path} gap={4} wrap="nowrap" align="stretch">
+										<UnstyledButton
+											data-worktree-path={entry.path}
+											py="xs"
+											px={6}
+											style={{ flex: 1, minWidth: 0, borderRadius: 4 }}
+											bg={
+												entry.path === context?.cwd
+													? "var(--mantine-color-default-hover)"
+													: undefined
+											}
+											title={`${context?.deviceId}: ${entry.path}`}
+											disabled={
+												!canSwitch ||
+												state.busy ||
+												switchMutation.isPending ||
+												entry.path === context?.cwd ||
+												entry.locked ||
+												entry.prunable
+											}
+											onClick={() =>
+												void switchTo(entry.path)
+													.then(() => setMenuOpened(false))
+													.catch(() => {})
+											}
+										>
+											<Group gap="xs" wrap="nowrap">
+												<Text size="sm" truncate>
+													{entry.branch
+														? worktreeLabel(entry)
+														: `${t("worktree.detached")} · ${worktreeLabel(entry)}`}
+												</Text>
+												{entry.path === context?.cwd && (
+													<Badge size="xs">{t("worktree.current")}</Badge>
+												)}
+												{entry.locked && (
+													<Badge size="xs" color="yellow">
+														{t("worktree.locked")}
+													</Badge>
+												)}
+												{entry.prunable && (
+													<Badge size="xs" color="red">
+														{t("worktree.unavailable")}
+													</Badge>
+												)}
+											</Group>
+											<Text size="xs" c="dimmed" truncate>
+												{context?.deviceId !== "local" && `${context?.deviceId}: `}
+												{worktreeDirectoryLabel(entry.path)}
 											</Text>
-											{entry.path === context?.cwd && (
-												<Badge size="xs">{t("worktree.current")}</Badge>
+											{sort !== "name" && (
+												<Text size="xs" c="dimmed">
+													{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}
+													: {formatTime(entry[sort])}
+												</Text>
 											)}
-											{entry.locked && (
-												<Badge size="xs" color="yellow">
-													{t("worktree.locked")}
-												</Badge>
-											)}
-											{entry.prunable && (
-												<Badge size="xs" color="red">
-													{t("worktree.unavailable")}
-												</Badge>
-											)}
-										</Group>
-										<Text size="xs" c="dimmed" truncate>
-											{context?.deviceId !== "local" && `${context?.deviceId}: `}
-											{worktreeDirectoryLabel(entry.path)}
-										</Text>
-										{sort !== "name" && (
-											<Text size="xs" c="dimmed">
-												{t(sort === "createdAt" ? "worktree.createdTime" : "worktree.lastCommit")}:{" "}
-												{formatTime(entry[sort])}
-											</Text>
+										</UnstyledButton>
+										{canRemove && (
+											<Tooltip
+												label={entry.locked ? t("worktree.removeLocked") : t("worktree.remove")}
+												withArrow
+											>
+												<ActionIcon
+													size="lg"
+													variant="subtle"
+													color="red"
+													aria-label={t("worktree.remove")}
+													data-worktree-remove={entry.path}
+													// A prunable checkout is exactly what removal is for: its
+													// directory is gone and only the registration is left.
+													disabled={entry.locked || state.busy}
+													onClick={() => setRemovalPath(entry.path)}
+												>
+													<IconTrash size={15} />
+												</ActionIcon>
+											</Tooltip>
 										)}
-									</Button>
+									</Group>
 								))}
 								<div ref={sentinel} data-worktree-sentinel style={{ minHeight: 1 }} />
 								{worktrees.isFetchingNextPage && <Loader size="xs" />}
@@ -656,7 +769,14 @@ function ScopedWorktreeControls({
 							</Stack>
 						</ScrollArea.Autosize>
 						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
+						{/* Removal needs a healthy checkout of the requesting session. A session whose
+						    own directory was deleted sees its own prunable row here and nothing it
+						    can do about it, so name the way out instead of showing a dead list. */}
+						{canList && !canRemove && visibleEntries.some((entry) => entry.prunable) && (
+							<Alert color="yellow">{t("worktree.removeNeedsHealthyWorkspace")}</Alert>
+						)}
 						{switchError && <Alert color="red">{switchError}</Alert>}
+						{removalNotice && <Alert color="green">{removalNotice}</Alert>}
 					</Stack>
 				</Modal>
 			</Group>
@@ -758,7 +878,11 @@ function ScopedWorktreeControls({
 									? t("worktree.empty")
 									: state.error.startsWith("worktree.")
 										? t(state.error)
-										: state.error}
+										: state.errorCode
+											? // A refusal the catalogue knows (say, a partial clone this git cannot
+												// keep from fetching) in the user's language; else the server's sentence.
+												t(state.errorCode, { ns: "errors", defaultValue: state.error })
+											: state.error}
 							</Alert>
 						)}
 						{state.unknown && <Alert color="yellow">{t("worktree.unknown")}</Alert>}
@@ -767,8 +891,7 @@ function ScopedWorktreeControls({
 								variant="default"
 								onClick={() => {
 									setOpened(false);
-									setMenuOpened(true);
-									void worktrees.refetch();
+									void openList(true);
 								}}
 							>
 								{t("worktree.inspectExisting")}
@@ -798,6 +921,27 @@ function ScopedWorktreeControls({
 					</Stack>
 				</form>
 			</Modal>
+			<WorktreeRemovalDialog
+				opened={removalPath !== null}
+				narratorId={narratorId}
+				worktreePath={removalPath}
+				workspaceKey={context?.git?.workspaceKey ?? ""}
+				onClose={() => setRemovalPath(null)}
+				onRemoved={(result) => {
+					setRemovalPath(null);
+					retainWorktreeFirstPage(queryClient, listKey);
+					void queryClient.invalidateQueries({ queryKey: ["narratorWorktrees"] });
+					// The requesting session may itself have been moved out of the checkout.
+					void queryClient.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
+					setRemovalNotice(
+						result.outcome === "removed"
+							? result.relocatedTo
+								? t("worktree.removeSuccessRelocated", { path: result.relocatedTo })
+								: t("worktree.removeSuccess")
+							: t("worktree.removeAlreadyAbsent"),
+					);
+				}}
+			/>
 		</>
 	);
 }

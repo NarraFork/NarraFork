@@ -40,6 +40,7 @@
 
 import type { Database } from "bun:sqlite";
 import { logger } from "../lib/logger";
+import { backfillNarratorAliasSelectors } from "./alias-selector-backfill";
 import { migrateLegacyNarratorDraftTraits } from "./migrate-narrator-drafts";
 
 export interface SqliteDataBackfillOptions {
@@ -255,6 +256,14 @@ export async function applySqliteDataBackfills(
 		}
 	} catch (err) {
 		logger.warn("Knowledge base seed failed (non-fatal)", { error: String(err) });
+	}
+
+	// Titles and `subagent-alias:` traits written before the selector columns existed
+	// must be indexed, or occupancy would miss a live member and reuse its name.
+	try {
+		backfillNarratorAliasSelectors(sqlite);
+	} catch (error) {
+		logger.warn("Alias selector backfill failed (non-fatal)", { error: String(error) });
 	}
 
 	// Historical token semantics cannot be inferred from counter sizes or provider names.

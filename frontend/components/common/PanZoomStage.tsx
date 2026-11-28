@@ -17,8 +17,13 @@ import { pinchStep as pinchMath, wheelZoomFactor, zoomAround } from "./pan-zoom-
  * mind map (which draws its own native-DOM stage and keeps its transform imperatively).
  */
 
-const MIN_SCALE = 0.1;
-const MAX_SCALE = 12;
+/**
+ * Zoom limits, exported so callers and tests can state the bound instead of
+ * hard-coding a percentage. The range covers "fit a huge screenshot" (10%) up to
+ * "inspect single pixels" (1200%) while still refusing to zoom into nothing.
+ */
+export const PANZOOM_MIN_SCALE = 0.1;
+export const PANZOOM_MAX_SCALE = 12;
 const BUTTON_ZOOM_FACTOR = 1.25;
 /**
  * Max pointer travel (px) still treated as a click rather than a drag. Beyond
@@ -36,7 +41,7 @@ interface Transform {
 const IDENTITY: Transform = { scale: 1, tx: 0, ty: 0, rotation: 0 };
 
 function clampScale(scale: number): number {
-	return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
+	return Math.min(PANZOOM_MAX_SCALE, Math.max(PANZOOM_MIN_SCALE, scale));
 }
 
 export interface PanZoomControls {
@@ -67,6 +72,13 @@ export interface PanZoomStageProps {
 	closeOnBackdropClick?: boolean;
 	/** Right-click handler (e.g. to open a context menu). */
 	onContextMenu?: (e: React.MouseEvent) => void;
+	/**
+	 * A plain click on the CONTENT (not the empty backdrop) that never became a drag, a
+	 * pinch or a wheel-zoom. Used by the file viewer's embedded preview to open the
+	 * enlarged view when the picture itself is clicked. Keyboard users keep the toolbar
+	 * button, so this is never the only way in.
+	 */
+	onContentActivate?: () => void;
 }
 
 export function PanZoomStage({
@@ -77,6 +89,7 @@ export function PanZoomStage({
 	enableRotateKey = false,
 	closeOnBackdropClick = false,
 	onContextMenu,
+	onContentActivate,
 }: PanZoomStageProps) {
 	const { t } = useTranslation("common");
 	const [transform, setTransform] = useState<Transform>(IDENTITY);
@@ -101,6 +114,11 @@ export function PanZoomStage({
 	// released back on the empty backdrop. Any of those violations clears it, so a
 	// drag / pan / pinch / wheel-zoom never closes the overlay.
 	const backdropClickCandidate = useRef(false);
+	// Mirror of the above for "a plain click on the content" (→ onContentActivate).
+	// It starts false-until-a-press-on-content and is cleared by every gesture that
+	// turns the press into something else (drag, pinch, wheel), so panning an image
+	// never counts as clicking it.
+	const contentActivateCandidate = useRef(false);
 
 	const reset = useCallback(() => setTransform(IDENTITY), []);
 
@@ -204,8 +222,10 @@ export function PanZoomStage({
 	const handleWheel = useCallback(
 		(e: React.WheelEvent) => {
 			e.preventDefault();
-			// Wheel-zoom is an interaction, not a click — never close afterwards.
+			// Wheel-zoom is an interaction, not a click — never close afterwards, and
+			// never report the gesture as a plain click on the content either.
 			backdropClickCandidate.current = false;
+			contentActivateCandidate.current = false;
 			const factor = wheelZoomFactor(e.deltaY);
 			zoomAt(transformRef.current.scale * factor, e.clientX, e.clientY);
 		},
@@ -228,6 +248,9 @@ export function PanZoomStage({
 		pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 		if (pointers.current.size === 1) {
 			backdropClickCandidate.current = onBackdrop;
+			// A content click must START on the content (the image), not on the
+			// empty canvas around it.
+			contentActivateCandidate.current = !onBackdrop;
 			dragState.current = {
 				startTx: transformRef.current.tx,
 				startTy: transformRef.current.ty,
@@ -238,6 +261,7 @@ export function PanZoomStage({
 		} else if (pointers.current.size === 2) {
 			// Second finger → pinch gesture, never a click.
 			backdropClickCandidate.current = false;
+			contentActivateCandidate.current = false;
 			const pts = [...pointers.current.values()];
 			const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
 			pinchState.current = {
@@ -278,6 +302,7 @@ export function PanZoomStage({
 					dragState.current.moved = true;
 					// Any real movement turns this into a pan, not a click.
 					backdropClickCandidate.current = false;
+					contentActivateCandidate.current = false;
 				}
 				setTransform((prev) => ({
 					...prev,
@@ -308,8 +333,10 @@ export function PanZoomStage({
 			if (pointers.current.size === 0) {
 				const wasDrag = dragState.current?.moved;
 				const wasBackdropCandidate = backdropClickCandidate.current;
+				const activatesContent = contentActivateCandidate.current;
 				dragState.current = null;
 				backdropClickCandidate.current = false;
+				contentActivateCandidate.current = false;
 				// Only a genuine click on empty backdrop closes: it must have started
 				// on the backdrop, stayed a click (no drag/pinch/wheel), AND be
 				// released back over the backdrop (not over the image / a toolbar
@@ -318,9 +345,12 @@ export function PanZoomStage({
 					const releaseTarget = document.elementFromPoint(e.clientX, e.clientY);
 					if (releaseTarget === containerRef.current) onClose?.();
 				}
+				// Likewise, only a click that began AND stayed on the content activates it:
+				// a pan that happens to end where it started must not open the big view.
+				if (!wasDrag && activatesContent) onContentActivate?.();
 			}
 		},
-		[onClose, closeOnBackdropClick],
+		[onClose, closeOnBackdropClick, onContentActivate],
 	);
 
 	// A cancelled gesture (browser took over, e.g. OS gesture) is never a click —
@@ -331,6 +361,7 @@ export function PanZoomStage({
 		if (pointers.current.size === 0) {
 			dragState.current = null;
 			backdropClickCandidate.current = false;
+			contentActivateCandidate.current = false;
 		}
 	}, []);
 
@@ -457,7 +488,9 @@ export function PanZoomStage({
 					// Prevent drag-pan from selecting text inside SVG diagrams.
 					userSelect: "none",
 					WebkitUserSelect: "none",
-					cursor: transform.scale > 1 ? "grab" : "default",
+					// `zoom-in` is the affordance for "click the picture to enlarge it";
+					// `cursor` inherits, so the image itself shows it too.
+					cursor: transform.scale > 1 ? "grab" : onContentActivate ? "zoom-in" : "default",
 				}}
 			>
 				<div

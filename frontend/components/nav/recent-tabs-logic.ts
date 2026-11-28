@@ -23,7 +23,7 @@
 // Imported from where the type is DEFINED, not through `hooks/useRecentTabs` which
 // re-exports it: that module pulls in React Query, and a type-only import there would
 // still be a real module edge for the HMR graph this split exists to keep small.
-import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
+import { type RecentTab, recentTabHref } from "@frontend/hooks/recent-tabs-utils";
 
 /** Horizontal travel, in px, at which a released swipe commits instead of springing back. */
 export const SWIPE_THRESHOLD = 80;
@@ -84,13 +84,10 @@ export function autoScrollAllowedForPointer(
 
 /** Whether `tab` is the one the current `pathname` is showing. */
 export function isTabActive(tab: RecentTab, pathname: string): boolean {
-	if (tab.type === "project") {
-		return pathname === `/projects/${tab.id}`;
-	}
-	// A folder is not a page.
-	if (tab.type === "folder") return false;
-	// narrator and subagent both route to /narrators/:id
-	return pathname === `/narrators/${tab.id}`;
+	// A folder is not a page; narrator and subagent both route to /narrators/:id, a team tab to
+	// its team page.
+	const href = recentTabHref(tab);
+	return href !== null && pathname === href;
 }
 
 /**

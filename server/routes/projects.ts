@@ -1,10 +1,14 @@
 import { existsSync, rmSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { ResolveProjectDirectoryResponse } from "@shared/project-directory";
+import type { ProjectListSummaryResponse } from "@shared/project-overview";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
+import { type SSEStreamingApi, streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import { narrators, projects, remoteDevices } from "../db/schema";
+import { trackStreamingRequestWork } from "../http-request-lifecycle";
 import { AppError, GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
@@ -14,23 +18,39 @@ import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access"
 import {
 	createProjectSchema,
 	projectMembersSchema,
+	projectSessionsQuerySchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "../lib/validators";
+import { executionPolicyEngine } from "../services/execution-policy/engine";
 import { gitService } from "../services/git-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { canWriteProject, type ProjectAclRow } from "../services/project-acl";
-import { assignProjectRootKey, scheduleProjectIndexRebuild } from "../services/project-index";
+import { canReadProject, canWriteProject, type ProjectAclRow } from "../services/project-acl";
 import {
+	assignProjectRootKey,
+	resolveProjectForDirectory,
+	scheduleProjectIndexRebuild,
+} from "../services/project-index";
+import {
+	countProjectMembers,
 	getProjectAccess,
 	removeProjectMember,
 	setProjectMembers,
 	setProjectVisibility,
 	transferProjectOwner,
 } from "../services/project-membership";
+import {
+	readProjectAttention,
+	readProjectSessions,
+	readProjectSummaries,
+} from "../services/project-overview";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
+import { isGitWorkTree } from "../services/teams/team-git";
+import { keepPinnedGithubTarget } from "../services/teams/team-github-pin";
+import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
 
@@ -136,6 +156,78 @@ projectRoutes.get("/hidden-existence", async (c) => {
 	return c.json({ hasHidden: await adapter.anyProjectExists() });
 });
 
+/**
+ * The project list's card numbers (R2): for the caller's first 200 readable projects (the list's
+ * order), running sessions, teams, what waits for them and the last activity — one bounded read
+ * per kind across all of them, never a request per card (`services/project-overview.ts`). SQLite
+ * only, like the narrator and team surfaces it counts: 503 on PostgreSQL before anything else.
+ */
+projectRoutes.get("/summaries", async (c) => {
+	requireSqliteProjectMutation("Project summaries");
+	c.header("Cache-Control", "no-store");
+	const summaries = await readProjectSummaries(projectPrincipalOf(c), c.req.raw.signal);
+	return c.json({ summaries } satisfies ProjectListSummaryResponse);
+});
+
+/**
+ * Which project a local directory belongs to, before any session exists there: the
+ * new-session dialog's "start as a team" option needs a project id for the team route.
+ *
+ * Same rules and same gate as starting a session in that directory: any signed-in user may
+ * start a local session anywhere, and the session would put the directory into a project
+ * through the project index (`resolveProjectForDirectory`), creating the project of a git
+ * repository that has none, owned by the caller. `create: false` only looks; `create: true`
+ * makes that project. A non-git directory never gets one. A directory covered by a project
+ * the caller cannot read is answered exactly like a non-git directory (`not_git`), so the
+ * lookup cannot be used to find where private projects live. `gitWorkTree` says whether a
+ * readable project's directory is a local git work tree (a project may be associated with any
+ * existing folder, and a team needs git). Shape: `shared/project-directory.ts`.
+ *
+ * SQLite only, like the project index and the team routes it leads to: 503 on PostgreSQL
+ * before anything else.
+ */
+projectRoutes.post("/resolve-directory", async (c) => {
+	requireSqliteProjectMutation("Resolving a directory's project");
+	const principal = projectPrincipalOf(c);
+	if (!principal.userId) throw new AppError("Unauthorized", 401, "UNAUTHORIZED");
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		throw new ValidationError("Request body must be JSON");
+	}
+	const parsed = resolveProjectDirectorySchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const reply = (response: ResolveProjectDirectoryResponse) => c.json(response);
+
+	const directory = resolveProjectDirectory(parsed.data.cwd);
+	const info = await stat(directory).catch(() => null);
+	if (!info?.isDirectory()) return reply({ status: "not_directory" });
+
+	const found = await resolveProjectForDirectory(directory, principal.userId, {
+		create: parsed.data.create,
+	});
+	// One answer for "no git repository" and "a project you cannot see": nothing in the
+	// response may tell the two apart.
+	const notGit = () => reply({ status: "not_git" });
+	if (found.kind === "none") return notGit();
+	if (found.kind === "repository") return reply({ status: "repository", root: found.root });
+
+	const row = await db.query.projects.findFirst({ where: eq(projects.id, found.projectId) });
+	if (!row || !(await canReadProject(row as ProjectAclRow, principal))) return notGit();
+	return reply({
+		status: "project",
+		project: {
+			id: row.id,
+			name: row.name,
+			gitPath: row.gitPath ?? null,
+			archived: row.status === "archived",
+			canWrite: await canWriteProject(row as ProjectAclRow, principal),
+			gitWorkTree: row.gitPath ? await isGitWorkTree(row.gitPath) : false,
+		},
+	});
+});
+
 projectRoutes.post("/", async (c) => {
 	requireSqliteProjectMutation("Project creation");
 	const parsed = createProjectSchema.safeParse(await c.req.json());
@@ -164,7 +256,7 @@ projectRoutes.post("/", async (c) => {
 				? { username: body.cloneUsername, password: body.clonePassword }
 				: undefined;
 
-		return streamSSE(c, async (stream) => {
+		const cloneAndCreate = async (stream: SSEStreamingApi) => {
 			let sseId = 0;
 			try {
 				await gitService.cloneRepoStreaming(
@@ -235,7 +327,8 @@ projectRoutes.post("/", async (c) => {
 						.catch(() => {});
 				}
 			}
-		});
+		};
+		return streamSSE(c, trackStreamingRequestWork(cloneAndCreate));
 	}
 
 	// Associating an existing directory is metadata-only. Git is consulted only for
@@ -280,6 +373,13 @@ projectRoutes.get("/:id/access", async (c) => {
 	return c.json(await getProjectAccess(id, projectPrincipalOf(c)));
 });
 
+// The header's 「N 位成员」: a count only, for anyone who can read the project (404 otherwise).
+projectRoutes.get("/:id/members/count", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	return c.json(await countProjectMembers(id));
+});
+
 projectRoutes.patch("/:id/visibility", async (c) => {
 	requireSqliteProjectMutation("Project visibility changes");
 	const id = c.req.param("id");
@@ -319,6 +419,42 @@ projectRoutes.post("/:id/transfer-owner", async (c) => {
 	return c.json(await transferProjectOwner(id, parsed.data.userId, projectPrincipalOf(c)));
 });
 
+/**
+ * The project page's 「等你处理」 (R2): pending calls across the project's sessions and teams that
+ * the caller may decide, then the ready items of their teams; at most 50 calls and 20 items.
+ * Members (project write) only: a reader gets 403, a stranger 404. SQLite only (503 on PG).
+ */
+projectRoutes.get("/:id/attention", async (c) => {
+	requireSqliteProjectMutation("Project attention");
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readProjectAttention(c.req.param("id"), projectPrincipalOf(c), c.req.raw.signal),
+	);
+});
+
+/**
+ * The project page's session list (R2): `view=active|all|mine`, keyset-paged, no coordinators or
+ * subagents, only sessions the caller can read. Readers may list it; others get 404.
+ */
+projectRoutes.get("/:id/sessions", async (c) => {
+	requireSqliteProjectMutation("Project sessions");
+	const parsed = projectSessionsQuerySchema.safeParse({
+		view: c.req.query("view") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+		limit: c.req.query("limit") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readProjectSessions(
+			c.req.param("id"),
+			projectPrincipalOf(c),
+			parsed.data,
+			c.req.raw.signal,
+		),
+	);
+});
+
 projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	// Denial and absence are both NotFoundError, so this cannot be used to discover
@@ -345,38 +481,47 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
-	const existingProject = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { chapterSettings: true },
-	});
-	if (!existingProject) throw new NotFoundError("Project", id);
-
-	// Merge chapterSettings with existing values instead of overwriting
-	let mergedSettings: Record<string, unknown> | undefined;
-	if (incomingSettings) {
-		let current: Record<string, unknown> = {};
-		try {
-			current =
-				typeof existingProject.chapterSettings === "string"
-					? JSON.parse(existingProject.chapterSettings)
-					: (existingProject.chapterSettings ?? {});
-		} catch {
-			// corrupted JSON — start fresh
+	const gitPath = rest.gitPath !== undefined ? resolveProjectDirectory(rest.gitPath) : undefined;
+	// Merge chapterSettings with existing values instead of overwriting. The settings are
+	// read in the same transaction as the update, so a concurrent PATCH is never lost.
+	const { updated, mergedSettings } = db.transaction((tx) => {
+		const existingProject = tx
+			.select({ chapterSettings: projects.chapterSettings })
+			.from(projects)
+			.where(eq(projects.id, id))
+			.get();
+		if (!existingProject) throw new NotFoundError("Project", id);
+		let merged: Record<string, unknown> | undefined;
+		if (incomingSettings) {
+			let current: Record<string, unknown> = {};
+			try {
+				current =
+					typeof existingProject.chapterSettings === "string"
+						? JSON.parse(existingProject.chapterSettings)
+						: ((existingProject.chapterSettings as Record<string, unknown> | null) ?? {});
+			} catch {
+				// corrupted JSON — start fresh
+			}
+			// G: the confirmed GitHub repository is kept (only `PUT …/team-github` writes it).
+			merged = keepPinnedGithubTarget(current, { ...current, ...incomingSettings });
 		}
-		mergedSettings = { ...current, ...incomingSettings };
-	}
-
-	const [updated] = await db
-		.update(projects)
-		.set({
-			...rest,
-			...(rest.gitPath !== undefined ? { gitPath: resolveProjectDirectory(rest.gitPath) } : {}),
-			...(mergedSettings !== undefined ? { chapterSettings: mergedSettings } : {}),
-			updatedAt: now,
-		})
-		.where(eq(projects.id, id))
-		.returning();
+		const row = tx
+			.update(projects)
+			.set({
+				...rest,
+				...(gitPath !== undefined ? { gitPath } : {}),
+				...(merged !== undefined ? { chapterSettings: merged } : {}),
+				updatedAt: now,
+			})
+			.where(eq(projects.id, id))
+			.returning()
+			.get();
+		return { updated: row, mergedSettings: merged };
+	});
 	if (!updated) throw new NotFoundError("Project", id);
+	if (mergedSettings !== undefined || rest.gitPath !== undefined) {
+		executionPolicyEngine.invalidateProject(id);
+	}
 	if (rest.gitPath !== undefined) await indexNewProjectRoot(id);
 
 	return c.json(updated);
@@ -392,23 +537,38 @@ projectRoutes.delete("/:id", async (c) => {
 	return withProjectRetirement(
 		id,
 		async () => {
+			// Teams record the worktrees and branches they made; deleting the project would orphan
+			// them. Checked before anything is propagated, and again in the transaction below:
+			// retirement does not hold off team creation, so one may appear in between.
+			const hasTeams = () =>
+				new AppError(
+					"This project has teams. Delete their coordinator sessions before deleting the project.",
+					409,
+					"PROJECT_HAS_TEAMS",
+				);
+			if (projectHasTeams(id)) throw hasTeams();
 			await propagateOAuthProjectRemoval(id);
 
 			const deviceRevokedAt = new Date().toISOString();
-			await db
-				.update(narrators)
-				.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
-				.where(eq(narrators.contextProjectId, id));
-			await db
-				.update(remoteDevices)
-				.set({
-					projectId: null,
-					status: "offline",
-					revokedAt: deviceRevokedAt,
-					updatedAt: deviceRevokedAt,
-				})
-				.where(eq(remoteDevices.projectId, id));
-			await db.delete(projects).where(eq(projects.id, id));
+			// One synchronous transaction: a team created after the check above makes this a clean
+			// 409 with nothing detached or revoked, instead of a RESTRICT failure halfway through.
+			db.transaction((tx) => {
+				if (projectHasTeams(id, tx)) throw hasTeams();
+				tx.update(narrators)
+					.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
+					.where(eq(narrators.contextProjectId, id))
+					.run();
+				tx.update(remoteDevices)
+					.set({
+						projectId: null,
+						status: "offline",
+						revokedAt: deviceRevokedAt,
+						updatedAt: deviceRevokedAt,
+					})
+					.where(eq(remoteDevices.projectId, id))
+					.run();
+				tx.delete(projects).where(eq(projects.id, id)).run();
+			});
 			removeTabFromAllUsers("project", id).catch((err) => {
 				logger.warn("Failed to remove project tab from users", {
 					projectId: id,

@@ -32,6 +32,8 @@ export function loadMonaco(): Promise<MonacoAPI> {
 			import("monaco-editor/features/clipboard/register"),
 			import("monaco-editor/features/wordOperations/register"),
 			import("monaco-editor/features/linesOperations/register"),
+			// Core renders "Show more" even without its click-handling contribution.
+			import("monaco-editor/features/longLinesHelper/register"),
 			import("monaco-editor/features/bracketMatching/register"),
 			import("monaco-editor/features/comment/register"),
 			import("monaco-editor/features/multicursor/register"),

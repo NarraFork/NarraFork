@@ -1,23 +1,33 @@
-import { Alert, Button, Group, Stack, Switch, Text } from "@mantine/core";
+import { Alert, Button, Group, Select, Stack, Switch, Text } from "@mantine/core";
 import {
 	parseTokenDanceRecoveryAction,
+	type TokenDanceLoginChoice,
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { formatTokenDanceMoney, useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
+import {
+	invalidateQuotaSnapshots,
+	useQuotaSnapshot,
+	useRefreshQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { ApiError, api } from "../../lib/api";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 import { TokenDanceRechargeDialog } from "../settings/TokenDanceRechargeDialog";
 import { ModelList, type ModelListProps } from "./ModelList";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 export function TokenDanceSection({
 	connection,
 	/** 启用开关的草稿值（保存条统一提交，避免一拨就落库）。 */
 	enabled,
 	onToggleEnabled,
+	toolResultImages,
+	onToolResultImagesChange,
 	onLogin,
 	onChanged,
 	onDeleted,
@@ -25,26 +35,40 @@ export function TokenDanceSection({
 }: Omit<ModelListProps, "models"> & {
 	connection: TokenDancePublicConnection;
 	enabled: boolean;
+	toolResultImages?: ToolResultImagesMode;
+	onToolResultImagesChange: (value: ToolResultImagesMode) => void;
 	onToggleEnabled: () => void;
-	onLogin: () => Promise<void>;
+	onLogin: (choice?: TokenDanceLoginChoice) => Promise<void>;
 	onChanged: () => Promise<void>;
 	onDeleted: () => void;
 }) {
-	const { t, i18n } = useTranslation("settings");
+	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
-	const qc = useQueryClient();
-	const balance = useTokenDanceBalance(
-		connection.generation,
+	const balance = useQuotaSnapshot(
+		"tokendance",
+		undefined,
 		connection.connected && !connection.disabled,
 	);
+	const identity = `${connection.generation}:${user?.id ?? ""}`;
+	const previousIdentity = useRef(identity);
+	const identityChanged = previousIdentity.current !== identity;
+	const qc = useQueryClient();
+	useEffect(() => {
+		if (previousIdentity.current === identity) return;
+		previousIdentity.current = identity;
+		void invalidateQuotaSnapshots(qc);
+	}, [identity, qc]);
+	const snapshot = identityChanged ? null : balance.data;
+	const refresh = useRefreshQuotaSnapshots(identity);
 	const [rechargeOpened, setRechargeOpened] = useState(false);
 	const [balanceRefreshFailed, setBalanceRefreshFailed] = useState(false);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: Credential and actor changes close confirmation UI.
 	useEffect(() => {
 		setRechargeOpened(false);
 		setBalanceRefreshFailed(false);
+		setLoginSelection(null);
 	}, [connection.generation, connection.disabled, user?.id, user?.role]);
 	const [recovery, setRecovery] = useState<{
 		generation: number;
@@ -55,6 +79,15 @@ export function TokenDanceSection({
 	const busyRef = useRef(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState(false);
+	const [loginSelection, setLoginSelection] = useState<string | null>(null);
+	const unboundKeys = connection.unboundKeys ?? [];
+	const needsLoginChoice = unboundKeys.length > 0;
+	const loginChoice: TokenDanceLoginChoice | undefined =
+		loginSelection === "add"
+			? { mode: "add" }
+			: unboundKeys.some((key) => `replace:${key.id}` === loginSelection)
+				? { mode: "replace", credentialId: loginSelection?.slice(8) ?? "" }
+				: undefined;
 	const run = async (action: () => Promise<unknown>) => {
 		if (busyRef.current || !isAdmin) return;
 		busyRef.current = true;
@@ -78,36 +111,20 @@ export function TokenDanceSection({
 	return (
 		<Stack>
 			<Text>{connection.name || "TokenDance"}</Text>
-			<Group wrap="wrap">
-				<Text>
-					{t("tokendance.balance")}:{" "}
-					{formatTokenDanceMoney(balance.data?.balance, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-				<Text>
-					{t("tokendance.credits")}:{" "}
-					{formatTokenDanceMoney(balance.data?.credits, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-				<Text>
-					{t("tokendance.creditsUsed")}:{" "}
-					{formatTokenDanceMoney(balance.data?.creditsUsed, i18n.resolvedLanguage) ??
-						t("tokendance.balanceUnknown")}
-				</Text>
-			</Group>
-			{(balance.isError || balance.data?.hasError) && (
+			<QuotaSnapshotIndicator snapshot={snapshot} title={t("tokendance.balance")} />
+			{(balance.isError || snapshot?.hasError || snapshot?.error) && (
 				<Alert color="red">{t("tokendance.operationFailed")}</Alert>
 			)}
 			{balanceRefreshFailed && <Alert color="red">{t("tokendance.balanceRefreshFailed")}</Alert>}
-			{balance.data?.balance != null &&
-				(balance.isError || balance.data.hasError || balanceRefreshFailed) && (
+			{!!snapshot?.balances.length &&
+				(balance.isError || snapshot.hasError || snapshot.error || balanceRefreshFailed) && (
 					<Text c="yellow" size="sm">
 						{t("tokendance.balanceStale")}
 					</Text>
 				)}
-			{balance.data?.balance != null && balance.data.balance <= 0 && (
-				<Alert color="yellow">{t("tokendance.balanceInsufficient")}</Alert>
-			)}
+			{snapshot?.balances.some(
+				(entry) => !entry.unlimited && entry.remaining != null && entry.remaining <= 0,
+			) && <Alert color="yellow">{t("tokendance.balanceInsufficient")}</Alert>}
 			{isAdmin && (
 				<Group>
 					<Button
@@ -116,11 +133,16 @@ export function TokenDanceSection({
 							void run(async () => {
 								setBalanceRefreshFailed(false);
 								try {
-									const result = await api.tokenDanceRefreshBalance();
-									if (result.generation !== connection.generation)
-										throw new Error("Balance generation changed");
-									qc.setQueryData(["tokendance", "balance", connection.generation], result);
-									if (result.hasError) throw new Error("Balance refresh failed");
+									const result = await refresh.mutateAsync({ groupId: "tokendance" });
+									if (
+										result.entries.some(
+											(entry) =>
+												entry.groupId === "tokendance" &&
+												!entry.refreshing &&
+												(entry.snapshot?.hasError || entry.snapshot?.error),
+										)
+									)
+										throw new Error("Balance refresh failed");
 								} catch {
 									setBalanceRefreshFailed(true);
 									throw new Error("Balance refresh failed");
@@ -141,6 +163,18 @@ export function TokenDanceSection({
 				disabled={connection.disabled}
 				onClose={() => setRechargeOpened(false)}
 			/>
+			<Select
+				label={t("toolResultImages")}
+				description={t("toolResultImagesDesc")}
+				data={[
+					{ value: "off", label: t("toolResultImagesOff") },
+					{ value: "inline", label: t("toolResultImagesInline") },
+					{ value: "separate", label: t("toolResultImagesSeparate") },
+				]}
+				value={toolResultImages ?? "off"}
+				disabled={busy || !isAdmin}
+				onChange={(value) => onToolResultImagesChange((value ?? "off") as ToolResultImagesMode)}
+			/>
 			{error && <Alert color="red">{t("tokendance.operationFailed")}</Alert>}
 			{recoveryAction && <Alert color="yellow">{t(`tokendance.${recoveryAction}`)}</Alert>}
 			<Switch
@@ -149,6 +183,23 @@ export function TokenDanceSection({
 				disabled={busy || !isAdmin}
 				onChange={onToggleEnabled}
 			/>
+			{isAdmin && needsLoginChoice && (
+				<Select
+					label={t("tokendance.loginChoice")}
+					description={t("tokendance.loginChoiceDescription")}
+					placeholder={t("tokendance.loginChoicePlaceholder")}
+					value={loginSelection}
+					onChange={setLoginSelection}
+					disabled={busy}
+					data={[
+						{ value: "add", label: t("tokendance.loginKeepKeys") },
+						...unboundKeys.map((key) => ({
+							value: `replace:${key.id}`,
+							label: t("tokendance.loginReplaceKey", { key: key.label }),
+						})),
+					]}
+				/>
+			)}
 			<Group wrap="wrap">
 				<Button
 					loading={busy}
@@ -157,7 +208,10 @@ export function TokenDanceSection({
 				>
 					{t("tokendance.refresh")}
 				</Button>
-				<Button disabled={busy || !isAdmin} onClick={() => void run(onLogin)}>
+				<Button
+					disabled={busy || !isAdmin || (needsLoginChoice && !loginChoice)}
+					onClick={() => void run(() => onLogin(needsLoginChoice ? loginChoice : undefined))}
+				>
 					{t("tokendance.reauthorize")}
 				</Button>
 				{recoveryAction && !isAdmin && <Text>{t("tokendance.contactAdmin")}</Text>}
@@ -181,6 +235,7 @@ export function TokenDanceSection({
 					{t("tokendance.delete")}
 				</Button>
 			</Group>
+			{isAdmin && <ProviderKeysPanel key="tokendance" providerId="tokendance" showSingleKey />}
 			<ModelList
 				{...modelListProps}
 				models={connection.models.map((model) => ({

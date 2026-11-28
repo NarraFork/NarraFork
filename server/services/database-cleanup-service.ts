@@ -24,12 +24,18 @@ import {
 	type StorageScanSessionPreviewResult,
 } from "@server/lib/db-worker/protocol";
 import {
+	CLEANUP_CONTEXT_BUDGET_EXCEEDED,
+	type CleanupContextRow,
+	NARRATOR_CLEANUP_COLUMNS,
+} from "@server/lib/db-worker/storage-cleanup-context-query";
+import {
 	type ParallelScanOutcome,
 	runParallelObjectStorageScan,
 } from "@server/lib/db-worker/storage-scan-runner";
 import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { narratorService } from "@server/services/narrator-service";
+import { TEAM_TRAIT } from "../lib/narrator-utils";
 import {
 	pauseModelHistorySourceWorkers,
 	resumeModelHistorySourceWorkers,
@@ -57,6 +63,7 @@ import {
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
+import { listTeamsWithLiveWork } from "./teams/team-records";
 import {
 	pauseTokenRecalculationWorkers,
 	resumeTokenRecalculationWorkers,
@@ -254,6 +261,8 @@ export interface DatabaseVacuumResult {
 interface CleanupNarratorContext {
 	narrators: NarratorCleanupRecord[];
 	runningTerminalIds: Set<string>;
+	/** Team coordinators that cannot be deleted yet (`TEAM_HAS_LIVE_WORK`). */
+	liveTeamIds: Set<string>;
 }
 
 interface SessionPreviewData {
@@ -359,22 +368,12 @@ function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorC
 	};
 }
 
-const NARRATOR_CLEANUP_COLUMNS = `
-	id,
-	parent_narrator_id AS parentNarratorId,
-	type,
-	variant,
-	traits,
-	title,
-	status,
-	COALESCE(message_count, 0) AS messageCount,
-	created_at AS createdAt,
-	updated_at AS updatedAt,
-	last_message_at AS lastMessageAt,
-	COALESCE(is_background, 0) AS isBackground,
-	background_status AS backgroundStatus`;
+/** Team coordinators among the loaded rows: the only candidates for `teamLiveWork`. */
+function coordinatorIdsOf(rows: NarratorCleanupRecord[]): string[] {
+	return rows.filter((row) => row.traits?.includes(TEAM_TRAIT)).map((row) => row.id);
+}
 
-async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
+function loadCleanupNarratorContextForExecution(): CleanupNarratorContext {
 	const narratorRows = sqlite
 		.prepare(`SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators`)
 		.all() as Record<string, unknown>[];
@@ -385,9 +384,31 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 			 WHERE status = 'running' AND narrator_id IS NOT NULL`,
 		)
 		.all() as Array<{ narratorId: string }>;
+	const narrators = narratorRows.map(normalizeNarratorCleanupRecord);
 	return {
-		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		narrators,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
+	};
+}
+
+async function readCleanupNarratorContext(
+	signal?: AbortSignal,
+	deadlineAt = Date.now() + 30_000,
+): Promise<CleanupNarratorContext> {
+	const rows = await runCleanupReadTask<CleanupContextRow[]>(
+		{ kind: "databaseCleanupContext" },
+		signal,
+		deadlineAt,
+	);
+	signal?.throwIfAborted();
+	const narrators = rows.map(normalizeNarratorCleanupRecord);
+	return {
+		narrators,
+		runningTerminalIds: new Set(
+			rows.filter((row) => row.hasRunningTerminal === 1).map((row) => row.id),
+		),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narrators)),
 	};
 }
 
@@ -408,9 +429,11 @@ function loadRootSubtreeContext(rootNarratorId: string): CleanupNarratorContext 
 			 WHERE status = 'running' AND narrator_id IN (SELECT id FROM subtree)`,
 		)
 		.all(rootNarratorId) as Array<{ narratorId: string }>;
+	const narratorsInSubtree = narratorRows.map(normalizeNarratorCleanupRecord);
 	return {
-		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		narrators: narratorsInSubtree,
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+		liveTeamIds: listTeamsWithLiveWork(coordinatorIdsOf(narratorsInSubtree)),
 	};
 }
 
@@ -427,6 +450,7 @@ function isCleanupRootStillEligible(
 	const [latest] = buildNarratorCleanupPlan(sessionPlan.target, context.narrators, {
 		staleCutoffIso: sessionPlan.staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 		rootNarratorIds: new Set([root.rootNarratorId]),
 	}).safeRoots;
 	if (!latest) return false;
@@ -439,7 +463,10 @@ function isCleanupRootStillEligible(
 
 /** Never scan payload columns on the HTTP/agent thread, even when both worker paths fail. */
 async function runCleanupReadTask<T>(
-	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
+	params:
+		| StorageScanCleanupSummariesParams
+		| StorageScanSessionPreviewParams
+		| { kind: "databaseCleanupContext" },
 	signal?: AbortSignal,
 	deadlineAt?: number,
 ): Promise<T> {
@@ -471,6 +498,9 @@ async function runCleanupReadTask<T>(
 	} catch (err) {
 		if (signal?.aborted) throw err;
 		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
+		if (err instanceof Error && "code" in err && err.code === CLEANUP_CONTEXT_BUDGET_EXCEEDED) {
+			throw new AppError(err.message, 413, CLEANUP_CONTEXT_BUDGET_EXCEEDED);
+		}
 		logger.warn("Database cleanup read workers unavailable", {
 			task: params.kind,
 			reason: err instanceof Error ? err.message : String(err),
@@ -494,6 +524,7 @@ function planSessionCleanup(
 	const plan = buildNarratorCleanupPlan(target, context.narrators, {
 		staleCutoffIso,
 		runningTerminalIds: context.runningTerminalIds,
+		liveTeamIds: context.liveTeamIds,
 	});
 	return { target, normalizedDays, staleCutoffIso, plan };
 }
@@ -510,6 +541,8 @@ function isStatisticsOnlyFailure(err: unknown): boolean {
 async function buildSessionPreview(
 	sessionPlan: SessionCleanupPlan,
 	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<SessionPreviewData> {
 	const { target, normalizedDays, plan } = sessionPlan;
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
@@ -517,12 +550,16 @@ async function buildSessionPreview(
 	const limitedRoots = plan.safeRoots.slice(0, limit);
 	let measured: StorageScanSessionPreviewResult | null = null;
 	try {
-		measured = await runCleanupReadTask<StorageScanSessionPreviewResult>({
-			kind: "storageScanSessionPreview",
-			narratorIds: allNarratorIds,
-			sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
-			relations: SESSION_OWNED_TABLES,
-		});
+		measured = await runCleanupReadTask<StorageScanSessionPreviewResult>(
+			{
+				kind: "storageScanSessionPreview",
+				narratorIds: allNarratorIds,
+				sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
+				relations: SESSION_OWNED_TABLES,
+			},
+			signal,
+			deadlineAt,
+		);
 	} catch (err) {
 		if (!isStatisticsOnlyFailure(err)) throw err;
 		logger.warn("Session cleanup statistics unavailable; plan counts only", {
@@ -766,13 +803,15 @@ async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
 	deadlineAt?: number,
 ): Promise<DatabaseStorageBreakdown["cleanupCandidates"]> {
-	const cleanupContext = await loadCleanupNarratorContext();
+	const cleanupContext = await readCleanupNarratorContext(signal, deadlineAt);
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const stalePlan = buildNarratorCleanupPlan("staleSessions", cleanupContext.narrators, {
 		staleCutoffIso: getCutoffIso(DEFAULT_STALE_SESSION_DAYS),
 		runningTerminalIds: cleanupContext.runningTerminalIds,
+		liveTeamIds: cleanupContext.liveTeamIds,
 	});
 	const archivedNarratorIds = [
 		...new Set(archivedPlan.safeRoots.flatMap((root) => root.deletedNarratorIds)),
@@ -857,7 +896,7 @@ export const databaseCleanupService = {
 
 	async previewCleanup(
 		target: DatabaseCleanupTarget,
-		options: { olderThanDays?: number; sampleLimit?: number } = {},
+		options: { olderThanDays?: number; sampleLimit?: number; signal?: AbortSignal } = {},
 	): Promise<DatabaseCleanupPreviewResult> {
 		const startedAt = performance.now();
 		try {
@@ -868,12 +907,15 @@ export const databaseCleanupService = {
 					sampleLimit,
 				);
 			}
-			const sessionPlan = planSessionCleanup(
-				target,
-				options.olderThanDays,
-				await loadCleanupNarratorContext(),
+			const deadlineAt = Date.now() + 30_000;
+			const context = await readCleanupNarratorContext(options.signal, deadlineAt);
+			const sessionPlan = planSessionCleanup(target, options.olderThanDays, context);
+			const { preview } = await buildSessionPreview(
+				sessionPlan,
+				sampleLimit,
+				options.signal,
+				deadlineAt,
 			);
-			const { preview } = await buildSessionPreview(sessionPlan, sampleLimit);
 			return preview;
 		} finally {
 			logSlowDatabaseStep("previewCleanup", startedAt, { target });
@@ -892,6 +934,8 @@ export const databaseCleanupService = {
 				let preview: DatabaseCleanupPreviewResult;
 				let changed = false;
 				let skippedSessions = 0;
+				// Coordinators that gained live team work after the re-check below: kept, as blocked.
+				let teamBlockedSessions = 0;
 
 				if (target === "toolCallPayloads") {
 					preview = await buildToolCallPayloadPreview(
@@ -918,7 +962,7 @@ export const databaseCleanupService = {
 					const sessionPlan = planSessionCleanup(
 						target,
 						options.olderThanDays,
-						await loadCleanupNarratorContext(),
+						loadCleanupNarratorContextForExecution(),
 					);
 					// Statistics are best effort here: deleting never depends on a read worker.
 					preview = (await buildSessionPreview(sessionPlan, 0)).preview;
@@ -927,8 +971,23 @@ export const databaseCleanupService = {
 							skippedSessions++;
 							continue;
 						}
-						await narratorService.remove(root.rootNarratorId);
+						try {
+							await narratorService.remove(root.rootNarratorId);
+						} catch (error) {
+							// A work item may be added between the re-check and the delete; the
+							// refusal keeps that coordinator, the rest of the cleanup goes on.
+							if (!(error instanceof AppError) || error.code !== "TEAM_HAS_LIVE_WORK") throw error;
+							teamBlockedSessions++;
+							continue;
+						}
 						changed = true;
+					}
+					if (teamBlockedSessions > 0) {
+						preview = { ...preview, blockedCount: preview.blockedCount + teamBlockedSessions };
+						logger.warn("Database cleanup kept team coordinators that gained live work", {
+							target,
+							teamBlockedSessions,
+						});
 					}
 					if (skippedSessions > 0) {
 						logger.warn("Database cleanup skipped sessions that changed after planning", {

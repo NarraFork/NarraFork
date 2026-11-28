@@ -1,9 +1,12 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Progress, Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
 	CallToolResultSchema,
+	isJSONRPCErrorResponse,
+	isJSONRPCNotification,
+	isJSONRPCResultResponse,
 	ListToolsResultSchema,
 	ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -12,6 +15,7 @@ import { eventBus } from "../event-bus";
 import { logger } from "../logger";
 import type { McpServerConfig } from "../settings";
 import { settings } from "../settings";
+import { getMcpOAuthStatus, isMcpAuthorizationError, type McpOAuthStatus } from "./oauth";
 import { createTransport } from "./transports";
 
 /** Timeout for a connection or one discovery page, not the entire directory (ms). */
@@ -41,6 +45,7 @@ export interface McpServerConfigProjection {
 	url?: string;
 	envKeys: string[];
 	headerKeys: string[];
+	oauth?: { clientId?: string; scope?: string };
 	mode: McpLoadingMode;
 	enabled: boolean;
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
@@ -50,6 +55,8 @@ export interface McpServerConfigProjection {
 export interface McpServerStatus extends McpServerConfigProjection {
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;
+	/** OAuth state for remote servers; `required` means a background connect needs an admin. */
+	auth?: McpOAuthStatus & { required: boolean };
 	tools: Tool[];
 }
 
@@ -72,6 +79,7 @@ export function projectMcpServerConfig(config: McpServerConfig): McpServerConfig
 		...(config.url !== undefined && { url: config.url }),
 		envKeys: Object.keys(config.env ?? {}).sort(),
 		headerKeys: Object.keys(config.headers ?? {}).sort(),
+		...(config.oauth !== undefined && { oauth: { ...config.oauth } }),
 		mode: resolveMcpLoadingMode(config),
 		enabled: resolveMcpLoadingMode(config) !== "disabled",
 		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
@@ -97,6 +105,8 @@ interface ActiveClient {
 	tools: Tool[];
 	status: "connected" | "connecting" | "error";
 	error?: string;
+	/** Last failure was missing/expired OAuth authorization; retrying cannot fix it. */
+	authRequired?: boolean;
 	/** Number of consecutive reconnect attempts since last successful connection. */
 	reconnectAttempts: number;
 	/** Timer for pending reconnect. Cleared on manual disconnect. */
@@ -106,6 +116,18 @@ interface ActiveClient {
 	candidate?: ToolCandidate;
 	notification?: Promise<void>;
 	refreshAgain?: boolean;
+}
+
+// At most 3 UTF-8 bytes per UTF-16 unit, so a capped result stays under the
+// pipeline's 256 KiB per-capture limit.
+const MAX_STRUCTURED_CONTENT_CHARS = 80_000;
+
+/** Spec 2025-06-18+: structured results SHOULD be mirrored as text; serialize when a server omits it. */
+function structuredContentText(structured: unknown): string {
+	const json = JSON.stringify(structured) ?? "null";
+	if (json.length <= MAX_STRUCTURED_CONTENT_CHARS) return json;
+	// Notice first: output previews keep the tail, so the JSON excerpt must be the last line.
+	return `[structured content truncated: first ${MAX_STRUCTURED_CONTENT_CHARS} of ${json.length} chars]\n${json.slice(0, MAX_STRUCTURED_CONTENT_CHARS)}`;
 }
 
 class McpManager {
@@ -305,6 +327,13 @@ class McpManager {
 					CONNECT_TIMEOUT_MS,
 					`MCP connect to "${config.name}"`,
 				);
+				// SDK 1.29 runs notifications/progress in a microtask and deletes that
+				// handler as soon as the matching result is applied. Stdio's
+				// processReadBuffer and a streamable-HTTP JSON body both hand every
+				// frame in one read to onmessage before that microtask runs, so the
+				// result wins and the notice is dropped. Hold only that matching
+				// result for one microtask. Any other message is delivered unchanged.
+				holdResultBehindSameReadProgress(transport);
 				if (!this.isCurrent(entry) || entry.status === "error")
 					throw new Error("MCP connection superseded");
 				client.setNotificationHandler(ToolListChangedNotificationSchema, () => this.notify(entry));
@@ -329,7 +358,12 @@ class McpManager {
 
 	private connectionFailed(entry: ActiveClient, error: unknown): void {
 		entry.status = "error";
-		entry.error = error instanceof Error ? error.message : String(error);
+		entry.authRequired = isMcpAuthorizationError(error);
+		entry.error = entry.authRequired
+			? `MCP server "${entry.config.name}" requires OAuth authorization`
+			: error instanceof Error
+				? error.message
+				: String(error);
 		this.revision++;
 		eventBus.emit({
 			type: "mcp:server_error",
@@ -337,7 +371,7 @@ class McpManager {
 			name: entry.config.name,
 			error: entry.error,
 		});
-		this.scheduleReconnect(entry.config.id);
+		if (!entry.authRequired) this.scheduleReconnect(entry.config.id);
 	}
 
 	/** Disconnect a single MCP server. */
@@ -497,12 +531,19 @@ class McpManager {
 		return result;
 	}
 
-	/** Call a tool on a specific MCP server. */
+	/**
+	 * Call a tool on a specific MCP server.
+	 *
+	 * `onProgress` is optional. Only a caller that passes it gets SDK
+	 * `notifications/progress` (the SDK then sets `progressToken`). The default
+	 * 60s request timeout is unchanged: a progress notice does not extend the call.
+	 */
 	async callTool(
 		serverId: string,
 		toolName: string,
 		args: Record<string, unknown>,
 		signal?: AbortSignal,
+		onProgress?: (progress: Progress) => void,
 	): Promise<{
 		content: Array<{
 			type: string;
@@ -510,6 +551,9 @@ class McpManager {
 			data?: string;
 			mimeType?: string;
 			resource?: unknown;
+			uri?: string;
+			name?: string;
+			title?: string;
 		}>;
 		isError?: boolean;
 	}> {
@@ -529,21 +573,24 @@ class McpManager {
 		}
 		// NarraFork consumes the content envelope, not structured fields as typed business data.
 		// Validate that envelope without the SDK's outputSchema precompilation/validation cache.
+		// Keep `client.request`: the high-level `callTool` compiles `outputSchema`.
+		const requestOptions =
+			signal || onProgress
+				? {
+						...(signal ? { signal } : {}),
+						...(onProgress ? { onprogress: onProgress } : {}),
+					}
+				: undefined;
 		const result = await entry.client.request(
 			{ method: "tools/call", params: { name: toolName, arguments: args } },
 			CallToolResultSchema,
-			signal ? { signal } : undefined,
+			requestOptions,
 		);
 		return {
 			content:
 				result.content.length || result.structuredContent === undefined
 					? result.content
-					: [
-							{
-								type: "text",
-								text: "The MCP server returned structured content only (currently not displayed). The tool call has completed.",
-							},
-						],
+					: [{ type: "text", text: structuredContentText(result.structuredContent) }],
 			isError: result.isError,
 		};
 	}
@@ -557,6 +604,9 @@ class McpManager {
 				...projectMcpServerConfig(cfg),
 				status: entry?.status ?? "disconnected",
 				error: entry?.error,
+				...(cfg.transport !== "stdio" && {
+					auth: { ...getMcpOAuthStatus(cfg), required: !!entry?.authRequired },
+				}),
 				tools: entry?.tools ?? [],
 			};
 		});
@@ -565,10 +615,11 @@ class McpManager {
 	/** Test connection without persisting. Returns tool list on success. */
 	async testConnection(
 		config: McpServerConfig,
-	): Promise<{ ok: boolean; tools?: Tool[]; error?: string }> {
+		oauthKey = config.id,
+	): Promise<{ ok: boolean; tools?: Tool[]; error?: string; authRequired?: boolean }> {
 		let transport: Transport | null = null;
 		try {
-			transport = createTransport(config);
+			transport = createTransport(config, oauthKey);
 			const client = new Client({ name: "narrafork-test", version: "0.1.0" }, { capabilities: {} });
 			await client.connect(transport);
 			const tools = await listAllTools(client);
@@ -583,6 +634,7 @@ class McpManager {
 			return {
 				ok: false,
 				error: err instanceof Error ? err.message : String(err),
+				...(isMcpAuthorizationError(err) && { authRequired: true }),
 			};
 		}
 	}
@@ -646,12 +698,54 @@ class McpManager {
 			a.cwd !== b.cwd ||
 			JSON.stringify(a.args) !== JSON.stringify(b.args) ||
 			JSON.stringify(a.env) !== JSON.stringify(b.env) ||
-			JSON.stringify(a.headers) !== JSON.stringify(b.headers)
+			JSON.stringify(a.headers) !== JSON.stringify(b.headers) ||
+			JSON.stringify(a.oauth) !== JSON.stringify(b.oauth)
 		);
 	}
 }
 
 export const mcpManager = new McpManager();
+
+function finiteRpcId(value: unknown): number | undefined {
+	if (typeof value !== "number" && typeof value !== "string") return undefined;
+	const id = Number(value);
+	return Number.isFinite(id) ? id : undefined;
+}
+
+/**
+ * Keep a `notifications/progress` that shares a read with its tools/call result.
+ *
+ * The SDK invokes the progress handler on a microtask and drops it if the result
+ * has already removed the handler. Stdio and a JSON streamable-HTTP body deliver
+ * both frames synchronously. The matching result waits until that microtask has
+ * run. Other messages, including a result with no progress token in this turn,
+ * are passed through immediately.
+ */
+function holdResultBehindSameReadProgress(transport: Transport): void {
+	const deliver = transport.onmessage;
+	if (!deliver) return;
+	const pending = new Set<number>();
+	transport.onmessage = (message, extra) => {
+		if (isJSONRPCNotification(message) && message.method === "notifications/progress") {
+			const token = finiteRpcId(
+				(message.params as { progressToken?: unknown } | undefined)?.progressToken,
+			);
+			if (token !== undefined) pending.add(token);
+			deliver(message, extra);
+			if (token !== undefined) queueMicrotask(() => pending.delete(token));
+			return;
+		}
+		const responseId =
+			isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)
+				? finiteRpcId(message.id)
+				: undefined;
+		if (responseId !== undefined && pending.has(responseId)) {
+			queueMicrotask(() => deliver(message, extra));
+			return;
+		}
+		deliver(message, extra);
+	};
+}
 
 /** Bound each SDK request, not the total directory: a healthy next page may continue. */
 async function listAllTools(client: Client): Promise<Tool[]> {

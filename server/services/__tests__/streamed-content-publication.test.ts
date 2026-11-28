@@ -1,13 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, getFileTestDb, readTestMessageContent } from "../../../tests/setup";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, AgentEvent } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
 
 // Only the upstream provider and the network sink are replaced. The actual loop,
 // execution receipt, event consumer, append/publication and SQLite paths all run.
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
@@ -290,7 +290,7 @@ afterAll(() => {
 	mock.module("../../db", () => realDb);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 	mock.restore();
-	cleanDb(sqlite);
+	dispose();
 });
 
 describe("real loop content publication before tools", () => {

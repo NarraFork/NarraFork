@@ -1,10 +1,12 @@
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
-import { Hono } from "hono";
-import { NugProvider } from "../lib/agent/nug-provider";
+import { createHash, randomBytes } from "node:crypto";
+import type { NugPaymentIntent } from "@shared/nug-payment";
+import { isNugPaymentContext } from "@shared/nug-payment";
+import { type Context, Hono } from "hono";
+import { z } from "zod";
+import { type NugBillingOrderResponse, NugProvider } from "../lib/agent/nug-provider";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { getNarraforkHome } from "../lib/narrafork-home";
+import { requireNarratorAccess } from "../lib/narrator-access";
 import {
 	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
@@ -16,6 +18,23 @@ import {
 	nugModelRefreshCoordinator,
 } from "../lib/nug-model-refresh-coordinator";
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
+import {
+	getNugPaymentSubject as nugBillingSubject,
+	resolveNugPaymentContext,
+} from "../lib/nug-payment-context";
+import {
+	buildNugQuotaCache,
+	type CapturedNugQuotaSubject,
+	captureNugQuotaSubject,
+	fetchNugQuota,
+	getAllNugCachedQuotas,
+	getNugCachedQuota,
+	normalizeNugQuotaResponse,
+	nugQuotaIdentity,
+	purgeNugQuotaCache,
+	setNugCachedQuota,
+	updateNugQuotaByPrefix,
+} from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
 	type NUGProviderConfig,
@@ -25,71 +44,16 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
+import { requireSessionAuth } from "../middleware/auth";
 
 export const nugRoutes = new Hono();
+export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
 
-// === In-memory NUG quota cache (key = provider id) ===
-
-interface NugQuotaCache {
-	balance: number | null;
-	totalGranted: number | null;
-	detailedQuotaBalance: string | null;
-	extra?: unknown;
-	fetchedAt: number;
-}
-
-const cachedQuotaByProvider = new Map<string, NugQuotaCache>();
-const cacheDir = getNarraforkHome();
-const quotaCachePath = resolve(cacheDir, "nug-quotas.json");
-const SAVE_DEBOUNCE_MS = 250;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let saveInFlight = false;
-let saveRequested = false;
-
-loadAllCachedQuotas();
-
-function normalizeNullableNumber(value: unknown): number | null {
-	if (value == null) return null;
-	const numericValue = typeof value === "number" ? value : Number(value);
-	return Number.isFinite(numericValue) ? numericValue : null;
-}
-
-function normalizeNullableString(value: unknown): string | null {
-	if (value == null) return null;
-	const text = String(value).trim();
-	return text ? text : null;
-}
-
-function formatQuotaDetails(value: unknown): string | null {
-	if (value == null) return null;
-	if (typeof value === "string") return normalizeNullableString(value);
-	if (typeof value === "number" || typeof value === "boolean") return String(value);
-	if (value && typeof value === "object" && !Array.isArray(value)) {
-		const lines = Object.entries(value as Record<string, unknown>)
-			.filter(([, entryValue]) => entryValue != null)
-			.map(([key, entryValue]) => {
-				const formatted =
-					typeof entryValue === "string" ||
-					typeof entryValue === "number" ||
-					typeof entryValue === "boolean"
-						? String(entryValue)
-						: JSON.stringify(entryValue);
-				return `${key}: ${formatted}`;
-			});
-		return lines.length > 0 ? lines.join("\n") : null;
-	}
-	try {
-		return JSON.stringify(value);
-	} catch {
-		return null;
-	}
-}
-
-function nugQuotaDetailsFrom(value: unknown): string | null {
-	const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-	return formatQuotaDetails(record.detailedQuotaBalance) ?? formatQuotaDetails(record.extra);
-}
+registerModelListReader("nug", (group) => getNugCachedModelsByProvider(group.id));
 
 function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 	return (baseUrl ?? "")
@@ -98,114 +62,175 @@ function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 		.replace(/\/(?:api\/v1|api|v1)$/i, "");
 }
 
-function normalizeNugQuotaResponse<T extends Record<string, unknown>>(
-	data: T,
-): T & {
-	balance: number;
-	totalGranted: number;
-	detailedQuotaBalance: string | null;
-} {
+function getNugProvider(id: string): {
+	config: NUGProviderConfig;
+	provider: NugProvider;
+	quotaSubject: CapturedNugQuotaSubject;
+} | null {
+	const configured = (settings.nugProviders ?? []).find((p) => p.id === id);
+	if (!configured) return null;
+	const quotaSubject = captureNugQuotaSubject(configured);
 	return {
-		...data,
-		balance: normalizeNullableNumber(data.balance ?? data.quotaBalance ?? data.remaining) ?? 0,
-		totalGranted:
-			normalizeNullableNumber(
-				data.totalGranted ?? data.quotaTotalGranted ?? data.total_granted ?? data.total,
-			) ?? 0,
-		detailedQuotaBalance: nugQuotaDetailsFrom(data),
+		config: quotaSubject.config,
+		provider: new NugProvider(quotaSubject.config),
+		quotaSubject,
 	};
 }
 
-function loadAllCachedQuotas(): void {
+const NUG_BILLING_BINDING_TTL = 24 * 60 * 60_000;
+const MAX_NUG_BILLING_BINDINGS = 500;
+const MAX_NUG_BILLING_BINDINGS_PER_USER = 50;
+interface NugBillingBinding {
+	owner: string;
+	providerId: string;
+	credentialId: string;
+	storedCredential: boolean;
+	/** Hash only: never retain another long-lived copy of a secret or config. */
+	identityHash: string;
+	orderId?: string;
+	/** 失败请求发起的订单继续受该 narrator 写权限约束；独立充值没有此字段。 */
+	narratorId?: string;
+	expiresAt: number;
+}
+const nugBillingBindings = new Map<string, NugBillingBinding>();
+
+const paymentIntentSchema = z.discriminatedUnion("mode", [
+	z.object({ mode: z.literal("standalone") }).strict(),
+	z
+		.object({
+			mode: z.literal("request"),
+			narratorId: z.string().min(1).max(128),
+			paymentContext: z.string().max(256).refine(isNugPaymentContext),
+		})
+		.strict(),
+]);
+
+function parsePaymentIntent(input: unknown): NugPaymentIntent {
+	const parsed = paymentIntentSchema.safeParse(input);
+	if (!parsed.success)
+		throw new AppError(
+			"必须明确提供失败请求的充值上下文或独立充值意图",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	return parsed.data;
+}
+
+async function subjectForPaymentIntent(c: Context, providerId: string, intent: NugPaymentIntent) {
+	if (intent.mode === "standalone") return nugBillingSubject(providerId);
+	await requireNarratorAccess(c, intent.narratorId, "write");
+	return resolveNugPaymentContext(providerId, intent.narratorId, intent.paymentContext);
+}
+
+async function recheckPaymentIntent(c: Context, providerId: string, intent: NugPaymentIntent) {
+	if (intent.mode === "request") await subjectForPaymentIntent(c, providerId, intent);
+}
+
+async function requirePaymentOrderAccess(c: Context, binding: NugBillingBinding) {
+	if (binding.narratorId) await requireNarratorAccess(c, binding.narratorId, "write");
+}
+
+function pruneNugBillingBindings(): void {
+	const now = Date.now();
+	for (const [token, binding] of nugBillingBindings) {
+		if (binding.expiresAt <= now) nugBillingBindings.delete(token);
+	}
+}
+
+function reserveNugBillingBinding(
+	owner: string,
+	providerId: string,
+	subject: ReturnType<typeof nugBillingSubject>,
+) {
+	pruneNugBillingBindings();
+	if (
+		nugBillingBindings.size >= MAX_NUG_BILLING_BINDINGS ||
+		[...nugBillingBindings.values()].filter((binding) => binding.owner === owner).length >=
+			MAX_NUG_BILLING_BINDINGS_PER_USER
+	) {
+		throw new AppError(
+			"Too many NUG payment sessions; try again after older sessions expire",
+			429,
+			"NUG_PAYMENT_LIMIT",
+		);
+	}
+	let token = randomBytes(32).toString("base64url");
+	while (nugBillingBindings.has(token)) token = randomBytes(32).toString("base64url");
+	const binding: NugBillingBinding = {
+		owner,
+		providerId,
+		credentialId: subject.credentialId,
+		storedCredential: subject.storedCredential,
+		identityHash: subject.identityHash,
+		expiresAt: Date.now() + NUG_BILLING_BINDING_TTL,
+	};
+	nugBillingBindings.set(token, binding);
+	return { token, binding };
+}
+
+function currentNugBillingSubject(token: string, binding: NugBillingBinding) {
+	if (nugBillingBindings.get(token) !== binding || binding.expiresAt <= Date.now()) {
+		nugBillingBindings.delete(token);
+		throw new AppError(
+			"NUG payment session expired or is unavailable; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	}
 	try {
-		if (!existsSync(quotaCachePath)) return;
-		const data = JSON.parse(readFileSync(quotaCachePath, "utf-8")) as Record<
-			string,
-			Partial<NugQuotaCache>
-		>;
-		for (const [providerId, cache] of Object.entries(data)) {
-			cachedQuotaByProvider.set(providerId, {
-				balance: normalizeNullableNumber(cache.balance),
-				totalGranted: normalizeNullableNumber(cache.totalGranted),
-				detailedQuotaBalance: normalizeNullableString(cache.detailedQuotaBalance),
-				...(cache.extra !== undefined ? { extra: cache.extra } : {}),
-				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
-			});
-		}
+		const subject = nugBillingSubject(binding.providerId, binding);
+		if (subject.identityHash !== binding.identityHash) throw new Error("changed");
+		return subject;
 	} catch {
-		// Corrupt or unreadable cache — ignore; quota will refresh on the next NUG event/request.
+		nugBillingBindings.delete(token);
+		throw new AppError(
+			"NUG payment credential or connection changed; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
 	}
 }
 
-function serializeCachedQuotas(): string {
-	const data: Record<string, NugQuotaCache> = {};
-	for (const [providerId, cache] of cachedQuotaByProvider) {
-		data[providerId] = cache;
+function ownedNugBillingBinding(
+	owner: string,
+	providerId: string,
+	orderId: string,
+	token: string | undefined,
+) {
+	if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token))
+		throw new AppError(
+			"NUG payment binding is required; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	pruneNugBillingBindings();
+	const binding = nugBillingBindings.get(token);
+	if (
+		!binding ||
+		binding.owner !== owner ||
+		binding.providerId !== providerId ||
+		binding.orderId !== orderId
+	) {
+		throw new AppError("NUG payment session not found or expired", 404, "NUG_PAYMENT_CONTEXT");
 	}
-	return JSON.stringify(data);
+	return { binding, token };
 }
 
-async function flushCachedQuotas(): Promise<void> {
-	if (saveInFlight) return;
-	saveInFlight = true;
-	try {
-		while (saveRequested) {
-			saveRequested = false;
-			try {
-				await mkdir(cacheDir, { recursive: true });
-				await writeFile(quotaCachePath, serializeCachedQuotas());
-			} catch {
-				// Non-critical: failing to persist quota must not break active narrator runs.
-			}
-		}
-	} finally {
-		saveInFlight = false;
+function boundNugBillingResponse(
+	data: NugBillingOrderResponse,
+	token: string,
+	expectedOrderId?: string,
+) {
+	if (
+		!data?.order ||
+		typeof data.order.id !== "string" ||
+		!data.order.id ||
+		data.order.id.length > 300 ||
+		(expectedOrderId !== undefined && data.order.id !== expectedOrderId)
+	) {
+		throw new AppError("Invalid NUG billing order response", 502, "NUG_PAYMENT_RESPONSE");
 	}
-}
-
-function scheduleSaveAllCachedQuotas(): void {
-	saveRequested = true;
-	if (saveTimer || saveInFlight) return;
-	saveTimer = setTimeout(() => {
-		saveTimer = null;
-		void flushCachedQuotas();
-	}, SAVE_DEBOUNCE_MS);
-	saveTimer.unref?.();
-}
-
-function buildNugQuotaCache(
-	data: {
-		balance?: unknown;
-		totalGranted?: unknown;
-		detailedQuotaBalance?: unknown;
-		extra?: unknown;
-	},
-	existing?: NugQuotaCache,
-): NugQuotaCache {
-	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
-	return {
-		balance: normalizeNullableNumber(data.balance) ?? existing?.balance ?? null,
-		totalGranted: normalizeNullableNumber(data.totalGranted) ?? existing?.totalGranted ?? null,
-		detailedQuotaBalance,
-		...(data.extra !== undefined
-			? { extra: data.extra }
-			: existing?.extra !== undefined
-				? { extra: existing.extra }
-				: {}),
-		fetchedAt: Date.now(),
-	};
-}
-
-function setNugCachedQuota(providerId: string, cache: NugQuotaCache): void {
-	cachedQuotaByProvider.set(providerId, cache);
-	scheduleSaveAllCachedQuotas();
-}
-
-function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugProvider } | null {
-	const providers = settings.nugProviders ?? [];
-	const config = providers.find((p) => p.id === id);
-	if (!config) return null;
-	return { config, provider: new NugProvider(config) };
+	return { ...data, order: { ...data.order, binding: token } };
 }
 
 type NugUsageRecord = Record<string, unknown>;
@@ -490,31 +515,19 @@ function normalizeNugUsageResponse(value: unknown): NugUsageRecord {
 	};
 }
 
-/** Fetch quota from a single NUG provider. */
-async function fetchNugQuota(config: NUGProviderConfig): Promise<{
-	balance: number;
-	totalGranted: number;
-	detailedQuotaBalance?: string | null;
-	extra?: unknown;
-} | null> {
-	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
-	if (!baseUrl || !config.apiKey) return null;
-	try {
-		const provider = new NugProvider(config);
-		return await provider.getQuota();
-	} catch {
-		return null;
-	}
-}
-
 /** Fetch quota for all configured NUG providers (called on startup). */
 export async function fetchAllNugQuotas(): Promise<void> {
 	const providers = settings.nugProviders ?? [];
 	await Promise.allSettled(
 		providers.map(async (p) => {
-			const data = await fetchNugQuota(p);
+			const quotaSubject = captureNugQuotaSubject(p);
+			const data = await fetchNugQuota(quotaSubject.config);
 			if (data) {
-				setNugCachedQuota(p.id, buildNugQuotaCache(data, cachedQuotaByProvider.get(p.id)));
+				setNugCachedQuota(
+					p.id,
+					buildNugQuotaCache(data, getNugCachedQuota(p.id, quotaSubject)),
+					quotaSubject,
+				);
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -524,76 +537,14 @@ export async function fetchAllNugQuotas(): Promise<void> {
 	);
 }
 
-/** Update cached quota balance for a provider identified by prefix. */
-export function updateNugQuotaByPrefix(
-	prefix: string,
-	quotaBalance: number | null,
-	detailedQuotaBalance?: string | null,
-	extra?: unknown,
-): void {
-	const providers = settings.nugProviders ?? [];
-	const config = providers.find((p) => p.prefix === prefix || p.id === prefix);
-	if (!config) return;
-	const existing = cachedQuotaByProvider.get(config.id);
-	setNugCachedQuota(
-		config.id,
-		buildNugQuotaCache(
-			{
-				balance: quotaBalance,
-				detailedQuotaBalance,
-				...(extra !== undefined ? { extra } : {}),
-			},
-			existing,
-		),
-	);
-}
-
-/** Get cached quota for a provider by ID. */
-export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined {
-	return cachedQuotaByProvider.get(providerId);
-}
-
-/** Get all cached quotas keyed by provider ID. */
-export function getAllNugCachedQuotas(): Record<
-	string,
-	{
-		balance: number | null;
-		totalGranted: number | null;
-		detailedQuotaBalance: string | null;
-		extra?: unknown;
-	}
-> {
-	const result: Record<
-		string,
-		{
-			balance: number | null;
-			totalGranted: number | null;
-			detailedQuotaBalance: string | null;
-			extra?: unknown;
-		}
-	> = {};
-	for (const [id, cache] of cachedQuotaByProvider) {
-		result[id] = {
-			balance: cache.balance,
-			totalGranted: cache.totalGranted,
-			detailedQuotaBalance: cache.detailedQuotaBalance,
-			...(cache.extra !== undefined ? { extra: cache.extra } : {}),
-		};
-	}
-	return result;
-}
-
 /** Remove cached models and quotas for providers that no longer exist in settings. */
 export function purgeNugProviderCache(removedIds: string[]): void {
 	let changed = false;
 	for (const id of removedIds) {
 		if (deleteNugCachedModels(id)) changed = true;
-		if (cachedQuotaByProvider.delete(id)) changed = true;
 	}
-	if (changed) {
-		saveAllCachedNugModels();
-		scheduleSaveAllCachedQuotas();
-	}
+	purgeNugQuotaCache(removedIds);
+	if (changed) saveAllCachedNugModels();
 }
 
 function getActiveNugCachedModels(): NugModelInfo[] {
@@ -757,9 +708,21 @@ nugRoutes.post("/models/refresh-if-stale", async (c) => {
 	});
 });
 
-nugRoutes.get("/providers/:id/models", (c) => {
+nugRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getNugCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? nugProviderPrefix(config) : id },
+		"nug",
+	);
+	return c.json({
+		models: await getServiceTemplate(group.templateId).listModels(
+			group,
+			undefined,
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 nugRoutes.post("/providers/:id/models/refresh", async (c) => {
@@ -798,93 +761,191 @@ nugRoutes.get("/providers/:id/channels/health", async (c) => {
 	}
 });
 
-/** Proxy quota balance from NUG service (updates cache). */
+/**
+ * Payment confirmation only: NugRechargeDialog re-reads this after an order becomes paid,
+ * then resumes the paused narrator. It must remain available to ordinary session users,
+ * like the billing/order endpoints; ordinary quota displays use /api/quota-snapshots.
+ */
 nugRoutes.get("/providers/:id/quota", async (c) => {
 	const id = c.req.param("id");
+	if (c.req.query("binding") !== undefined || c.req.query("orderId") !== undefined) {
+		await requireSessionAuth(c, async () => {});
+		try {
+			const bound = ownedNugBillingBinding(
+				c.get("user").sub,
+				id,
+				c.req.query("orderId") ?? "",
+				c.req.query("binding"),
+			);
+			await requirePaymentOrderAccess(c, bound.binding);
+			const subject = currentNugBillingSubject(bound.token, bound.binding);
+			const provider = new NugProvider(subject.config, subject.connection);
+			const data = (await provider.getQuota()) as unknown as Record<string, unknown>;
+			await requirePaymentOrderAccess(c, bound.binding);
+			const current = currentNugBillingSubject(bound.token, bound.binding);
+			const primary = captureNugQuotaSubject(current.connection);
+			const paymentCredentialIsPrimary =
+				primary.id === bound.binding.credentialId &&
+				createHash("sha256").update(primary.identity).digest("hex") === bound.binding.identityHash;
+			// Route through the source owner with A's captured CID even when B is now primary.
+			// Never merge B's previous balance or legacy-normalized zeroes into A's probe.
+			const quotaSubject = {
+				id: bound.binding.credentialId,
+				providerId: id,
+				config: subject.config,
+				identity: nugQuotaIdentity(subject.config),
+			};
+			setNugCachedQuota(
+				id,
+				buildNugQuotaCache(data, getNugCachedQuota(id, quotaSubject)),
+				quotaSubject,
+			);
+			return c.json({ ...normalizeNugQuotaResponse(data), paymentCredentialIsPrimary });
+		} catch (err) {
+			if (err instanceof AppError) throw err;
+			logger.error("NUG payment balance fetch failed", { providerId: id });
+			return c.json({ error: "NUG payment balance fetch failed" }, 502);
+		}
+	}
 	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	if (!entry) return c.json({ error: "quota_subject_not_found" }, 404);
 	try {
-		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
-		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
-		return c.json(responseData);
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG quota fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		const data = (await entry.provider.getQuota(AbortSignal.timeout(15_000))) as unknown as Record<
+			string,
+			unknown
+		>;
+		setNugCachedQuota(
+			id,
+			buildNugQuotaCache(data, getNugCachedQuota(id, entry.quotaSubject)),
+			entry.quotaSubject,
+		);
+		const response = normalizeNugQuotaResponse(data);
+		// Keep the payment consumer's contract, not the template-private upstream payload.
+		return c.json({
+			balance: response.balance,
+			totalGranted: response.totalGranted,
+			detailedQuotaBalance: response.detailedQuotaBalance,
+		});
+	} catch {
+		return c.json({ error: "quota_unavailable" }, 502);
 	}
 });
+
+// Match the application's first-party gate even when this router is mounted alone.
+// Keep ordinary session users' existing payment access; do not add an admin-only gate.
+nugRoutes.use("/providers/:id/billing/orders", requireSessionAuth);
+nugRoutes.use("/providers/:id/billing/orders/*", requireSessionAuth);
 
 /** Proxy billing config from NUG service. */
 nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	await requireSessionAuth(c, async () => {});
 	try {
-		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
-		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
-		return c.json(responseData);
+		const intent = parsePaymentIntent(c.req.query());
+		const subject = await subjectForPaymentIntent(c, id, intent);
+		const identity = nugQuotaIdentity(subject.config);
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = (await provider.getBillingConfig()) as unknown as Record<string, unknown>;
+		await recheckPaymentIntent(c, id, intent);
+		const quotaSubject = {
+			id: subject.credentialId,
+			providerId: id,
+			config: subject.config,
+			identity,
+		};
+		setNugCachedQuota(
+			id,
+			buildNugQuotaCache(data, getNugCachedQuota(id, quotaSubject)),
+			quotaSubject,
+		);
+		return c.json(normalizeNugQuotaResponse(data));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing config fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing config fetch failed", { providerId: id });
+		return c.json({ error: "NUG billing config fetch failed" }, 502);
 	}
 });
 
-/** Create a NUG billing order using the configured provider API key. */
+/** Create under one captured CID; only the random binding leaves this server. */
 nugRoutes.post("/providers/:id/billing/orders", async (c) => {
-	const entry = getNugProvider(c.req.param("id"));
-	if (!entry) return c.json({ error: `Provider "${c.req.param("id")}" not found` }, 404);
+	const id = c.req.param("id");
+	let token: string | undefined;
 	try {
-		const body = (await c.req.json()) as { amount?: number; provider?: string; channel?: string };
+		const body = (await c.req.json()) as {
+			amount?: number;
+			provider?: string;
+			channel?: string;
+			intent?: unknown;
+		};
 		const amount = Number(body.amount);
-		if (!Number.isFinite(amount) || amount <= 0) {
+		if (!Number.isFinite(amount) || amount <= 0)
 			return c.json({ error: "amount must be greater than 0" }, 400);
-		}
-		if (!body.provider) {
+		if (typeof body.provider !== "string" || !body.provider.trim())
 			return c.json({ error: "provider is required" }, 400);
-		}
-		const data = await entry.provider.createBillingOrder({
+		if (body.channel !== undefined && typeof body.channel !== "string")
+			return c.json({ error: "invalid channel" }, 400);
+		const intent = parsePaymentIntent(body.intent);
+		const subject = await subjectForPaymentIntent(c, id, intent);
+		const reserved = reserveNugBillingBinding(c.get("user").sub, id, subject);
+		if (intent.mode === "request") reserved.binding.narratorId = intent.narratorId;
+		token = reserved.token;
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = await provider.createBillingOrder({
 			amount,
 			provider: body.provider,
 			channel: body.channel,
 		});
-		return c.json(data, 201);
+		// 发布支付二维码前再次校验失败请求权限及已绑定主体，不能改充新首 Key。
+		await recheckPaymentIntent(c, id, intent);
+		currentNugBillingSubject(token, reserved.binding);
+		const response = boundNugBillingResponse(data, token);
+		reserved.binding.orderId = response.order.id;
+		return c.json(response, 201);
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order create failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (token) nugBillingBindings.delete(token);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order create failed", { providerId: id });
+		return c.json({ error: "NUG billing order create failed" }, 502);
 	}
 });
 
-/** Fetch a NUG billing order owned by the configured API-key user. */
+/** Poll only the creating user's live CID, never today's first key. */
 nugRoutes.get("/providers/:id/billing/orders/:orderId", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	const orderId = c.req.param("orderId");
 	try {
-		const data = await entry.provider.getBillingOrder(c.req.param("orderId"));
-		return c.json(data);
+		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
+		await requirePaymentOrderAccess(c, bound.binding);
+		const subject = currentNugBillingSubject(bound.token, bound.binding);
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = await provider.getBillingOrder(orderId);
+		await requirePaymentOrderAccess(c, bound.binding);
+		currentNugBillingSubject(bound.token, bound.binding);
+		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order fetch failed", { providerId: id });
+		return c.json({ error: "NUG billing order fetch failed" }, 502);
 	}
 });
 
-/** Refresh a pending NUG billing order pay URL. */
+/** Refresh a pay URL under the same creating subject and local session owner. */
 nugRoutes.post("/providers/:id/billing/orders/:orderId/repay", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	const orderId = c.req.param("orderId");
 	try {
-		const data = await entry.provider.repayBillingOrder(c.req.param("orderId"));
-		return c.json(data);
+		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
+		await requirePaymentOrderAccess(c, bound.binding);
+		const subject = currentNugBillingSubject(bound.token, bound.binding);
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = await provider.repayBillingOrder(orderId);
+		await requirePaymentOrderAccess(c, bound.binding);
+		currentNugBillingSubject(bound.token, bound.binding);
+		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order repay failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order repay failed", { providerId: id });
+		return c.json({ error: "NUG billing order repay failed" }, 502);
 	}
 });
 
@@ -1036,11 +1097,6 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 		logger.error("NUG API key creation failed", { error: msg, provider: config.name });
 		return c.json({ error: msg }, 502);
 	}
-});
-
-/** Get cached quotas for all NUG providers. */
-nugRoutes.get("/quotas", (c) => {
-	return c.json(getAllNugCachedQuotas());
 });
 
 // ─── OAuth Flow ───

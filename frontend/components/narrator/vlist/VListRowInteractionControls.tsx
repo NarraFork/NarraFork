@@ -96,6 +96,8 @@ export function VListRowInteractionControls({
 		toolUseId: toolDetailRef?.toolUseId ?? toolUseId,
 		toolDetailRef,
 		filePath: toolMeta?.filePath,
+		fileTarget: toolMeta?.fileTarget,
+		fileNarratorId: toolMeta?.fileNarratorId,
 	});
 
 	// --- Menu items (shared by swipe reveal + context menu) ---
@@ -231,7 +233,7 @@ export function VListRowInteractionControls({
 						swipe.closeSwipe();
 					}}
 				>
-					{tNarrator(editNavigation.open ? "editPreview.open" : "contextMenu_openFilePanel")}
+					{tNarrator(editNavigation.open ? editNavigation.labelKey : "contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>

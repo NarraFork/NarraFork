@@ -58,7 +58,7 @@ beforeEach(async () => {
 	previousWorker = process.env.NARRAFORK_DB_WORKER;
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	delete process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	await workerPool.resetDbWorkerPoolForTest();
 	bindConnection(file);
 });

@@ -92,16 +92,18 @@ test("free tokens cannot make an unpriced image request look complete", () => {
 	expect(combineReferenceCostStatus("partial", priced)).toBe("partial");
 });
 
-test("batch and long-context rows are never used for a standard-tier dimension", () => {
+test("batch, time-of-use and long-context rows are never used for a standard-tier dimension", () => {
 	const estimate = estimateReferenceUsageDimensions(
 		card({
 			input_cost_per_image_batches: 0.001,
+			input_cost_per_image_peak: 0.003,
+			input_cost_per_image_off_peak: 0,
 			long_context_input_token_threshold: 200000,
 			long_context_input_cost_multiplier: 2,
 		}),
 		{ images: 10 },
 	);
-	// The only image rate belongs to the batch tier, so the standard request is unpriced.
+	// All image rates belong to other tiers, so the standard request is unpriced.
 	expect(estimate.status).toBe("unknown");
 	expect(estimate.missingFields).toEqual(["images"]);
 });

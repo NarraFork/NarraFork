@@ -17,8 +17,10 @@ import {
 	Checkbox,
 	Divider,
 	Group,
+	Loader,
 	Modal,
 	ScrollArea,
+	SegmentedControl,
 	Select,
 	Stack,
 	Text,
@@ -28,6 +30,7 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { handleLength, MIN_HANDLE_LENGTH } from "@shared/narrator-handle";
+import type { TeamDetail } from "@shared/project-teams";
 import {
 	IconFolder,
 	IconFolderOpen,
@@ -58,27 +61,30 @@ import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { useWorkspaceDevices } from "../../hooks/useWorkspaceContext";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
-import { Z } from "../../lib/z-index";
+import { DeviceDirectoryModal } from "../common/DeviceDirectoryPicker";
 import { DirectoryPicker } from "../common/DirectoryPicker";
-import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
+import { deviceSelectData, LOCAL_DEVICE } from "../common/device-directory-options";
 import { resolveCwdPrefill } from "./composer/create-narrator-cwd-prefill";
 import {
 	resolveStartInPlanModePrefill,
 	shouldSendStartInPlanMode,
 } from "./composer/create-narrator-plan-mode-prefill";
+import { useTeamStartEligibility } from "./create-narrator-team";
 import { followIdentityKind } from "./details/git-identity-follow-label";
 import { ProjectPromptModal } from "./ProjectPromptModal";
 
-const RemoteDirectoryBrowser = lazy(() =>
-	import("../permissions/RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
+// "Start as a team": loaded only when chosen, so the session path never pulls in the router.
+const CreateTeamFromDirectory = lazy(() =>
+	import("./CreateTeamFromDirectory").then((m) => ({ default: m.CreateTeamFromDirectory })),
 );
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
-const LOCAL_DEVICE = "local";
+/** `undefined` and the local sentinel both mean this server. */
+function requestedCreationDevice(deviceId: string | undefined): string {
+	return deviceId && deviceId !== LOCAL_DEVICE ? deviceId : LOCAL_DEVICE;
+}
 
 /** 选择它表示不写绑定，跟随本人的默认身份（与会话详情面板的哨兵值一致）。 */
 const FOLLOW_DEFAULT_GIT_IDENTITY = "__follow_default__";
@@ -96,6 +102,11 @@ export interface CreateNarratorModalProps {
 	onCreated?: (narrator: CreateNarratorResult) => void;
 	/** Pre-fill the working directory (e.g. "new narrator in this directory" entry points). */
 	initialCwd?: string;
+	/**
+	 * Pre-fill the execution device, so an entry point that already chose one (the
+	 * dashboard composer) opens on the same target instead of silently falling back here.
+	 */
+	initialDeviceId?: string;
 	/** Explicit project membership; a directory alone never implies a project. */
 	contextProjectId?: string;
 	/**
@@ -105,6 +116,11 @@ export interface CreateNarratorModalProps {
 	 * 让选择器说清"跟随"跟的是哪一条。
 	 */
 	gitIdentityFolderId?: string;
+	/**
+	 * "Start as a team" opens the new team's page by default; a caller without a router (a
+	 * test fixture) observes the created team here instead.
+	 */
+	onTeamCreated?: (team: TeamDetail) => void;
 }
 
 function FavoriteItemContent({
@@ -191,17 +207,20 @@ export function CreateNarratorModalBody({
 	onClose,
 	onCreated,
 	initialCwd,
+	initialDeviceId,
 	contextProjectId,
 	gitIdentityFolderId,
+	onTeamCreated,
 }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
 	const createNarrator = useCreateNarrator();
 	const queryClient = useQueryClient();
-	const { groupedModels, modelOptionsFilter } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels(opened);
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		enabled: opened,
 		gcTime: CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	// Only a default that EXISTS is prefilled: the server no longer creates it, so an unset
@@ -217,7 +236,10 @@ export function CreateNarratorModalBody({
 	const [cwd, setCwd] = useState(initialCwd ?? "");
 	// Which execution device the session starts on. A remote device makes `cwd` a path
 	// on THAT machine, so the local picker (favorites, mkdir, drive list) does not apply.
-	const [deviceId, setDeviceId] = useState<string>(LOCAL_DEVICE);
+	// Seed from the caller: the prefill effect below runs in the same commit, and a
+	// state that is still local there would write this server's default directory
+	// into a remote session.
+	const [deviceId, setDeviceId] = useState<string>(requestedCreationDevice(initialDeviceId));
 	const [remoteBrowserOpen, setRemoteBrowserOpen] = useState(false);
 	const workspaceDevicesQuery = useWorkspaceDevices(contextProjectId ?? null, opened);
 	const remoteDevices = (workspaceDevicesQuery.data?.devices ?? []).filter(
@@ -262,6 +284,10 @@ export function CreateNarratorModalBody({
 		: undefined;
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
+	// A plain session, or a team (a coordinator session plus its team row) in the directory's
+	// project. The team option stays visible and says why when the directory cannot have one.
+	const [mode, setMode] = useState<"session" | "team">("session");
+	const teamEligibility = useTeamStartEligibility({ opened, cwd, isRemoteDevice });
 	// No directory typed and no usable default: the server would refuse, so ask up front.
 	// A project context supplies its own directory — but only for the LOCAL device: a
 	// remote creation always needs an explicit path on that machine.
@@ -304,10 +330,19 @@ export function CreateNarratorModalBody({
 	useEffect(() => () => resizeCleanupRef.current?.(), []);
 
 	// Callers may keep this modal mounted across opens (or swap the target directory
-	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
+	// while it is closed), so adopt the entry point on every open. An absent device
+	// means this server. A remote target with no directory must drop a path that was
+	// filled for this server; carrying it would create the session in the wrong place.
 	useEffect(() => {
-		if (opened && initialCwd) setCwd(initialCwd);
-	}, [opened, initialCwd]);
+		if (!opened) return;
+		const nextDeviceId = requestedCreationDevice(initialDeviceId);
+		setDeviceId(nextDeviceId);
+		if (initialCwd) {
+			setCwd(initialCwd);
+		} else if (nextDeviceId !== LOCAL_DEVICE) {
+			setCwd("");
+		}
+	}, [opened, initialCwd, initialDeviceId]);
 
 	// When the caller gives no entry-point directory, pre-fill the instance's default
 	// project directory: the field previously only SHOWED it as a placeholder while an
@@ -319,7 +354,10 @@ export function CreateNarratorModalBody({
 	// render or two late and a fires-once-on-open effect would miss it permanently.
 	const prefilledForOpenRef = useRef(false);
 	useEffect(() => {
-		if (isRemoteDevice) {
+		// The prop is authoritative on this commit. `deviceId` can still be local when
+		// a mounted dialog has just been handed a remote target, and the state update
+		// from the effect above is not visible yet.
+		if (requestedCreationDevice(initialDeviceId) !== LOCAL_DEVICE || isRemoteDevice) {
 			// The instance's default project directory is a path on THIS server; pre-filling
 			// it into a remote session would create it in a directory that does not exist
 			// there. Re-arm the prefill so switching back to local still adopts it.
@@ -345,7 +383,7 @@ export function CreateNarratorModalBody({
 			setCwd(decision.value);
 			prefilledForOpenRef.current = true;
 		}
-	}, [opened, cwd, initialCwd, defaultProjectDir, isRemoteDevice]);
+	}, [opened, cwd, initialCwd, defaultProjectDir, isRemoteDevice, initialDeviceId]);
 
 	// Same timing question as the cwd field: the settings query is often unresolved
 	// on the first open, so `defaultStartInPlanMode` arrives a render or two late.
@@ -508,6 +546,7 @@ export function CreateNarratorModalBody({
 		setSessionTitle("");
 		setPromptEditorOpen(false);
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
+		setMode("session");
 	}, []);
 
 	const handleClose = () => {
@@ -577,14 +616,10 @@ export function CreateNarratorModalBody({
 			<Select
 				label={t("executionDevice")}
 				description={t("executionDeviceHint")}
-				data={[
-					{ value: LOCAL_DEVICE, label: t("executionDeviceLocal") },
-					...remoteDevices.map((device) => ({
-						value: device.id,
-						label: device.online ? device.name : `${device.name} · ${t("executionDeviceOffline")}`,
-						disabled: !device.online,
-					})),
-				]}
+				data={deviceSelectData(remoteDevices, {
+					local: t("executionDeviceLocal"),
+					offline: t("executionDeviceOffline"),
+				})}
 				value={deviceId}
 				onChange={(value) => handleDeviceChange(value ?? LOCAL_DEVICE)}
 				allowDeselect={false}
@@ -707,6 +742,48 @@ export function CreateNarratorModalBody({
 				{cwd.trim() ? t("projectPromptOpenHint") : t("projectPromptChooseDirectory")}
 			</Text>
 		</Stack>
+	);
+
+	const modeSection = (
+		<Stack gap={4} style={{ flexShrink: 0 }}>
+			<SegmentedControl
+				fullWidth
+				value={mode}
+				onChange={(value) => setMode(value === "team" ? "team" : "session")}
+				data={[
+					{ value: "session", label: t("createMode.session") },
+					{
+						value: "team",
+						label: t("createMode.team"),
+						// Off, never hidden, while the directory cannot have a team; once chosen it
+						// stays chosen and the team half says why it cannot be created.
+						disabled: !teamEligibility.ok && mode !== "team",
+					},
+				]}
+				data-testid="create-mode"
+			/>
+			<Text size="xs" c="dimmed" data-testid="create-mode-hint">
+				{mode === "team"
+					? t("createMode.teamHint")
+					: teamEligibility.ok
+						? t("createMode.teamAvailable")
+						: t("createMode.teamUnavailable", {
+								reason: t(`teamStart.reason.${teamEligibility.reason}`),
+							})}
+			</Text>
+		</Stack>
+	);
+
+	const teamSection = (
+		<Suspense fallback={<Loader size="sm" />}>
+			<CreateTeamFromDirectory
+				cwd={cwd}
+				eligibility={teamEligibility}
+				onCancel={handleClose}
+				onDone={handleClose}
+				onTeamCreated={onTeamCreated}
+			/>
+		</Suspense>
 	);
 
 	const optionsSection = (
@@ -838,8 +915,11 @@ export function CreateNarratorModalBody({
 		</>
 	);
 
+	const rightSection = mode === "team" ? teamSection : optionsSection;
+
 	return (
 		<>
+			{modeSection}
 			{isWide ? (
 				// Two columns: left dedicated to directory + favorites, right to options.
 				// Use an explicit viewport height (not a flex chain through Modal body, which
@@ -848,7 +928,8 @@ export function CreateNarratorModalBody({
 					align="stretch"
 					wrap="nowrap"
 					gap="lg"
-					h="calc(85vh - 150px)"
+					h="calc(85vh - 200px)"
+					mt="sm"
 					style={{ minHeight: 0 }}
 				>
 					<Stack gap="md" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
@@ -857,7 +938,7 @@ export function CreateNarratorModalBody({
 					<Divider orientation="vertical" />
 					<ScrollArea style={{ flex: 1, minWidth: 0 }} type="auto">
 						<Stack gap="md" pr="xs">
-							{optionsSection}
+							{rightSection}
 						</Stack>
 					</ScrollArea>
 				</Group>
@@ -867,70 +948,64 @@ export function CreateNarratorModalBody({
 				// min-width:0; combined with minWidth:0 here, long favorite paths truncate
 				// instead of forcing horizontal scroll on mobile.
 				<ScrollArea
-					mah="calc(85vh - 64px)"
+					mah="calc(85vh - 114px)"
+					mt="sm"
 					style={{ flex: 1, minWidth: 0, minHeight: 0 }}
 					type="auto"
 				>
 					<Stack gap="md" pb="xs">
 						{directorySection}
-						{optionsSection}
+						{rightSection}
 					</Stack>
 				</ScrollArea>
 			)}
 
-			{/* Fixed footer — always visible, never scrolled out of reach. */}
-			<Divider mt="sm" />
-			<Group justify="flex-end" pt="sm">
-				<Button variant="default" onClick={handleClose}>
-					{tc("cancel")}
-				</Button>
-				<Button
-					onClick={() => void handleCreate()}
-					loading={createNarrator.isPending}
-					disabled={
-						directoryRequired ||
-						(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
-						(bot && !sessionTitle.trim())
-					}
-				>
-					{t("createNarrator")}
-				</Button>
-			</Group>
+			{/* Fixed footer — always visible, never scrolled out of reach. The team half has its own. */}
+			{mode === "session" && (
+				<>
+					<Divider mt="sm" />
+					<Group justify="flex-end" pt="sm">
+						<Button variant="default" onClick={handleClose}>
+							{tc("cancel")}
+						</Button>
+						<Button
+							onClick={() => void handleCreate()}
+							loading={createNarrator.isPending}
+							disabled={
+								directoryRequired ||
+								(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
+								(bot && !sessionTitle.trim())
+							}
+						>
+							{t("createNarrator")}
+						</Button>
+					</Group>
+				</>
+			)}
 			{promptEditorOpen && cwd.trim() ? (
 				<ProjectPromptModal cwd={cwd} onClose={() => setPromptEditorOpen(false)} />
 			) : null}
 			{isRemoteDevice ? (
-				<Modal
+				<DeviceDirectoryModal
 					opened={remoteBrowserOpen}
 					onClose={() => setRemoteBrowserOpen(false)}
 					title={t("browseRemoteDirectoryTitle", { device: selectedDevice?.name ?? deviceId })}
-					size="md"
-					// Opened from inside this modal: use the global modal token, not Mantine's
-					// base modal level, or the picker would render behind its parent.
-					zIndex={Z.modal}
-					styles={DIRECTORY_BROWSER_MODAL_STYLES}
-				>
-					{remoteBrowserOpen ? (
-						<Suspense fallback={null}>
-							<RemoteDirectoryBrowser
-								deviceLabel={selectedDevice?.name ?? deviceId}
-								initialPath={cwd.trim() || undefined}
-								listDirectory={(path, opts) =>
-									api.browseWorkspaceDirectory(deviceId, path, {
-										showHidden: opts.showHidden,
-										projectId: contextProjectId,
-									})
-								}
-								queryKey={["workspaceDeviceBrowse", deviceId, contextProjectId ?? null]}
-								onSelect={(path) => {
-									setCwd(path);
-									setRemoteBrowserOpen(false);
-								}}
-								onCancel={() => setRemoteBrowserOpen(false)}
-							/>
-						</Suspense>
-					) : null}
-				</Modal>
+					deviceId={deviceId}
+					deviceLabel={selectedDevice?.name ?? deviceId}
+					initialPath={cwd.trim() || undefined}
+					listDirectory={(path, opts) =>
+						api.browseWorkspaceDirectory(deviceId, path, {
+							showHidden: opts.showHidden,
+							projectId: contextProjectId,
+						})
+					}
+					queryKey={["workspaceDeviceBrowse", deviceId, contextProjectId ?? null]}
+					onSelect={(path) => {
+						setCwd(path);
+						setRemoteBrowserOpen(false);
+					}}
+					onCancel={() => setRemoteBrowserOpen(false)}
+				/>
 			) : null}
 		</>
 	);

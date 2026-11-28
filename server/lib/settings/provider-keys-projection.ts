@@ -1,5 +1,5 @@
 /**
- * settings.json ↔ provider-keys.json.
+ * settings.json ↔ the provider key store (provider-keys.ts).
  *
  * On disk, provider entries carry no API key; the keys live in the provider key store.
  * In memory each entry's `apiKey` is its first stored key, so every reader of a single
@@ -8,29 +8,38 @@
  *
  * Covered fields: the `apiKey` of custom API providers, NUG providers, TokenDance, Command
  * Code and custom search providers, custom API providers' `quotaAccessToken`, and NUG's
- * `oauthClientSecret`. Custom API providers own their inference keys under their own id
- * (they can hold several, see agent/pooled-provider.ts); all other credentials hold one key
- * each, under a namespaced owner id. Site tokens and OAuth secrets never join that pool.
+ * `oauthClientSecret`. Model providers project only their first inference key; extra keys
+ * stay in the pool. NUG and built-ins retain namespaced facade owners until S5, mapped to
+ * group ids by the unified store. Site tokens and OAuth secrets never join that pool.
  * Search headers live separately in search-header-secrets.ts.
  */
-import { getProviderKeyStore } from "../provider-keys";
+import {
+	COMMAND_CODE_KEY_OWNER,
+	getProviderKeyStore,
+	nugKeyOwner,
+	nugOAuthKeyOwner,
+	quotaKeyOwner,
+	searchKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "../provider-keys";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import type { NarraForkSettings } from "./types";
 
-// Custom API provider ids are nanoids, which never contain ":", so these cannot collide.
-export const TOKENDANCE_KEY_OWNER = "builtin:tokendance";
-export const COMMAND_CODE_KEY_OWNER = "builtin:CommandCode";
-export const nugKeyOwner = (providerId: string) => `nug:${providerId}`;
-export const nugOAuthKeyOwner = (providerId: string) => `nug-oauth:${providerId}`;
-export const searchKeyOwner = (providerId: string) => `search:${providerId}`;
-export const quotaKeyOwner = (providerId: string) => `quota:${providerId}`;
+export {
+	COMMAND_CODE_KEY_OWNER,
+	nugKeyOwner,
+	nugOAuthKeyOwner,
+	quotaKeyOwner,
+	searchKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+};
 
 /** One settings field whose secret lives in the key store. */
 interface KeySlot {
 	/** Store owner id. */
 	owner: string;
-	/** Custom API providers keep their extra keys when the slot goes away (see the route). */
-	pooled: boolean;
+	/** Whether deleting the entire holder removes its owner; unrelated to pool size. */
+	pruneOnDelete: boolean;
 	holder: { apiKey?: string; quotaAccessToken?: string; oauthClientSecret?: string };
 	field: "apiKey" | "quotaAccessToken" | "oauthClientSecret";
 	/** The field is required on this holder, so "no key" is "" rather than absent. */
@@ -40,10 +49,10 @@ interface KeySlot {
 function keySlots(settings: NarraForkSettings): KeySlot[] {
 	const slots: KeySlot[] = [];
 	for (const holder of settings.customApiProviders ?? []) {
-		slots.push({ owner: holder.id, pooled: true, holder, field: "apiKey", required: true });
+		slots.push({ owner: holder.id, pruneOnDelete: false, holder, field: "apiKey", required: true });
 		slots.push({
 			owner: quotaKeyOwner(holder.id),
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "quotaAccessToken",
 			required: false,
@@ -52,14 +61,14 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 	for (const holder of settings.nugProviders ?? []) {
 		slots.push({
 			owner: nugKeyOwner(holder.id),
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "apiKey",
 			required: true,
 		});
 		slots.push({
 			owner: nugOAuthKeyOwner(holder.id),
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "oauthClientSecret",
 			required: false,
@@ -69,7 +78,7 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 		const holder = settings.tokendance;
 		slots.push({
 			owner: TOKENDANCE_KEY_OWNER,
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "apiKey",
 			required: true,
@@ -79,7 +88,7 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 		const holder = settings.commandCode;
 		slots.push({
 			owner: COMMAND_CODE_KEY_OWNER,
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "apiKey",
 			required: false,
@@ -88,7 +97,7 @@ function keySlots(settings: NarraForkSettings): KeySlot[] {
 	for (const holder of settings.search?.customProviders ?? []) {
 		slots.push({
 			owner: searchKeyOwner(holder.id),
-			pooled: false,
+			pruneOnDelete: true,
 			holder,
 			field: "apiKey",
 			required: false,
@@ -121,6 +130,8 @@ export function absorbProviderKeys(settings: NarraForkSettings): boolean {
 	const store = getProviderKeyStore();
 	const slots = keySlots(settings);
 	const hadKeys = slots.some((slot) => !!slot.holder[slot.field]?.trim());
+	// Neither a legacy singleton id nor a projected/inline secret records OAuth provenance.
+	// Preserve real account metadata; unmarked upgrades choose a slot during OAuth instead.
 	store.syncFirstKeys(asStoreEntries(slots), { clearOnEmpty: false });
 	hydrateProviderKeys(settings);
 	return hadKeys && store.readable;
@@ -132,17 +143,17 @@ export function syncProviderKeys(settings: NarraForkSettings): void {
 }
 
 /**
- * After a successful save: keys of single-key entries that `previous` had and `next` no
- * longer has (a deleted provider's site token, a NUG/search provider or a cleared TokenDance
- * connection) are removed, so the next load cannot bring them back. Custom API inference
- * keys are left to the settings route, which removes all of a deleted provider's keys.
+ * After a successful save, remove an owner's keys only when its entire settings holder
+ * disappeared. Clearing/removing/reordering the projected first key must never prune the
+ * surviving pool. Deleting a NUG/built-in/search connection removes its whole pool; custom
+ * API inference pools remain owned by the settings route's provider-deletion handling.
  */
 export function pruneProviderKeys(previous: NarraForkSettings, next: NarraForkSettings): void {
 	const store = getProviderKeyStore();
 	if (!store.readable || previous === next) return;
 	const kept = new Set(keySlots(next).map((slot) => slot.owner));
 	for (const slot of keySlots(previous)) {
-		if (!slot.pooled && !kept.has(slot.owner)) store.removeProvider(slot.owner);
+		if (slot.pruneOnDelete && !kept.has(slot.owner)) store.removeProvider(slot.owner);
 	}
 }
 

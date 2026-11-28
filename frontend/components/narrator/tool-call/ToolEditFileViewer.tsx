@@ -1,4 +1,5 @@
 import { Alert, Badge, Box, Button, Center, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type { ToolEditPreviewSide } from "@shared/tool-edit-preview";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
@@ -23,6 +24,28 @@ export interface ToolEditFileViewerProps {
 
 /** A separate, read-only historical resource; never mounts a current-file reader/editor. */
 export function ToolEditFileViewer(props: ToolEditFileViewerProps) {
+	const { t } = useTranslation("narrator");
+	const deviceId = props.reference?.deviceId;
+	if (
+		!isToolEditReference(props.reference) ||
+		typeof deviceId !== "string" ||
+		!deviceId.trim() ||
+		!isFileHistoryEnabledForDevice(deviceId)
+	) {
+		// Restored layouts can predate captured device identity. Do not consult
+		// historical contents or borrow the current host's device to fill that gap.
+		return (
+			<Center h="100%">
+				<Text size="sm" c="dimmed">
+					{t(
+						deviceId === "local"
+							? "editPreview.reason.unsupported"
+							: "editPreview.reason.identity_unverified",
+					)}
+				</Text>
+			</Center>
+		);
+	}
 	return <HistoricalEdit key={toolEditReferenceKey(props.reference)} {...props} />;
 }
 
@@ -35,6 +58,7 @@ function HistoricalEdit({ reference, filePath, navigationRequestId }: ToolEditFi
 		queryKey: [
 			...toolCallDetailQueryKey(reference.narratorId, reference.toolUseId, reference),
 			"file-edit-preview",
+			reference.deviceId,
 		],
 		enabled: valid,
 		queryFn: ({ signal }) =>
@@ -49,7 +73,11 @@ function HistoricalEdit({ reference, filePath, navigationRequestId }: ToolEditFi
 		gcTime: 30_000,
 		refetchOnWindowFocus: false,
 	});
-	const preview = query.data;
+	const preview =
+		query.data?.deviceId === reference.deviceId &&
+		isFileHistoryEnabledForDevice(query.data?.deviceId)
+			? query.data
+			: undefined;
 	const diff = useMemo(() => {
 		if (
 			!preview ||
@@ -115,7 +143,9 @@ function HistoricalEdit({ reference, filePath, navigationRequestId }: ToolEditFi
 				{preview?.deviceId ? `${preview.deviceId} · ` : ""}
 				{preview?.filePath ?? filePath}
 			</Text>
-			{!valid && <Alert color="red">{t("editPreview.reason.identity_unverified")}</Alert>}
+			{(!valid || (query.data && !preview)) && (
+				<Alert color="red">{t("editPreview.reason.identity_unverified")}</Alert>
+			)}
 			{valid && query.isPending && (
 				<Center style={{ flex: 1 }}>
 					<Loader size="sm" />

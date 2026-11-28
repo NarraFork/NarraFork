@@ -117,7 +117,8 @@ test("Codex native revocation changes only the hosted declaration overlay, never
 	]);
 	expect(tools).toHaveLength(1);
 	for (const request of requests) {
-		expect(request.instructions).toBe(requests[0].instructions);
+		expect(request).not.toHaveProperty("instructions");
+		expect((request.input as unknown[])[0]).toEqual((requests[0].input as unknown[])[0]);
 		expect(request.prompt_cache_key).toBe("same-epoch");
 		expect((request.tools as unknown[])[0]).toEqual(tools[0]);
 	}

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { readQueryFirst } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
@@ -11,6 +12,7 @@ import {
 	canonicalProtectionAdmissionPath as canonicalAdmissionPath,
 	canonicalProtectionPath as canonicalPath,
 	readProtectionClaims,
+	readReceiptRequestIdentity,
 } from "./resource-protection-index";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 
@@ -21,6 +23,15 @@ export interface LifecycleTarget {
 	shadowKey?: string;
 	/** Authorization scope is independent of repository/path/device location. */
 	scopeProjectId?: string | null;
+	/**
+	 * This deletion retires a worktree whose owner row was created by this request. Its
+	 * own creation receipt (a legacy receipt at the identical path whose recorded
+	 * `request.requestId` is this value) is inventory of the thing being removed, not a
+	 * user of it, so it does not protect it. Matched by the receipt's content, so it still
+	 * works after the owner session was deleted. Every other claim, including other
+	 * requests' receipts, registry rows and any narrator cwd, still protects.
+	 */
+	retiringCreateRequestId?: string;
 }
 export interface ResourceClaim extends LifecycleTarget {
 	kind: "registry" | "narrator" | "receipt";
@@ -62,6 +73,8 @@ interface PathFootprint {
 	raw: string;
 	canonical: string;
 	identity: string | null;
+	/** Original freeze evidence survives a confirmed creation or removal. */
+	readonly initialIdentity: string | null;
 	removed?: boolean;
 }
 interface Reservation {
@@ -178,6 +191,11 @@ export interface LifecycleGuardPorts {
 	/** Bounded lstat projection: device/inode only, never contents or a directory walk. */
 	pathIdentity?(path: string): Promise<string | null>;
 	probeGitRoot?(path: string, deadline: number): Promise<{ root: string; common: string } | null>;
+	/** Bounded read of the request a receipt records (claim id is the receipt file). */
+	receiptRequest?(
+		receiptId: string,
+		deadline: number,
+	): Promise<{ requestId: string; destination: string } | null>;
 }
 
 /** A shadow reference owns its hashed storage, never its historical logical cwd. */
@@ -273,6 +291,8 @@ const productionPorts: LifecycleGuardPorts & {
 	pathIdentity: (path) => (fixturePorts.getStore()?.pathIdentity ?? readPathIdentity)(path),
 	probeGitRoot: (path, deadline) =>
 		(fixturePorts.getStore()?.probeGitRoot ?? probeGitRoot)(path, deadline),
+	receiptRequest: (receiptId, deadline) =>
+		(fixturePorts.getStore()?.receiptRequest ?? readReceiptRequestIdentity)(receiptId, deadline),
 };
 async function boundedRead<T>(work: Promise<T>, deadline: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -313,7 +333,15 @@ async function freezeFootprint(
 		return existing;
 	}
 	if (held.footprints.size >= MAX_TARGETS * 3) reject("resource footprint budget", unavailable());
-	const footprint = { raw: path, canonical, identity };
+	const original = [...held.footprints.values()].find((item) => item.canonical === canonical);
+	// A dangling leaf may resolve to a missing canonical destination while the
+	// originally frozen raw path is still present as a symlink.
+	const initialIdentity = original
+		? original.initialIdentity
+		: identity === null && canonical !== key && ports.pathIdentity
+			? await boundedRead(ports.pathIdentity(path), deadline)
+			: identity;
+	const footprint = { raw: path, canonical, identity, initialIdentity };
 	held.footprints.set(key, footprint);
 	// An absent destination has no inode yet. Freeze its nearest real parent so
 	// replacing that directory cannot silently redirect a later trusted creation.
@@ -547,6 +575,19 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 				for (const target of normalized) {
 					if (!overlaps(target, canonical) && !(shadowPhysical && overlaps(target, shadowPhysical)))
 						continue;
+					if (
+						target.retiringCreateRequestId &&
+						claim.kind === "receipt" &&
+						target.path &&
+						canonical.path === target.path
+					) {
+						const recorded = await ports.receiptRequest?.(claim.id, deadline);
+						if (
+							recorded?.requestId === target.retiringCreateRequestId &&
+							(await ports.canonicalPath(recorded.destination).catch(() => null)) === target.path
+						)
+							continue;
+					}
 					// A repository-root cwd is not an owner of every linked worktree stored
 					// beneath it. This exception needs positive distinct Git-root evidence,
 					// never a path convention; durable inventories/receipts are never waived.
@@ -559,6 +600,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						!localPathSemantics.contains(targetPath, claimPath) &&
 						!(target.repositoryKey && target.repositoryKey === canonical.repositoryKey) &&
 						!(target.shadowKey && target.shadowKey === canonical.shadowKey);
+
 					if (
 						pathOnlyAncestor &&
 						claim.kind === "narrator" &&
@@ -750,18 +792,25 @@ export async function withProjectRetirement<T>(
 			async () => {
 				const { db } = await import("../db");
 				const { narratorWorktreeResources } = await import("../db/schema");
-				const scopedResource = db
-					.select({
-						id: narratorWorktreeResources.id,
-						path: narratorWorktreeResources.worktreePath,
-						deviceId: narratorWorktreeResources.deviceId,
-						state: narratorWorktreeResources.state,
-						scopeProjectId: narratorWorktreeResources.scopeProjectId,
-					})
-					.from(narratorWorktreeResources)
-					.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
-					.limit(1)
-					.get();
+				const scopedResource = await readQueryFirst(
+					db
+						.select({
+							id: narratorWorktreeResources.id,
+							path: narratorWorktreeResources.worktreePath,
+							deviceId: narratorWorktreeResources.deviceId,
+							state: narratorWorktreeResources.state,
+							scopeProjectId: narratorWorktreeResources.scopeProjectId,
+						})
+						.from(narratorWorktreeResources)
+						.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal,
+						timeoutMs: Math.max(1, deadline - performance.now()),
+					},
+				);
 				if (scopedResource)
 					reject("project delete", {
 						status: "protected",

@@ -302,9 +302,13 @@ describe("SQLite async publication facade wiring", () => {
 			])
 			.run();
 		const pub = getRuntimePublicationService();
+		const { binding } = await pub.startRun({
+			narratorId: child,
+			binding: { deliverTo: { narratorId: parent, toolUseId: "restart-tool" } },
+		});
 		const result = await pub.restartAgentTask({
 			taskId,
-			logicalRunId: generateId(),
+			logicalRunId: binding.logicalRunId,
 			subagentNarratorId: child,
 			subagentType: "general",
 			expectedStatus: "completed",
@@ -353,10 +357,14 @@ describe("SQLite async publication facade wiring", () => {
 			])
 			.run();
 		const pub = getRuntimePublicationService();
+		const { binding } = await pub.startRun({
+			narratorId: child,
+			binding: { deliverTo: { narratorId: parent, toolUseId: "restart-tool" } },
+		});
 		// Wrong expected status: row is "completed" but we say "failed"
 		const result = await pub.restartAgentTask({
 			taskId,
-			logicalRunId: generateId(),
+			logicalRunId: binding.logicalRunId,
 			subagentNarratorId: child,
 			subagentType: "general",
 			expectedStatus: "failed",

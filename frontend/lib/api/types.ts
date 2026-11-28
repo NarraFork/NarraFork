@@ -10,7 +10,9 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { ReasoningTranslationFields } from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -34,90 +36,6 @@ export type ChangelogEntry = {
 	version: string;
 	date: string;
 } & LocalizedValue<string>;
-
-/**
- * One OpenCode Go plan window (5-hour rolling / weekly / monthly) as cached by
- * the server. `percent` is how much of the window is already USED; the status bar
- * converts it to the "remaining" convention the other quota indicators use.
- */
-export interface OpencodeUsageWindow {
-	status: "ok" | "rate-limited" | null;
-	percent: number | null;
-	/** ISO timestamp when the window refills. The windows are not calendar periods. */
-	resetsAt: string | null;
-	/** Absolute amounts in the plan's units, only when upstream reported both. */
-	used?: number | null;
-	limit?: number | null;
-}
-
-/**
- * Per-provider OpenCode Go usage cache entry.
- *
- * `GET /api/opencode/usages` is readable by any signed-in user, but the upstream error text
- * is not: it describes the deployment's own provider account rather than the requesting
- * user's allowance, so the server sends `error` only to admins and everyone else gets
- * `hasError`. Both fields are optional here because a given response carries exactly one of
- * them — read them through `opencodeUsageFailed()` rather than testing `error` directly, or a
- * non-admin's failed fetch reads as a successful one whose numbers are merely stale.
- */
-export interface OpencodeUsageCache {
-	rolling: OpencodeUsageWindow | null;
-	weekly: OpencodeUsageWindow | null;
-	monthly: OpencodeUsageWindow | null;
-	/** Pay-as-you-go fallback balance, when upstream reports one. */
-	balance?: number | null;
-	generation: string;
-	fetchedAt: number;
-	/** Admin-only: the upstream failure text. Absent for non-admins. */
-	error?: string | null;
-	/** Non-admin substitute for `error`: that it failed, without saying how. */
-	hasError?: boolean;
-}
-
-/** Per-provider official DeepSeek balance; errors are redacted for non-admins. */
-export interface DeepSeekBalanceCache {
-	generation: string;
-	isAvailable: boolean | null;
-	balanceInfos: Array<{
-		currency: string;
-		totalBalance: string;
-		grantedBalance: string;
-		toppedUpBalance: string;
-	}>;
-	fetchedAt: number;
-	error?: string | null;
-	hasError?: boolean;
-}
-
-/** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
-export interface KimiUsageWindow {
-	used: number | null;
-	limit: number | null;
-	remaining: number | null;
-	resetTime: string | null;
-}
-
-/**
- * Per-provider Kimi (kimi.com / kimi.ai) usage cache entry.
- *
- * `GET /api/kimi/usages` is readable by any signed-in user, but the upstream error text
- * is not: it is verbatim provider output about the deployment's own account and can
- * contain a key fragment or an internal URL, so the server sends `error` only to admins
- * and everyone else gets `hasError`. Both fields are optional here because a given
- * response carries exactly one of them — read them through `kimiUsageFailed()` rather
- * than testing `error` directly, or a non-admin's failed fetch reads as a successful one.
- */
-export interface KimiUsageCache {
-	fiveHour: KimiUsageWindow | null;
-	weekly: KimiUsageWindow | null;
-	monthly: KimiUsageWindow | null;
-	extraWindows: Array<{ label: string } & KimiUsageWindow>;
-	fetchedAt: number;
-	/** Admin-only: the upstream failure text. Absent for non-admins. */
-	error?: string | null;
-	/** Non-admin substitute for `error`: that it failed, without saying how. */
-	hasError?: boolean;
-}
 
 /**
  * How a third-party component reaches the user — which is what determines our
@@ -434,7 +352,8 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "backgroundRunning"
 	| "nonArchived"
 	| "nonStaleStatus"
-	| "recentActivity";
+	| "recentActivity"
+	| "teamLiveWork";
 
 export type DatabaseCleanupWarningCode = string;
 
@@ -606,6 +525,7 @@ export interface SubagentToolCallTiming {
 
 export interface SubagentToolCallHeader {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -629,7 +549,7 @@ export interface SubagentToolCallHeader {
 	 * feed the normal tool card rather than an activity row and need no summary.
 	 * See `SubagentActivityRow`.
 	 */
-	inputSummary?: SubagentToolInputSummary;
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface SubagentFileChanges {
@@ -673,6 +593,8 @@ export interface SubagentActivitySummary {
 	 * rendering a plain "running" card.
 	 */
 	takenOver?: boolean;
+	/** The helpers this child launched itself (its one nested level); absent when none. */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {
@@ -692,7 +614,7 @@ export interface ExecutionTargetIdentity {
 	selectionSource?: "explicit" | "session_default" | "local_default";
 }
 
-export interface BaseContentBlock {
+export interface BaseContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string;
 	thinking?: string;
@@ -1039,7 +961,18 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 
+export interface BufferedMessageEditLease {
+	ok: true;
+	token: string;
+	expiresAt: number;
+	leaseMs: number;
+	contentRevision: number;
+}
+
 export interface BufferMessageSummary {
+	hasComposerDocument?: boolean;
+	/** Content-only revision, when supplied by a revision-aware server. */
+	contentRevision?: number;
 	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */
 	id: string;
 	/** Canonical timeline message id, when supplied by a new server. */
@@ -1071,6 +1004,7 @@ export interface TreeMessage {
 	provider?: string | null;
 	id: string;
 	narratorId: string;
+	stateRevision?: number;
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;
@@ -1136,6 +1070,8 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/** Client-only row holding a projected streaming block over a persisted checkpoint. */
+	liveContentProjection?: boolean;
 	/**
 	 * Client-only synthetic row: animation baseline of the last accepted text
 	 * snapshot. Travels with this message through the layout commit, so new

@@ -1,6 +1,16 @@
 import "@mantine/core/styles.css";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
 import { api } from "@frontend/lib/api";
+import { confirmAuthUser, setToken } from "@frontend/lib/api/client";
+import {
+	endDrag,
+	moveDrag,
+	PANEL_DROP_PRIORITY,
+	registerPanelDropTarget,
+	startDragManual,
+} from "@frontend/lib/panel-drag";
+import { getRecentTabsScope, recentTabsSectionQueryKey } from "@frontend/lib/recent-tabs-owner";
 import common from "@frontend/locales/en/common.json";
 import narrator from "@frontend/locales/en/narrator.json";
 import { MantineProvider } from "@mantine/core";
@@ -33,15 +43,18 @@ await i18n
 const query = new QueryClient({
 	defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 });
-query.setQueryData(["auth", "me"], { id: "fixture-user" });
-query.setQueryData(["named-narrators"], []);
+function seedFixtureUser(userId: string) {
+	const generation = setToken(`fixture-auth:${userId}`);
+	seedCurrentUser(query, generation, { id: userId });
+	confirmAuthUser(generation, userId);
+}
+seedFixtureUser("fixture-user");
 const composer = createRef<NarratorComposerHandle>();
 const fileInput = createRef<HTMLInputElement>();
 const sending = { current: false };
 const persistentAttachments = new URLSearchParams(window.location.search).has("persist");
 const attachmentT = (key: string, options?: Record<string, unknown>) =>
 	String(i18n.t(key, { ...options, ns: "narrator" }));
-if (persistentAttachments) localStorage.setItem("narrafork_token", "fixture-user");
 const noop = () => {};
 let switchNarrator: (id: string) => void;
 let switchAccount: (id: string) => void;
@@ -434,8 +447,68 @@ export function remember(doc: ComposerDocument) {
 export function clear() {
 	composer.current?.clearTextAndDraft();
 }
-export function namedCandidates(candidates: { id: string; handle: string; title?: string }[]) {
-	query.setQueryData(["named-narrators"], candidates);
+export async function mentionCandidates(
+	candidates: {
+		id: string;
+		handle?: string;
+		title?: string;
+		isRecent?: boolean;
+		readOnly?: boolean;
+		outsideSearchPage?: boolean;
+		verificationFails?: boolean;
+	}[],
+	holdRemote = false,
+	holdExact = false,
+) {
+	// Keep the communication reader on the real HTTP stack, independently of loaded recent tabs.
+	const response = await fetch("/__fixture/mention-candidates", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ candidates, holdRemote, holdExact }),
+	});
+	if (!response.ok) throw new Error("Unable to seed mention candidates");
+	const scope = getRecentTabsScope();
+	if (!scope) throw new Error("Missing composer fixture scope");
+	query.setQueryData(recentTabsSectionQueryKey(scope, "work"), {
+		pages: [
+			{
+				items: candidates
+					.filter((candidate) => candidate.isRecent !== false)
+					.map((candidate, index) => ({
+						type: "narrator" as const,
+						id: candidate.id,
+						title: candidate.title ?? candidate.handle ?? candidate.id,
+						lastVisitedAt: 100 - index,
+						folderId: "collapsed-folder",
+					})),
+			},
+		],
+	});
+}
+export function panelReferenceDrop(
+	id: string,
+	title: string,
+	kind: "narrator" | "tool" = "narrator",
+) {
+	const element = document.querySelector('[role="textbox"]') as HTMLElement;
+	const rect = element.getBoundingClientRect();
+	let fallbacks = 0;
+	const off = registerPanelDropTarget({
+		id: "fixture-dock",
+		priority: PANEL_DROP_PRIORITY.dock,
+		hitTest: () => true,
+		onDrop: () => {
+			fallbacks++;
+		},
+	});
+	try {
+		startDragManual(id, title, rect.left + 10, rect.top + 10, kind);
+		moveDrag(rect.left + 10, rect.top + 10);
+		endDrag();
+	} finally {
+		off();
+	}
+	return fallbacks;
 }
 
 function textboxEditor(): Editor {
@@ -548,8 +621,8 @@ export function switchToNarrator(narratorId: string) {
 }
 export function switchToUser(userId: string) {
 	flushSync(() => {
-		localStorage.setItem("narrafork_token", userId);
-		query.setQueryData(["auth", "me"], { id: userId });
+		currentUser = userId;
+		seedFixtureUser(userId);
 		switchAccount(userId);
 	});
 }

@@ -145,89 +145,18 @@ async function put(bytes: Uint8Array | string): Promise<FileChangeBlobRef> {
 	const value = typeof bytes === "string" ? Buffer.from(bytes) : bytes;
 	return store.putBytes(value, { expectedSize: value.byteLength });
 }
-// Pause only this real audit worker after its start snapshot and first reservation
-// page. IPC progress is advisory, not an awaited write barrier: without this gate
-// the end snapshot can race the writer's SQLite lock (busy_timeout stays zero).
-// The preload wraps process.send, not hashing, metadata, budgets or summaries.
+// Pause the real worker after its start snapshot and first reservation query.
+// The writer completes before the worker resumes; progress IPC is not a write barrier.
 async function auditDuringMetadataMutation(
 	mutate: () => void | Promise<void>,
 	budget: FileChangePhysicalAuditOptions["budget"],
 ): Promise<FileChangePhysicalAuditSummary> {
-	const preload = join(sandbox, "metadata-barrier.ts");
-	await writeFile(
-		preload,
-		`import { readFileSync } from "node:fs";
-const send = process.send.bind(process);
-let paused = false;
-process.send = (message) => {
-	const data = typeof message === "string" ? JSON.parse(message) : undefined;
-	send(message);
-	if (!paused && data?.type === "progress" && data.value.phase === "reservations") {
-		paused = true;
-		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test metadata barrier");
-	}
-};
-`,
-		{ mode: 0o600 },
-	);
-	const realSpawn = Bun.spawn;
-	let worker: Bun.Subprocess<"pipe", "ignore", "ignore"> | undefined;
-	// Adapt Bun's overloaded API only for runWorker's verified (command, options)
-	// call. The returned process is real; no IPC result or metadata is fabricated.
-	const spawnWithBarrier = ((command: string[], config?: Parameters<typeof Bun.spawn>[1]) => {
-		if (!command[1]?.endsWith("/file-change-physical-audit-worker.ts"))
-			throw new Error("Metadata barrier must only wrap its own audit worker");
-		worker = realSpawn<"pipe", "ignore", "ignore">(
-			[command[0], "--preload", preload, ...command.slice(1)],
-			{
-				...config,
-				stdio: ["pipe", "ignore", "ignore"],
-				stdin: "pipe",
-				stdout: "ignore",
-				stderr: "ignore",
-			},
-		);
-		return worker;
-	}) as typeof Bun.spawn;
-	const spawn = spyOn(Bun, "spawn").mockImplementation(spawnWithBarrier);
-	let released = false;
-	const release = () => {
-		if (!worker || released) return;
-		released = true;
-		worker.stdin.write("release");
-		worker.stdin.end();
-	};
-	const controller = new AbortController();
-	let mutation: Promise<void> | undefined;
-	let mutationError: unknown;
-	let catalogRowsAtMutation: number | undefined;
-	let readBytesAtMutation: number | undefined;
-	let running: Promise<FileChangePhysicalAuditSummary> | undefined;
-	try {
-		running = auditFileChangePhysical(
-			await options({
-				budget,
-				signal: controller.signal,
-				onProgress(progress) {
-					if (mutation || progress.phase !== "reservations") return;
-					catalogRowsAtMutation = progress.catalogRows;
-					readBytesAtMutation = progress.readBytes;
-					mutation = Promise.resolve()
-						.then(mutate)
-						.catch((error) => {
-							mutationError = error;
-							controller.abort();
-						})
-						.finally(release);
-				},
-			}),
-		);
+	return withAuditBarrier(async ({ audit, held, release }) => {
+		const running = audit(await options({ budget }));
+		expect(await held(running)).toBe(0);
+		await mutate();
+		release();
 		const summary = await running;
-		await mutation;
-		if (mutationError) throw mutationError;
-		expect(mutation).toBeDefined();
-		expect(catalogRowsAtMutation).toBe(0);
-		expect(readBytesAtMutation).toBe(0);
 		expect(summary.start?.generation).toBe(generation);
 		expect(summary.start?.pendingReservations).toBe("none_observed");
 		expect(summary.end).toBeDefined();
@@ -235,56 +164,68 @@ process.send = (message) => {
 		expect(codes(summary)).not.toContain("sqlite_busy");
 		expect(codes(summary)).not.toContain("deadline");
 		return summary;
-	} finally {
-		release();
-		controller.abort();
-		try {
-			await running;
-		} finally {
-			spawn.mockRestore();
-		}
-	}
+	}, "reservations");
 }
 
-/**
- * Deterministic hold inside the PHYSICAL phase, for tests that must act while an object hash is
- * in flight. Progress is throttled to one event per 250 ms in the worker AND again in the parent,
- * so on a loaded runner a 2 MiB hash can finish, or its physical event be dropped, before a test's
- * onProgress mutation ever runs. Instead, the worker's preload pauses right after it emits its
- * first physical progress with readBytes > 0 (object handle open mid-hash) and records that in an
- * atomically published marker file. `held` resolves from the marker, independent of the parent's
- * progress throttle; it must never observe an empty file between creation and writing its bytes.
- * Hashing, metadata, budgets and the summary are untouched; only the emission is gated, like the
- * metadata barrier above. Once released, every later worker runs free.
+/** Test-process-only handshake after REAL work, independent of throttled progress IPC.
+ * Physical holds after the first real Hash.update (object FD still open); reservations holds
+ * after the first real page query. Neither wrapper fabricates bytes, rows, IPC or summaries.
  */
-async function withPhysicalBarrier<T>(
-	body: (barrier: { held: Promise<number>; release: () => void }) => Promise<T>,
+async function withAuditBarrier<T>(
+	body: (barrier: {
+		audit: typeof auditFileChangePhysical;
+		held: (running: Promise<FileChangePhysicalAuditSummary>) => Promise<number>;
+		release: () => void;
+	}) => Promise<T>,
+	phase: "physical" | "reservations" = "physical",
 ): Promise<T> {
 	const preload = join(sandbox, "physical-barrier.ts");
 	const marker = join(sandbox, "physical-barrier.held");
-	await rm(marker, { force: true });
 	await writeFile(
 		preload,
-		`import { readFileSync, renameSync, writeFileSync } from "node:fs";
-const send = process.send.bind(process);
+		`import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 const pendingMarker = ${JSON.stringify(`${marker}.pending-`)} + process.pid;
 let paused = false;
-process.send = (message) => {
-	const data = typeof message === "string" ? JSON.parse(message) : undefined;
-	send(message);
-	if (!paused && data?.type === "progress" && data.value.phase === "physical" && data.value.readBytes > 0) {
-		paused = true;
-		// Publish only complete bytes: the parent's concurrent read must not see Number("") === 0.
-		writeFileSync(pendingMarker, String(data.value.readBytes), { mode: 0o600 });
-		renameSync(pendingMarker, ${JSON.stringify(marker)});
-		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test physical barrier");
-	}
-};
+function hold(bytes) {
+	if (paused) return;
+	paused = true;
+	writeFileSync(pendingMarker, String(bytes), { mode: 0o600 });
+	renameSync(pendingMarker, ${JSON.stringify(marker)});
+	if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test audit barrier");
+}
+if (${JSON.stringify(phase)} === "physical") {
+	const prototype = Object.getPrototypeOf(createHash("sha256"));
+	const update = prototype.update;
+	prototype.update = function (...args) {
+		const result = Reflect.apply(update, this, args);
+		hold(args[0].byteLength);
+		return result;
+	};
+} else {
+	const query = Database.prototype.query;
+	Database.prototype.query = function (sql) {
+		const statement = Reflect.apply(query, this, [sql]);
+		if (sql.includes("FROM main.file_change_blob_reservations INDEXED BY idx_fc_reservation_budget")) {
+			const all = statement.all;
+			statement.all = function (...args) {
+				const rows = Reflect.apply(all, this, args);
+				hold(0);
+				return rows;
+			};
+		}
+		return statement;
+	};
+}
 `,
 		{ mode: 0o600 },
 	);
 	const realSpawn = Bun.spawn;
+	const workers: Bun.Subprocess<"pipe", "ignore", "ignore">[] = [];
 	const pending: Bun.Subprocess<"pipe", "ignore", "ignore">[] = [];
+	const audits: Promise<FileChangePhysicalAuditSummary>[] = [];
+	const controller = new AbortController();
 	let open = false;
 	const flush = () => {
 		for (const worker of pending.splice(0)) {
@@ -309,6 +250,7 @@ process.send = (message) => {
 				stderr: "ignore",
 			},
 		);
+		workers.push(worker);
 		pending.push(worker);
 		if (open) flush();
 		return worker;
@@ -318,24 +260,54 @@ process.send = (message) => {
 		open = true;
 		flush();
 	};
+	const audit: typeof auditFileChangePhysical = (request) => {
+		const running = auditFileChangePhysical({
+			...request,
+			signal: request.signal
+				? AbortSignal.any([controller.signal, request.signal])
+				: controller.signal,
+		});
+		audits.push(running);
+		return running;
+	};
 	let stopPolling = false;
-	const held = (async () => {
-		while (!stopPolling) {
-			try {
-				return Number(await readFile(marker, "utf8"));
-			} catch {
-				await Bun.sleep(5);
+	const held = async (running: Promise<FileChangePhysicalAuditSummary>) => {
+		const polling = (async () => {
+			const deadline = performance.now() + 2500;
+			while (!stopPolling && performance.now() < deadline) {
+				try {
+					return Number(await readFile(marker, "utf8"));
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					await Bun.sleep(5);
+				}
 			}
+			throw new Error(`Audit ${phase} barrier was not reached within 2500ms`);
+		})();
+		try {
+			return await Promise.race([
+				polling,
+				running.then((summary) => {
+					throw new Error(`Audit ended before ${phase} barrier: ${JSON.stringify(summary)}`);
+				}),
+			]);
+		} finally {
+			stopPolling = true;
+			await polling.catch(() => {});
 		}
-		throw new Error("Physical barrier was never reached");
-	})();
-	held.catch(() => {});
+	};
 	try {
-		return await body({ held, release });
+		return await body({ audit, held, release });
 	} finally {
 		stopPolling = true;
 		release();
-		spawn.mockRestore();
+		controller.abort();
+		try {
+			await Promise.allSettled(audits);
+			await Promise.allSettled(workers.map((worker) => worker.exited));
+		} finally {
+			spawn.mockRestore();
+		}
 	}
 }
 
@@ -436,13 +408,13 @@ if (process.argv.includes(flag)) {
 						build.onResolve(
 							{
 								filter:
-									/^\.\/(?:serve|manager\/main|db\/integrity-probe-worker|db\/snapshot-builder-worker|lib\/watcher\/parcel-watcher-worker|lib\/reveal-protocol-client)$/,
+									/^\.\/(?:serve|manager\/main|db\/integrity-probe-worker|db\/snapshot-builder-worker|lib\/watcher\/parcel-watcher-worker|lib\/reveal-protocol-client|services\/git-changelist-cli)$/,
 							},
 							(args) => ({ path: args.path, namespace: "forbidden-app" }),
 						);
 						build.onLoad({ filter: /.*/, namespace: "forbidden-app" }, () => ({
 							contents:
-								'throw new Error("application imported by audit"); export const serve = () => {}; export const exitWithStartupProblem = () => {}; export const runManager = () => {}; export const runRevealProtocolClient = () => {};',
+								'throw new Error("application imported by audit"); export const serve = () => {}; export const exitWithStartupProblem = () => {}; export const runManager = () => {}; export const runRevealProtocolClient = () => {}; export const runGitChangelistCli = () => {};',
 							loader: "ts",
 						}));
 					},
@@ -838,15 +810,46 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		expect(await readFile(databasePath)).toEqual(before);
 	});
 
+	test("barrier reports an early audit summary and restores the spawn spy", async () => {
+		await put("no-hash-budget");
+		const originalSpawn = Bun.spawn;
+		await expect(
+			withAuditBarrier(async ({ audit, held }) => {
+				const running = audit(await options({ budget: { readBytes: 0 } }));
+				await held(running);
+			}),
+		).rejects.toThrow(/Audit ended before physical barrier:.*read_byte_limit/);
+		expect(Bun.spawn).toBe(originalSpawn);
+		expect((await auditFileChangePhysical(await options())).full).toBe(true);
+	});
+
+	test("barrier failure cancels and settles active and queued audits before restoring spawn", async () => {
+		await put(Buffer.alloc(64 * 1024, 37));
+		const originalSpawn = Bun.spawn;
+		const request = await options({ budget: { chunkBytes: 256 } });
+		const running: Promise<FileChangePhysicalAuditSummary>[] = [];
+		await expect(
+			withAuditBarrier(async ({ audit, held }) => {
+				const first = audit(request);
+				running.push(first);
+				await held(first);
+				running.push(audit(request));
+				throw new Error("injected fixture failure");
+			}),
+		).rejects.toThrow("injected fixture failure");
+		expect(Bun.spawn).toBe(originalSpawn);
+		for (const summary of await Promise.all(running)) expect(codes(summary)).toContain("cancelled");
+		expect((await auditFileChangePhysical(await options())).full).toBe(true);
+	});
+
 	test("cancel during streamed hash closes worker handles before the same-scope queued job starts", async () => {
 		await put(Buffer.alloc(2 * 1024 * 1024, 37));
 		const controller = new AbortController();
 		const events: { phase: string; at: number }[] = [];
 		const request = await options({ budget: { chunkBytes: 256 } });
 		let nextStarted = false;
-		let queued: Promise<FileChangePhysicalAuditSummary> | undefined;
-		const summary = await withPhysicalBarrier(async ({ held, release }) => {
-			const running = auditFileChangePhysical({
+		const summary = await withAuditBarrier(async ({ audit, held, release }) => {
+			const running = audit({
 				...request,
 				signal: controller.signal,
 				onProgress(progress) {
@@ -855,9 +858,9 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 			});
 			// The worker is held mid-hash: cancel it there, and admit the queued job while the
 			// first one still owns the scope; only then may the cancelled worker continue.
-			expect(await held).toBeGreaterThan(0);
+			expect(await held(running)).toBeGreaterThan(0);
 			controller.abort();
-			queued = auditFileChangePhysical({
+			const queued = audit({
 				...request,
 				budget: { readBytes: 0 },
 				onProgress() {
@@ -865,14 +868,14 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 				},
 			});
 			release();
-			return running;
+			const cancelled = await running;
+			expect(nextStarted).toBe(false);
+			const next = await queued;
+			expect(codes(next)).toContain("read_byte_limit");
+			return cancelled;
 		});
-		if (!queued) throw new Error("fixture");
 		expect(codes(summary)).toContain("cancelled");
 		expect(summary.full).toBe(false);
-		expect(nextStarted).toBe(false);
-		const next = await queued;
-		expect(codes(next)).toContain("read_byte_limit");
 		for (let n = 1; n < events.length; n++)
 			expect(events[n].at - events[n - 1].at).toBeGreaterThanOrEqual(249);
 		assertAuthority(summary);
@@ -905,10 +908,10 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		let mutationObservedAt: number | undefined;
 		let generationBeforeMutation: number | undefined;
 		const request = await options({ budget: { chunkBytes: 128 } });
-		const summary = await withPhysicalBarrier(async ({ held, release }) => {
-			const running = auditFileChangePhysical(request);
+		const summary = await withAuditBarrier(async ({ audit, held, release }) => {
+			const running = audit(request);
 			// Mutate exactly while the worker is held mid-hash, after observed physical reads.
-			mutationObservedAt = await held;
+			mutationObservedAt = await held(running);
 			changed = true;
 			try {
 				const currentBudget = catalog.getBudget();
@@ -939,9 +942,9 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 31));
 		let changed = false;
 		const request = await options({ budget: { chunkBytes: 128 } });
-		const summary = await withPhysicalBarrier(async ({ held, release }) => {
-			const running = auditFileChangePhysical(request);
-			const readBytes = await held;
+		const summary = await withAuditBarrier(async ({ audit, held, release }) => {
+			const running = audit(request);
+			const readBytes = await held(running);
 			expect(readBytes).toBeGreaterThan(0);
 			expect(readBytes).toBeLessThan(ref.sizeBytes);
 			try {
@@ -1065,9 +1068,9 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 73));
 		let changed = false;
 		const request = await options({ budget: { chunkBytes: 128 } });
-		const summary = await withPhysicalBarrier(async ({ held, release }) => {
-			const running = auditFileChangePhysical(request);
-			expect(await held).toBeGreaterThan(0);
+		const summary = await withAuditBarrier(async ({ audit, held, release }) => {
+			const running = audit(request);
+			expect(await held(running)).toBeGreaterThan(0);
 			changed = true;
 			try {
 				chmodSync(pathFor(ref), 0o644);

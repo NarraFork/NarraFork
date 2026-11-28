@@ -397,8 +397,8 @@ describe("scheduleBackgroundIntegrityCheck decisions", () => {
 	let previousFull: string | undefined;
 
 	beforeEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		home = mkdtempSync(join(tmpdir(), "narrafork-integrity-decide-"));
 		previousHome = process.env.NARRAFORK_HOME;
 		previousMode = process.env.NARRAFORK_DB_INTEGRITY_CHECK;
@@ -409,8 +409,8 @@ describe("scheduleBackgroundIntegrityCheck decisions", () => {
 	});
 
 	afterEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		for (const [key, value] of [
 			["NARRAFORK_HOME", previousHome],
 			["NARRAFORK_DB_INTEGRITY_CHECK", previousMode],
@@ -424,16 +424,15 @@ describe("scheduleBackgroundIntegrityCheck decisions", () => {
 
 	/** Schedule with a probe that never runs (long delay) and report only the decision. */
 	async function decide(options: { wasClean: boolean; isHotReload?: boolean }) {
-		const { cancelBackgroundIntegrityCheck, scheduleBackgroundIntegrityCheck } = await import(
-			"../integrity-check"
-		);
+		const { resetBackgroundIntegrityCheckForTests, scheduleBackgroundIntegrityCheck } =
+			await import("../integrity-check");
 		const decision = scheduleBackgroundIntegrityCheck({
 			wasClean: options.wasClean,
 			isHotReload: options.isHotReload ?? false,
 			delayMs: 600_000,
 			probe: async () => report(),
 		});
-		await cancelBackgroundIntegrityCheck();
+		await resetBackgroundIntegrityCheckForTests();
 		return decision;
 	}
 
@@ -528,16 +527,16 @@ describe("background probe bookkeeping", () => {
 	let previousHome: string | undefined;
 
 	beforeEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		home = mkdtempSync(join(tmpdir(), "narrafork-integrity-book-"));
 		previousHome = process.env.NARRAFORK_HOME;
 		process.env.NARRAFORK_HOME = home;
 	});
 
 	afterEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 		else process.env.NARRAFORK_HOME = previousHome;
 		rmSync(home, { recursive: true, force: true });
@@ -578,8 +577,8 @@ describe("background probe bookkeeping", () => {
 		expect(readPendingDatabaseRepair()).toBeNull();
 		expect(readPendingFtsRepair()).toMatchObject({ tables: ["narrator_blocks_fts"], details });
 		// A second finding (next startup's probe) adds to the queue rather than replacing it.
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		await runWithVerdict(
 			report({ status: "corrupt", details: 'fts5: checksum mismatch for table "narrators_fts"' }),
 		);
@@ -640,16 +639,16 @@ describe("cancelBackgroundIntegrityCheck", () => {
 	let previousHome: string | undefined;
 
 	beforeEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		home = mkdtempSync(join(tmpdir(), "narrafork-integrity-cancel-"));
 		previousHome = process.env.NARRAFORK_HOME;
 		process.env.NARRAFORK_HOME = home;
 	});
 
 	afterEach(async () => {
-		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
-		await cancelBackgroundIntegrityCheck();
+		const { resetBackgroundIntegrityCheckForTests } = await import("../integrity-check");
+		await resetBackgroundIntegrityCheckForTests();
 		if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 		else process.env.NARRAFORK_HOME = previousHome;
 		rmSync(home, { recursive: true, force: true });
@@ -673,33 +672,143 @@ describe("cancelBackgroundIntegrityCheck", () => {
 		).toBe("scheduled");
 
 		expect(await cancelBackgroundIntegrityCheck()).toEqual({ timerCleared: true, killed: 0 });
+		await cancelBackgroundIntegrityCheck();
+		expect(scheduleBackgroundIntegrityCheck({ wasClean: false, isHotReload: false })).toBe(
+			"already_scheduled",
+		);
 		await Bun.sleep(120);
 		expect(probeStarted).toBe(false);
 	});
 
-	test("kills a probe subprocess that is still scanning", async () => {
-		const { cancelBackgroundIntegrityCheck, runIntegrityProbe } = await import(
+	function fakeProbe() {
+		writeFileSync(join(home, "narrafork.db"), "fake probe existence fixture");
+		const exit = Promise.withResolvers<number>();
+		const killed = Promise.withResolvers<void>();
+		const terminated = Promise.withResolvers<void>();
+		const signals: string[] = [];
+		const proc = {
+			exited: exit.promise,
+			stdout: null,
+			stderr: null,
+			kill: (signal: string) => {
+				signals.push(signal);
+				if (signal === "SIGTERM") terminated.resolve();
+				if (signal === "SIGKILL") killed.resolve();
+			},
+		};
+		const started = Promise.withResolvers<void>();
+		const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+			started.resolve();
+			return proc as unknown as ReturnType<typeof Bun.spawn>;
+		});
+		return {
+			exit,
+			killed,
+			signals,
+			spawn,
+			started: started.promise,
+			terminated: terminated.promise,
+		};
+	}
+	test("escalates TERM to KILL but waits for the owned subprocess's real exit", async () => {
+		const { cancelBackgroundIntegrityCheck, runIntegrityProbe, getIntegrityCheckShutdownSnapshot } =
+			await import("../integrity-check");
+		const fake = fakeProbe();
+		try {
+			const pending = runIntegrityProbe("quick");
+			await fake.started;
+			let stopped = false;
+			const stopping = cancelBackgroundIntegrityCheck().then(() => {
+				stopped = true;
+			});
+			const repeated = cancelBackgroundIntegrityCheck();
+			await fake.terminated;
+			expect(fake.signals).toEqual(["SIGTERM"]);
+			await fake.killed.promise;
+			expect(fake.signals).toEqual(["SIGTERM", "SIGKILL"]);
+			expect(stopped).toBe(false);
+			expect(getIntegrityCheckShutdownSnapshot().pendingProcesses).toBe(1);
+			const blocked = await runIntegrityProbe("full");
+			expect(blocked.status).toBe("unavailable");
+			expect(fake.spawn).toHaveBeenCalledTimes(1);
+			fake.exit.resolve(137);
+			await Promise.all([stopping, repeated]);
+			expect((await pending).status).toBe("unavailable");
+			expect(getIntegrityCheckShutdownSnapshot()).toEqual({
+				stopped: true,
+				pendingProcesses: 0,
+				pendingTasks: 0,
+				scheduled: false,
+			});
+		} finally {
+			fake.exit.resolve(137);
+			await cancelBackgroundIntegrityCheck();
+			fake.spawn.mockRestore();
+		}
+	});
+	test("a deadline retains the live process and task until exited really resolves", async () => {
+		const { cancelBackgroundIntegrityCheck, runIntegrityProbe, getIntegrityCheckShutdownSnapshot } =
+			await import("../integrity-check");
+		const fake = fakeProbe();
+		try {
+			const pending = runIntegrityProbe("quick");
+			await fake.started;
+			await expect(cancelBackgroundIntegrityCheck({ deadlineAt: Date.now() + 20 })).rejects.toThrow(
+				"shutdown deadline",
+			);
+			expect(getIntegrityCheckShutdownSnapshot().pendingProcesses).toBe(1);
+			expect(getIntegrityCheckShutdownSnapshot().pendingTasks).toBe(1);
+			await fake.killed.promise;
+			expect(fake.signals).toEqual(["SIGTERM", "SIGKILL"]);
+			fake.exit.resolve(137);
+			await pending;
+			await cancelBackgroundIntegrityCheck();
+			expect(getIntegrityCheckShutdownSnapshot().pendingProcesses).toBe(0);
+		} finally {
+			fake.exit.resolve(137);
+			await cancelBackgroundIntegrityCheck();
+			fake.spawn.mockRestore();
+		}
+	});
+	test("external cancellation terminates its own probe and releases its listener", async () => {
+		const { runIntegrityProbe, getIntegrityCheckShutdownSnapshot } = await import(
 			"../integrity-check"
 		);
-		// The probe needs a real database file to get past the existence check.
-		const db = new Database(join(home, "narrafork.db"));
-		db.run("CREATE TABLE t (a integer primary key)");
-		db.close();
-
-		const pending = runIntegrityProbe("quick", {
-			timeoutMs: 60_000,
-			command: [process.execPath, "-e", "await Bun.sleep(60_000)"],
+		const fake = fakeProbe();
+		const controller = new AbortController();
+		const remove = spyOn(controller.signal, "removeEventListener");
+		try {
+			const pending = runIntegrityProbe("quick", { signal: controller.signal });
+			await fake.started;
+			controller.abort();
+			await fake.terminated;
+			expect(fake.signals).toEqual(["SIGTERM"]);
+			fake.exit.resolve(143);
+			expect((await pending).status).toBe("unavailable");
+			expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+			expect(getIntegrityCheckShutdownSnapshot().pendingProcesses).toBe(0);
+		} finally {
+			fake.exit.resolve(143);
+			fake.spawn.mockRestore();
+			remove.mockRestore();
+		}
+	});
+	test("a spawn failure leaves neither a live process nor an active task", async () => {
+		const { cancelBackgroundIntegrityCheck, runIntegrityProbe, getIntegrityCheckShutdownSnapshot } =
+			await import("../integrity-check");
+		writeFileSync(join(home, "narrafork.db"), "fake existence fixture");
+		const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("fake spawn failed");
 		});
-		// Give Bun.spawn time to register the handle before cancelling.
-		await Bun.sleep(300);
-		const cancelled = await cancelBackgroundIntegrityCheck();
-		expect(cancelled.killed).toBe(1);
-
-		// An orphaned probe would have held a read-only handle for up to PROBE_TIMEOUT_MS; killing it
-		// means this resolves now, inconclusively, rather than in ten minutes.
-		const result = await pending;
-		expect(result.status).toBe("unavailable");
-	}, 30_000);
+		try {
+			expect((await runIntegrityProbe("quick")).details).toContain("fake spawn failed");
+			await cancelBackgroundIntegrityCheck();
+			expect(getIntegrityCheckShutdownSnapshot().pendingProcesses).toBe(0);
+			expect(getIntegrityCheckShutdownSnapshot().pendingTasks).toBe(0);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
 
 	test("cancel waits for actual process exit and does not admit a replacement on a kill request", async () => {
 		const { cancelBackgroundIntegrityCheck, runIntegrityProbe } = await import(
@@ -756,6 +865,42 @@ describe("cancelBackgroundIntegrityCheck", () => {
 	test("is safe to call when nothing is scheduled", async () => {
 		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
 		expect(await cancelBackgroundIntegrityCheck()).toEqual({ timerCleared: false, killed: 0 });
+	});
+	test("drains an already-started scheduled task and suppresses its cancelled bookkeeping", async () => {
+		const {
+			scheduleBackgroundIntegrityCheck,
+			cancelBackgroundIntegrityCheck,
+			getIntegrityCheckShutdownSnapshot,
+		} = await import("../integrity-check");
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<IntegrityProbeReport>();
+		let handled = false;
+		scheduleBackgroundIntegrityCheck({
+			wasClean: false,
+			isHotReload: false,
+			delayMs: 0,
+			probe: () => {
+				started.resolve();
+				return release.promise;
+			},
+			onSettled: () => {
+				handled = true;
+			},
+		});
+		await started.promise;
+		await expect(cancelBackgroundIntegrityCheck({ deadlineAt: Date.now() + 10 })).rejects.toThrow(
+			"shutdown deadline",
+		);
+		expect(getIntegrityCheckShutdownSnapshot().pendingTasks).toBe(1);
+		release.resolve(report());
+		await cancelBackgroundIntegrityCheck();
+		expect(handled).toBe(false);
+		expect(getIntegrityCheckShutdownSnapshot().pendingTasks).toBe(0);
+	});
+	test("is safe to call repeatedly when nothing is scheduled", async () => {
+		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
+		await cancelBackgroundIntegrityCheck();
+		await cancelBackgroundIntegrityCheck();
 	});
 });
 

@@ -8,9 +8,11 @@
  *     fontSizes / lineHeights / headings.sizes / spacing / radius
  *   - MarkdownContent.module.css (the ground-truth markdown styles)
  *
- * The app theme (frontend/main.tsx) only overrides primaryColor + defaultRadius
- * ("sm"); it does NOT override fontFamily / fontSizes / lineHeights / headings,
- * so the Mantine defaults below are authoritative.
+ * The app theme overrides `fontFamily` to the UI stack in `styles/tokens.css`
+ * (`--nf-font-ui`). `SANS_FAMILY` below is that same stack, written out, because canvas
+ * `measureText` does not resolve CSS variables. `MONO_FAMILY` stays Mantine's default
+ * monospace: the vlist paints code with these strings, not `--nf-font-mono`. `fontSizes`
+ * / `lineHeights` / `headings` stay on Mantine's defaults.
  *
  * IMPORTANT: pretext `font` strings follow the CSS shorthand accepted by canvas
  * `measureText`: "[style] [weight] <size>px <family>". Keep size in px.
@@ -41,9 +43,9 @@ import {
 	scaleLineHeightRatio,
 } from "./typography";
 
-// ── Font families (Mantine defaults; app does not override) ──────────────────
+// ── Font families (the painted `--nf-font-ui` stack; canvas cannot read the variable) ──
 export const SANS_FAMILY =
-	"-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji";
+	'ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif';
 export const MONO_FAMILY =
 	"ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace";
 // Headings share the base family by default (theme.headings.fontFamily === DEFAULT_FONT_FAMILY).

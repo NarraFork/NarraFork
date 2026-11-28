@@ -4,6 +4,12 @@ import { isValidModelContextWindow } from "@shared/model-context-window";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
 import { registerListingWindows } from "../lib/model-catalog";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	type GeminiProviderConfig,
@@ -13,6 +19,9 @@ import {
 	registerGeminiModelLister,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const geminiRoutes = new Hono();
@@ -57,7 +66,7 @@ export interface GeminiModelCacheEntry {
 }
 
 /** Cached models keyed by provider config id and tagged with the wire transport. */
-const cachedModelsByProvider = new Map<string, GeminiModelCacheEntry>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, GeminiModelCacheEntry>();
 
 function geminiTransport(config: Pick<GeminiProviderConfig, "geminiTransport">) {
 	return config.geminiTransport ?? "generate-content";
@@ -129,6 +138,15 @@ export function getGeminiCachedModelsByProvider(providerId: string): GeminiModel
 	);
 	return provider ? matchingCachedModels(provider, cachedModelsByProvider) : [];
 }
+
+registerModelOptionsCapture("gemini-compatible", (group) =>
+	captureModelOptionsArray(
+		getGeminiCachedModelsByProvider(group.id),
+		(model) => optionInput(group, model.id),
+		cachedModelsByProvider.generation,
+	),
+);
+registerModelListReader("gemini-compatible", (group) => getGeminiCachedModelsByProvider(group.id));
 
 /** Get all cached models across active providers with matching transports. */
 export function getGeminiCachedModels(): GeminiModelInfo[] {
@@ -422,9 +440,21 @@ geminiRoutes.post("/models/refresh", async (c) => {
 });
 
 /** GET /api/gemini/providers/:id/models — cached models for a specific provider. */
-geminiRoutes.get("/providers/:id/models", (c) => {
+geminiRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getGeminiCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.geminiProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? geminiProviderPrefix(config) : id },
+		"gemini-compatible",
+	);
+	return c.json({
+		models: await getServiceTemplate(group.templateId).listModels(
+			group,
+			undefined,
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 /** POST /api/gemini/providers/:id/models/refresh — refresh one provider. */

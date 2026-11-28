@@ -26,6 +26,7 @@
 
 import type { PreparedTextWithSegments } from "@chenglou/pretext";
 import type { PreparedRichInline } from "@chenglou/pretext/rich-inline";
+import type { PreparedAgentReferences } from "./agent-reference-flow";
 import type { TextPreview } from "./text-preview";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,6 +45,8 @@ export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 /** Common fields shared by every prepared block. */
 export interface PreparedBlockBase {
+	/** Original Markdown coordinates when source provenance was requested. */
+	sourceRange?: { start: number; end: number };
 	/** Top margin (px) applied before this block within its element. First
 	 * block in an element typically uses 0. */
 	marginTop: number;
@@ -66,6 +69,8 @@ export interface PreparedInlineBlock extends PreparedBlockBase {
 	kind: "inline";
 	/** pretext prepared rich-inline flow (already measured segment widths). */
 	flow: PreparedRichInline;
+	/** Inputs needed to size reference atoms to the actual content column. */
+	agentReferences?: PreparedAgentReferences;
 	/** Line box height (px) for this block's text role. */
 	lineHeight: number;
 	/** Per-fragment CSS class names, indexed by rich-inline itemIndex. */
@@ -172,6 +177,8 @@ export interface PreparedFixedBlock extends PreparedBlockBase {
 export interface PreparedTableCell {
 	/** pretext prepared rich-inline flow for the cell's content. */
 	flow: PreparedRichInline;
+	/** Inputs needed to size reference atoms to the actual content column. */
+	agentReferences?: PreparedAgentReferences;
 	/** Per-fragment CSS class names, indexed by rich-inline itemIndex. */
 	classNames: string[];
 	/** Per-fragment hrefs (null when not a link), indexed by itemIndex. */
@@ -189,7 +196,7 @@ export interface PreparedTableCell {
 	mathHtmls?: Array<InlineMathFragment | null>;
 	/** Width (px) the content occupies when never wrapped (max-content). */
 	naturalWidth: number;
-	/** Width (px) of the widest unbreakable piece (min-content). */
+	/** Min-content width (px); ellipsizable references contribute only their chrome. */
 	minWidth: number;
 	/**
 	 * Tallest formula in this cell (px), or 0 when it has none. The table's row
@@ -197,6 +204,8 @@ export interface PreparedTableCell {
 	 * line box) or the cell clips it.
 	 */
 	mathHeight?: number;
+	/** Tallest non-math inline atom (px), such as a fixed-height agent reference. */
+	inlineHeight?: number;
 }
 
 /**
@@ -556,7 +565,7 @@ export function layoutTable(
 
 /**
  * Line box height (px) for one table row: the table's text line height, raised to
- * the tallest formula in the row.
+ * the tallest formula or fixed-height inline atom in the row.
  *
  * Exported because BOTH sides must agree — `layoutTable` reserves the row height
  * with it, and the render layer positions each cell's lines with it. If the render
@@ -569,21 +578,22 @@ export function tableRowLineHeight(
 ): number {
 	let lineHeight = baseLineHeight;
 	for (const cell of cells) {
-		const mathHeight = cell?.mathHeight ?? 0;
-		if (mathHeight > lineHeight) lineHeight = Math.ceil(mathHeight);
+		const atomHeight = Math.max(cell?.mathHeight ?? 0, cell?.inlineHeight ?? 0);
+		if (atomHeight > lineHeight) lineHeight = Math.ceil(atomHeight);
 	}
 	return lineHeight;
 }
 
 /**
  * Adapt a table cell to the `PreparedInlineBlock` shape the shared resolver
- * accepts. Only `flow` and `lineHeight` are read for metrics; the rest are inert
- * defaults, so this allocation stays a thin view rather than a second model.
+ * accepts. Forward the column-dependent atom inputs alongside the flow; the rest
+ * are inert defaults, so this stays a thin view rather than a second model.
  */
 function cellAsInlineBlock(cell: PreparedTableCell, lineHeight: number): PreparedInlineBlock {
 	return {
 		kind: "inline",
 		flow: cell.flow,
+		...(cell.agentReferences ? { agentReferences: cell.agentReferences } : {}),
 		lineHeight,
 		classNames: cell.classNames,
 		hrefs: cell.hrefs,
@@ -673,7 +683,13 @@ export function accumulateFrame(
 				// Same rationale as the unknown branch below: a block whose painted
 				// width is known from data (aspect-fitted image) must report it, or a
 				// shrink-wrap container clips it.
-				blockUsedWidth = block.contentLeft + (block.displayWidth ?? 0);
+				// Markdown previews fill their content column, regardless of source
+				// dimensions. Include that width so injection/user shrink-wrap boxes
+				// cannot collapse an image-only body to its indent lane.
+				blockUsedWidth =
+					block.tag === "markdown-image"
+						? block.contentLeft + Math.max(1, contentWidth - block.contentLeft)
+						: block.contentLeft + (block.displayWidth ?? 0);
 				break;
 			case "unknown":
 				height = block.placeholderHeight;

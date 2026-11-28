@@ -859,7 +859,8 @@ export async function ensureImageWorktreeCopy(
 		);
 		temporaryPath = allocatedPath;
 		let copiedBytes = 0;
-		const deadline = performance.now() + 10_000;
+		const deadline =
+			performance.now() + (budget ? Math.max(0, budget.deadlineAt - Date.now()) : 10_000);
 		const checkDeadline = () => {
 			signal?.throwIfAborted();
 			if (performance.now() > deadline || (budget && Date.now() >= budget.deadlineAt))

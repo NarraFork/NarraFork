@@ -18,13 +18,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { decodeLegacyContent } from "@shared/narrator-blocks/decode";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { OutputContentAccumulator } from "../../lib/agent/output-content";
 import { toTurns } from "../../lib/agent/projection/turns";
 import type { AgentConfig, AgentEvent, ContentBlock } from "../../lib/agent/types";
 import type { EventHandlerContext } from "../narrator-event-handler";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -134,11 +137,12 @@ afterEach(() => {
 	for (const id of ["n1", "parent", "child"]) clearStreamingSnapshot(id);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("partial assistant visibility", () => {

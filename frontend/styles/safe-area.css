@@ -83,6 +83,21 @@ html[data-nf-authenticated-app-shell="true"] .nf-app-shell-main {
 }
 
 /*
+ * iOS native root-scroll bridge. The one-pixel body offset and root scroll cancel
+ * each other; the bridge verifies both the real range and settled geometry before
+ * arming. No shell height or fixed-position containing block is changed.
+ */
+html[data-nf-authenticated-app-shell="true"][data-nf-ios-scroll-to-top="true"] {
+	overflow-y: auto;
+	scroll-behavior: auto;
+}
+
+html[data-nf-authenticated-app-shell="true"][data-nf-ios-scroll-to-top="true"] body {
+	position: relative;
+	top: 1px;
+}
+
+/*
  * Overlay surfaces are the second layer that has to name the viewport, for the same
  * reason the Navbar does (see APP_SHELL_MOBILE_NAVBAR_HEIGHT in lib/safe-area.ts).
  *

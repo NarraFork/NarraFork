@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { clearedToolOutput } from "@shared/storage-retention";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { testEnvironment } from "../../../tests/preload";
 import { db, sqlite } from "../../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -11,16 +13,19 @@ import {
 	runtimePublicationOutbox,
 	users,
 } from "../../db/schema";
+import * as readPool from "../../lib/db-worker/pool";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { narratorRoutes } from "../../routes/narrators";
 import { getRunHold, setRunHold } from "../agent-runtime/ownership";
 import { runtimePublication } from "../agent-runtime/publication";
+import { publicationDedupeKey } from "../agent-runtime/publication-key";
 import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
 import { narratorStore } from "../narrator-store";
+import { readCommittedToolDetail } from "../narrator-tool-detail";
 import * as subagentFileChanges from "../subagent-file-changes";
 
 const createdUsers: string[] = [];
@@ -500,6 +505,24 @@ describe("outbound aggregation positive scope and metadata budgets", () => {
 		).not.toContain(realChild.id);
 	});
 
+	test("activity evidence inherits the display cancellation signal and total deadline", async () => {
+		const own = narrator();
+		const parent = tool(own.id, "evidence-read-budget", { toolName: "Agent" });
+		const realChild = child(own, parent);
+		tool(realChild.id, "evidence-budget-child", { parentToolUseId: parent.toolUseId });
+		const current = spyOn(subagentFileChanges, "getCurrentSubagentFileChangeOptions");
+		const evidence = spyOn(subagentFileChanges, "getFileChangesBySubagent");
+		const signal = new AbortController().signal;
+		const before = Date.now();
+		await narratorService.getPretextDocumentPage(own.id, { limit: 20, signal });
+		expect(current).toHaveBeenCalled();
+		const options = current.mock.calls[0]?.[2];
+		expect(options?.signal).toBe(signal);
+		expect(options?.deadlineAt).toBeGreaterThanOrEqual(before);
+		expect(options?.deadlineAt).toBeLessThanOrEqual(Date.now() + 10_000);
+		expect(evidence.mock.calls[0]?.[1]).toMatchObject(options ?? {});
+	});
+
 	test("revoking a parent ref during async activity aggregation prevents the response", async () => {
 		const own = narrator();
 		const parent = tool(own.id, "revoke-during-aggregate", { toolName: "Agent" });
@@ -641,7 +664,17 @@ describe("tool detail references and durable child origins", () => {
 		db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, parentCall.id)).run();
 		db.delete(narratorMessages).where(eq(narratorMessages.id, parentCall.messageId)).run();
 		expect((await narratorService.getToolCallDetail(fork.id, stored.toolUseId)).id).toBe(stored.id);
-		removeRef(copiedMessageId, fork.id);
+		await expect(
+			readCommittedToolDetail(
+				fork.id,
+				stored.toolUseId,
+				{},
+				new AbortController().signal,
+				async () => {
+					removeRef(copiedMessageId, fork.id);
+				},
+			),
+		).rejects.toBeInstanceOf(NotFoundError);
 		await expect(
 			narratorService.getToolCallDetail(fork.id, stored.toolUseId),
 		).rejects.toBeInstanceOf(NotFoundError);
@@ -853,6 +886,11 @@ describe("tool detail unique selection and bounded payload reads", () => {
 			narratorService.getToolCallDetail(own.id, allowed.toolUseId),
 		).rejects.toMatchObject({ code: "TOOL_CALL_DETAIL_TOO_LARGE" });
 		expect(trace.payloadReads()).toHaveLength(0);
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${allowed.toolUseId}`,
+		);
+		expect(response.status).toBe(413);
+		expect(trace.payloadReads()).toHaveLength(0);
 	});
 
 	test("route selectors are bounded and do not bypass the caller narrator ACL", async () => {
@@ -868,6 +906,138 @@ describe("tool detail unique selection and bounded payload reads", () => {
 			);
 			expect(response.status).toBe(400);
 		}
+	});
+});
+
+describe("committed tool detail reads", () => {
+	test("returns a multi-frame tool payload unchanged without selecting it on the caller connection", async () => {
+		const own = narrator();
+		const outputJson = { text: "🙂界".repeat(25_000) };
+		const stored = tool(own.id, "multi-frame-output", { outputJson });
+		const trace = traceToolReads();
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ id: stored.id, outputJson });
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
+	test("preserves the response shape and never loads cleared input on the main thread", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "redacted", { outputJson: clearedToolOutput(now) });
+		sqlite.run("UPDATE narrator_tool_calls SET input_json = 'malformed' WHERE id = ?", [stored.id]);
+		const expected = await narratorService.getToolCallDetail(own.id, stored.toolUseId);
+		const trace = traceToolReads();
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(JSON.parse(JSON.stringify(expected)));
+		expect(expected.inputJson).toBeNull();
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
+	test("rejects a snapshot when retention clears the tool payload before delivery", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "changed-detail");
+		await expect(
+			readCommittedToolDetail(
+				own.id,
+				stored.toolUseId,
+				{},
+				new AbortController().signal,
+				async () => {
+					db.update(narratorToolCalls)
+						.set({ inputJson: null, outputJson: clearedToolOutput(now) })
+						.where(eq(narratorToolCalls.id, stored.id))
+						.run();
+				},
+			),
+		).rejects.toBeInstanceOf(NotFoundError);
+	});
+
+	test("the route rechecks narrator ACL after the Worker returns", async () => {
+		const own = narrator();
+		const other = user();
+		const stored = tool(own.id, "acl-changed-detail");
+		const read = readPool.runTrackedEphemeralReadTask;
+		spyOn(readPool, "runTrackedEphemeralReadTask").mockImplementation(
+			<T>(...args: Parameters<typeof read>) => {
+				const handle = read<T>(...args);
+				return {
+					...handle,
+					result: handle.result.then((snapshot) => {
+						db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, own.id)).run();
+						return snapshot;
+					}),
+				};
+			},
+		);
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(404);
+		expect(await response.text()).not.toContain("allowed output");
+	});
+
+	test("worker creation, execution, and timeout failures propagate without loading payloads inline", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "worker-failure");
+		const trace = traceToolReads();
+		const worker = spyOn(readPool, "runTrackedEphemeralReadTask");
+		const authorize = mock(async () => {});
+		for (const error of [
+			new readPool.WorkersUnavailableError("creation_failed"),
+			new readPool.DbReadTaskExecutionError("execution failed"),
+			new readPool.DbReadTaskTimeoutError("timed out"),
+		]) {
+			worker.mockReturnValueOnce({ result: Promise.reject(error), released: Promise.resolve() });
+			const signal = new AbortController().signal;
+			await expect(
+				readCommittedToolDetail(own.id, stored.toolUseId, {}, signal, authorize),
+			).rejects.toBe(error);
+			expect(worker.mock.lastCall?.[2]?.signal).toBe(signal);
+		}
+		expect(authorize).not.toHaveBeenCalled();
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
+	test("a disabled Worker does not fall back to a main-thread detail read", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "worker-disabled");
+		const trace = traceToolReads();
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		try {
+			await expect(
+				readCommittedToolDetail(
+					own.id,
+					stored.toolUseId,
+					{},
+					new AbortController().signal,
+					async () => {},
+				),
+			).rejects.toMatchObject({ reason: "disabled_by_env" });
+			expect(trace.payloadReads()).toHaveLength(0);
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
+
+	test("cancellation before delivery discards the snapshot without loading payloads inline", async () => {
+		const own = narrator();
+		const stored = tool(own.id, "cancelled-detail");
+		const trace = traceToolReads();
+		const controller = new AbortController();
+		const cancelReason = new Error("request cancelled");
+		await expect(
+			readCommittedToolDetail(own.id, stored.toolUseId, {}, controller.signal, async () => {
+				controller.abort(cancelReason);
+			}),
+		).rejects.toBe(cancelReason);
+		expect(trace.payloadReads()).toHaveLength(0);
 	});
 });
 
@@ -1008,7 +1178,14 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 					),
 				)
 				.all();
-			expect(published).toEqual([{ eventKind: "completed" }]);
+			const delivered = db
+				.select({ id: narratorBufferedMessages.id })
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.dedupeKey, publicationDedupeKey(run, "completed")))
+				.all();
+			expect([...published, ...delivered.map(() => ({ eventKind: "completed" }))]).toEqual([
+				{ eventKind: "completed" },
+			]);
 			const reference = await narratorPersistence.resolveSubagentConclusionReference(
 				f.subagent.id,
 				f.own.id,

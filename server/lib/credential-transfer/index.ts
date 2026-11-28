@@ -1,34 +1,24 @@
 /**
- * Moving credentials between NarraFork instances.
- *
- * Each credential family plugs in as a `TransferKind`; export collects the chosen
- * credentials into a passphrase-sealed bundle (see bundle.ts), import previews which
- * of them already exist here and then adds or replaces them as the admin decides.
- * Exporting requires a step-up grant (password + second factor), checked by the route.
+ * Credentials move in a passphrase-sealed bundle (see bundle.ts). Preview matches
+ * installed accounts; import adds or explicitly replaces the admin's selections.
+ * Export requires a step-up grant (password + second factor), checked by the route.
  */
 import { logger } from "../logger";
-import { type BundleItem, openBundle, sealBundle } from "./bundle";
-import { KINDS, type TransferableCredential } from "./kinds";
+import { normalizeLegacyBundle } from "../sourcing/legacy-transfer";
+import { openBundle, sealBundle } from "./bundle";
+import { exportCredentialItems, importCredentialItems, matchCredentialItem } from "./kinds";
 
-export type { TransferableCredential };
+export type { TransferableCredential } from "./kinds";
+export { listCredentialSummaries as listTransferableCredentials } from "./kinds";
 
-const kindOf = (kind: string) => KINDS.find((k) => k.kind === kind);
-
-export function listTransferableCredentials(): TransferableCredential[] {
-	return KINDS.flatMap((kind) => kind.list());
-}
-
-/** `selection` absent = every credential of every kind. */
+/** `selection` absent = every credential. Unknown wire kinds select nothing. */
 export async function exportCredentials(
 	selection: Array<{ kind: string; id: string }> | undefined,
 	passphrase: string,
 	actor: { userId: string },
 ): Promise<{ text: string; count: number }> {
-	const items = KINDS.flatMap((kind) => {
-		if (!selection) return kind.export(undefined);
-		const ids = selection.filter((s) => s.kind === kind.kind).map((s) => s.id);
-		return ids.length ? kind.export(ids) : [];
-	});
+	const ids = selection?.filter((item) => item.kind === "credential").map((item) => item.id);
+	const items = ids?.length === 0 ? [] : await exportCredentialItems(ids);
 	const text = await sealBundle({ exportedAt: Date.now(), items }, passphrase);
 	logger.info("Credentials exported", {
 		userId: actor.userId,
@@ -48,37 +38,19 @@ export interface ImportPreviewItem {
 	unsupported?: boolean;
 }
 
-function groupByKind(items: readonly BundleItem[]) {
-	const groups = new Map<string, Array<{ index: number; item: BundleItem }>>();
-	items.forEach((item, index) => {
-		const group = groups.get(item.kind) ?? [];
-		group.push({ index, item });
-		groups.set(item.kind, group);
-	});
-	return groups;
-}
-
 export async function previewCredentialImport(
 	text: string,
 	passphrase: string,
 ): Promise<{ exportedAt: number; items: ImportPreviewItem[] }> {
 	const bundle = await openBundle(text, passphrase);
-	const items: ImportPreviewItem[] = bundle.items.map((item, index) => ({
-		index,
-		kind: item.kind,
-		label: item.label,
-		unsupported: true,
-	}));
-	for (const [kindName, group] of groupByKind(bundle.items)) {
-		const kind = kindOf(kindName);
-		if (!kind) continue;
-		const matches = kind.match(group.map((g) => g.item.data));
-		group.forEach(({ index }, i) => {
-			const match = matches[i];
-			if (match)
-				items[index] = { index, kind: kindName, label: match.label, existingId: match.existingId };
-		});
-	}
+	const items = await Promise.all(
+		normalizeLegacyBundle(bundle.items).map(async (item, index): Promise<ImportPreviewItem> => {
+			const match = item.kind === "credential" ? await matchCredentialItem(item.data) : null;
+			return match
+				? { index, kind: item.kind, label: match.label, existingId: match.existingId }
+				: { index, kind: item.kind, label: item.label, unsupported: true };
+		}),
+	);
 	return { exportedAt: bundle.exportedAt, items };
 }
 
@@ -93,26 +65,15 @@ export async function applyCredentialImport(
 	actor: { userId: string },
 ): Promise<{ added: number; replaced: number; skipped: number }> {
 	const bundle = await openBundle(text, passphrase);
-	const total = { added: 0, replaced: 0, skipped: 0 };
-	for (const [kindName, group] of groupByKind(bundle.items)) {
-		const kind = kindOf(kindName);
-		if (!kind) {
-			total.skipped += group.length;
-			continue;
-		}
-		const result = kind.import(
-			group.map((g) => g.item.data),
-			(i, existingId) => {
-				const choice = choices.get(group[i]?.index ?? -1);
-				if (!choice) return "skip";
-				if (!existingId) return "add";
-				return choice === "replace" ? "replace" : "skip";
-			},
-		);
-		total.added += result.added;
-		total.replaced += result.replaced;
-		total.skipped += result.skipped;
-	}
-	logger.info("Credentials imported", { userId: actor.userId, ...total });
-	return total;
+	const result = await importCredentialItems(
+		normalizeLegacyBundle(bundle.items),
+		(index, existingId) => {
+			const choice = choices.get(index);
+			if (!choice) return "skip";
+			if (choice === "replace") return "replace";
+			return existingId ? "skip" : "add";
+		},
+	);
+	logger.info("Credentials imported", { userId: actor.userId, ...result });
+	return result;
 }

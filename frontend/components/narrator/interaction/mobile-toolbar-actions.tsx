@@ -1,7 +1,7 @@
 import { ActionIcon, Button, Menu, Tooltip } from "@mantine/core";
 import { IconGitBranch, IconLock, IconLockOpen } from "@tabler/icons-react";
-import type { UseMutationResult } from "@tanstack/react-query";
 import type { NarratorStatusToolbarAction } from "../header/NarratorStatusToolbar";
+import type { PendingMutate } from "./mutate";
 
 export interface BuildMobileToolbarActionsOptions {
 	bottomActions: NarratorStatusToolbarAction[];
@@ -10,11 +10,9 @@ export interface BuildMobileToolbarActionsOptions {
 	hasPlanTrait: boolean;
 	relaxedPlanEnabled: boolean;
 	relaxedPlanForced: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation shape is incidental here
-	relaxedPlanMutation: UseMutationResult<any, any, { id: string; relaxedPlan: boolean }, any>;
+	relaxedPlanMutation: PendingMutate<{ id: string; relaxedPlan: boolean }>;
 	isAskInPassing: boolean | null | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation shape is incidental here
-	promoteMutation: UseMutationResult<any, any, any, any>;
+	promoteMutation: { isPending: boolean };
 	handlePromote: () => void;
 }
 

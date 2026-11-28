@@ -1,12 +1,17 @@
 /**
- * Owns only the children it starts. Source development keeps hot reload; production
- * launches a frozen local runtime, optionally beside the source Vite frontend.
+ * Owns only the children it starts. Plain production uses a frozen local runtime;
+ * hybrid mode keeps the source backend beside Vite so filesystem frontend builds
+ * remain visible without a backend restart.
  */
 
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { type Subprocess, spawn } from "bun";
-import { devAllBackendEnv } from "./lib/dev-app-url";
+import {
+	DEFAULT_DEV_FRONTEND_PORT,
+	DEV_ALL_BACKEND_PORT,
+	devAllBackendEnv,
+} from "./lib/dev-app-url";
 
 export interface LaunchOptions {
 	production: boolean;
@@ -91,16 +96,17 @@ export async function runDevAll(
 	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		let runtime = options.runtime;
-		if (options.production) {
+		// Hybrid mode stays on the source backend so each frontend build is visible
+		// through its filesystem static handler without a backend restart. An
+		// explicit runtime remains an opt-in frozen override.
+		const useFrozenRuntime = options.production && (!options.frontendDev || !!runtime);
+		if (useFrozenRuntime) {
 			if (runtime) {
 				runtime = await realpath(runtime);
 				if (!(await stat(runtime)).isFile())
 					throw new Error("--runtime must name an executable file");
 			} else {
-				({ executable: runtime } = await deps.build({
-					frontend: !options.frontendDev,
-					signal,
-				}));
+				({ executable: runtime } = await deps.build({ frontend: true, signal }));
 				signal?.throwIfAborted();
 				console.log(`Runtime ready: ${runtime}\nReuse with: --runtime=${JSON.stringify(runtime)}`);
 			}
@@ -116,7 +122,7 @@ export async function runDevAll(
 			: devAllBackendEnv(env);
 		if (options.production && options.frontendDev)
 			backendEnv.NF_SQL_TRACE = env.NF_SQL_TRACE || "summary";
-		const backendCommand = options.production
+		const backendCommand = useFrozenRuntime
 			? [runtime as string, "--serve", ...options.serverArgs]
 			: [
 					process.execPath,
@@ -128,7 +134,11 @@ export async function runDevAll(
 		const running: Child[] = [backend];
 		if (!options.production || options.frontendDev) {
 			const frontendEnv = options.production
-				? { ...env, VITE_PORT: env.VITE_PORT || "41221", BACKEND_PORT: env.PORT || "7778" }
+				? {
+						...env,
+						VITE_PORT: env.VITE_PORT || DEFAULT_DEV_FRONTEND_PORT,
+						BACKEND_PORT: env.PORT || DEV_ALL_BACKEND_PORT,
+					}
 				: { ...env };
 			running.push(
 				start(

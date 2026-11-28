@@ -1,12 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { CodexProvider, isCodexProviderExpected101WebSocketFailure } from "../codex-provider";
+import { CodexWebSocketFallbackError } from "../codex-websocket";
 import {
 	CODEX_IMAGE_GENERATION_PARTIAL_IMAGES,
 	OpenAIProvider,
 	supportsCodexImageGeneration,
 } from "../openai-provider";
-import type { DbMessage } from "../provider";
+import type { ChatParams, DbMessage } from "../provider";
 
 describe("CodexProvider Responses WebSocket handling", () => {
 	test("detects expected 101 errors from wrapped runtime events", () => {
@@ -321,5 +322,111 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		expect(inputJson).toContain('"image_url":"data:image/png;base64,');
 		expect(toolsJson).toContain('"type":"image_generation"');
 		expect(toolsJson).toContain(`"partial_images":${CODEX_IMAGE_GENERATION_PARTIAL_IMAGES}`);
+	});
+});
+
+describe("CodexProvider credential reporting", () => {
+	/** A manager stub that always hands out one account. */
+	function withAccount(provider: CodexProvider) {
+		const manager = (provider as unknown as { manager: Record<string, unknown> }).manager;
+		const ctx = {
+			id: "codex-account-1",
+			token: "tok",
+			authorization: "Bearer tok",
+			credential: {
+				id: "codex-account-1",
+				accountId: "acc-1",
+				disabled: false,
+				expiresAt: Date.now() + 3_600_000,
+				authMode: "oauth",
+			},
+		};
+		const originals = { ...manager };
+		Object.assign(manager, {
+			acquireContext: async () => ctx,
+			refreshUsageOnUseIfNeeded: async () => {},
+			snapshot: () => ({ available: 1, entries: [] }),
+			reportSuccess: () => {},
+			isDiagnosticCredentialCurrent: () => true,
+		});
+		return () => Object.assign(manager, originals);
+	}
+
+	async function run(useWebSocket: boolean) {
+		const provider = new CodexProvider({ useWebSocket });
+		const restore = withAccount(provider);
+		// The inner adapter is configured with id "codex" and may say so.
+		const chat = spyOn(OpenAIProvider.prototype, "chat").mockImplementation(async function* (
+			params: ChatParams,
+		) {
+			params.onRequestStart?.({ credentialId: "codex" });
+			yield { text: "hi", credentialId: "codex" };
+		} as never);
+		if (useWebSocket) {
+			// Force the WebSocket attempt onto its SSE fallback before anything is sent.
+			(provider as unknown as Record<string, unknown>).buildResponsesWebSocketRequest = () => {
+				throw new CodexWebSocketFallbackError("WebSocket unavailable");
+			};
+		}
+		const started: Array<string | undefined> = [];
+		const events: Array<string | undefined> = [];
+		try {
+			for await (const event of provider.chat({
+				conversationId: "conv-credential",
+				content: "hello",
+				model: "gpt-5.5",
+				cwd: process.cwd(),
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+				onRequestStart: (info) => started.push(info?.credentialId),
+			})) {
+				events.push(event.credentialId);
+			}
+		} finally {
+			chat.mockRestore();
+			restore();
+		}
+		return { started, events };
+	}
+
+	test("HTTP mode reports the account, never the inner adapter's id", async () => {
+		expect(await run(false)).toEqual({
+			started: ["codex-account-1"],
+			events: ["codex-account-1"],
+		});
+	});
+
+	test("the WebSocket mode's SSE fallback reports the account at request start", async () => {
+		expect(await run(true)).toEqual({
+			started: ["codex-account-1"],
+			events: ["codex-account-1"],
+		});
+	});
+
+	test("non-streaming results are billed to the account", async () => {
+		const provider = new CodexProvider({ useWebSocket: false });
+		const restore = withAccount(provider);
+		const result = { text: "summary", usage: undefined };
+		const generate = spyOn(OpenAIProvider.prototype, "generateWithMeta").mockResolvedValue(
+			result as never,
+		);
+		const history = spyOn(
+			OpenAIProvider.prototype,
+			"generateWithHistoryWithMeta",
+		).mockResolvedValue(result as never);
+		try {
+			expect((await provider.generateWithMeta("hi", "gpt-5.5")).credentialId).toBe(
+				"codex-account-1",
+			);
+			expect(
+				(await provider.generateWithHistoryWithMeta("sys", "hi", "gpt-5.5")).credentialId,
+			).toBe("codex-account-1");
+		} finally {
+			generate.mockRestore();
+			history.mockRestore();
+			restore();
+		}
 	});
 });

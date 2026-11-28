@@ -67,7 +67,11 @@ function timeValue(iso: string | null): number {
 	return Number.isFinite(value) ? value : 0;
 }
 
-function toSession(n: DashboardNarrator, live: NarratorActivity | undefined): DashboardSession {
+/** A list row with its live activity overlay, as a card shows it (also the project page's). */
+export function toSession(
+	n: DashboardNarrator,
+	live: NarratorActivity | undefined,
+): DashboardSession {
 	return {
 		narratorId: n.id,
 		title: live?.title || n.title || n.id.slice(0, 8),

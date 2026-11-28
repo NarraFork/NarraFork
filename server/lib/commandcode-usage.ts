@@ -8,9 +8,21 @@
  * 两者都用 CLI 登录后的凭据鉴权（`Authorization: Bearer <auth.json 的 apiKey>`）。
  */
 
-import { commandCodeApiOrigin } from "./commandcode-protocol";
+import type { QuotaSnapshot, QuotaWindow } from "@shared/quota-snapshot";
+import type { CommandCodeProviderSettings } from "./agent/commandcode-provider";
+import {
+	COMMAND_CODE_PREFIX,
+	commandCodeApiOrigin,
+	commandCodeProviderBase,
+} from "./commandcode-protocol";
+import type { UsageSubject } from "./provider-key-subjects";
+import { COMMAND_CODE_KEY_OWNER, getProviderKeyStore, withProviderKey } from "./provider-keys";
+import { settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
+import { quotaStore } from "./sourcing/quota-store";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+export const COMMAND_CODE_USAGE_STALE_MS = 60_000;
 /** 额度接口不该有巨大响应；超过这个字节数就取消读取。 */
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -136,10 +148,17 @@ export async function readResponseJsonLimited(
 	}
 }
 
-async function getJson(path: string, token: string, origin: string): Promise<unknown> {
+async function getJson(
+	path: string,
+	token: string,
+	origin: string,
+	signal?: AbortSignal,
+): Promise<unknown> {
 	const response = await fetch(`${origin}${path}`, {
 		headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		signal: signal
+			? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+			: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 	});
 	if (!response.ok) {
 		throw new CommandCodeUsageError(
@@ -213,16 +232,206 @@ export function parseCommandCodeSummary(value: unknown): CommandCodeUsageSummary
 export async function fetchCommandCodeUsage(
 	token: string,
 	baseUrl?: string,
+	signal?: AbortSignal,
 ): Promise<CommandCodeUsage> {
 	const origin = commandCodeApiOrigin(baseUrl);
-	const { credits, windowLimits, sandboxAccess } = parseCommandCodeCredits(
-		await getJson("/alpha/billing/credits", token, origin),
-	);
+	const response = await getJson("/alpha/billing/credits", token, origin, signal);
+	// The display parser's legacy zero fallback is not evidence of an exhausted balance.
+	if (
+		!isRecord(response) ||
+		!isRecord(response.credits) ||
+		optionalNum(response.credits.monthlyCredits) === undefined
+	) {
+		throw new CommandCodeUsageError(502, "invalid_response");
+	}
+	const { credits, windowLimits, sandboxAccess } = parseCommandCodeCredits(response);
 	let summary: CommandCodeUsageSummary | undefined;
 	try {
-		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token, origin));
-	} catch {
+		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token, origin, signal));
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		// 用量摘要失败不阻塞额度展示。
 	}
 	return { credits, windowLimits, sandboxAccess, summary };
+}
+
+function quotaWindow(kind: "5h" | "weekly", window: CommandCodeWindow | undefined): QuotaWindow[] {
+	if (!window) return [];
+	return [
+		{
+			kind,
+			usedRatio:
+				window.exceeded || (window.cap > 0 && window.used >= window.cap)
+					? 1
+					: window.cap > 0
+						? window.used / window.cap
+						: null,
+			resetsAt: window.resetAt ?? null,
+		},
+	];
+}
+
+/** The shared projection; the legacy route reads the original usage back from detail. */
+export function commandCodeUsageSnapshot(
+	usage: CommandCodeUsage,
+	fetchedAt = Date.now(),
+): QuotaSnapshot {
+	return {
+		fetchedAt,
+		scope: "subscription",
+		windows: [
+			...quotaWindow("5h", usage.windowLimits?.fiveHour),
+			...quotaWindow("weekly", usage.windowLimits?.weekly),
+		],
+		balances: [
+			{
+				unit: "credits",
+				remaining: usage.credits.monthlyCredits,
+				...(usage.summary
+					? { total: usage.credits.monthlyCredits + usage.summary.totalMonthlyCredits }
+					: {}),
+			},
+		],
+		detail: usage,
+	};
+}
+
+export type CommandCodeUsageSubject = UsageSubject<
+	CommandCodeProviderSettings & { apiKey: string }
+>;
+
+/** One settings-key probe. CLI auth has no corresponding credential and stays uncached. */
+export async function probeCommandCodeQuota(
+	credential: CommandCodeUsageSubject,
+	signal: AbortSignal,
+): Promise<QuotaSnapshot> {
+	return commandCodeUsageSnapshot(
+		await fetchCommandCodeUsage(credential.config.apiKey, credential.config.baseUrl, signal),
+	);
+}
+
+export const commandCodeQuotaIdentity = (config: CommandCodeUsageSubject["config"]): string =>
+	JSON.stringify([
+		commandCodeApiOrigin(config.baseUrl),
+		commandCodeProviderBase(config.baseUrl),
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+
+/** Each managed key owns its window; the legacy endpoint still shows the first one. */
+export function listCommandCodeUsageSubjects(): CommandCodeUsageSubject[] {
+	const configured = settings.commandCode;
+	if (configured?.disabled) return [];
+	const config = { ...configured, apiKey: configured?.apiKey ?? "" };
+	const stored = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER);
+	if (stored.length > 0) {
+		return stored
+			.filter((key) => !key.disabled)
+			.map((key) => ({
+				id: key.id,
+				providerId: COMMAND_CODE_PREFIX,
+				config: withProviderKey(config, key),
+			}));
+	}
+	return config.apiKey
+		? [{ id: COMMAND_CODE_PREFIX, providerId: COMMAND_CODE_PREFIX, config }]
+		: [];
+}
+
+function commandCodeUsageSubject(credentialId?: string): CommandCodeUsageSubject | undefined {
+	const subjects = listCommandCodeUsageSubjects();
+	return credentialId === undefined
+		? subjects[0]
+		: subjects.find((subject) => subject.id === credentialId);
+}
+
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
+	const detail = (snapshot.detail ?? {}) as Partial<CommandCodeUsage>;
+	const parsed = parseCommandCodeCredits(detail);
+	return commandCodeUsageSnapshot(
+		{ ...parsed, summary: parseCommandCodeSummary(detail.summary) },
+		snapshot.fetchedAt,
+	);
+}
+
+function cachedSnapshot(subject: CommandCodeUsageSubject): QuotaSnapshot | undefined {
+	return quotaStore.get(subject.id, commandCodeQuotaIdentity(subject.config), restoreSnapshot);
+}
+
+export function getCommandCodeQuotaSnapshot(
+	credentialId?: string,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const subject = commandCodeUsageSubject(credentialId);
+	return subject ? { credentialId: subject.id, snapshot: cachedSnapshot(subject) } : undefined;
+}
+
+export function isCommandCodeQuotaRefreshing(credentialId?: string): boolean {
+	const subject = commandCodeUsageSubject(credentialId);
+	return !!subject && refreshes.has(commandCodeQuotaIdentity(subject.config));
+}
+
+/** Refresh the selected managed key; omitted id keeps the legacy first-usable view. */
+export function refreshCommandCodeQuota(
+	force = false,
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	const subject = commandCodeUsageSubject(credentialId);
+	if (!subject) return Promise.resolve(undefined);
+	const cached = cachedSnapshot(subject);
+	if (!force && cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS)
+		return Promise.resolve(cached.detail as CommandCodeUsage);
+	return refreshUsage(subject);
+}
+
+const refreshes = new Map<string, Promise<CommandCodeUsage>>();
+
+async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCodeUsage> {
+	const key = commandCodeQuotaIdentity(subject.config);
+	const existing = refreshes.get(key);
+	if (existing) return existing;
+	const task = probeCommandCodeQuota(subject, new AbortController().signal)
+		.then((snapshot) => {
+			const current = listCommandCodeUsageSubjects().find(
+				(candidate) => candidate.id === subject.id,
+			);
+			if (current?.id === subject.id && commandCodeQuotaIdentity(current.config) === key) {
+				quotaStore.set(subject.id, key, snapshot);
+			}
+			return snapshot.detail as CommandCodeUsage;
+		})
+		.catch(() => {
+			const current = commandCodeUsageSubject(subject.id);
+			if (current?.id === subject.id && commandCodeQuotaIdentity(current.config) === key) {
+				const previous = cachedSnapshot(subject);
+				quotaStore.set(
+					subject.id,
+					key,
+					{
+						scope: "subscription",
+						windows: [],
+						balances: [],
+						...previous,
+						error: "quota_unavailable",
+						// Failed attempts must also obey the request-driven TTL.
+						fetchedAt: Date.now(),
+					},
+					false,
+				);
+			}
+			throw new CommandCodeUsageError(502, "usage_unavailable");
+		})
+		.finally(() => refreshes.delete(key));
+	refreshes.set(key, task);
+	return task;
+}
+
+/** Request-driven 60-second cache for a settings key; there is no polling timer. */
+export async function getCommandCodeUsageFromSettings(): Promise<CommandCodeUsage | undefined> {
+	return getCommandCodeUsageForCredential();
+}
+
+export async function getCommandCodeUsageForCredential(
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	return refreshCommandCodeQuota(false, credentialId);
 }

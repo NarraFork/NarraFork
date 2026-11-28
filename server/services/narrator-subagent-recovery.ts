@@ -32,7 +32,7 @@
 
 import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { db } from "../db";
 import {
 	backgroundTasks,
 	narratorMessageRefs,
@@ -40,8 +40,10 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { queueContextCharacterRefresh } from "../lib/context-characters";
+import { DbReadError } from "../lib/db-worker/errors";
 import { ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -52,18 +54,31 @@ import {
 	parseTraits,
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/runtime-source";
+import {
+	controllerOf,
+	executionPrincipalOf,
+	RUNTIME_SOURCE_COLUMNS,
+	runDeliverToOf,
+} from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { getExecutionOwner } from "./agent-runtime/ownership";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
+import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { adoptHumanReplyContext } from "./narrator-reply-context";
-import { narratorService } from "./narrator-service";
+import { narratorPersistence, narratorService } from "./narrator-service";
 import { isNarratorRuntimeBusy, withNarratorStartAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
+import {
+	AGENT_TASK_OBSERVATION_COLUMNS,
+	RESTART_TOOL_COLUMNS,
+	RESUME_SUBAGENT_COLUMNS,
+} from "./recovery-observation";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
+import { SubagentRecoveryObservation } from "./subagent-recovery-observation";
 
 /** Statuses that mean "this tool call never produced a usable result". */
 const NON_TERMINAL_TOOL_CALL_STATUSES = new Set(["initializing", "pending", "running"]);
@@ -76,6 +91,18 @@ const UNFINISHED_SUBSTATUS_TAGS = ["error", "interrupted", "timeout"] as const;
 
 /** Serializes recovery preparation per narrator. */
 const recoveryLock = new AsyncMutex();
+
+type RecoveryReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
+
+function recoveryReadOptions(options: RecoveryReadOptions = {}): ReadQueryOptions {
+	return {
+		signal: options.signal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: options.timeoutMs,
+		executionPolicy: "worker-required",
+		maxRows: 100,
+	};
+}
 
 // === Pure selection logic (unit-testable) ===
 
@@ -276,7 +303,7 @@ export function withRecoveryOfferedTrait(traits: unknown, failedAtMs: number): s
  * timestamp of a failed background run. Creation, metadata updates and run starts
  * cannot prove when an error happened; legacy rows without evidence are omitted.
  */
-export function recoveryFailureTimeMs(sa: RecoveryCardSubagentInput): number | null {
+export function recoveryFailureTimeMs(sa: Partial<RecoveryCardSubagentInput>): number | null {
 	const { pauseStartedAtMs } = parseTurnPauseTiming(parseSubstatus(sa.substatus));
 	if (pauseStartedAtMs != null) return pauseStartedAtMs;
 	if (sa.backgroundStatus !== "failed") return null;
@@ -286,7 +313,7 @@ export function recoveryFailureTimeMs(sa: RecoveryCardSubagentInput): number | n
 
 /** Shared by card generation and execution: old cards never bypass a newer turn. */
 function recoveryFailureTimeInTurn(
-	sa: RecoveryCardSubagentInput,
+	sa: Pick<RecoveryCardSubagentInput, "substatus" | "backgroundStatus" | "backgroundCompletedAt">,
 	turnStartedAtMs: number | null | undefined,
 ): number | null {
 	if (turnStartedAtMs == null || !Number.isFinite(turnStartedAtMs)) return null;
@@ -382,29 +409,34 @@ export const TOOL_CALL_RESET_FIELDS = {
 	executionStartedAt: null,
 };
 
-async function findLatestTopLevelMessage(narratorId: string) {
-	const rows = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			role: narratorMessages.role,
-		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
-			),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(1);
-	return rows.length > 0 ? rows[0] : null;
+async function findLatestTopLevelMessage(
+	narratorId: string,
+	observation = new SubagentRecoveryObservation(),
+) {
+	return observation.first((store) =>
+		store
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				role: narratorMessages.role,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessages.parentToolUseId),
+					inArray(narratorMessages.role, ["user", "assistant"]),
+				),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1),
+	);
 }
 
 /** Map Agent tool_use ids → the subagent narrator they spawned. */
 async function loadSubagentsByOriginToolUse(
 	toolUseIds: string[],
+	observation: SubagentRecoveryObservation,
 ): Promise<Map<string, RecoverySubagentInput & { title: string | null; variant: string | null }>> {
 	const map = new Map<
 		string,
@@ -412,14 +444,19 @@ async function loadSubagentsByOriginToolUse(
 	>();
 	if (toolUseIds.length === 0) return map;
 
-	const linked = await db
-		.select({
-			narratorId: narratorMessages.narratorId,
-			parentToolUseId: narratorMessages.parentToolUseId,
-		})
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
-		.orderBy(asc(narratorMessages.createdAt));
+	const linked = await observation.ids(toolUseIds, (store, ids) =>
+		store
+			.select({
+				narratorId: narratorMessages.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+				createdAt: narratorMessages.createdAt,
+			})
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.parentToolUseId, ids))
+			.orderBy(asc(narratorMessages.createdAt))
+			.limit(1_001),
+	);
+	linked.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 
 	const originBySubagent = new Map<string, string>();
 	for (const row of linked) {
@@ -429,17 +466,20 @@ async function loadSubagentsByOriginToolUse(
 	}
 	if (originBySubagent.size === 0) return map;
 
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.id, [...originBySubagent.keys()]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			isBackground: true,
-			title: true,
-			variant: true,
-		},
-	});
+	const rows = await observation.ids([...originBySubagent.keys()], (store, ids) =>
+		store.query.narrators.findMany({
+			where: inArray(narrators.id, ids),
+			columns: {
+				id: true,
+				status: true,
+				substatus: true,
+				isBackground: true,
+				title: true,
+				variant: true,
+			},
+			limit: 1_001,
+		}),
+	);
 	for (const row of rows) {
 		const origin = originBySubagent.get(row.id);
 		if (!origin) continue;
@@ -453,24 +493,30 @@ async function loadSubagentsByOriginToolUse(
  * The earliest linked parent tool use of each subagent, for the card path: up to 50
  * subagents at once in one SELECT.
  */
-async function resolveOriginToolUseIds(subagentIds: string[]): Promise<Map<string, string>> {
+async function resolveOriginToolUseIds(
+	subagentIds: string[],
+	observation: SubagentRecoveryObservation,
+): Promise<Map<string, string>> {
 	const origins = new Map<string, string>();
 	if (subagentIds.length === 0) return origins;
 
-	const rows = await db
-		.select({
-			narratorId: narratorMessages.narratorId,
-			parentToolUseId: narratorMessages.parentToolUseId,
-		})
-		.from(narratorMessages)
-		.where(
-			and(
-				inArray(narratorMessages.narratorId, subagentIds),
-				eq(narratorMessages.role, "user"),
-				sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
-			),
-		)
-		.orderBy(asc(narratorMessages.createdAt));
+	const rows = await observation.ids(subagentIds, (store, ids) =>
+		store
+			.select({
+				narratorId: narratorMessages.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+			})
+			.from(narratorMessages)
+			.where(
+				and(
+					inArray(narratorMessages.narratorId, ids),
+					eq(narratorMessages.role, "user"),
+					sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
+				),
+			)
+			.orderBy(asc(narratorMessages.createdAt))
+			.limit(1_001),
+	);
 
 	for (const row of rows) {
 		if (!row.parentToolUseId || origins.has(row.narratorId)) continue;
@@ -498,6 +544,9 @@ export function resumeIncompleteAgentWorkForContinue(input: {
 	userId?: string | null;
 	/** Only an explicit human recovery action may replace the recipient's reply policy. */
 	humanReplyContext?: ReplyContext;
+	signal?: AbortSignal;
+	deadlineAt?: number;
+	timeoutMs?: number;
 }): Promise<ResumeIncompleteAgentWorkResult> {
 	const acceptedInput = {
 		...input,
@@ -514,49 +563,61 @@ async function prepareAndStartRecovery(input: {
 	replyInUserLanguage: boolean;
 	userId?: string | null;
 	humanReplyContext?: ReplyContext;
+	signal?: AbortSignal;
+	deadlineAt?: number;
+	timeoutMs?: number;
 }): Promise<ResumeIncompleteAgentWorkResult> {
 	const { narratorId } = input;
 	if (getExecutionOwner(narratorId) || isNarratorRuntimeBusy(narratorId)) {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
 	}
-	const latest = await findLatestTopLevelMessage(narratorId);
+	const observation = new SubagentRecoveryObservation(input);
+	const latest = await findLatestTopLevelMessage(narratorId, observation);
 	if (!latest || latest.role !== "assistant") return { recovering: false, items: [] };
 
-	const toolCalls = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.messageId, latest.messageId),
-		),
-		columns: {
-			id: true,
-			toolUseId: true,
-			toolName: true,
-			status: true,
-			inputJson: true,
-			outputJson: true,
-			messageId: true,
-		},
-	});
+	const toolCalls = await observation.all((store) =>
+		store.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.messageId, latest.messageId),
+			),
+			columns: {
+				id: true,
+				toolUseId: true,
+				toolName: true,
+				status: true,
+				inputJson: true,
+				outputJson: true,
+				messageId: true,
+			},
+			limit: 1_001,
+		}),
+	);
 	if (toolCalls.length === 0) return { recovering: false, items: [] };
 
 	const agentToolUseIds = toolCalls
 		.filter((tc) => tc.toolName === "Agent")
 		.map((tc) => tc.toolUseId);
-	const subagentByOrigin = await loadSubagentsByOriginToolUse(agentToolUseIds);
+	const subagentByOrigin = await loadSubagentsByOriginToolUse(agentToolUseIds, observation);
 	const candidates = selectRecoverableToolCalls(toolCalls, subagentByOrigin);
 	if (candidates.length === 0) return { recovering: false, items: [] };
 
 	// Indexed once: a linear scan per candidate is O(candidates × toolCalls) over rows
 	// that carry recorded tool input.
 	const toolCallsById = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall]));
+	runAtomicWrite(db, "subagent-recovery.resetTools", (tx) => {
+		observation.assert(tx);
+		for (const candidate of candidates) {
+			tx.update(narratorToolCalls)
+				.set(TOOL_CALL_RESET_FIELDS)
+				.where(eq(narratorToolCalls.id, candidate.toolCallId))
+				.run();
+		}
+	});
 
 	// Re-arm each row so buildHistory does not treat the stale result as final.
 	// Broadcasting tool_started puts the card back into its running visual state.
 	for (const candidate of candidates) {
-		await db
-			.update(narratorToolCalls)
-			.set(TOOL_CALL_RESET_FIELDS)
-			.where(eq(narratorToolCalls.id, candidate.toolCallId));
 		const source = toolCallsById.get(candidate.toolCallId);
 		queueContextCharacterRefresh(narratorId, source?.messageId);
 		broadcastToNarrator(narratorId, {
@@ -736,44 +797,51 @@ async function settleUnfinishedCandidates(
 	candidates: RecoverableToolCall[],
 ): Promise<void> {
 	if (candidates.length === 0) return;
-	let rows: Array<{ id: string; toolUseId: string; status: string; messageId: string | null }>;
+	let rows: Array<Pick<typeof narratorToolCalls.$inferSelect, keyof typeof RESTART_TOOL_COLUMNS>>;
 	try {
-		rows = await db
-			.select({
-				id: narratorToolCalls.id,
-				toolUseId: narratorToolCalls.toolUseId,
-				status: narratorToolCalls.status,
-				messageId: narratorToolCalls.messageId,
-			})
-			.from(narratorToolCalls)
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					candidates.map((candidate) => candidate.toolCallId),
-				),
-			);
+		const observation = new SubagentRecoveryObservation();
+		rows = await observation.ids(
+			candidates.map((candidate) => candidate.toolCallId),
+			(store, ids) =>
+				store
+					.select(RESTART_TOOL_COLUMNS)
+					.from(narratorToolCalls)
+					.where(inArray(narratorToolCalls.id, ids)),
+		);
 	} catch (err) {
 		logger.error("Could not verify recovered tool results before continuing", {
 			narratorId,
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return;
+		throw err;
 	}
 
 	for (const row of rows) {
 		if (!NON_TERMINAL_TOOL_CALL_STATUSES.has(row.status)) continue;
+		const guard = new SubagentRecoveryObservation();
+		guard.observe(
+			(store) =>
+				store
+					.select(RESTART_TOOL_COLUMNS)
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.id, row.id))
+					.limit(1),
+			[row],
+		);
 		const errorMessage = "Recovery failed: the result of this tool call could not be persisted.";
 		logger.warn("Forcing a terminal result onto an unsettled recovered tool call", {
 			narratorId,
 			toolUseId: row.toolUseId,
 			status: row.status,
 		});
-		await narratorService
-			.updateToolCallResult(
+		await narratorPersistence
+			.updateToolCallResultIfActive(
 				row.toolUseId,
 				{ output: errorMessage, status: "fail", errorMessage, completedAt: Date.now() },
 				row.messageId ?? undefined,
 				row.id,
+				undefined,
+				(tx) => guard.assert(tx),
 			)
 			.catch((err) => {
 				// Nothing else can be done here; startup recovery fails leftover rows on boot.
@@ -782,6 +850,7 @@ async function settleUnfinishedCandidates(
 					toolUseId: row.toolUseId,
 					error: err instanceof Error ? err.message : String(err),
 				});
+				throw err;
 			});
 	}
 }
@@ -821,22 +890,19 @@ async function driveRecoveryCandidate(
 			return;
 		}
 
-		const [
-			{ awaitAgentResultDetailed },
-			{ buildRecoveredAwaitToolOutput },
-			{ DEFAULT_AWAIT_TIMEOUT_MS },
-		] = await Promise.all([
-			import("./agent-communication"),
-			import("./update-recovery-service"),
-			import("../lib/agent/tools/await"),
-		]);
-		const result = await awaitAgentResultDetailed({
-			callerNarratorId: narratorId,
+		// Close a legacy Await slot with an observation receipt, never a hidden waiter.
+		const result = await registerRecoveryAgentWatch({
+			narratorId,
 			id: candidate.targetId,
-			timeoutMs: DEFAULT_AWAIT_TIMEOUT_MS,
+			toolUseId: candidate.toolUseId,
+			userId: input.userId,
 			signal,
 		});
-		output = buildRecoveredAwaitToolOutput(candidate.targetId, result);
+		output = result.metadata ? { _text: result.output, _metadata: result.metadata } : result.output;
+		if (result.isError) {
+			status = "fail";
+			errorMessage = result.output;
+		}
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		status = "fail";
@@ -886,11 +952,18 @@ export interface SubagentRecoveryCardEntry extends RecoveryCardCandidate {}
  * Insert the UI-only recovery card listing error subagents that Path A does not
  * cover. Fire-and-forget from `updateStatus`; never throws into the caller.
  */
-export async function persistSubagentRecoveryCard(narratorId: string): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, variant: true, turnStartedAt: true },
-	});
+export async function persistSubagentRecoveryCard(
+	narratorId: string,
+	options: RecoveryReadOptions = {},
+): Promise<boolean> {
+	const observation = new SubagentRecoveryObservation(options);
+	const narrator = await observation.first((store) =>
+		store.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, variant: true, turnStartedAt: true },
+			limit: 1,
+		}),
+	);
 	if (!narrator || isSubagentVariant(narrator.variant)) return false;
 
 	const turnStartedAtMs = narrator.turnStartedAt ? Date.parse(narrator.turnStartedAt) : Number.NaN;
@@ -903,48 +976,57 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 	// only ever be too generous, never too strict (any row whose real failure time is
 	// within the cutoff necessarily has `updatedAt >= cutoff`). The precise decision is
 	// made in-memory by recoveryFailureTimeMs, which prefers the substatus timing tag.
-	const rows = await db.query.narrators.findMany({
-		where: and(
-			eq(narrators.parentNarratorId, narratorId),
-			eq(narrators.status, "idle"),
-			gte(narrators.updatedAt, new Date(cutoffMs).toISOString()),
-		),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			isBackground: true,
-			title: true,
-			subagentType: true,
-			variant: true,
-			errorMessage: true,
-			traits: true,
-			createdAt: true,
-			updatedAt: true,
-			backgroundCompletedAt: true,
-			backgroundStatus: true,
-		},
-		orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
-		limit: 50,
-	});
+	const rows = await observation.all(
+		(store) =>
+			store.query.narrators.findMany({
+				where: and(
+					eq(narrators.parentNarratorId, narratorId),
+					eq(narrators.status, "idle"),
+					gte(narrators.updatedAt, new Date(cutoffMs).toISOString()),
+				),
+				columns: {
+					id: true,
+					status: true,
+					substatus: true,
+					isBackground: true,
+					title: true,
+					subagentType: true,
+					variant: true,
+					errorMessage: true,
+					traits: true,
+					createdAt: true,
+					backgroundCompletedAt: true,
+					backgroundStatus: true,
+				},
+				orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
+				limit: 50,
+			}),
+		50,
+	);
 	if (rows.length === 0) return false;
 
-	const latest = await findLatestTopLevelMessage(narratorId);
+	const latest = await findLatestTopLevelMessage(narratorId, observation);
 	const latestTurnToolUseIds = new Set<string>();
 	if (latest?.role === "assistant") {
-		const latestAgentCalls = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.messageId, latest.messageId),
-				eq(narratorToolCalls.toolName, "Agent"),
-			),
-			columns: { toolUseId: true },
-		});
+		const latestAgentCalls = await observation.all((store) =>
+			store.query.narratorToolCalls.findMany({
+				where: and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.messageId, latest.messageId),
+					eq(narratorToolCalls.toolName, "Agent"),
+				),
+				columns: { toolUseId: true },
+				limit: 1_001,
+			}),
+		);
 		for (const call of latestAgentCalls) latestTurnToolUseIds.add(call.toolUseId);
 	}
 
 	const subagentRows = rows.filter((row) => isSubagentVariant(row.variant));
-	const origins = await resolveOriginToolUseIds(subagentRows.map((row) => row.id));
+	const origins = await resolveOriginToolUseIds(
+		subagentRows.map((row) => row.id),
+		observation,
+	);
 	const withOrigin: RecoveryCardSubagentInput[] = subagentRows.map((row) => ({
 		...row,
 		originToolUseId: origins.get(row.id) ?? null,
@@ -961,6 +1043,7 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 		narratorId,
 		`[Subagent recovery] ${candidates.length} subagent(s) stopped with an error.`,
 		[{ type: "subagent_recovery", status: "pending", subagents: candidates }],
+		(tx) => observation.assert(tx),
 	);
 	// Watermark AFTER the card exists, so a failed insert leaves the offer open.
 	// Without this, the next narrator error rebuilds the very same card and the user
@@ -970,6 +1053,7 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 			const row = byId.get(candidate.id);
 			return { id: candidate.id, failedAtMs: row ? recoveryFailureTimeMs(row) : null };
 		}),
+		options,
 	);
 	return true;
 }
@@ -1005,6 +1089,7 @@ export function buildRecoveryOfferedUpdate(
  */
 export async function markRecoveryOffered(
 	entries: Array<{ id: string; failedAtMs: number | null }>,
+	options: RecoveryReadOptions = {},
 ): Promise<void> {
 	const wanted = new Map<string, number>();
 	for (const entry of entries) {
@@ -1013,21 +1098,22 @@ export async function markRecoveryOffered(
 	}
 	if (wanted.size === 0) return;
 
-	let existing: Array<{ id: string; traits: unknown }>;
-	try {
-		existing = await db.query.narrators.findMany({
-			where: inArray(narrators.id, [...wanted.keys()]),
-			columns: { id: true, traits: true },
-		});
-	} catch (err) {
-		logger.warn("Failed to read traits before watermarking offered recovery subagents", {
-			count: wanted.size,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return;
+	const existing: Array<{ id: string; traits: unknown }> = [];
+	const ids = [...wanted.keys()];
+	for (let offset = 0; offset < ids.length; offset += 100) {
+		existing.push(
+			...(await readQuery(
+				db
+					.select({ id: narrators.id, traits: narrators.traits })
+					.from(narrators)
+					.where(inArray(narrators.id, ids.slice(offset, offset + 100))),
+				recoveryReadOptions(options),
+			)),
+		);
 	}
 
 	for (const row of existing) {
+		options.signal?.throwIfAborted();
 		const failedAtMs = wanted.get(row.id);
 		if (failedAtMs == null) continue;
 		// Already watermarked at (or past) this failure — nothing to write.
@@ -1035,19 +1121,31 @@ export async function markRecoveryOffered(
 		if (offeredAtMs != null && offeredAtMs >= failedAtMs) continue;
 		try {
 			await narratorTraitsLock.acquire(row.id, async () => {
-				// Re-read INSIDE the lock: the batched read above may be stale by now, and
-				// writing from it would clobber whatever landed in between.
-				const current = await db.query.narrators.findFirst({
-					where: eq(narrators.id, row.id),
-					columns: { traits: true },
+				options.signal?.throwIfAborted();
+				if (options.deadlineAt !== undefined && options.deadlineAt <= Date.now()) {
+					throw new DbReadError("DB_READ_TASK_TIMEOUT", "Recovery watermark deadline exceeded");
+				}
+				runAtomicWrite(db, "subagent-recovery.markOffered", (tx) => {
+					const current = tx
+						.select({ traits: narrators.traits })
+						.from(narrators)
+						.where(eq(narrators.id, row.id))
+						.get();
+					if (!current) return;
+					const offeredAt = parseRecoveryOfferedAtMs(current.traits);
+					if (offeredAt !== null && offeredAt >= failedAtMs) return;
+					tx.update(narrators)
+						.set(buildRecoveryOfferedUpdate(current.traits, failedAtMs))
+						.where(eq(narrators.id, row.id))
+						.run();
 				});
-				if (!current) return;
-				await db
-					.update(narrators)
-					.set(buildRecoveryOfferedUpdate(current.traits, failedAtMs))
-					.where(eq(narrators.id, row.id));
 			});
 		} catch (err) {
+			if (
+				options.signal?.aborted ||
+				(options.deadlineAt !== undefined && options.deadlineAt <= Date.now())
+			)
+				throw err;
 			logger.warn("Failed to watermark an offered recovery subagent", {
 				subagentId: row.id,
 				error: err instanceof Error ? err.message : String(err),
@@ -1059,6 +1157,7 @@ export async function markRecoveryOffered(
 export interface ResumeRecoverySubagentsResult {
 	resumed: string[];
 	skipped: Array<{ id: string; reason: string }>;
+	conflict?: RuntimeReadConflictError;
 }
 
 /**
@@ -1072,40 +1171,66 @@ async function clearBackgroundRunningClaim(
 	subagentId: string,
 	parentNarratorId: string,
 	reason: string,
+	expectedRunId: string | null,
+	options: RecoveryReadOptions,
 ): Promise<void> {
-	// Creation can throw after INSERT (e.g. while broadcasting). Check ownership
-	// before compensating: an id conflict with another task must leave it untouched.
-	try {
-		const { getExecutionOwner } = await import("./agent-runtime/ownership");
-		// A manual continuation may have won the session while this batch prepared
-		// its row. Never withdraw the claim of that live run.
-		if (getExecutionOwner(subagentId)) return;
-		const task = await db.query.backgroundTasks.findFirst({
-			where: and(
-				eq(backgroundTasks.id, subagentId),
-				eq(backgroundTasks.type, "agent"),
-				eq(backgroundTasks.parentNarratorId, parentNarratorId),
-				eq(backgroundTasks.subagentNarratorId, subagentId),
-			),
-			columns: { id: true },
-		});
-		// Await reads background_tasks first: clearing only the narrator flag leaves
-		// a durable running task with no runner and can hold an await batch open.
-		if (task) await backgroundTaskService.markFailed(subagentId, reason);
-	} catch (err) {
-		logger.error("Failed to settle an unstarted recovery task", { subagentId, error: String(err) });
-	}
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ backgroundStatus: "failed", backgroundCompletedAt: now, updatedAt: now })
-		.where(and(eq(narrators.id, subagentId), eq(narrators.backgroundStatus, "running")))
-		.catch((err) => {
-			logger.error("Failed to clear the background claim of an unstarted subagent", {
-				subagentId,
-				error: err instanceof Error ? err.message : String(err),
+	await withNarratorStartAdmission(subagentId, async () => {
+		if (!expectedRunId || getExecutionOwner(subagentId)) return;
+		const observation = new SubagentRecoveryObservation(options);
+		const narrator = await observation.first((store) =>
+			store.query.narrators.findMany({
+				where: eq(narrators.id, subagentId),
+				columns: {
+					...RUNTIME_SOURCE_COLUMNS,
+					id: true,
+					logicalRunId: true,
+					backgroundStatus: true,
+				},
+				limit: 1,
+			}),
+		);
+		if (
+			!narrator ||
+			narrator.logicalRunId !== expectedRunId ||
+			controllerOf(narrator)?.narratorId !== parentNarratorId
+		)
+			throw new RuntimeReadConflictError();
+		const task = await readQueryFirst(
+			db
+				.select({
+					...AGENT_TASK_OBSERVATION_COLUMNS,
+					alias: backgroundTasks.alias,
+					toolCallId: backgroundTasks.toolCallId,
+					executionAttempt: backgroundTasks.executionAttempt,
+					command: backgroundTasks.command,
+					backgroundKind: backgroundTasks.backgroundKind,
+				})
+				.from(backgroundTasks)
+				.where(
+					and(
+						eq(backgroundTasks.id, subagentId),
+						eq(backgroundTasks.type, "agent"),
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						eq(backgroundTasks.subagentNarratorId, subagentId),
+					),
+				)
+				.limit(1),
+			recoveryReadOptions(options),
+		);
+		if (task && task.logicalRunId !== expectedRunId) throw new RuntimeReadConflictError();
+		if (task?.status === "running")
+			await backgroundTaskService.markFailed(subagentId, reason, undefined, undefined, {
+				expectedRestartTask: task,
 			});
+		const now = new Date().toISOString();
+		runAtomicWrite(db, "subagent-recovery.clearClaim", (tx) => {
+			observation.assert(tx);
+			tx.update(narrators)
+				.set({ backgroundStatus: "failed", backgroundCompletedAt: now, updatedAt: now })
+				.where(and(eq(narrators.id, subagentId), eq(narrators.backgroundStatus, "running")))
+				.run();
 		});
+	});
 	backgroundOccupancyStore.refreshNarrator(subagentId);
 }
 
@@ -1115,35 +1240,53 @@ async function clearBackgroundRunningClaim(
  * A foreground subagent is marked background explicitly, the same way a detached
  * run is (`controlRun` "detach" in agent-runtime/run.ts).
  */
-export async function resumeRecoverySubagents(input: {
-	narratorId: string;
-	subagentIds: string[];
-	locale: Locale;
-	userId?: string | null;
-}): Promise<ResumeRecoverySubagentsResult> {
+export async function resumeRecoverySubagents(
+	input: {
+		narratorId: string;
+		subagentIds: string[];
+		locale: Locale;
+		userId?: string | null;
+	} & RecoveryReadOptions,
+): Promise<ResumeRecoverySubagentsResult> {
 	return recoveryLock.acquire(input.narratorId, async () => {
 		const resumed: string[] = [];
 		const skipped: Array<{ id: string; reason: string }> = [];
+		const readBudget = {
+			signal: input.signal,
+			deadlineAt: input.deadlineAt,
+			timeoutMs: input.timeoutMs,
+		};
+		if (!input.subagentIds.length) return { resumed, skipped };
+		const reads = new SubagentRecoveryObservation(input);
+		const [parent, subagents, tasks] = await Promise.all([
+			reads.first((store) =>
+				store.query.narrators.findMany({
+					where: eq(narrators.id, input.narratorId),
+					columns: { id: true, turnStartedAt: true },
+					limit: 1,
+				}),
+			),
+			reads.ids(input.subagentIds, (store, batch) =>
+				store.query.narrators.findMany({
+					where: inArray(narrators.id, batch),
+					columns: RESUME_SUBAGENT_COLUMNS,
+				}),
+			),
+			reads.ids(input.subagentIds, (store, batch) =>
+				store
+					.select({ ...AGENT_TASK_OBSERVATION_COLUMNS, createdAt: backgroundTasks.createdAt })
+					.from(backgroundTasks)
+					.where(inArray(backgroundTasks.id, batch)),
+			),
+		]);
+		const byId = new Map(subagents.map((row) => [row.id, row]));
+		const tasksById = new Map(tasks.map((row) => [row.id, row]));
 
-		for (const subagentId of new Set(input.subagentIds)) {
-			let taskClaimed = false;
+		const selectedIds = [...new Set(input.subagentIds)];
+		for (const [index, subagentId] of selectedIds.entries()) {
+			let claimedRunId: string | null = null;
 			try {
-				const subagent = await db.query.narrators.findFirst({
-					where: eq(narrators.id, subagentId),
-					columns: {
-						...RUNTIME_SOURCE_COLUMNS,
-						id: true,
-						status: true,
-						substatus: true,
-						createdAt: true,
-						backgroundStatus: true,
-						backgroundCompletedAt: true,
-						isBackground: true,
-						title: true,
-						subagentType: true,
-						traits: true,
-					},
-				});
+				const subagent = byId.get(subagentId);
 				if (!subagent || controllerOf(subagent)?.narratorId !== input.narratorId) {
 					skipped.push({ id: subagentId, reason: "not_controlled" });
 					continue;
@@ -1158,12 +1301,6 @@ export async function resumeRecoverySubagents(input: {
 					skipped.push({ id: subagentId, reason: "no_longer_failed" });
 					continue;
 				}
-				// Re-read the parent's latest turn for each item. A saved card or an
-				// earlier item in this batch must not authorize work from an older turn.
-				const parent = await db.query.narrators.findFirst({
-					where: eq(narrators.id, input.narratorId),
-					columns: { turnStartedAt: true },
-				});
 				const turnStartedAtMs = Date.parse(parent?.turnStartedAt ?? "");
 				if (recoveryFailureTimeInTurn(subagent, turnStartedAtMs) == null) {
 					skipped.push({ id: subagentId, reason: "failure_outside_latest_turn" });
@@ -1189,23 +1326,30 @@ export async function resumeRecoverySubagents(input: {
 					input.narratorId,
 					subagentId,
 					title,
+					readBudget,
 				);
 				// b) durable background task row (idempotent restart when it exists).
-				// The service can fail after INSERT, so compensate that path too.
-				taskClaimed = true;
 				const task = await backgroundTaskService.createAgentTask({
 					id: subagentId,
 					subagentNarratorId: subagentId,
 					subagentType,
 					alias,
 					title,
+					subagentRecovery: subagent,
+					parentRecoveryTurn: parent,
+					readOptions: readBudget,
+					observedTask: tasksById.get(subagentId) ?? null,
+					onRegistered: (logicalRunId) => {
+						claimedRunId = logicalRunId;
+					},
 					binding: {
 						deliverTo,
 						principal: { userId: input.userId ?? null },
 					},
 				});
+				claimedRunId = task.logicalRunId;
 				// c) mark the narrator itself as background, the same way a detached run is.
-				await backgroundTaskService.markNarratorRunning(subagentId);
+				await backgroundTaskService.markNarratorRunning(subagentId, input);
 
 				// d) continue the task's run. Its result lands on the task (the historical
 				//    Agent tool_result stays untouched), exactly like any detached run.
@@ -1215,10 +1359,22 @@ export async function resumeRecoverySubagents(input: {
 					input.locale,
 					false,
 					input.userId ?? null,
-					{ resumeRunId: task.logicalRunId ?? undefined, recovered: true },
+					{
+						resumeRunId: task.logicalRunId ?? undefined,
+						recovered: true,
+						recoveryObservation: task.recoveryObservation,
+						parentRecoveryTurn: parent,
+						cancelSignal: input.signal,
+					},
 				);
 				if (!started.ok) {
-					await clearBackgroundRunningClaim(subagentId, input.narratorId, "resume_not_started");
+					await clearBackgroundRunningClaim(
+						subagentId,
+						input.narratorId,
+						"resume_not_started",
+						claimedRunId,
+						input,
+					);
 					skipped.push({ id: subagentId, reason: "resume_not_started" });
 					continue;
 				}
@@ -1231,7 +1387,27 @@ export async function resumeRecoverySubagents(input: {
 				resumed.push(alias);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				if (taskClaimed) await clearBackgroundRunningClaim(subagentId, input.narratorId, message);
+				let conflict = err instanceof RuntimeReadConflictError ? err : undefined;
+				if (claimedRunId) {
+					try {
+						await clearBackgroundRunningClaim(
+							subagentId,
+							input.narratorId,
+							message,
+							claimedRunId,
+							input,
+						);
+					} catch (cleanupError) {
+						if (!(cleanupError instanceof RuntimeReadConflictError)) throw cleanupError;
+						conflict = cleanupError;
+					}
+				}
+				if (conflict) {
+					if (!resumed.length) throw conflict;
+					const reason = conflict.code;
+					skipped.push(...selectedIds.slice(index).map((id) => ({ id, reason })));
+					return { resumed, skipped, conflict };
+				}
 				logger.warn("Failed to resume recovery subagent", { subagentId, error: message });
 				skipped.push({ id: subagentId, reason: message });
 			}
@@ -1242,14 +1418,16 @@ export async function resumeRecoverySubagents(input: {
 }
 
 /** Flip the card block to its resolved state and push the update to clients. */
-export async function markRecoveryCardResolved(input: {
-	narratorId: string;
-	messageId: string;
-	mode: "notify" | "await";
-	resumedAliases: string[];
-	/** Failed starts stay actionable; successful starts must not be restarted twice. */
-	retrySubagentIds?: string[];
-}): Promise<void> {
+export async function markRecoveryCardResolved(
+	input: {
+		narratorId: string;
+		messageId: string;
+		mode: "notify" | "watch";
+		resumedAliases: string[];
+		/** Failed starts stay actionable; successful starts must not be restarted twice. */
+		retrySubagentIds?: string[];
+	} & RecoveryReadOptions,
+): Promise<void> {
 	const retryIds = new Set(input.retrySubagentIds ?? []);
 	// Card state: the card's model text is its content text (§5.4).
 	const written = narratorStore.patchState(input.messageId, (blocks) => {
@@ -1273,15 +1451,20 @@ export async function markRecoveryCardResolved(input: {
 		return blocks;
 	});
 	if (!written) return;
-	sqlite
-		.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
-		.run(input.narratorId);
+	db.update(narrators)
+		.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+		.where(eq(narrators.id, input.narratorId))
+		.run();
 
 	const updated = fillBody(
-		await db.query.narratorMessages.findFirst({
-			...bodyColumns(),
-			where: eq(narratorMessages.id, input.messageId),
-		}),
+		await readQueryFirst(
+			db.query.narratorMessages.findMany({
+				...bodyColumns(),
+				where: eq(narratorMessages.id, input.messageId),
+				limit: 1,
+			}),
+			recoveryReadOptions(input),
+		),
 	);
 	if (!updated) return;
 	broadcastToNarrator(input.narratorId, {
@@ -1291,50 +1474,109 @@ export async function markRecoveryCardResolved(input: {
 	});
 }
 
+/** Recovery registers an observation under the same live capability ceiling as tools. */
+export async function registerRecoveryAgentWatch(input: {
+	narratorId: string;
+	id: string;
+	toolUseId: string;
+	signal: AbortSignal;
+	userId?: string | null;
+	timeout?: number;
+	deadlineAt?: number;
+	timeoutMs?: number;
+}) {
+	const [{ watchTool }, { resolveNarratorRuntimePolicy }, { isRuntimeToolAllowed }] =
+		await Promise.all([
+			import("../lib/agent/tools/watch"),
+			import("./trait-layer-service"),
+			import("./agent-runtime/policy"),
+		]);
+	const owner = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, input.narratorId),
+			columns: { ...RUNTIME_SOURCE_COLUMNS, ownerUserId: true, cwd: true },
+			limit: 1,
+		}),
+		recoveryReadOptions(input),
+	);
+	if (!owner) throw new ValidationError("Recovery narrator no longer exists");
+	const userId = input.userId !== undefined ? input.userId : executionPrincipalOf(owner)?.userId;
+	if (userId === undefined)
+		throw new Error("Recovery observation requires a registered execution principal");
+	const policy = await resolveNarratorRuntimePolicy(input.narratorId, userId);
+	const recheckAuthorization = async () => {
+		const current = await resolveNarratorRuntimePolicy(input.narratorId, userId);
+		if (!isRuntimeToolAllowed(current, "Watch") || !current.capabilities.watchAgent)
+			throw new Error("Watch(agent) is unavailable under the current runtime policy");
+	};
+	await recheckAuthorization();
+	return watchTool.execute(
+		{
+			type: "agent",
+			id: input.id,
+			...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
+		},
+		{
+			narratorId: input.narratorId,
+			currentToolUseId: input.toolUseId,
+			cwd: owner.cwd ?? ".",
+			locale: "en",
+			signal: input.signal,
+			userId,
+			runtimePolicy: policy,
+			recheckAuthorization,
+			requestPermission: async () => ({
+				behavior: "deny",
+				message: "Recovery requires existing authority",
+			}),
+		},
+	);
+}
+
 export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): string {
 	const lines = entries.map((entry) => `- ${entry.alias}`).join("\n");
 	return (
 		"[System] The following background agents were restarted after a narrator error:\n" +
 		`${lines}\n` +
-		'Use Await({ type: "agent", id: "<alias>" }) to collect each result before continuing.'
+		"Results notify automatically. Continue unrelated work, or end the turn if the restarted work blocks the next step. Watch can register a non-blocking observation."
 	);
 }
 
 /**
- * "Resume and wait": synthesize one assistant turn holding N `Await` tool_use
- * blocks, run them server-side, then continue ONCE so the model sees every
- * result in a single request.
+ * "Resume and watch": register one non-blocking observation per restarted agent.
+ * The synthetic Watch calls finish at registration; notifications resume the parent.
  */
-export function startRecoveryAwaitBatch(
-	input: Parameters<typeof startRecoveryAwaitBatchUnlocked>[0],
+export function startRecoveryWatchBatch(
+	input: Parameters<typeof startRecoveryWatchBatchUnlocked>[0],
 ): Promise<{ messageId: string; toolUseIds: string[] }> {
 	const acceptedInput = {
 		...input,
 		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
 	};
 	return withNarratorStartAdmission(input.narratorId, () =>
-		startRecoveryAwaitBatchUnlocked(acceptedInput),
+		startRecoveryWatchBatchUnlocked(acceptedInput),
 	);
 }
 
-async function startRecoveryAwaitBatchUnlocked(input: {
-	narratorId: string;
-	aliases: string[];
-	locale: Locale;
-	replyInUserLanguage: boolean;
-	userId?: string | null;
-	humanReplyContext?: ReplyContext;
-}): Promise<{ messageId: string; toolUseIds: string[] }> {
+async function startRecoveryWatchBatchUnlocked(
+	input: {
+		narratorId: string;
+		aliases: string[];
+		locale: Locale;
+		replyInUserLanguage: boolean;
+		userId?: string | null;
+		humanReplyContext?: ReplyContext;
+	} & RecoveryReadOptions,
+): Promise<{ messageId: string; toolUseIds: string[] }> {
 	if (getExecutionOwner(input.narratorId) || isNarratorRuntimeBusy(input.narratorId)) {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
 	}
 	if (input.aliases.length === 0) throw new ValidationError("No subagents were resumed");
-	const { DEFAULT_AWAIT_TIMEOUT_MS } = await import("../lib/agent/tools/await");
 	const blocks = input.aliases.map((alias) => ({
 		type: "tool_use",
 		id: `toolu_recover_${generateShortId()}`,
-		name: "Await",
-		input: { type: "agent", id: alias, timeout: DEFAULT_AWAIT_TIMEOUT_MS },
+		name: "Watch",
+		input: { type: "agent", id: alias },
 	}));
 
 	const message = await narratorService.persistAssistantMessage(input.narratorId, {
@@ -1348,7 +1590,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 			content: [
 				{
 					type: "text",
-					text: `Collecting results from ${input.aliases.length} restarted background agent(s).`,
+					text: `Registering observations for ${input.aliases.length} restarted background agent(s).`,
 				},
 				...blocks,
 			],
@@ -1356,11 +1598,15 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 	});
 
 	const persisted = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, message.id),
-			...bodyColumns(),
-			with: { toolCalls: true },
-		}),
+		await readQueryFirst(
+			db.query.narratorMessages.findMany({
+				where: eq(narratorMessages.id, message.id),
+				...bodyColumns(),
+				with: { toolCalls: true },
+				limit: 1,
+			}),
+			recoveryReadOptions(input),
+		),
 	);
 	const toolCallIdByUseId = new Map<string, string>();
 	for (const call of persisted?.toolCalls ?? []) {
@@ -1377,7 +1623,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 			narratorId: input.narratorId,
 			toolCallId: toolCallIdByUseId.get(block.id) ?? null,
 			toolUseId: block.id,
-			toolName: "Await",
+			toolName: "Watch",
 			input: block.input,
 		});
 	}
@@ -1387,11 +1633,8 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		setTurnStart: true,
 	});
 
-	// Same reasoning as the Path A stage: this batch runs with no activeNarrators entry,
-	// so a registered controller is the ONLY thing Interrupt can reach. Without it the
-	// user's interrupt does nothing and they sit through the full Await timeout.
-	// `foregroundSubagentIds` stays empty — these awaits own only the parent-side
-	// wait, and the resumed background agents should keep running.
+	// Protect the bounded registration stage from concurrent starts. This controller
+	// never owns the observed agents and is released once registration finishes.
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
 	const registration = registerPlannedUpdateRecoveryController(
@@ -1409,13 +1652,15 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		throw error;
 	}
 
-	void runRecoveryAwaitBatch(
+	await runRecoveryWatchBatch(
 		{
 			narratorId: input.narratorId,
 			messageId: message.id,
 			locale: input.locale,
 			replyInUserLanguage: input.replyInUserLanguage,
 			userId: input.userId,
+			deadlineAt: input.deadlineAt,
+			timeoutMs: input.timeoutMs,
 			entries: blocks.map((block, index) => ({
 				toolUseId: block.id,
 				toolCallId: toolCallIdByUseId.get(block.id) ?? null,
@@ -1425,7 +1670,7 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 		controller.signal,
 	)
 		.catch((err) => {
-			logger.error("Recovery await batch failed", {
+			logger.error("Recovery Watch registration failed", {
 				narratorId: input.narratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
@@ -1443,22 +1688,19 @@ async function startRecoveryAwaitBatchUnlocked(input: {
 	return { messageId: message.id, toolUseIds: blocks.map((block) => block.id) };
 }
 
-async function runRecoveryAwaitBatch(
+async function runRecoveryWatchBatch(
 	input: {
 		narratorId: string;
 		messageId: string;
 		locale: Locale;
 		replyInUserLanguage: boolean;
 		userId?: string | null;
+		deadlineAt?: number;
+		timeoutMs?: number;
 		entries: Array<{ toolUseId: string; toolCallId: string | null; alias: string }>;
 	},
 	signal: AbortSignal,
 ): Promise<void> {
-	const [{ awaitAgentResultDetailed }, { buildRecoveredAwaitToolOutput }] = await Promise.all([
-		import("./agent-communication"),
-		import("./update-recovery-service"),
-	]);
-
 	try {
 		await Promise.all(
 			input.entries.map(async (entry, index) => {
@@ -1466,19 +1708,26 @@ async function runRecoveryAwaitBatch(
 				let status: "success" | "fail" = "success";
 				let errorMessage: string | undefined;
 				try {
-					// The caller's registered signal, not a throwaway controller: an interrupt has
-					// to be able to release this wait. Every branch still writes a terminal result
-					// below, so an aborted await cannot leave a tool_use without a tool_result.
-					const result = await awaitAgentResultDetailed({
-						callerNarratorId: input.narratorId,
+					const result = await registerRecoveryAgentWatch({
+						narratorId: input.narratorId,
 						id: entry.alias,
+						toolUseId: entry.toolUseId,
+						userId: input.userId,
+						deadlineAt: input.deadlineAt,
+						timeoutMs: input.timeoutMs,
 						signal,
 					});
-					output = buildRecoveredAwaitToolOutput(entry.alias, result);
+					output = result.metadata
+						? { _text: result.output, _metadata: result.metadata }
+						: result.output;
+					if (result.isError) {
+						status = "fail";
+						errorMessage = result.output;
+					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					status = "fail";
-					errorMessage = `Await failed: ${message}`;
+					errorMessage = `Watch registration failed: ${message}`;
 					output = errorMessage;
 				}
 				await narratorService
@@ -1507,34 +1756,16 @@ async function runRecoveryAwaitBatch(
 					narratorId: input.narratorId,
 					toolCallId: entry.toolCallId,
 					toolUseId: entry.toolUseId,
-					toolName: "Await",
+					toolName: "Watch",
 					status,
 					output,
 				});
 			}),
 		);
 	} finally {
-		const { continueNarrator } = await import("./narrator-session");
-		const continued = await continueNarrator(
-			input.narratorId,
-			input.locale,
-			input.replyInUserLanguage,
-			input.userId,
-		).catch((err) => {
-			logger.error("continueNarrator after recovery await batch failed", {
-				narratorId: input.narratorId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-			return { ok: false };
-		});
-		if (!continued.ok) {
-			await narratorService
-				.updateStatus(input.narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: "Recovery awaits finished but the narrator could not be continued.",
-				})
-				.catch(() => {});
-		}
+		// Registration is finished, not the observed work. Release the parent now;
+		// the normal completion/mailbox path will resume it when a result arrives.
+		await narratorService.updateStatus(input.narratorId, "idle", { substatus: [] });
 	}
 }
 

@@ -12,6 +12,12 @@ import type { RuntimePolicyTrait } from "@server/lib/runtime-policy-trait";
  * with the same traits behave the same, however they were created.
  */
 export interface RuntimePolicy {
+	/**
+	 * Delegation levels below a primary narrator: 0 for a narrator that declares none, 1 for a
+	 * primary's subagent, 2 for a subagent's subagent. At {@link MAX_DELEGATION_DEPTH} the
+	 * ceiling never allows spawning or awaiting agents.
+	 */
+	readonly delegationDepth: number;
 	/** Search tools may only call the selected provider directly, never the channel router. */
 	readonly searchOnly: boolean;
 	/** Shell may only run the constrained local read-only Git policy. */
@@ -29,10 +35,8 @@ export interface RuntimePolicy {
 	};
 	readonly capabilities: {
 		readonly spawnAgent: boolean;
-		readonly awaitAgent: boolean;
+		readonly watchAgent: boolean;
 		readonly askUserQuestion: "sync-or-async" | "disabled";
-		/** Waiting on an existing own question does not grant permission to create one. */
-		readonly awaitOwnQuestion: boolean;
 		readonly planApproval: boolean;
 		readonly stopHooks: boolean;
 		readonly switchWorkingDirectory: boolean;
@@ -48,7 +52,7 @@ const READ_TOOLS = Object.freeze([
 	"WebFetch",
 	BASH_TOOL_NAME,
 	"TeamStatus",
-	"Await",
+	"Watch",
 	"Stop",
 	"Question",
 	"ContextAsk",
@@ -58,11 +62,121 @@ const READ_TOOLS = Object.freeze([
 	...OUTLINE_READ_TOOLS,
 ]);
 const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill", OUTLINE_EDIT_TOOL]);
+/** Tools that create or continue another agent; hidden wherever spawning is not allowed. */
+const SPAWN_TOOLS: readonly string[] = Object.freeze([
+	"Agent",
+	"Task",
+	"ContinueTask",
+	"ForkNarrator",
+]);
+/**
+ * Optional tools a delegation template may preload (`enabledTools` at creation), the way a
+ * knowledge steward gets its knowledge tools. Each still needs its template's ceiling to allow
+ * it, and its own permission prompts and caps (`agent-resource-caps.ts`) apply as for anyone.
+ */
+export const TERMINAL_TOOL = "Terminal";
+export const BROWSER_TOOL = "Browser";
+/**
+ * A worker does the `general` work, may hand parts of it to helpers it waits for, and runs
+ * long-lived things itself: an interactive terminal (dev server, REPL) and a browser.
+ */
+const WORKER_TOOLS = Object.freeze([...GENERAL_TOOLS, "Agent", TERMINAL_TOOL, BROWSER_TOOL]);
+/**
+ * Optional tools a read-only ceiling may still list. Browser is one: under a read-only ceiling
+ * the permission gate allows only its page-reading actions (`isBrowserReadAction`), so a
+ * reviewer can look at a page but never click, type, run scripts or write files with it.
+ */
+const READ_ONLY_OPTIONAL_TOOLS = Object.freeze([BROWSER_TOOL]);
+/** The tools a read-only ceiling narrows built-ins to. */
+const READ_ONLY_CEILING_TOOLS = Object.freeze([...READ_TOOLS, ...READ_ONLY_OPTIONAL_TOOLS]);
+
+/**
+ * Browser actions that only look at a page: open or move to a web URL, read it, capture it
+ * without writing a file, and close it. Clicking, typing, form filling, script evaluation,
+ * tracing and memory profiles (which write files and share links) are not reads. `hover` and
+ * `scroll` are kept as reads although they fire the page's own handlers (hover menus, lazy
+ * loading, infinite scroll): they are how a person looks at a page, and they submit nothing.
+ */
+const BROWSER_READ_ACTIONS: ReadonlySet<string> = new Set([
+	"launch",
+	"navigate",
+	"screenshot",
+	"get_text",
+	"get_attribute",
+	"get_console",
+	"get_network",
+	"network_start",
+	"network_stop",
+	"wait",
+	"scroll",
+	"hover",
+	"dom",
+	"close",
+	"set_ttl",
+	"set_viewport",
+	"list_sessions",
+]);
+
+/**
+ * Whether a URL is a web page a read-only reader may open: http(s) only, or `about:blank`.
+ * `data:` carries its own script, `file:` reads the host's files, and `chrome:`, `devtools:`,
+ * `view-source:` and `javascript:` reach the browser itself; none of them is looking at a page.
+ */
+export function isReadOnlyBrowserUrl(url: unknown): boolean {
+	if (typeof url !== "string") return false;
+	if (url.trim().toLowerCase() === "about:blank") return true;
+	try {
+		const protocol = new URL(url).protocol;
+		return protocol === "http:" || protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether a Browser call only reads pages. A screenshot saved to a file writes; a headed
+ * launch may open a tab in the person's own browser with their sign-ins; a launch or
+ * navigation to anything but a web URL (`isReadOnlyBrowserUrl`) is not looking at a page.
+ * `navigate` without a URL moves back or forward through pages already opened this way.
+ */
+export function isBrowserReadAction(input: Record<string, unknown>): boolean {
+	const action = typeof input.action === "string" ? input.action : "";
+	if (!BROWSER_READ_ACTIONS.has(action)) return false;
+	if (action === "screenshot" && input.file_path !== undefined) return false;
+	if (action === "launch" && (input.headless === false || !isReadOnlyBrowserUrl(input.url)))
+		return false;
+	if (action === "navigate" && input.url !== undefined && !isReadOnlyBrowserUrl(input.url))
+		return false;
+	return true;
+}
+
+/**
+ * The optional tools a template's subagent starts with loaded. Only what its ceiling (and the
+ * delegator's, `isRuntimeToolAllowed` on the merged policy) allows is kept by the caller.
+ */
+export function delegationPreloadTools(template: string): readonly string[] {
+	switch (template) {
+		case "worker":
+			return [TERMINAL_TOOL, BROWSER_TOOL];
+		case "review":
+			return [BROWSER_TOOL];
+		default:
+			return [];
+	}
+}
+
+/**
+ * Subagents nest at most this many levels below a primary narrator: a primary's subagent
+ * (level 1) may spawn and await its own helpers (level 2); a level-2 subagent never spawns.
+ * Every backstop (visibility here, creation in `narrator-service`, control in
+ * `narrator-control`) reads this one number.
+ */
+export const MAX_DELEGATION_DEPTH = 2;
 const SEARCH_TOOLS = Object.freeze([
 	"WebSearch",
 	"WebFetch",
 	"TeamStatus",
-	"Await",
+	"Watch",
 	"Question",
 	"ContextAsk",
 	"Send",
@@ -71,12 +185,19 @@ const SEARCH_TOOLS = Object.freeze([
 /** Delegated work coordinates through its delegator; it never orchestrates or asks the user. */
 const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
 	"spawnAgent",
-	"awaitAgent",
+	"watchAgent",
 	"askUserQuestion",
 	"planApproval",
 	"stopHooks",
 	"switchWorkingDirectory",
 ];
+/**
+ * A worker coordinates its own helpers (spawns, waits for and stops them) but, like every
+ * delegate, never asks the user, approves plans or leaves its delegator's directory.
+ */
+const WORKER_DENY: NonNullable<RuntimePolicyTrait["deny"]> = DELEGATED_DENY.filter(
+	(key) => key !== "spawnAgent" && key !== "watchAgent" && key !== "awaitAgent",
+);
 
 /**
  * A bot's ceiling, stored on it at creation. Nobody reads a bot's transcript, so
@@ -91,6 +212,7 @@ export const BOT_RUNTIME_CEILING: RuntimePolicyTrait = {
 /** Template names with a built-in ceiling; any other name is a custom definition. */
 export const BUILTIN_DELEGATION_TEMPLATES: ReadonlySet<string> = new Set([
 	"general",
+	"worker",
 	"explore",
 	"plan",
 	"review",
@@ -129,13 +251,17 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 	switch (input.template) {
 		case "general":
 			return { ...base, tools: builtin(GENERAL_TOOLS), mcp: "nonDenied" };
+		case "worker":
+			// Nesting is a template grant, never a loosening of the others: only a worker may
+			// spawn, and only while it sits above the deepest level (`withDelegationDepth`).
+			return { ...base, deny: [...WORKER_DENY], tools: builtin(WORKER_TOOLS), mcp: "nonDenied" };
 		case "search":
 			return { ...base, tools: [...SEARCH_TOOLS], mcp: "none", readOnly: true, searchOnly: true };
 		case "review":
-			// Review may inspect Git synchronously, never control running tasks.
+			// Review may inspect Git synchronously and look at pages, never control running tasks.
 			return {
 				...base,
-				tools: builtin(READ_TOOLS.filter((name) => name !== "Stop")),
+				tools: builtin([...READ_TOOLS.filter((name) => name !== "Stop"), BROWSER_TOOL]),
 				mcp: "readOnly",
 				readOnly: true,
 				readOnlyGitShell: true,
@@ -157,6 +283,24 @@ export function compileDelegationPolicy(input: DelegationTemplateInput): Runtime
 	return { ...base, tools: builtin(READ_TOOLS), mcp: "readOnly", readOnly: true };
 }
 
+/**
+ * Stamp a compiled ceiling with the level it is created at. At the deepest level the
+ * ceiling itself also removes spawning and agent waits, so the stored row says what the
+ * resolved policy enforces even when read without its source chain.
+ */
+export function withDelegationDepth(trait: RuntimePolicyTrait, depth: number): RuntimePolicyTrait {
+	const stamped: RuntimePolicyTrait = { ...trait, delegationDepth: depth };
+	if (depth < MAX_DELEGATION_DEPTH) return stamped;
+	const deny = new Set(trait.deny ?? []);
+	deny.add("spawnAgent");
+	deny.add("awaitAgent");
+	return {
+		...stamped,
+		deny: [...deny],
+		...(trait.tools ? { tools: trait.tools.filter((name) => !SPAWN_TOOLS.includes(name)) } : {}),
+	};
+}
+
 const MCP_RANK = { none: 0, readOnly: 1, nonDenied: 2 } as const;
 
 function intersect(current: "all" | string[], declared: readonly string[] | undefined) {
@@ -167,7 +311,7 @@ function intersect(current: "all" | string[], declared: readonly string[] | unde
 /**
  * Merge ceiling declarations from any number of layers. Every field only narrows,
  * so order does not matter. Read-only from any layer also narrows built-ins to the
- * read tools and MCP to read-only.
+ * read tools (plus Browser, gated to its read actions) and MCP to read-only.
  */
 export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]): RuntimePolicy {
 	let builtin: "all" | string[] = "all";
@@ -178,8 +322,10 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 	let readOnlyGitShell = false;
 	let promoteTodo = true;
 	let maxPasses: number | null = null;
+	let delegationDepth = 0;
 	const denied = new Set<string>();
 	for (const trait of declarations) {
+		delegationDepth = Math.max(delegationDepth, trait.delegationDepth ?? 0);
 		builtin = intersect(builtin, trait.tools);
 		mcpNames = intersect(mcpNames, trait.mcpNames);
 		if (trait.mcp && MCP_RANK[trait.mcp] < MCP_RANK[mcp]) mcp = trait.mcp;
@@ -192,11 +338,17 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		for (const key of trait.deny ?? []) denied.add(key);
 	}
 	if (readOnly) {
-		builtin = intersect(builtin, READ_TOOLS);
+		builtin = intersect(builtin, READ_ONLY_CEILING_TOOLS);
 		if (mcp === "nonDenied") mcp = "readOnly";
+	}
+	// The deepest level never orchestrates, whatever its template or any layer allows.
+	if (delegationDepth >= MAX_DELEGATION_DEPTH) {
+		denied.add("spawnAgent");
+		denied.add("awaitAgent");
 	}
 	const allowed = (key: string) => !denied.has(key);
 	return Object.freeze({
+		delegationDepth,
 		searchOnly,
 		readOnlyGitShell,
 		continuation: Object.freeze({ promoteTodo, maxPasses }),
@@ -208,9 +360,9 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		}),
 		capabilities: Object.freeze({
 			spawnAgent: allowed("spawnAgent"),
-			awaitAgent: allowed("awaitAgent"),
+			// Stored v1 ceilings keep their meaning; never rewrite old allowlists.
+			watchAgent: allowed("watchAgent") && allowed("awaitAgent"),
 			askUserQuestion: allowed("askUserQuestion") ? "sync-or-async" : "disabled",
-			awaitOwnQuestion: true,
 			planApproval: allowed("planApproval"),
 			stopHooks: allowed("stopHooks"),
 			switchWorkingDirectory: allowed("switchWorkingDirectory"),
@@ -246,9 +398,14 @@ export function isRuntimeToolAllowed(
 	mcpBehavior?: string | null,
 ): boolean {
 	const caps = policy.capabilities;
-	if (toolName === "Question") return caps.awaitOwnQuestion;
+	// Frozen provider declarations and stored allowlists never revive the retired tool.
+	if (toolName === "Await") return false;
+	if (toolName === "Question") return true;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
-	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)
+	if (
+		SPAWN_TOOLS.includes(toolName) &&
+		(!caps.spawnAgent || policy.delegationDepth >= MAX_DELEGATION_DEPTH)
+	)
 		return false;
 	if (["EnterPlanMode", "ExitPlanMode"].includes(toolName) && !caps.planApproval) return false;
 	if (toolName === "SwitchWorkingDirectory" && !caps.switchWorkingDirectory) return false;
@@ -260,30 +417,25 @@ export function isRuntimeToolAllowed(
 	return policy.tools.builtin === "all" || policy.tools.builtin.includes(toolName);
 }
 
-export type RuntimeAwaitTarget = "agent" | "bash" | "transfer" | "question";
-export function runtimeAwaitTargets(policy: RuntimePolicy): RuntimeAwaitTarget[] {
-	return [
-		...(policy.capabilities.awaitAgent ? ["agent" as const] : []),
-		"bash",
-		"transfer",
-		...(policy.capabilities.awaitOwnQuestion ? ["question" as const] : []),
-	];
+export type RuntimeWatchTarget = "terminal" | "bash" | "agent";
+export function runtimeWatchTargets(policy: RuntimePolicy): RuntimeWatchTarget[] {
+	return ["terminal", "bash", ...(policy.capabilities.watchAgent ? ["agent" as const] : [])];
 }
 
 /** Interaction instructions are a projection of the same finite capability policy. */
 export function runtimeInteractionHint(policy: RuntimePolicy, locale: string): string {
 	const lines: string[] = [];
-	if (!policy.capabilities.awaitAgent)
+	if (!policy.capabilities.watchAgent)
 		lines.push(
 			locale === "zh-CN"
-				? "不得使用 Await(agent) 等待其他代理。"
-				: "Do not use Await(agent) to wait for other agents.",
+				? "不得使用 Watch(agent) 观察其他代理；需要传递信息时使用异步 Send。"
+				: "Do not use Watch(agent) to observe other agents; use asynchronous Send to deliver information.",
 		);
 	if (policy.capabilities.askUserQuestion === "disabled")
 		lines.push(
 			locale === "zh-CN"
-				? "当前不可调用 AskUserQuestion 发起问题；Await(question) 仅可等待本会话已有的问题，不代表获得提问权限。"
-				: "AskUserQuestion is unavailable; Await(question) may only wait on this session's existing questions and does not grant permission to ask new ones.",
+				? "当前不可调用 AskUserQuestion 发起问题；可用 Question 查询本会话已有问题，回答会自动通知。"
+				: "AskUserQuestion is unavailable; use Question to inspect this session's existing questions. Answers notify automatically.",
 		);
 	return lines.join("\n");
 }

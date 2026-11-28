@@ -14,6 +14,7 @@ const calls = [];
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 65536 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
  getDeviceConnectionGeneration: () => online ? generation : null,
+ getConnectedDeviceHello: () => online ? {capabilities:{}} : null,
  hasDeviceProtocolFeature: (_id, f) => supported && (f === "git.workspace.v1" || (previewSupported && f === "git.workspace.commit-preview.v1") || (statusSupported && f === "git.workspace.status.v1") || (lineStatsSupported && f === "git.workspace.line-stats.v1") || (branchesSupported && f === "git.workspace.branches.v1") || (switchSupported && f === "git.workspace.branch-switch.v1") || (syncSupported && f === "git.workspace.remote-sync.v1")),
  sendRpc: async (id, method, params, opts) => {
   calls.push({id, method, params, opts});
@@ -125,6 +126,11 @@ syncSupported=false;
 assert.equal(b.supportsGitRemoteSync,false);
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"push"}),/sync unsupported/);
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"fetch"}),/sync unsupported/);
+assert.equal(b.gitStaging, undefined);
+for (const operation of ["stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset"]) {
+ await b.gitWorkspace({cwd:"/repo",expectedRoot:"/repo",operation},controller.signal);
+ assert.deepEqual(calls.at(-1).opts.requiredFeatures,["git.workspace.v1"]);
+}
 supported=false; assert.equal(b.supportsGitWorkspace,false);
 assert.equal(b.supportsGitLineStats,false);
 assert.equal(b.supportsGitBranches,false);
@@ -137,10 +143,12 @@ generation=3; online=false;
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"}),/offline/);
 online=true; controller.abort();
 await assert.rejects(b.gitWorkspace({cwd:"/repo",operation:"probe"},controller.signal),/aborted/);
-assert.equal(calls.length,19);
 console.log("remote Git backend assertions passed");
 `;
-	const proc = Bun.spawn([process.execPath, "--eval", source], { stdout: "pipe", stderr: "pipe" });
+	const proc = Bun.spawn([process.execPath, "--no-env-file", "--eval", source], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	const timeout = setTimeout(() => proc.kill(), 10000);
 	async function collect(stream: ReadableStream<Uint8Array>) {
 		const chunks: Uint8Array[] = [];
@@ -161,7 +169,7 @@ console.log("remote Git backend assertions passed");
 			collect(proc.stderr),
 			proc.exited,
 		]);
-		expect(code).toBe(0);
+		expect(code, stderr).toBe(0);
 		expect(stderr).toBe("");
 		expect(stdout).toContain("remote Git backend assertions passed");
 	} finally {

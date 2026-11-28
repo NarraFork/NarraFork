@@ -128,13 +128,272 @@ describe("codex credential transfer", () => {
 	});
 });
 
-describe("api key transfer", () => {
-	test("keys travel with their provider config and recreate it where it is missing", async () => {
-		const { KINDS } = await import("../credential-transfer/kinds");
+describe("unified credential transfer", () => {
+	test("NUG, singleton credentials and group secrets round-trip with fresh ids", async () => {
+		const { exportCredentialItems, matchCredentialItem, importCredentialItems } = await import(
+			"../credential-transfer/kinds"
+		);
 		const { getProviderKeyStore } = await import("../provider-keys");
 		const { saveSettings, settings } = await import("../settings");
-		const kind = KINDS.find((k) => k.kind === "api-key");
-		if (!kind) throw new Error("api-key kind missing");
+		const original = structuredClone(settings);
+		const store = getProviderKeyStore();
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [],
+				nugProviders: [
+					{
+						id: "nug-source",
+						name: "NUG",
+						prefix: "nug-source",
+						baseUrl: "https://nug.example",
+						defaultModel: "",
+						apiKey: "nug-secret",
+						oauthClientSecret: "oauth-secret",
+					},
+				],
+				tokendance: {
+					apiKey: "td-secret",
+					disabled: false,
+					generation: 1,
+					models: [
+						{
+							id: "td-model",
+							name: "TokenDance model",
+							context_length: 128_000,
+							supported_protocols: ["openai:responses"],
+						},
+					],
+				},
+				commandCode: { apiKey: "cc-secret", baseUrl: "https://cc.example" },
+			});
+			const exported = (await exportCredentialItems())
+				.filter((item) => item.kind === "credential")
+				.filter((item) => {
+					const data = item.data as { templateId?: string };
+					return ["nug", "tokendance", "command-code"].includes(data.templateId ?? "");
+				});
+			expect(exported).toHaveLength(4);
+			for (const item of exported) {
+				const data = item.data as { credential?: { id?: string }; group: Record<string, unknown> };
+				expect(data.credential?.id).toBeUndefined();
+				expect(data.group).not.toHaveProperty("apiKey");
+				expect(data.group).not.toHaveProperty("oauthClientSecret");
+			}
+
+			saveSettings({
+				...settings,
+				nugProviders: [],
+				tokendance: { apiKey: "", disabled: false, generation: 0 },
+				commandCode: undefined,
+			});
+			for (const id of ["nug-source", "tokendance", "CommandCode"]) store.removeGroup(id);
+			const data = exported.map((item) => item.data);
+			expect(
+				(await Promise.all(data.map(matchCredentialItem))).every(
+					(item) => item && !item.existingId,
+				),
+			).toBe(true);
+			expect(await importCredentialItems(exported, () => "add")).toEqual({
+				added: 4,
+				replaced: 0,
+				skipped: 0,
+			});
+
+			expect(settings.nugProviders?.[0]?.apiKey).toBe("nug-secret");
+			expect(settings.nugProviders?.[0]?.oauthClientSecret).toBe("oauth-secret");
+			expect(settings.tokendance?.apiKey).toBe("td-secret");
+			expect(settings.tokendance?.models?.map((model) => model.id)).toEqual(["td-model"]);
+			const { getTokenDanceCatalogModels } = await import("../../services/tokendance-service");
+			expect(getTokenDanceCatalogModels().map((model) => model.id)).toEqual(["td-model"]);
+			expect(settings.commandCode?.apiKey).toBe("cc-secret");
+			expect(store.groupSecrets("nug-source")).toEqual({ oauthClientSecret: "oauth-secret" });
+			const oldIds = new Set(exported.map((item) => item.id));
+			for (const id of ["nug-source", "tokendance", "CommandCode"]) {
+				for (const key of store.listGroup(id)) expect(oldIds.has(key.id)).toBe(false);
+			}
+		} finally {
+			for (const id of ["nug-source", "tokendance", "CommandCode"]) store.removeGroup(id);
+			saveSettings(original);
+		}
+	});
+
+	test("distinct groups with the same endpoint do not collapse during one import", async () => {
+		const { exportCredentialItems, importCredentialItems } = await import(
+			"../credential-transfer/kinds"
+		);
+		const { getProviderKeyStore } = await import("../provider-keys");
+		const { saveSettings, settings } = await import("../settings");
+		const original = structuredClone(settings);
+		const store = getProviderKeyStore();
+		const provider = (id: string, apiKey: string) => ({
+			id,
+			name: id,
+			prefix: id,
+			baseUrl: "https://shared.example/v1",
+			defaultModel: "",
+			protocol: "completions-compatible" as const,
+			apiKey,
+		});
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [provider("group-a", "key-a"), provider("group-b", "key-b")],
+			});
+			const exported = (await exportCredentialItems()).filter((item) => {
+				const data = item.data as { group: { id: string } };
+				return ["group-a", "group-b"].includes(data.group.id);
+			});
+			saveSettings({ ...settings, customApiProviders: [] });
+			for (const id of ["group-a", "group-b"]) store.removeGroup(id);
+			expect(await importCredentialItems(exported, () => "add")).toEqual({
+				added: 2,
+				replaced: 0,
+				skipped: 0,
+			});
+			expect(settings.customApiProviders?.map((group) => group.id)).toEqual(["group-a", "group-b"]);
+			expect(store.firstGroupKey("group-a")).toBe("key-a");
+			expect(store.firstGroupKey("group-b")).toBe("key-b");
+		} finally {
+			for (const id of ["group-a", "group-b"]) store.removeGroup(id);
+			saveSettings(original);
+		}
+	});
+
+	test("rotated Codex tokens retain JWT identity matching in both old and unified bundles", async () => {
+		const { getCodexManager, __setCodexManagerForTests } = await import("../codex-manager");
+		const { previewCredentialImport, applyCredentialImport } = await import(
+			"../credential-transfer"
+		);
+		const previous = getCodexManager();
+		const target = manager([account("local-jwt", { sub: "jwt-sub", priority: 7 })]);
+		__setCodexManagerForTests(target);
+		const jwt = `e30.${Buffer.from(JSON.stringify({ sub: "jwt-sub" })).toString("base64url")}.signature`;
+		try {
+			for (const kind of ["codex", "credential"]) {
+				const refreshToken = `rotated-${kind}`;
+				const data =
+					kind === "codex"
+						? { refreshToken, accessToken: jwt, displayName: "JWT account", priority: 0 }
+						: {
+								group: { id: "codex", prefix: "codex", name: "Codex" },
+								templateId: "codex",
+								credential: {
+									target: { groupId: "codex" },
+									ownerUserId: null,
+									priority: 0,
+									createdAt: 1,
+									auth: { kind: "oauth", refreshToken, accessToken: jwt },
+								},
+							};
+				const text = await sealBundle(
+					{ exportedAt: 1, items: [{ kind, id: "remote-jwt", label: "JWT account", data }] },
+					"a long passphrase",
+				);
+				const preview = await previewCredentialImport(text, "a long passphrase");
+				expect(preview.items[0]?.existingId).toBe("local-jwt");
+				expect(
+					await applyCredentialImport(text, "a long passphrase", new Map([[0, "replace"]]), {
+						userId: "admin",
+					}),
+				).toEqual({ added: 0, replaced: 1, skipped: 0 });
+				expect(target.exportForTransfer()[0]).toMatchObject({
+					id: "local-jwt",
+					priority: 7,
+					refreshToken,
+					sub: "jwt-sub",
+				});
+			}
+		} finally {
+			target.dispose();
+			__setCodexManagerForTests(previous);
+		}
+	});
+
+	test("old api-key and codex bundles are normalized and imported with new credential ids", async () => {
+		const { previewCredentialImport, applyCredentialImport } = await import(
+			"../credential-transfer"
+		);
+		const { getProviderKeyStore } = await import("../provider-keys");
+		const { getCodexManager } = await import("../codex-manager");
+		const { saveSettings, settings } = await import("../settings");
+		const original = structuredClone(settings);
+		const store = getProviderKeyStore();
+		const manager = getCodexManager();
+		const oldCodexIds = [...manager.snapshot().entries, ...manager.snapshot().archivedEntries].map(
+			(entry) => entry.id,
+		);
+		try {
+			saveSettings({ ...settings, customApiProviders: [] });
+			const legacy = await sealBundle(
+				{
+					exportedAt: 1,
+					items: [
+						{
+							kind: "api-key",
+							id: "legacy-key-id",
+							label: "Legacy",
+							data: {
+								provider: {
+									id: "legacy-provider",
+									name: "Legacy",
+									prefix: "legacy",
+									baseUrl: "https://legacy.example/v1",
+									defaultModel: "",
+									protocol: "completions-compatible",
+								},
+								key: { id: "legacy-key-id", apiKey: "legacy-secret" },
+							},
+						},
+						{
+							kind: "codex",
+							id: "legacy-codex-id",
+							label: "legacy@example.com",
+							data: account("legacy-codex", { id: "legacy-codex-id" }),
+						},
+					],
+				},
+				"a long passphrase",
+			);
+			const preview = await previewCredentialImport(legacy, "a long passphrase");
+			expect(preview.items.map((item) => item.kind)).toEqual(["credential", "credential"]);
+			expect(preview.items.every((item) => !item.unsupported)).toBe(true);
+			const result = await applyCredentialImport(
+				legacy,
+				"a long passphrase",
+				new Map([
+					[0, "import"],
+					[1, "import"],
+				]),
+				{ userId: "admin" },
+			);
+			expect(result).toEqual({ added: 2, replaced: 0, skipped: 0 });
+			expect(settings.customApiProviders?.[0]?.id).toBe("legacy-provider");
+			expect(store.listGroup("legacy-provider")[0]?.id).not.toBe("legacy-key-id");
+			const importedCodex = manager
+				.snapshot()
+				.entries.find((entry) => entry.email === "legacy-codex@example.com");
+			expect(importedCodex).toBeDefined();
+			expect(importedCodex?.id).not.toBe("legacy-codex-id");
+		} finally {
+			store.removeGroup("legacy-provider");
+			const current = manager
+				.snapshot()
+				.entries.filter((entry) => !oldCodexIds.includes(entry.id))
+				.map((entry) => entry.id);
+			if (current.length) manager.removeCredentials(current);
+			saveSettings(original);
+		}
+	});
+});
+
+describe("api key transfer", () => {
+	test("keys travel with their provider config and recreate it where it is missing", async () => {
+		const { exportCredentialItems, matchCredentialItem, importCredentialItems } = await import(
+			"../credential-transfer/kinds"
+		);
+		const { getProviderKeyStore } = await import("../provider-keys");
+		const { saveSettings, settings } = await import("../settings");
 		const saved = structuredClone(settings.customApiProviders);
 		const store = getProviderKeyStore();
 		try {
@@ -153,7 +412,7 @@ describe("api key transfer", () => {
 				],
 			});
 			store.add("kimiA", { apiKey: "sk-kimi-second", label: "backup" });
-			const exported = kind.export(undefined);
+			const exported = await exportCredentialItems();
 			expect(exported.map((item) => item.label)).toEqual([
 				"Kimi Code · sk-k…irst",
 				"Kimi Code · backup",
@@ -162,13 +421,23 @@ describe("api key transfer", () => {
 
 			// Same instance: both keys are already here.
 			const data = exported.map((item) => item.data);
-			expect(kind.match(data).map((m) => m?.existingId)).toEqual(["kimiA", expect.any(String)]);
+			expect((await Promise.all(data.map(matchCredentialItem))).map((m) => m?.existingId)).toEqual([
+				"kimiA",
+				expect.any(String),
+			]);
 
 			// "Another device": the provider does not exist yet.
 			saveSettings({ ...settings, customApiProviders: [] });
 			store.removeProvider("kimiA");
-			expect(kind.match(data).map((m) => m?.existingId)).toEqual([undefined, undefined]);
-			expect(kind.import(data, () => "add")).toEqual({ added: 2, replaced: 0, skipped: 0 });
+			expect((await Promise.all(data.map(matchCredentialItem))).map((m) => m?.existingId)).toEqual([
+				undefined,
+				undefined,
+			]);
+			expect(await importCredentialItems(exported, () => "add")).toEqual({
+				added: 2,
+				replaced: 0,
+				skipped: 0,
+			});
 			const recreated = settings.customApiProviders?.find((p) => p.id === "kimiA");
 			expect(recreated?.baseUrl).toBe("https://api.kimi.com/coding/v1");
 			expect(recreated?.apiKey).toBe("sk-kimi-first");

@@ -43,7 +43,9 @@ export function extractRevertResult(value: unknown): FileChangeRevertApplyRespon
 			(result.reason === null || typeof result.reason === "string") &&
 			Array.isArray(result.files) &&
 			result.files.every(isFileResult) &&
-			(result.historyStatus === "complete" || result.historyStatus === "unavailable") &&
+			(result.historyStatus === "complete" ||
+				result.historyStatus === "unavailable" ||
+				result.historyStatus === "disabled") &&
 			typeof result.historyCommitted === "boolean"
 		)
 			return result as unknown as FileChangeRevertApplyResponse;

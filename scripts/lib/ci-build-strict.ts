@@ -67,7 +67,13 @@ export async function runCiBuildCommand(
 	timeoutMs = 60_000,
 	cwd?: string,
 ): Promise<void> {
-	const child = Bun.spawn(command, { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const child = Bun.spawn(command, {
+		cwd,
+		env: process.env,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	let bytes = 0;
 	let diagnostic = "";
 	let failure: Error | undefined;

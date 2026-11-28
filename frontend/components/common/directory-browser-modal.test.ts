@@ -7,6 +7,7 @@ import {
 
 const MODAL_HOSTS = [
 	"./DirectoryPicker.tsx",
+	"./DeviceDirectoryPicker.tsx",
 	"./PathInputWithBrowse.tsx",
 	"./DirListEditor.tsx",
 	"../permissions/TargetPathInput.tsx",

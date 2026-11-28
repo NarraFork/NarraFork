@@ -11,9 +11,11 @@
  * Each server below speaks the subset of the protocol the transport reads:
  * `response.created` → optional content → `response.completed`.
  */
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { settings } from "../../settings";
 import { createProviderTurnContext } from "../codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
@@ -326,6 +328,170 @@ test("abort during large preparation dispatches nothing and leaves the session r
 	expect(collectText(await runStream(activeServer))).toBe("ok");
 	expect(activeServer.requests).toHaveLength(1);
 	expect(activeServer.requests[0].body.previous_response_id).toBeUndefined();
+});
+
+test("revoked diagnostics credentials never open a socket or send a request", async () => {
+	activeServer = startServer(({ send }) => {
+		for (const frame of completedFrames("after-revocation", "ok")) send(frame);
+	});
+	const denied = new Error("diagnostics credential revoked");
+	await expect(
+		runStream(activeServer, {
+			ephemeralSession: true,
+			validateBeforeDispatch: () => {
+				throw denied;
+			},
+		}),
+	).rejects.toBe(denied);
+	expect(activeServer.connectionCount()).toBe(0);
+	expect(activeServer.requests).toHaveLength(0);
+	expect(collectText(await runStream(activeServer))).toBe("ok");
+});
+
+test("diagnostics revocation during socket replacement prevents the next handshake", async () => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	await runStream(activeServer, { userAgent: "client/1" });
+	const { default: WebSocket } = await import("ws");
+	const originalClose = WebSocket.prototype.close;
+	let revoked = false;
+	const close = spyOn(WebSocket.prototype, "close").mockImplementation(function (
+		this: InstanceType<typeof WebSocket>,
+		...args
+	) {
+		revoked = true;
+		Reflect.apply(originalClose, this, args);
+	});
+	try {
+		await expect(
+			runStream(activeServer, {
+				userAgent: "client/2",
+				validateBeforeDispatch: () => {
+					if (revoked) throw new Error("diagnostics credential revoked during close");
+				},
+			}),
+		).rejects.toThrow("diagnostics credential revoked during close");
+		expect(revoked).toBe(true);
+		expect(activeServer.connectionCount()).toBe(1);
+		expect(activeServer.requests).toHaveLength(1);
+	} finally {
+		close.mockRestore();
+	}
+	await runStream(activeServer, { userAgent: "client/2" });
+	expect(activeServer.requests[1]?.body.previous_response_id).toBeUndefined();
+});
+
+test.each([
+	false,
+	true,
+])("diagnostics revocation in the prepared-request observer prevents send (reused=%s)", async (reused) => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	if (reused) await runStream(activeServer);
+	let revoked = false;
+	await expect(
+		runStream(activeServer, {
+			input: ["hello", "revoked"],
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked before send");
+			},
+			onRequestPrepared: () => {
+				revoked = true;
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked before send");
+	expect(revoked).toBe(true);
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(reused ? 1 : 0);
+	await runStream(activeServer, { input: ["hello", "fresh"] });
+	expect(activeServer.connectionCount()).toBe(2);
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBeUndefined();
+});
+
+test("diagnostics revocation at upgrade is checked after async body and evidence encoding", async () => {
+	activeServer = startServer(({ send }) => {
+		for (const frame of completedFrames("unexpected-send")) send(frame);
+	});
+	let revoked = false;
+	const frames: RecordingFrame[] = [];
+	const recording = liveRecording(frames);
+	recording.frame = (frame) => {
+		frames.push(frame);
+		if (frame.type === "websocket.upgrade") revoked = true;
+	};
+	await expect(
+		runStream(activeServer, {
+			input: ["large body ".repeat(128 * 1024)],
+			requestDump: new ApiRequestDumpCollector(recording),
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked during upgrade");
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked during upgrade");
+	expect(revoked).toBe(true);
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(0);
+	expect(frames.some((frame) => frame.direction === "request")).toBe(false);
+});
+
+test("diagnostics revocation after a recoverable failure prevents reconnect and resend", async () => {
+	let revoked = false;
+	activeServer = startServer(({ send }) => {
+		revoked = true;
+		send(CONNECTION_LIMIT_FRAME);
+	});
+	await expect(
+		runStream(activeServer, {
+			ephemeralSession: true,
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked before retry");
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked before retry");
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(1);
+});
+
+test.each([
+	false,
+	true,
+])("explicit ephemeral sessions leave shared cache and response chains untouched (cached=%s)", async (cached) => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	if (cached) await runStream(activeServer, { input: ["hello"] });
+	const { default: WebSocket } = await import("ws");
+	const originalSend = WebSocket.prototype.send;
+	let ephemeralSocket: InstanceType<typeof WebSocket> | undefined;
+	const send = spyOn(WebSocket.prototype, "send").mockImplementation(function (
+		this: InstanceType<typeof WebSocket>,
+		...args
+	) {
+		ephemeralSocket = this;
+		Reflect.apply(originalSend, this, args);
+	});
+	try {
+		await runStream(activeServer, {
+			input: ["diagnostics probe"],
+			ephemeralSession: true,
+			resetSessionBeforeRequest: true,
+		});
+		expect(ephemeralSocket?.readyState).toBe(WebSocket.CLOSED);
+	} finally {
+		send.mockRestore();
+	}
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBeUndefined();
+	await runStream(activeServer, { input: ["hello", "continue"] });
+	expect(activeServer.connectionCount()).toBe(2);
+	expect(activeServer.requests.at(-1)?.connectionIndex).toBe(cached ? 0 : 1);
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBe(
+		cached ? "resp-0" : undefined,
+	);
+	expect(activeServer.requests.at(-1)?.body.input).toEqual(
+		(cached ? ["continue"] : ["hello", "continue"]).map(userMessage),
+	);
 });
 
 test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incoming message boundaries", async () => {
@@ -932,6 +1098,72 @@ test("final handshake headers govern reuse; non-auth changes retain the same tur
 	expect(server.requests[6]?.body.previous_response_id).toBe("resp-5");
 });
 
+test("proxy exemptions govern both the selected agent and cached handshake identity", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	const target = "codex-proxy-routing.invalid";
+	const baseUrl = server.baseUrl.replace("127.0.0.1", target);
+	const savedProxy = settings.proxy;
+	const proxies: Array<string | undefined> = [];
+	const websocketModule = { ...(await import("ws")) };
+	const RealWebSocket = websocketModule.default;
+	// Bun's ws implementation uses native WebSocket, bypassing node:http.request.
+	// Observe the final transport options at the shared constructor boundary, then
+	// use the real client against this local server; no DNS or external proxy runs.
+	class LocalWebSocket extends RealWebSocket {
+		constructor(url: string, options: import("ws").ClientOptions) {
+			expect(new URL(url).hostname).toBe(target);
+			proxies.push(options.agent instanceof HttpsProxyAgent ? options.agent.proxy.href : undefined);
+			super(url.replace(target, "127.0.0.1"), { ...options, agent: undefined });
+		}
+	}
+	mock.module("ws", () => ({ ...websocketModule, default: LocalWebSocket }));
+	const turnContext = createProviderTurnContext();
+	const send = (proxy: string) =>
+		runStream(server, {
+			baseUrl,
+			proxy,
+			turnContext,
+			input: Array.from({ length: server.requests.length + 1 }, (_, index) => `input-${index}`),
+		});
+	const firstProxy = "http://user:first@proxy.invalid:8080/";
+	const nextProxy = "http://user:next@proxy.invalid:8080/";
+	try {
+		settings.proxy = {
+			mode: "direct",
+			noProxyRules: [{ match: "wildcard", pattern: target }],
+		};
+		await send(firstProxy);
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined]);
+		expect(server.connectionCount()).toBe(1);
+		expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+		settings.proxy = { mode: "direct", noProxyRules: [] };
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined, nextProxy]);
+		expect(server.connectionCount()).toBe(2);
+		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+		expect(requestTurnState(server, 2)).toBe("sticky-0");
+		await send(nextProxy);
+		expect(server.requests[3]?.body.previous_response_id).toBe("resp-2");
+		settings.proxy = {
+			mode: "direct",
+			noProxyRules: [{ match: "wildcard", pattern: target }],
+		};
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined, nextProxy, undefined]);
+		expect(server.connectionCount()).toBe(3);
+		expect(server.requests[4]?.body.previous_response_id).toBeUndefined();
+		expect(requestTurnState(server, 4)).toBe("sticky-0");
+	} finally {
+		mock.module("ws", () => websocketModule);
+		settings.proxy = savedProxy;
+	}
+});
+
 test("credential and endpoint changes cannot reuse a preceding turn token or response chain", async () => {
 	const server = startServer(({ requestIndex, send }) => {
 		send(turnStateFrame(`owner-${requestIndex}`));
@@ -1045,6 +1277,52 @@ test("the request dump records the original request, not a recovery resend", asy
 	// Reported once. Overwriting the dump with the resend would erase the payload
 	// that actually triggered the failure someone is trying to diagnose.
 	expect(dumped).toHaveLength(1);
+});
+
+test("resumable recovery preserves an explicit developer prefix and its stable identity", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		if (requestIndex === 0) {
+			send(turnStateFrame());
+			send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+			send(CONNECTION_LIMIT_FRAME);
+			return;
+		}
+		for (const frame of completedFrames("resp-resumed", "continued")) send(frame);
+	});
+	activeServer = server;
+	const provider = createChatProvider(server);
+	const turnContext = createProviderTurnContext();
+	const instructions = { role: "system", content: "Follow the repository instructions." };
+	const first = await runChat(provider, { history: [instructions], turnContext });
+	expect(first.error).toMatchObject({ resumable: true });
+	expect(collectText(first.events)).toBe("partial");
+	const developerPrefix = (server.requests[0]?.body.input as unknown[])[0];
+	expect(developerPrefix).toMatchObject({
+		type: "message",
+		id: expect.stringMatching(/^msg_nf_instructions_/),
+		role: "developer",
+		content: [{ type: "input_text", text: instructions.content }],
+	});
+	const history = [
+		userMessage("hello"),
+		{ role: "assistant", content: [{ type: "output_text", text: "partial" }] },
+	];
+	const second = await runChat(provider, {
+		history: [instructions, ...history],
+		content: "continue",
+		turnContext,
+	});
+	expect(second.error).toBeUndefined();
+	expect(collectText(second.events)).toBe("continued");
+	expect(server.requests).toHaveLength(2);
+	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+	expect(server.requests[1]?.body.instructions).toBeUndefined();
+	expect(server.requests[1]?.body.input).toEqual([
+		developerPrefix,
+		...history,
+		userMessage("continue"),
+	]);
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 });
 
 const recoverableErrors = [

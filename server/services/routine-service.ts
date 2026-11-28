@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Routine service — manages enabling/disabling built-in routines.
  *
@@ -25,6 +26,7 @@ import {
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects, userPreferences } from "../db/schema";
+import { userPreferencesLock } from "../lib/async-mutex";
 import {
 	type BuiltinRoutine,
 	getAllBuiltinRoutines,
@@ -36,6 +38,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import type { Command } from "./command-service";
+import { withSkillCreation } from "./skill-write-scope";
 
 // ---------------------------------------------------------------------------
 // Marker used to identify routine-managed entries
@@ -287,6 +290,8 @@ export async function setToolRoutineModeForProject(
 ): Promise<void> {
 	requireToolRoutine(routineId);
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, chapterSettings: true },
@@ -318,6 +323,8 @@ export async function enableRoutineForProject(routineId: string, projectId: stri
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -361,6 +368,8 @@ export async function disableRoutineForProject(
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -403,6 +412,8 @@ export async function resetRoutineForProject(routineId: string, projectId: strin
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -500,11 +511,23 @@ function buildCommandFromRoutine(routine: BuiltinRoutine): Command {
 	};
 }
 
+/**
+ * Read-modify-write of the user's command list. It shares the preferences lock with every
+ * other preferences writer, so a concurrent settings save cannot be overwritten by the
+ * list read on the Worker before it.
+ */
 async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	await userPreferencesLock.acquire(userId, () => addGlobalCommandLocked(routine, userId));
+}
+
+async function addGlobalCommandLocked(routine: BuiltinRoutine, userId: string): Promise<void> {
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 
 	let cmds: Command[] = [];
 	if (pref?.commands) {
@@ -532,10 +555,17 @@ async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promis
 }
 
 async function removeGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	await userPreferencesLock.acquire(userId, () => removeGlobalCommandLocked(routine, userId));
+}
+
+async function removeGlobalCommandLocked(routine: BuiltinRoutine, userId: string): Promise<void> {
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!pref?.commands) return;
 
 	let cmds: Command[] = [];
@@ -595,45 +625,57 @@ async function removeProjectCommand(
 async function addGlobalSkill(routine: BuiltinRoutine): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(getGlobalSkillsDir(), dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	await mkdir(skillDir, { recursive: true });
-	await writeFile(skillFile, buildSkillMd(skill.name, skill.descriptionEn, skill.content), "utf-8");
+	const skillsDir = getGlobalSkillsDir();
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		await mkdir(skillDir, { recursive: true });
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			buildSkillMd(skill.name, skill.descriptionEn, skill.content),
+			"utf-8",
+		);
+	});
 }
 
 async function removeGlobalSkill(routine: BuiltinRoutine): Promise<void> {
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(getGlobalSkillsDir(), dirName);
-	try {
-		await access(skillDir);
-		await rm(skillDir, { recursive: true, force: true });
-	} catch {
-		// Already gone
-	}
+	const skillsDir = getGlobalSkillsDir();
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		try {
+			await access(skillDir);
+			await rm(skillDir, { recursive: true, force: true });
+		} catch {
+			/* Already gone */
+		}
+	});
 }
 
 async function addProjectSkill(routine: BuiltinRoutine, gitPath: string): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
-	const skillFile = join(skillDir, "SKILL.md");
-
-	await mkdir(skillDir, { recursive: true });
-	await writeFile(skillFile, buildSkillMd(skill.name, skill.descriptionEn, skill.content), "utf-8");
+	const skillsDir = join(gitPath, ".narrafork", "skills");
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		await mkdir(skillDir, { recursive: true });
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			buildSkillMd(skill.name, skill.descriptionEn, skill.content),
+			"utf-8",
+		);
+	});
 }
 
 async function removeProjectSkill(routine: BuiltinRoutine, gitPath: string): Promise<void> {
-	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
-	try {
-		await access(skillDir);
-		await rm(skillDir, { recursive: true, force: true });
-	} catch {
-		// Already gone
-	}
+	const skillsDir = join(gitPath, ".narrafork", "skills");
+	return withSkillCreation(skillsDir, async () => {
+		const skillDir = join(skillsDir, routineSkillDirName(routine.id));
+		try {
+			await access(skillDir);
+			await rm(skillDir, { recursive: true, force: true });
+		} catch {
+			/* Already gone */
+		}
+	});
 }
 
 // ---------------------------------------------------------------------------

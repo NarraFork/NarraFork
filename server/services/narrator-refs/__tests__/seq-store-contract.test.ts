@@ -24,10 +24,16 @@
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../../db/schema";
+import {
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "../../__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
@@ -106,10 +112,11 @@ beforeEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("empty narrator base", () => {
@@ -444,8 +451,10 @@ describe("rollback", () => {
 		await narratorPersistence.persistUserMessage("n1", "real");
 		const versionBefore = messageVersionOf("n1");
 		await expect(
-			narratorPersistence.persistSegmentCompactMarker("n1", ["no-such-message"]),
-		).rejects.toThrow("No matching messages found");
+			await captureWorkerRejectionThrower(
+				narratorPersistence.persistSegmentCompactMarker("n1", ["no-such-message"]),
+			),
+		).toThrow("No matching messages found");
 		// The validation now happens INSIDE the write transaction, so a failure can
 		// leave no half-shifted refs, no marker message and no version bump.
 		expect(refsOf("n1")).toHaveLength(1);
@@ -487,18 +496,22 @@ describe("monotone production counter", () => {
 		);
 		try {
 			await expect(
-				narratorPersistence.persistAssistantMessage("n1", {
-					uuid: "failed-full",
-					session_id: "s",
-					message: { content: [{ type: "text", text: "failed" }] },
-				}),
-			).rejects.toThrow();
+				await captureWorkerRejectionThrower(
+					narratorPersistence.persistAssistantMessage("n1", {
+						uuid: "failed-full",
+						session_id: "s",
+						message: { content: [{ type: "text", text: "failed" }] },
+					}),
+				),
+			).toThrow();
 			await expect(
-				narratorPersistence.createPartialAssistantMessage("n1", {
-					uuid: "failed-partial",
-					session_id: "s",
-				}),
-			).rejects.toThrow();
+				await captureWorkerRejectionThrower(
+					narratorPersistence.createPartialAssistantMessage("n1", {
+						uuid: "failed-partial",
+						session_id: "s",
+					}),
+				),
+			).toThrow();
 		} finally {
 			sqlite.exec("DROP TRIGGER reject_assistant_ref");
 		}

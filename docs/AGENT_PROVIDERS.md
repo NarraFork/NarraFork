@@ -96,7 +96,7 @@
 **选择规则**
 - 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+；开源权重的 `gpt-oss` 按"其他"处理），含 `deepseek` → `anthropic_deferred_tail`，Kimi K3+（`kimi-k3*`、Kimi Coding 的 `k3`/`k3-256k`）与 `kimi-for-coding` → `kimi_system_tools`、`custom_injection`（K2.x 与 `kimi-for-coding-highspeed` 会以 400 拒绝带 `tools` 的 system 消息，只用 `custom_injection`；经 Anthropic/Responses 协议访问时落到 `custom_injection`），其他 → `custom_injection`。解析不出版本号的照常启用。
 - 取列表里第一个与适配器 `toolLoadingTarget()` 报告的协议相容的方式，都不相容就用 `replace_tools`。NUG 按渠道类型报告协议，并用路由后的模型名匹配默认值。
-- 因此新增 Kimi 供应商时默认创建为 Chat Completions 协议（预设字段 `creationProtocol`，见 `frontend/components/providers/provider-connection-presets.ts`），只有这条路径能给出 `kimi_system_tools`。Anthropic/Responses 仍可在协议下拉里手选，届时按上一条落到 `custom_injection`。
+- 因此新增 Kimi 供应商时默认创建为 Chat Completions 协议（预设变体字段 `creationProtocol`，见 `server/lib/sourcing/presets.ts`），只有这条路径能给出 `kimi_system_tools`。Anthropic/Responses 仍可在协议下拉里手选，届时按上一条落到 `custom_injection`。
 - 设为空列表 `[]` 即对该模型关闭，在设置页模型卡里编辑。
 
 **几处容易出错的地方**
@@ -129,21 +129,31 @@ sha512-9Gn+V7DtJ8M1nztP9CeDVl9g3RtrepI7rOFTyPRRnZe8D6zebIHKmC7OvBauucuAP0X0k85SD
 
 ### 有意保留的差异
 
-- **三种公开契约与 Codex 方言分开。** 普通 Responses 保留顶层基础 `instructions`；[Codex 0.171.0 的非空判断](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/core/src/client.rs#L1240-L1251)才产生稳定 ID 的 developer 前缀。空指令不造前缀，也不补默认 CLI 文本。`context_update` 仍留在原有 user 载体，不借版本更新改宿主或缓存纪元。
+- **三种公开契约与 Codex 方言分开。** 同步 `15eb583b4` 后，普通 Responses 沿上游实现将非空基础指令放入可缓存的 developer 输入，不再生成顶层 `instructions`；[Codex 0.171.0 的非空判断](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/core/src/client.rs#L1240-L1251)才产生稳定 ID 的 developer 前缀。空指令不造前缀，也不补默认 CLI 文本。`context_update` 仍留在原有 user 载体，不借版本更新改宿主或缓存纪元。
 - **非 lite 声明与正文一致。** Codex 保留顶层工具及并行工具调用，不声明或接受额外头中的 `x-openai-internal-codex-responses-lite`；这不是删除工具后重试的理由，也不保证每个模型都支持非 lite。
 - **`partial_answer` 不是误拼。** [Codex 的 MessagePhase](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/models.rs#L1051-L1065)确有 `commentary`、`partial_answer`、`final_answer`；[公开 SDK 的 phase 类型](https://github.com/openai/openai-node/blob/v7.62.0/src/resources/responses/responses.ts#L979)只列两种。不能因 SDK 少列而删除已证实的 Codex 值，也不能把 CLI 的三值枚举宣告为所有公开 Responses 端点的能力。NF 保留真实 item/part 身份及明确的同轮续写信号；缺字段不臆造 phase 或继续标记。
-- **输出上限。** [预算字段选择](../server/lib/agent/openai-provider.ts#L154-L180)按协议和端点区分：公开 Chat 使用 `max_completion_tokens`，需要旧字段的网关使用 `max_tokens`；普通 Responses 使用 `max_output_tokens`，公开端点的有效上限小于 16 时在发送前报错，不擅自调高。Codex 后端不发送该字段。[参数回退](../server/lib/agent/unsupported-parameter-fallback.ts#L3-L7)不会把这三个预算字段当作可删除选项。
+- **输出上限。** [预算字段选择](../server/lib/agent/openai-provider.ts)按协议和端点区分：公开 Chat 使用 `max_completion_tokens`，需要旧字段的网关使用 `max_tokens`；普通 Responses 使用 `max_output_tokens`，公开端点的有效上限小于 16 时在发送前报错，不擅自调高。Codex 后端不发送该字段。[参数回退](../server/lib/agent/unsupported-parameter-fallback.ts#L3-L7)不会把这三个预算字段当作可删除选项。
 - **Anthropic 版本与正文配对。** [公开 SDK 的默认版本](https://github.com/anthropics/anthropic-sdk-typescript/blob/sdk-v1.12.0/src/client.ts#L2135)为 `2026-10-21`。NF 的[版本选择](../server/lib/agent/anthropic-api-version.ts#L7-L39)只对标准公开直连、非 Claude Code 方言且无显式覆盖的配置自动选新版；CLI 方言和兼容网关默认 `2023-06-01`。新版不发 `temperature`/`top_p`/`top_k`。[消息块转换](../server/lib/agent/anthropic-api-version.ts#L72-L97)作用于出站内容，不改存储历史。
-- **拒绝与工具调用。** [拒绝解析器](../server/lib/agent/openai-refusal.ts#L3-L41)按协议字段识别拒绝，在保留已收到的用量后交付一次不可重试的结果，不触发空回答恢复；文本收集有长度和分段上限。Chat [工具分片](../server/lib/agent/openai-provider.ts#L3531-L3636)须有完整 ID 和名称才发布；先到参数可缓存，重复完成不能二次执行。[工具参数必填性](../server/lib/agent/tool-registry.ts#L213-L249)按声明结构判断，不执行预处理函数探测。
+- **拒绝与工具调用。** [拒绝解析器](../server/lib/agent/openai-refusal.ts#L3-L41)按协议字段识别拒绝，在保留已收到的用量后交付一次不可重试的结果，不触发空回答恢复；文本收集有长度和分段上限。Chat [工具分片](../server/lib/agent/openai-provider.ts)须有完整 ID 和名称才发布；先到参数可缓存，重复完成不能二次执行。[工具参数必填性](../server/lib/agent/tool-registry.ts#L213-L249)按声明结构判断，不执行预处理函数探测。
 - **不是整套 CLI 仿冒。** 不新增私有计费/签名/证明算法、凭证、遥测或内部调度，也不复制尚未实现的 beta 能力。既有 Anthropic CLI 方言的捆绑 SDK 兼容头与早期模型 beta 门控保留其已审计边界，不宣称全部重新复刻了 2.1.330。认证归属、工具权限、Worker 隔离、取消、缓存纪元与同轮路由锁不因身份版本号改变。
 
 本地正负向回归、真实 loopback HTTP/WS 捕获和发行包静态核验，不能证明真实上游接受每个字段、命中缓存或把请求可信地识别为官方客户端。UA/版本自报不是签名或身份凭据；要求真正由官方 CLI 发出时，应走官方 CLI 及授权路径。官方 SDK 接入不等同于 CLI 请求，也不提供额外的客户端身份证明。
 
-### 本地验收记录
+### 同步前本地验收记录
 
-以下结果来自基线 `499a21f9e` 上本次修改后的工作区；使用 `bun test --isolate`，不代表全仓 CI 或线上服务商验收。
+以下历史结果来自 `499a21f9e` 上修复后的提交 `c74ef6ef3`，使用 `bun test --isolate`；它们不代表后续合并 main 的验收、全仓 CI 或线上服务商验证。
 
 - **协议行为：25 个不同文件，892 通过、0 失败、2 项既有跳过。** [显式拒绝](../server/lib/agent/__tests__/openai-refusal.test.ts) 33 项、[工具调用分片](../server/lib/agent/__tests__/provider-tool-input-stream.test.ts) 41 项、预算/请求构造 150 项、错误/凭据/计量 264 项、schema/版本/旧会话等 404 项。两项跳过是 [ExitPlanMode 已知的声明差异](../server/lib/agent/tools/__tests__/tools.test.ts#L1441-L1479)，不计通过。
 - **最终请求：3 文件，170 通过、0 失败，单独报告。** [HTTP、搜索与降级](../server/lib/agent/__tests__/user-agent-egress.test.ts#L853)、[WS 复用和认证切换](../server/lib/agent/__tests__/codex-websocket-recovery.test.ts#L888-L933)、[模型目录回退](../server/routes/__tests__/models-fallback.test.ts#L337)使用本地接收端和测试凭据核对请求头及正文。仅改 UA 会重新握手但保留同轮路由；换认证不沿用旧凭据的 token。
 - **整仓类型检查通过。** 本机按根 `tsconfig.json` 运行 `bunx tsgo --noEmit --checkers 1 -p tsconfig.json`，没有排除文件或放宽 `strict`；编译器检查 10,956 个文件，报告总耗时 348.04 秒，退出码 0。修正类型诊断的 8 个测试文件另行隔离复跑：338 通过、0 失败（与上面的测试有重合，不累加）。
 - **其他检查：**Biome 无错误，仍有 12 个警告；`git diff --check` 和 `bun run i18n:check` 成功。i18n 有目录和额外键警告；Windows 有测试临时目录 `EBUSY` 清理警告，不影响上述用例结果。
+
+### 同步 main 后的验收（2026-11-28）
+
+同步的官方 main 基线为 `15eb583b4a5b86d11cfc8037afcae4065e3a812b`。两侧行为协调后重新验证，不把上节旧基线结果当作合并结果。
+
+- 在本机串行运行 43 个不同的定向隔离测试文件：1,483 通过、0 失败；插件管理、宿主服务、运行时和 RPC 四文件另有 104 通过、0 失败。
+- 独立审查补修了内置 Codex 的 WS→SSE 凭据作用域：内部 HTTP 委托改用与 WS 相同的实际凭据 ID，`prefix: "codex"` 保持不变。两种回退都验证同轮保留路由 token、新轮不沿用；相关三文件 30 通过、委托/诊断两文件 17 通过。这些有重合，单独报告，不重复合计。
+- 合并保留主线的缓存 developer 输入、诊断分叉、代理豁免、异步停止检查和凭据复核。Codex 诊断分叉保留父指令前缀 ID，同时隔离线上会话与路由状态。
+- `bun run build` 成功（Vite 报告 4m34s）；i18n 两语言覆盖率 100%；知识树结构检查 164 个节点通过。Biome 与补丁检查通过，仍有既有警告；Windows 部分测试临时目录的 `EBUSY` 提示没有变成断言失败。
+- 最终根配置严格类型检查通过：`GOMEMLIMIT=5120MiB GOMAXPROCS=2 bunx tsgo --noEmit --checkers 1 --pretty false --extendedDiagnostics -p tsconfig.json` 检查 11,825 个文件，退出码 0，编译器报告总耗时 618.135 秒。保持完整 include/exclude 与 strict；仅限制检查器并发，不放宽检查。

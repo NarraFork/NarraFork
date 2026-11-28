@@ -117,7 +117,7 @@ test("every production run entry supplies identity or explicitly relies on its o
 					// run service also reads the human-prepared active session's identity.
 					const preparedWrapper =
 						path === "server/services/narrator-session.ts" &&
-						context === "runAgentLoop" &&
+						context === "runAgentLoopUntracked" &&
 						name === "startNarratorRun" &&
 						args[0]?.getText(file).includes("...options");
 					// A background projection registered its principal atomically before
@@ -134,7 +134,7 @@ test("every production run entry supplies identity or explicitly relies on its o
 					// registered logical run: identity comes from that run's own registration.
 					const checkpointResume =
 						path === "server/services/background-task-service.ts" &&
-						context === "recoverStaleTasksAfterRestart" &&
+						context === "recoverStaleTaskPages" &&
 						name === "startNarratorRun" &&
 						/resumeRunId: task\.logicalRunId/.test(args[0]?.getText(file) ?? "") &&
 						/recovered: true/.test(args[0]?.getText(file) ?? "");
@@ -166,8 +166,13 @@ test("run registration is dispatched through both backend adapters, with no PG S
 	const pg = await Bun.file(
 		new URL("../agent-runtime/postgres-runtime-publication.ts", import.meta.url),
 	).text();
-	expect(source).toContain("startRun: async (input) => legacy.startRun(input)");
-	expect(source).toContain("startRun: (input) => engine.startRun(input)");
+	for (const call of ["legacy.startRun(input)", "await engine.startRun(input)"]) {
+		expect(source).toContain(`startRun: async (input) => {
+			const started = ${call};
+			eventBus.emit({ type: "narrator:execution_principal_changed", narratorId: input.narratorId });
+			return started;
+		}`);
+	}
 	const method = pg.slice(
 		pg.indexOf("async startRun("),
 		pg.indexOf("async getAgentRun(", pg.indexOf("async startRun(")),

@@ -47,10 +47,10 @@
 	font-size: 12px;
 	line-height: 20px;
 	user-select: none;
-	color: light-dark(#59636e, #9198a1);
-	background: light-dark(#ddf4ff, #121d2f);
-	border-top: 1px solid light-dark(#c6e6ff, #1f2a37);
-	border-bottom: 1px solid light-dark(#c6e6ff, #1f2a37);
+	color: var(--nf-diff-hunk-text);
+	background: var(--nf-diff-hunk-bg);
+	border-top: 1px solid var(--nf-diff-hunk-line);
+	border-bottom: 1px solid var(--nf-diff-hunk-line);
 }
 
 .side {

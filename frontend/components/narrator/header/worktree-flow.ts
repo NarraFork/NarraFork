@@ -19,6 +19,12 @@ export interface WorktreeFlowState {
 	step: WorktreeStep;
 	busy: boolean;
 	error?: string;
+	/**
+	 * Stable server code behind `error`, when the failure carried one: the controls show the
+	 * catalogue's sentence for it in the user's language (say `GIT_TOO_OLD_FOR_PARTIAL_CLONE`),
+	 * else `error` as it came. Cleared whenever `error` changes without one.
+	 */
+	errorCode?: string;
 	unknown?: boolean;
 	confirmedFailure?: boolean;
 	residuals?: WorktreeCreateResult["residuals"];
@@ -44,7 +50,8 @@ export class WorktreeFlow {
 		private changed: (state: WorktreeFlowState) => void,
 	) {}
 	private update(patch: Partial<WorktreeFlowState>) {
-		this.state = { ...this.state, ...patch };
+		const code = "error" in patch && !("errorCode" in patch) ? { errorCode: undefined } : {};
+		this.state = { ...this.state, ...code, ...patch };
 		this.changed(this.state);
 	}
 	restore(request: WorktreeCreateRequest) {
@@ -73,6 +80,7 @@ export class WorktreeFlow {
 			confirmedFailure: result.outcome === "failed",
 			residuals: result.residuals,
 			error: result.error?.message ?? result.outcome,
+			errorCode: result.error?.code,
 		});
 		return false;
 	}
@@ -128,6 +136,7 @@ export class WorktreeFlow {
 				unknown,
 				confirmedFailure: dispatched && !unknown,
 				error: error instanceof Error ? error.message : String(error),
+				errorCode: codeOf(error),
 			});
 		} finally {
 			this.update({ busy: false });
@@ -171,4 +180,10 @@ export class WorktreeFlow {
 			this.update({ busy: false });
 		}
 	}
+}
+
+/** The server's stable code on a thrown API error (`ApiError.data.code`), when it carried one. */
+function codeOf(error: unknown): string | undefined {
+	const data = (error as { data?: { code?: unknown } } | null)?.data;
+	return typeof data?.code === "string" && data.code ? data.code : undefined;
 }

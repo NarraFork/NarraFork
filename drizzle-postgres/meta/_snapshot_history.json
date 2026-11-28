@@ -608,6 +608,94 @@
 			"prevId": "4732deae-5c40-46e7-a744-98ff336e40ad",
 			"version": "7",
 			"snapshotDigest": "924477a94066dad819736d414a88c27485b0f83025ccce1c18e0c9e5431c8759"
+		},
+		{
+			"idx": 76,
+			"tag": "0076_project_teams",
+			"id": "44828ca8-52df-45aa-9c76-905894b958cf",
+			"prevId": "247a3c32-d37e-4ac1-8c2d-f1c176eb47a4",
+			"version": "7",
+			"snapshotDigest": "7277481332d016252190b944caf8970a57bd2ba025ed05e3dfb6cfdca56fa160"
+		},
+		{
+			"idx": 77,
+			"tag": "0077_index_active_background_tasks",
+			"id": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+			"prevId": "44828ca8-52df-45aa-9c76-905894b958cf",
+			"version": "7",
+			"snapshotDigest": "0d51cb0307dae359f6882ca594c4098a11600929137d6328fe6dbe55bf600fe4"
+		},
+		{
+			"idx": 78,
+			"tag": "0078_ask_in_passing_group_archive",
+			"id": "f040e99e-e551-4687-99f8-ee370353a9c1",
+			"prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+			"version": "7",
+			"snapshotDigest": "4b71044913fb107713df639dd40c55de46a62aabfd731cb38bbe3e95431f7eea"
+		},
+		{
+			"idx": 79,
+			"tag": "0079_watch_principal",
+			"id": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+			"prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
+			"version": "7",
+			"snapshotDigest": "e4f307ddcee16da5f22769fe557dc9b1889f3af55d102e00a52e36d9bebcc5c4"
+		},
+		{
+			"idx": 80,
+			"tag": "0080_recent_tab_team_project",
+			"id": "c07b4921-245c-4e69-b29f-01132e3f6156",
+			"prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+			"version": "7",
+			"snapshotDigest": "8748e2df5e280195b6f16925413c3586a2bc211ff10e4797aff075cf9f80ab87"
+		},
+		{
+			"idx": 81,
+			"tag": "0081_subagent-alias-addressable-scope",
+			"id": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
+			"version": "7",
+			"snapshotDigest": "e83c4ffd33b7c9b6347b41369135b22413c697523ec468a84144e96005a0a95b"
+		},
+		{
+			"idx": 82,
+			"tag": "0082_communication_topology",
+			"id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"version": "7",
+			"snapshotDigest": "5988cdbd02f574a70bd00e258f910cd54341bd2480df10735d1b513262a7f12e"
+		},
+		{
+			"idx": 83,
+			"tag": "0083_terminal_executor_session",
+			"id": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"version": "7",
+			"snapshotDigest": "6661e27969be1e613d16658d42d6eb0412cfa2dc32409a247f09ce8121c2a7b1"
+		},
+		{
+			"idx": 84,
+			"tag": "0084_team_work_item_dependencies",
+			"id": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+			"prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"version": "7",
+			"snapshotDigest": "587f742578638aba9cd456d8611d49ce08927ae0e36528af3de49aeb25890933"
+		},
+		{
+			"idx": 85,
+			"tag": "0085_background_task_executor_session",
+			"id": "4c8df1ee-e212-497f-b798-8e4df0878f06",
+			"prevId": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+			"version": "7",
+			"snapshotDigest": "3f5bc3a4028f06241299acbe2e8860eaf94f4278fd8d14cff4086cecbb63f968"
+		},
+		{
+			"idx": 86,
+			"tag": "0086_team_event_kind_index",
+			"id": "8b958c5e-584f-4329-9345-37753e276342",
+			"prevId": "4c8df1ee-e212-497f-b798-8e4df0878f06",
+			"version": "7",
+			"snapshotDigest": "1015e0f37e4244442fb64ebbeb3458c562897a67991345fcef66faa35fa185f4"
 		}
 	]
 }

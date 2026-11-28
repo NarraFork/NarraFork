@@ -3,7 +3,10 @@ import { Hono } from "hono";
 import type { RequestRecordingDetail } from "../../shared/request-recording";
 import { db } from "../db";
 import { apiRequests } from "../db/schema";
+import { readQuery } from "../db/worker-read";
+import { DbReadTaskOverloadedError, DbReadTaskTimeoutError } from "../lib/db-worker/pool";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { hotSafe } from "../lib/hot-safe";
 import {
 	deleteSavedRecording,
 	downloadSavedRecording,
@@ -13,13 +16,22 @@ import {
 	saveSpecificRequestRecording,
 } from "../lib/request-recorder";
 import { sanitizeRecordingDisplayText } from "../lib/request-recorder-sanitize";
+import { TaskQueue, TaskQueueError } from "../lib/worker-runtime/queue";
+
+// Only one recording lookup can enter the shared short-read pool at a time, so a burst
+// of recording requests cannot fill the pool's queue ahead of authentication.
+const metadataAdmission = hotSafe(
+	"narrafork.requestRecordingMetadataAdmission",
+	() => new TaskQueue({ concurrency: 1, maxQueued: 4, timeoutMs: 5_000 }),
+);
 
 export async function lookupApiRequestMetadata(
 	narratorId: string,
 	apiRequestId: string,
+	signal?: AbortSignal,
 ): Promise<RequestRecordingDetail["apiRequest"]> {
 	// Primary-key lookup, same-narrator ownership, bounded metadata only. No dump columns.
-	const [row] = await db
+	const query = db
 		.select({
 			id: apiRequests.id,
 			createdAt: apiRequests.createdAt,
@@ -30,6 +42,25 @@ export async function lookupApiRequestMetadata(
 		.from(apiRequests)
 		.where(and(eq(apiRequests.id, apiRequestId), eq(apiRequests.narratorId, narratorId)))
 		.limit(1);
+	const [row] = await metadataAdmission
+		.run(
+			(permit) =>
+				readQuery(query, {
+					shortRead: true,
+					signal: permit.signal,
+					timeoutMs: permit.deadlineAt - Date.now(),
+					diagnosticSource: "narrator.request-recording",
+				}),
+			{ signal },
+		)
+		.catch((error: unknown) => {
+			if (error instanceof TaskQueueError) {
+				if (error.code === "TASK_QUEUE_FULL") throw new DbReadTaskOverloadedError();
+				if (error.code === "TASK_QUEUE_TIMEOUT")
+					throw new DbReadTaskTimeoutError("request recording metadata read timed out");
+			}
+			throw error;
+		});
 	if (!row) return undefined;
 	return {
 		...row,
@@ -105,6 +136,7 @@ export function createRequestRecordingRoutes(
 			const apiRequest = await (service.lookupApiRequestMetadata ?? lookupApiRequestMetadata)(
 				narratorId,
 				detail.apiRequestId,
+				c.req.raw.signal,
 			);
 			if (apiRequest) return c.json({ ...detail, apiRequest });
 		}

@@ -1,6 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as workerRead from "@server/db/worker-read";
+import { assertDbReadersReady } from "@server/lib/db-worker/pool";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
@@ -15,8 +20,16 @@ import {
 	revertOperationFiles,
 	revertOperations,
 } from "../db/schema";
+import { readRevertPlan } from "../lib/db-worker/file-read-snapshots";
+import * as pool from "../lib/db-worker/pool";
+import {
+	closeFileWorkerDatabase,
+	openFileWorkerDatabase,
+	settleWorkerRead,
+} from "./__tests__/file-worker-database";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import { createFileChangeIdentity } from "./file-change-identity";
+import type { RevertReadInput } from "./file-read-snapshots";
 import {
 	type AppendRevertPlanFile,
 	type BeginRevertPlan,
@@ -115,8 +128,12 @@ let queries: string[];
 let lookups: { query: string; params: unknown[] }[];
 let published: Map<string, string>;
 let scope: typeof fileChangeScopes.$inferSelect;
+let snapshotReads: RevertReadInput[];
+let afterSnapshot: ((input: RevertReadInput) => void) | undefined;
+const originalDomainRead = workerRead.readDomainTask;
+let restoreDomainRead = () => {};
 
-beforeEach(() => {
+beforeEach(async () => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	expect(process.env.HOME).not.toBe(process.env.NARRAFORK_ORIGINAL_HOME);
 	clock = Date.parse("2026-09-07T12:00:00.000Z");
@@ -124,9 +141,23 @@ beforeEach(() => {
 	published = new Map();
 	queries = [];
 	lookups = [];
-	sqlite = new Database(":memory:");
-	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
+	sqlite = openFileWorkerDatabase();
 	sqlite.exec(DDL);
+	await assertDbReadersReady(sqlite.filename);
+	snapshotReads = [];
+	afterSnapshot = undefined;
+	const readSpy = spyOn(workerRead, "readDomainTask").mockImplementation(
+		async (client, task, input, options) => {
+			const result = await originalDomainRead(client, task, input, options);
+			if (task === "revertPlanSnapshot") {
+				const fixed = input as RevertReadInput;
+				snapshotReads.push(fixed);
+				afterSnapshot?.(fixed);
+			}
+			return result;
+		},
+	);
+	restoreDomainRead = () => readSpy.mockRestore();
 	db = drizzle(sqlite, {
 		logger: {
 			logQuery: (query, params) => {
@@ -163,7 +194,10 @@ beforeEach(() => {
 		.returning()
 		.get();
 });
-afterEach(() => sqlite.close());
+afterEach(async () => {
+	restoreDomainRead();
+	await closeFileWorkerDatabase(sqlite);
+});
 function now() {
 	return new Date(clock).toISOString();
 }
@@ -251,7 +285,11 @@ function code(run: () => unknown, suffix: string) {
 	expect(run).toThrow(expect.objectContaining({ code: `REVERT_PLAN_${suffix}` }));
 }
 async function rejected(promise: Promise<unknown>, suffix: string) {
-	await expect(promise).rejects.toMatchObject({ code: `REVERT_PLAN_${suffix}` });
+	const error = await promise.then(
+		() => null,
+		(error: unknown) => error,
+	);
+	expect(error).toMatchObject({ code: `REVERT_PLAN_${suffix}` });
 }
 function record(id: string) {
 	return db.select().from(revertOperations).where(eq(revertOperations.id, id)).get();
@@ -264,8 +302,8 @@ function storedFiles(id: string) {
 		.limit(FILE_CHANGE_LIMITS.revertFiles + 1)
 		.all();
 }
-function incomplete(id: string) {
-	expect(service.getSummary(owner, id)).toMatchObject({
+async function incomplete(id: string) {
+	expect(await service.getSummary(owner, id)).toMatchObject({
 		status: "planned",
 		coverageComplete: false,
 	});
@@ -280,6 +318,112 @@ async function appendAll(input: BeginRevertPlan, files: AppendRevertPlanFile[]) 
 		);
 	return result;
 }
+
+async function withFileBackedReader(run: (reader: RevertPlanService) => Promise<void>) {
+	const directory = mkdtempSync(join(tmpdir(), "narrafork-revert-file-page-"));
+	const path = join(directory, "plans.db");
+	sqlite.prepare("VACUUM INTO ?").run(path);
+	const fileDb = new Database(path);
+	const workerSetting = process.env.NARRAFORK_DB_WORKER;
+	const concurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	try {
+		await pool.resetDbWorkerPoolForTest();
+		delete process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		fileDb.exec("PRAGMA foreign_keys = ON");
+		const reader = new RevertPlanService(drizzle(fileDb), { namespaceKey });
+		const prepare = spyOn(fileDb, "prepare").mockImplementation(() => {
+			throw new Error("Unexpected main-thread revert file read");
+		});
+		try {
+			await run(reader);
+			expect(prepare).not.toHaveBeenCalled();
+		} finally {
+			prepare.mockRestore();
+		}
+	} finally {
+		await pool.resetDbWorkerPoolForTest();
+		if (workerSetting === undefined) delete process.env.NARRAFORK_DB_WORKER;
+		else process.env.NARRAFORK_DB_WORKER = workerSetting;
+		if (concurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+		else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = concurrency;
+		fileDb.close();
+		rmSync(directory, { recursive: true, force: true });
+	}
+}
+
+describe("off-thread revert file pages", () => {
+	test("matches local cursor pages and distinguishes empty pages from forbidden plans", async () => {
+		const files = [file(0), file(1), file(2)];
+		const prepared = await appendAll(plan(files), files);
+		const empty = service.begin(plan());
+		const signal = new AbortController().signal;
+		await withFileBackedReader(async (reader) => {
+			const first = await reader.readFilePage(owner, prepared.id, { limit: 2, signal });
+			expect(first).toEqual(await service.listFiles(owner, prepared.id, { limit: 2 }));
+			expect(first.items).toHaveLength(2);
+			expect(first.hasMore).toBe(true);
+			const cursor = first.nextCursor ?? undefined;
+			expect(await reader.readFilePage(owner, prepared.id, { cursor, signal })).toEqual(
+				await service.listFiles(owner, prepared.id, { cursor }),
+			);
+			const emptyPage = { items: [], hasMore: false, nextCursor: null };
+			expect(await reader.readFilePage(owner, empty.id, { signal })).toEqual(emptyPage);
+			expect(
+				await reader.readFilePage(owner, prepared.id, {
+					cursor: { fileKey: "f".repeat(64) },
+					signal,
+				}),
+			).toEqual(emptyPage);
+			for (const wrong of [
+				{ ...owner, subjectKey: "human:bob" },
+				{ ...owner, narratorId: "narrator-b" },
+				{ ...owner, projectId: "project-b" },
+			]) {
+				const result = await reader
+					.readFilePage(wrong, prepared.id, { signal })
+					.catch((error: unknown) => error);
+				expect(result).toMatchObject({ code: "REVERT_PLAN_NOT_FOUND" });
+			}
+		});
+	}, 30_000);
+
+	test("rejects aborted, disabled, failed and timed-out reads without an inline retry", async () => {
+		const prepared = service.begin(plan());
+		await withFileBackedReader(async (reader) => {
+			const controller = new AbortController();
+			controller.abort(new Error("revert file page cancelled"));
+			await expect(
+				(
+					await settleWorkerRead(
+						reader.readFilePage(owner, prepared.id, { signal: controller.signal }),
+					)
+				).result(),
+			).rejects.toThrow("revert file page cancelled");
+			const signal = new AbortController().signal;
+			process.env.NARRAFORK_DB_WORKER = "off";
+			await expect(
+				(await settleWorkerRead(reader.readFilePage(owner, prepared.id, { signal }))).result(),
+			).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+			delete process.env.NARRAFORK_DB_WORKER;
+			for (const error of [
+				new pool.WorkersUnavailableError("spawn failed"),
+				new Error("read worker crashed"),
+				new pool.DbReadTaskTimeoutError("read timed out"),
+			]) {
+				const worker = spyOn(pool, "runReadTask").mockRejectedValueOnce(error);
+				try {
+					await expect(
+						(await settleWorkerRead(reader.readFilePage(owner, prepared.id, { signal }))).result(),
+					).rejects.toBe(error);
+					expect(worker.mock.calls[0]?.[2]).toMatchObject({ signal, timeoutMs: 30_000 });
+				} finally {
+					worker.mockRestore();
+				}
+			}
+		});
+	}, 30_000);
+});
 
 describe("fixed manifest journal and owner boundary", () => {
 	test("begin pins original refs, declares expected count and is idempotent without preparing", () => {
@@ -385,13 +529,15 @@ describe("fixed manifest journal and owner boundary", () => {
 			{ ...owner, narratorId: "narrator-b" },
 			{ ...owner, projectId: "project-b" },
 		]) {
-			code(() => service.getSummary(wrong, first.id), "NOT_FOUND");
-			code(() => service.listFiles(wrong, first.id), "NOT_FOUND");
+			await rejected(service.getSummary(wrong, first.id), "NOT_FOUND");
+			await rejected(service.listFiles(wrong, first.id), "NOT_FOUND");
 			await rejected(service.appendFiles(wrong, first.id, [file()]), "NOT_FOUND");
 			await rejected(service.finalize(wrong, first.id, input.manifestProof), "NOT_FOUND");
 		}
-		expect(service.listSummaries(owner).items.map((item) => item.id)).toEqual([first.id]);
-		expect(service.listSummaries(other).items.map((item) => item.id)).toEqual([otherPlan.id]);
+		expect((await service.listSummaries(owner)).items.map((item) => item.id)).toEqual([first.id]);
+		expect((await service.listSummaries(other)).items.map((item) => item.id)).toEqual([
+			otherPlan.id,
+		]);
 	});
 
 	test("root connection, enabled FKs and no ambient transaction are required", () => {
@@ -429,7 +575,7 @@ describe("bounded fixed-file append and publication validation", () => {
 			"REQUEST_CONFLICT",
 		);
 		expect(storedFiles(result.id)[0]).toEqual(row);
-		incomplete(result.id);
+		await incomplete(result.id);
 		expect(row.beforeBlobDigest).toBe(
 			row.expectedStateJson.kind === "regular" ? row.expectedStateJson.blob.digest : null,
 		);
@@ -502,7 +648,7 @@ describe("bounded fixed-file append and publication validation", () => {
 		const result = await service.prepare(input, [target]);
 		expect(result.status).toBe("prepared");
 		expect(result.coverageComplete).toBe(false);
-		expect(service.listFiles(owner, result.id).items[0].desiredStateJson).toEqual({
+		expect((await service.listFiles(owner, result.id)).items[0].desiredStateJson).toEqual({
 			kind: "unknown",
 			reason: "history_unavailable",
 		});
@@ -521,7 +667,7 @@ describe("bounded fixed-file append and publication validation", () => {
 		code(() => service.begin(input), "INVALID_INPUT");
 		await rejected(service.prepare(input, []), "INVALID_INPUT");
 		expect(reads).toBe(0);
-		expect(service.listSummaries(owner).items).toHaveLength(0);
+		expect((await service.listSummaries(owner)).items).toHaveLength(0);
 	});
 
 	test("each identity must match its actual source, device, workspace, scope and path grammar", async () => {
@@ -537,9 +683,13 @@ describe("bounded fixed-file append and publication validation", () => {
 			{ canonicalPath: "/outside/file.txt" },
 		]) {
 			await expect(
-				service.appendFiles(owner, result.id, [
-					{ ...f, identity: { ...f.identity, ...patch } as typeof f.identity },
-				]),
+				(
+					await settleWorkerRead(
+						service.appendFiles(owner, result.id, [
+							{ ...f, identity: { ...f.identity, ...patch } as typeof f.identity },
+						]),
+					)
+				).result(),
 			).rejects.toBeDefined();
 		}
 		db.update(fileChangeScopes)
@@ -625,7 +775,7 @@ describe("bounded fixed-file append and publication validation", () => {
 		const input = plan([f]);
 		const prepared = await service.prepare(input, [f]);
 		expect(prepared.status).toBe("prepared");
-		expect(service.listFiles(owner, prepared.id).items[0]).toMatchObject({
+		expect((await service.listFiles(owner, prepared.id)).items[0]).toMatchObject({
 			expectedStateJson: symlink,
 			desiredStateJson: { kind: "regular", blob: { sizeBytes: 0 } },
 		});
@@ -639,7 +789,7 @@ describe("complete preparation, bounds and failures", () => {
 		const result = service.begin(input);
 		await service.appendFiles(owner, result.id, [files[0]]);
 		await rejected(service.finalize(owner, result.id, input.manifestProof), "INCOMPLETE_SET");
-		incomplete(result.id);
+		await incomplete(result.id);
 		db.update(revertOperations)
 			.set({ fileCount: 1 })
 			.where(eq(revertOperations.id, result.id))
@@ -665,7 +815,7 @@ describe("complete preparation, bounds and failures", () => {
 				service.finalize(owner, result.id, { ...input.manifestProof, ...patch }),
 				failure,
 			);
-			incomplete(result.id);
+			await incomplete(result.id);
 			expect({ operation: record(result.id), files: storedFiles(result.id) }).toEqual(before);
 		}
 		await rejected(
@@ -677,9 +827,13 @@ describe("complete preparation, bounds and failures", () => {
 		);
 		expect({ operation: record(result.id), files: storedFiles(result.id) }).toEqual(before);
 		await expect(
-			service.finalize(owner, result.id, undefined as unknown as RevertPlanManifestProof),
+			(
+				await settleWorkerRead(
+					service.finalize(owner, result.id, undefined as unknown as RevertPlanManifestProof),
+				)
+			).result(),
 		).rejects.toBeDefined();
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
 	test("same count but different file/sequence metadata cannot stand in for the published manifest", async () => {
@@ -691,14 +845,14 @@ describe("complete preparation, bounds and failures", () => {
 			{ ...files[1], sequence: 0 },
 		]);
 		await rejected(service.finalize(owner, result.id, input.manifestProof), "INCOMPLETE_SET");
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
 	test("1000 files cross all pages; preparation and read pagination never infer completeness from a prefix", async () => {
 		const files = Array.from({ length: 1000 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
 		const result = await appendAll(input, files);
-		incomplete(result.id);
+		await incomplete(result.id);
 		let ticks = 0;
 		const heartbeat = setInterval(() => ticks++, 0);
 		const prepared = await service.finalize(owner, result.id, input.manifestProof);
@@ -714,7 +868,7 @@ describe("complete preparation, bounds and failures", () => {
 		let cursor: RevertPlanFileCursor | undefined;
 		const seen = new Set<string>();
 		do {
-			const page = service.listFiles(owner, result.id, { cursor, limit: 37 });
+			const page = await service.listFiles(owner, result.id, { cursor, limit: 37 });
 			for (const item of page.items) {
 				expect(seen.has(item.fileKey)).toBe(false);
 				seen.add(item.fileKey);
@@ -726,17 +880,33 @@ describe("complete preparation, bounds and failures", () => {
 		} while (cursor);
 		expect(seen.size).toBe(1000);
 		expect(await service.finalize(owner, result.id, input.manifestProof)).toEqual(prepared);
-		const pages = queries.filter(
-			(query) => query.includes('from "revert_operation_files"') && query.includes("order by"),
-		);
+		const pages = snapshotReads.filter((input) => input.limit > 0);
 		expect(pages.length).toBeGreaterThan(32);
+		const reader = new Database(sqlite.filename, { readonly: true });
+		const prepare = spyOn(reader, "prepare");
+		let workerQueries: string[];
+		try {
+			readRevertPlan(reader, pages[0], new AbortController().signal);
+			workerQueries = prepare.mock.calls
+				.map(([query]) => query.toLowerCase())
+				.filter((query) => query.includes('from "revert_operation_files"'));
+		} finally {
+			prepare.mockRestore();
+			reader.close();
+		}
+		expect(workerQueries).toHaveLength(1);
 		expect(
-			pages.every(
-				(query) => query.includes("limit ?") && query.includes('"revert_operation_id" = ?'),
+			workerQueries.every(
+				(query) =>
+					query.includes("order by") &&
+					query.includes("limit ?") &&
+					query.includes('"revert_operation_id" = ?'),
 			),
 		).toBe(true);
 		expect(
-			queries.some((query) => /count\(|sum\(|group by|input_json|content_json/i.test(query)),
+			[...queries, ...workerQueries].some((query) =>
+				/count\(|sum\(|group by|input_json|content_json/i.test(query),
+			),
 		).toBe(false);
 	}, 20_000);
 
@@ -775,8 +945,12 @@ describe("complete preparation, bounds and failures", () => {
 				),
 			).toBe(true);
 			queries = [];
+			snapshotReads = [];
 			await service.finalize(owner, result.id, input.manifestProof);
-			expect(fileQueries().filter((query) => query.includes("order by"))).toHaveLength(batches);
+			const pages = snapshotReads.filter((input) => input.limit > 0);
+			expect(pages).toHaveLength(batches);
+			expect(pages.every((input) => input.limit === REVERT_PLAN_BATCH_ITEMS + 1)).toBe(true);
+			expect(fileQueries().filter((query) => query.includes("order by"))).toHaveLength(0);
 		});
 	}
 	test("expected fingerprints need no catalog row while desired remains pinned and budgeted", async () => {
@@ -863,10 +1037,10 @@ describe("complete preparation, bounds and failures", () => {
 		const files = Array.from({ length: 70 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
 		const result = await appendAll(input, files);
-		const first = service.listFiles(owner, result.id, { limit: 1 }).items[0];
+		const first = (await service.listFiles(owner, result.id, { limit: 1 })).items[0];
 		db.delete(revertOperationFiles).where(eq(revertOperationFiles.id, first.id)).run();
 		await rejected(service.finalize(owner, result.id, input.manifestProof), "INCOMPLETE_SET");
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
 	test("over 1000 files, metadata overflow and evidence overflow never yield a complete prefix", async () => {
@@ -905,7 +1079,7 @@ describe("complete preparation, bounds and failures", () => {
 				}),
 			"BUDGET_OR_INPUT",
 		);
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
 	test("finalization checks the cumulative desired budget once after all append batches", async () => {
@@ -924,7 +1098,7 @@ describe("complete preparation, bounds and failures", () => {
 		for (let i = 0; i < 9; i++) await service.appendFiles(owner, result.id, [file(i, ABSENT, big)]);
 		expect(storedFiles(result.id)).toHaveLength(9);
 		await rejected(service.finalize(owner, result.id, input.manifestProof), "BUDGET_OR_INPUT");
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
 	test("append DB failure is atomic and earlier pins survive; final DB failure stays incomplete", async () => {
@@ -935,20 +1109,20 @@ describe("complete preparation, bounds and failures", () => {
 		sqlite.exec(
 			"CREATE TRIGGER fail_append BEFORE INSERT ON revert_operation_files WHEN NEW.sequence = 2 BEGIN SELECT RAISE(ABORT, 'append-fault'); END",
 		);
-		await expect(service.appendFiles(owner, result.id, files.slice(1))).rejects.toThrow(
-			"append-fault",
-		);
+		await expect(
+			(await settleWorkerRead(service.appendFiles(owner, result.id, files.slice(1)))).result(),
+		).rejects.toThrow("append-fault");
 		expect(storedFiles(result.id)).toHaveLength(1);
-		incomplete(result.id);
+		await incomplete(result.id);
 		sqlite.exec("DROP TRIGGER fail_append");
 		await service.appendFiles(owner, result.id, files.slice(1));
 		sqlite.exec(
 			"CREATE TRIGGER fail_finalize BEFORE UPDATE OF status ON revert_operations WHEN NEW.status = 'prepared' BEGIN SELECT RAISE(ABORT, 'finalize-fault'); END",
 		);
-		await expect(service.finalize(owner, result.id, input.manifestProof)).rejects.toThrow(
-			"finalize-fault",
-		);
-		incomplete(result.id);
+		await expect(
+			(await settleWorkerRead(service.finalize(owner, result.id, input.manifestProof))).result(),
+		).rejects.toThrow("finalize-fault");
+		await incomplete(result.id);
 		expect(storedFiles(result.id)).toHaveLength(3);
 		for (const ref of [input.selector, input.plan, input.historyManifest])
 			expect(() =>
@@ -958,13 +1132,13 @@ describe("complete preparation, bounds and failures", () => {
 		expect((await service.finalize(owner, result.id, input.manifestProof)).status).toBe("prepared");
 	});
 
-	test("begin failure has no partially persisted journal", () => {
+	test("begin failure has no partially persisted journal", async () => {
 		const input = plan();
 		sqlite.exec(
 			"CREATE TRIGGER fail_begin BEFORE INSERT ON revert_operations BEGIN SELECT RAISE(ABORT, 'begin-fault'); END",
 		);
 		expect(() => service.begin(input)).toThrow("begin-fault");
-		expect(service.listSummaries(owner).items).toHaveLength(0);
+		expect((await service.listSummaries(owner)).items).toHaveLength(0);
 		expect(
 			db
 				.select({ digest: fileChangeBlobs.digest })
@@ -984,8 +1158,8 @@ describe("complete preparation, bounds and failures", () => {
 		});
 		expect(sqlite.inTransaction).toBe(false);
 		controller.abort(new Error("user-cancelled"));
-		await expect(pending).rejects.toThrow("user-cancelled");
-		incomplete(result.id);
+		await expect((await settleWorkerRead(pending)).result()).rejects.toThrow("user-cancelled");
+		await incomplete(result.id);
 		expect(storedFiles(result.id)).toHaveLength(70);
 		expect(() =>
 			db.delete(fileChangeBlobs).where(eq(fileChangeBlobs.digest, input.plan.digest)).run(),
@@ -999,10 +1173,22 @@ describe("complete preparation, bounds and failures", () => {
 		const files = Array.from({ length: 70 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
 		const controller = new AbortController();
-		const pending = service.prepare(input, files, { signal: controller.signal });
-		controller.abort(new Error("stop-batches"));
-		await expect(pending).rejects.toThrow("stop-batches");
-		const result = service.listSummaries(owner).items[0];
+		const append = service.appendFiles.bind(service);
+		const firstBatch = spyOn(service, "appendFiles").mockImplementation(async (...args) => {
+			const rows = await append(...args);
+			controller.abort(new Error("stop-batches"));
+			return rows;
+		});
+		try {
+			await expect(
+				(
+					await settleWorkerRead(service.prepare(input, files, { signal: controller.signal }))
+				).result(),
+			).rejects.toThrow("stop-batches");
+		} finally {
+			firstBatch.mockRestore();
+		}
+		const result = (await service.listSummaries(owner)).items[0];
 		expect(result).toMatchObject({
 			expectedFileCount: 70,
 			status: "planned",
@@ -1015,29 +1201,52 @@ describe("complete preparation, bounds and failures", () => {
 		const files = Array.from({ length: 70 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
 		const result = await appendAll(input, files.slice(0, 65));
-		const pending = service.finalize(owner, result.id, input.manifestProof);
-		db.update(revertOperations)
-			.set({ updatedAt: new Date(clock + 5000).toISOString() })
-			.where(eq(revertOperations.id, result.id))
-			.run();
-		await rejected(pending, "CONCURRENT_CHANGE");
-		incomplete(result.id);
+		afterSnapshot = (input) => {
+			if (!input.limit) return;
+			afterSnapshot = undefined;
+			db.update(revertOperations)
+				.set({ updatedAt: new Date(clock + 5000).toISOString() })
+				.where(eq(revertOperations.id, result.id))
+				.run();
+		};
+		await rejected(service.finalize(owner, result.id, input.manifestProof), "CONCURRENT_CHANGE");
+		await incomplete(result.id);
+	});
+
+	test("a completed Worker pre-read cannot authorize a changed final transaction", async () => {
+		const files = [file()];
+		const input = plan(files);
+		const result = await appendAll(input, files);
+		afterSnapshot = (page) => {
+			if (!page.limit) return;
+			afterSnapshot = undefined;
+			db.update(revertOperations)
+				.set({ updatedAt: new Date(clock + 5_000).toISOString() })
+				.where(eq(revertOperations.id, result.id))
+				.run();
+		};
+		await rejected(service.finalize(owner, result.id, input.manifestProof), "CONCURRENT_CHANGE");
+		await incomplete(result.id);
+		expect(snapshotReads.filter((page) => page.limit > 0)).toHaveLength(1);
 	});
 
 	test("early-page raw readiness is rechecked before final transition", async () => {
 		const files = Array.from({ length: 70 }, (_, i) => file(i));
 		const input = plan(files);
 		const result = await appendAll(input, files);
-		const first = service.listFiles(owner, result.id, { limit: 1 }).items[0];
-		const pending = service.finalize(owner, result.id, input.manifestProof);
+		const first = (await service.listFiles(owner, result.id, { limit: 1 })).items[0];
 		const ref = first.desiredStateJson.kind === "regular" ? first.desiredStateJson.blob : null;
 		expect(ref).not.toBeNull();
-		db.update(fileChangeBlobs)
-			.set({ status: "missing" })
-			.where(eq(fileChangeBlobs.digest, ref?.digest ?? ""))
-			.run();
-		await rejected(pending, "BLOB_NOT_READY");
-		incomplete(result.id);
+		afterSnapshot = (input) => {
+			if (!input.limit) return;
+			afterSnapshot = undefined;
+			db.update(fileChangeBlobs)
+				.set({ status: "missing" })
+				.where(eq(fileChangeBlobs.digest, ref?.digest ?? ""))
+				.run();
+		};
+		await rejected(service.finalize(owner, result.id, input.manifestProof), "BLOB_NOT_READY");
+		await incomplete(result.id);
 	});
 
 	test("unknown status, duplicate sequence, phase corruption and missing desired pins block finalization", async () => {
@@ -1059,8 +1268,10 @@ describe("complete preparation, bounds and failures", () => {
 				.set(patch)
 				.where(eq(revertOperationFiles.id, f?.id ?? ""))
 				.run();
-			await expect(service.finalize(owner, result.id, input.manifestProof)).rejects.toBeDefined();
-			incomplete(result.id);
+			await expect(
+				(await settleWorkerRead(service.finalize(owner, result.id, input.manifestProof))).result(),
+			).rejects.toBeDefined();
+			await incomplete(result.id);
 		}
 	});
 });
@@ -1076,12 +1287,12 @@ describe("expiry, unrevert and metadata-only reads", () => {
 		await rejected(service.appendFiles(owner, planned.id, [f]), "EXPIRED");
 		await rejected(service.finalize(owner, planned.id, plannedInput.manifestProof), "EXPIRED");
 		await rejected(service.finalize(owner, prepared.id, preparedInput.manifestProof), "EXPIRED");
-		expect(service.getSummary(owner, planned.id)).toMatchObject({
+		expect(await service.getSummary(owner, planned.id)).toMatchObject({
 			expired: true,
 			status: "planned",
 			coverageComplete: false,
 		});
-		expect(service.getSummary(owner, prepared.id)).toMatchObject({
+		expect(await service.getSummary(owner, prepared.id)).toMatchObject({
 			expired: true,
 			status: "prepared",
 		});
@@ -1107,10 +1318,13 @@ describe("expiry, unrevert and metadata-only reads", () => {
 		const files = Array.from({ length: 40 }, (_, i) => file(i, ABSENT, ABSENT));
 		const input = plan(files);
 		const result = await appendAll(input, files);
-		const pending = service.finalize(owner, result.id, input.manifestProof);
-		clock += FILE_CHANGE_LIMITS.planLifetimeMs;
-		await rejected(pending, "EXPIRED");
-		incomplete(result.id);
+		afterSnapshot = (input) => {
+			if (!input.limit) return;
+			afterSnapshot = undefined;
+			clock += FILE_CHANGE_LIMITS.planLifetimeMs;
+		};
+		await rejected(service.finalize(owner, result.id, input.manifestProof), "EXPIRED");
+		await incomplete(result.id);
 	});
 
 	test("unrevert requires a committed v2 parent in exactly the same owner and context", async () => {
@@ -1159,7 +1373,7 @@ describe("expiry, unrevert and metadata-only reads", () => {
 			.where(eq(revertOperations.id, parent.id))
 			.run();
 		await rejected(service.finalize(owner, child.id, input.manifestProof), "PARENT_UNAVAILABLE");
-		incomplete(child.id);
+		await incomplete(child.id);
 	});
 
 	test("read-only file keyset pages do not lose equal sequence values", async () => {
@@ -1172,23 +1386,23 @@ describe("expiry, unrevert and metadata-only reads", () => {
 		let cursor: RevertPlanFileCursor | undefined;
 		const ids: string[] = [];
 		do {
-			const page = service.listFiles(owner, result.id, { cursor, limit: 3 });
+			const page = await service.listFiles(owner, result.id, { cursor, limit: 3 });
 			ids.push(...page.items.map((item) => item.id));
 			cursor = page.nextCursor ?? undefined;
 		} while (cursor);
 		expect(new Set(ids).size).toBe(12);
 		expect(ids).toHaveLength(12);
-		incomplete(result.id);
+		await incomplete(result.id);
 	});
 
-	test("summary keyset pagination preserves equal creation timestamps and hides other contexts", () => {
+	test("summary keyset pagination preserves equal creation timestamps and hides other contexts", async () => {
 		for (let i = 0; i < 10; i++) service.begin(plan([], { idempotencyKey: `same-time-${i}` }));
 		service.begin(plan([], { idempotencyKey: "same-time-actor", subjectKey: "human:bob" }));
 		service.begin(plan([], { idempotencyKey: "same-time-context", projectId: "project-b" }));
 		let cursor: RevertPlanSummaryCursor | undefined;
 		const ids = new Set<string>();
 		do {
-			const page = service.listSummaries(owner, { cursor, limit: 3 });
+			const page = await service.listSummaries(owner, { cursor, limit: 3 });
 			for (const item of page.items) {
 				expect(ids.has(item.id)).toBe(false);
 				ids.add(item.id);
@@ -1196,7 +1410,7 @@ describe("expiry, unrevert and metadata-only reads", () => {
 			cursor = page.nextCursor ?? undefined;
 		} while (cursor);
 		expect(ids.size).toBe(10);
-		code(() => service.listSummaries(owner, { limit: 101 }), "BUDGET_OR_INPUT");
+		await rejected(service.listSummaries(owner, { limit: 101 }), "BUDGET_OR_INPUT");
 	});
 
 	test("summary byte budget limits output without losing the unreturned suffix", async () => {
@@ -1218,10 +1432,10 @@ describe("expiry, unrevert and metadata-only reads", () => {
 		const result = await appendAll(plan(files), files);
 		let cursor: RevertPlanFileCursor | undefined;
 		const ids = new Set<string>();
-		const first = service.listFiles(owner, result.id, { limit: 100 });
+		const first = await service.listFiles(owner, result.id, { limit: 100 });
 		expect(first.items.length).toBeLessThan(80);
 		do {
-			const page = service.listFiles(owner, result.id, { cursor, limit: 100 });
+			const page = await service.listFiles(owner, result.id, { cursor, limit: 100 });
 			expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(
 				FILE_CHANGE_LIMITS.summaryBytes,
 			);
@@ -1239,7 +1453,7 @@ describe("expiry, unrevert and metadata-only reads", () => {
 			coverageComplete: true,
 			expectedFileCount: 0,
 		});
-		expect(service.listFiles(owner, result.id)).toEqual({
+		expect(await service.listFiles(owner, result.id)).toEqual({
 			items: [],
 			hasMore: false,
 			nextCursor: null,

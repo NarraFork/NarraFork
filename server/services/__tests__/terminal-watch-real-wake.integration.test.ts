@@ -10,7 +10,7 @@ import {
 	terminals,
 } from "../../db/schema";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
-import type { ToolContext } from "../../lib/agent/types";
+import type { AgentEvent, ToolContext } from "../../lib/agent/types";
 import { resetUnsupportedParameterMemory } from "../../lib/agent/unsupported-parameter-fallback";
 import { generateId } from "../../lib/id";
 import { setOutboundFetchOverrideForTest } from "../../lib/net/outbound-fetch";
@@ -27,7 +27,6 @@ interface WireRequest {
 		model: string;
 		stream: boolean;
 		store: boolean;
-		instructions?: string;
 		input: Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>;
 		tools?: Array<{
 			type: string;
@@ -61,21 +60,27 @@ mock.module("../terminal-service", () => ({
 	},
 }));
 const { terminalTool, resetCursorForTerminal } = await import("../../lib/agent/tools/terminal");
+const { watchTool } = await import("../../lib/agent/tools/watch");
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { drainQueuedMessagesAfterCompact } = await import("../compact-queue-drain");
-const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const inbox = await import("../agent-runtime/inbox");
+const { wakeInboxIfEligible } = inbox;
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { runtimePublication } = await import("../agent-runtime/publication");
-const { acceptUserMessage } = await import("../narrator-session");
+const { acceptUserMessage, interruptNarrator } = await import("../narrator-session");
 const { activeNarrators, compactLocks } = await import("../narrator-session-state");
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { narratorService } = await import("../narrator-service");
+const executor = await import("../narrator-executor");
+const { runSubagent } = await import("../subagent-runner");
 const { activeWatchIds, notifyTerminalOutput } = await import("../terminal-watch-service");
 
 let narratorId: string;
 let terminalId: string;
 let payload: string;
+let childPrompt: string | undefined;
+const spawnedChildren = new Set<string>();
 const releaseGates: Array<() => void> = [];
 
 async function until(predicate: () => boolean, description: string): Promise<void> {
@@ -111,8 +116,8 @@ function notices() {
 		.all();
 }
 async function watch(): Promise<void> {
-	const result = await terminalTool.execute(
-		{ action: "watch", terminal_id: terminalId, pattern: "READY", timeout: 30 },
+	const result = await watchTool.execute(
+		{ type: "terminal", id: terminalId, pattern: "READY", timeout: 30_000 },
 		{
 			narratorId,
 			signal: new AbortController().signal,
@@ -152,7 +157,7 @@ async function waitForAdoption(expectedRequests: number): Promise<void> {
 		);
 	}
 }
-async function assertAdoptedOnce(): Promise<void> {
+async function assertAdoptedOnce(producerKind: "bash" | "agent" = "bash"): Promise<void> {
 	const source = task();
 	expect(source?.status).toBe("completed");
 	expect(source?.output).toContain(payload);
@@ -165,7 +170,7 @@ async function assertAdoptedOnce(): Promise<void> {
 	// survives and still binds this receipt to the exact task and logical run.
 	expect(JSON.parse(notice.dedupeKey ?? "[]")).toEqual([
 		"publication",
-		"bash",
+		producerKind,
 		source?.id,
 		source?.logicalRunId,
 		"completed",
@@ -222,9 +227,11 @@ async function assertAdoptedOnce(): Promise<void> {
 	).toBe(1);
 	const payloadParts = requests.flatMap(({ body }) => {
 		expect(body).toMatchObject({ model: "gpt-5.5", stream: true, store: false });
-		expect(typeof body.instructions).toBe("string");
-		expect(body.instructions?.trim().length).toBeGreaterThan(0);
-		expect(body.instructions).not.toContain(payload);
+		expect(body).not.toHaveProperty("instructions");
+		const prefix = body.input[0];
+		expect(prefix.role).toBe("developer");
+		expect(prefix.content?.[0]?.text?.trim()).toBeTruthy();
+		expect(JSON.stringify(prefix)).not.toContain(payload);
 		const read = body.tools?.find((tool) => tool.type === "function" && tool.name === "Read");
 		expect(read?.description?.length).toBeGreaterThan(0);
 		expect(read?.parameters).toMatchObject({
@@ -259,6 +266,8 @@ beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
 	await backgroundOccupancyStore.start();
 	requests.length = 0;
+	childPrompt = undefined;
+	spawnedChildren.clear();
 	resetUnsupportedParameterMemory();
 	// The preload restores this in-memory branch between cases; never save or
 	// reload settings, which could touch a real configuration file.
@@ -286,8 +295,10 @@ beforeEach(async () => {
 		expect(init?.signal?.aborted).toBe(false);
 		if (typeof init?.body !== "string") throw new Error("Expected a serialized Responses body");
 		requests.push({ raw: init.body, body: JSON.parse(init.body) });
+		const text =
+			childPrompt && init.body.includes(childPrompt) ? payload : "watch notification received";
 		return new Response(
-			'data: {"type":"response.output_text.delta","delta":"watch notification received"}\n\n' +
+			`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
 				'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n',
 			{ status: 200, headers: { "content-type": "text/event-stream" } },
 		);
@@ -329,16 +340,21 @@ afterEach(async () => {
 	compactLocks.delete(narratorId);
 	resetCursorForTerminal(terminalId);
 	for (const id of activeWatchIds(terminalId)) await backgroundTaskService.cancel(id);
-	const active = activeNarrators.get(narratorId);
-	if (active) {
-		active.alive = false;
-		active.abortController.abort();
-		if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+	for (const id of [narratorId, ...spawnedChildren]) {
+		const active = activeNarrators.get(id);
+		if (active) {
+			active.alive = false;
+			active.abortController.abort();
+			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+		}
 	}
 	// Never close the worker or clear history underneath an unfinished run, even
 	// on a failing assertion. Releasing gates and aborting precede this barrier.
-	await until(() => !getExecutionOwner(narratorId), "test run shuts down");
-	activeNarrators.delete(narratorId);
+	await until(
+		() => [narratorId, ...spawnedChildren].every((id) => !getExecutionOwner(id)),
+		"test runs shut down",
+	);
+	for (const id of [narratorId, ...spawnedChildren]) activeNarrators.delete(id);
 	// Keep the HTTP seam and transparent spy installed until the real run stops.
 	setOutboundFetchOverrideForTest(null);
 	mock.restore();
@@ -408,6 +424,204 @@ test("watch completion during run finalization automatically survives owner hand
 	await waitForAdoption(2);
 	await assertAdoptedOnce();
 }, 10_000);
+
+function injectCleanupFailure(
+	outcome: "workspace-restart" | "error" | "user-interrupt",
+	beforeFailure?: () => Promise<void>,
+): () => boolean {
+	const execute = executor.executeAgentLoop;
+	let cleanedUp = false;
+	spyOn(executor, "executeAgentLoop").mockImplementationOnce(async (options) => {
+		// Exercise the real executor/event handler and onErrorCleanup, not a
+		// fabricated ExecuteLoopResult or a database edit. Only this first pass's
+		// provider event source is injected, avoiding transport retry backoff.
+		const result = await execute(options, {
+			eventSource: (async function* (): AsyncGenerator<AgentEvent> {
+				await beforeFailure?.();
+				if (outcome === "user-interrupt") {
+					expect(interruptNarrator(narratorId)).toBe(true);
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+				yield {
+					type: "error",
+					message: "HTTP 408: request timeout before workspace rebuild",
+					diagnostics: {
+						schema: "narrafork.error-diagnostics.v1",
+						source: "provider",
+						statusCode: 408,
+					},
+				};
+			})(),
+		});
+		const failed = await narratorService.getById(narratorId);
+		if (outcome === "user-interrupt") {
+			expect(result.aborted).toBe(true);
+			expect(failed.substatus).toContain("interrupted");
+		} else {
+			expect(result.hasError).toBe(true);
+			expect(failed.substatus).toContain("error");
+			expect(failed.errorMessage).toContain("HTTP 408");
+		}
+		cleanedUp = true;
+		if (outcome === "workspace-restart") {
+			const active = activeNarrators.get(narratorId);
+			if (!active) throw new Error("The failing pass lost its active session");
+			// This is the existing, independently authorized restart decision.
+			// The test never clears a failure flag or changes the persisted status.
+			active._workspacePassInvalidated = true;
+		}
+		return result;
+	});
+	return () => cleanedUp;
+}
+
+async function completeSource(source: "watch" | "agent"): Promise<void> {
+	if (source === "watch") {
+		await watch();
+		emit(`READY ${payload}\r\n$ `);
+		return;
+	}
+	childPrompt = `finish-background-work-${generateId()}`;
+	const cwd = process.env.HOME;
+	if (!cwd) throw new Error("The test preload must provide an isolated HOME");
+	await runSubagent({
+		parentNarratorId: narratorId,
+		toolUseId: `agent-call-${terminalId}`,
+		subagentType: "general",
+		prompt: childPrompt,
+		cwd,
+		title: "real wake child",
+		model: "watch-wire:gpt-5.5",
+		background: true,
+		signal: new AbortController().signal,
+		locale: "en",
+		onCreated: (id) => spawnedChildren.add(id),
+	});
+}
+
+for (const source of ["watch", "agent"] as const) {
+	for (const arrival of ["idle", "owner-release"] as const) {
+		test(`${source} completion after HTTP408 cleanup and a legal successful pass automatically wakes at ${arrival}`, async () => {
+			const cleanedUp = injectCleanupFailure("workspace-restart");
+			let injected = false;
+			const gate = Promise.withResolvers<void>();
+			releaseGates.push(gate.resolve);
+			if (arrival === "owner-release") {
+				const updateStatus = narratorService.updateStatus.bind(narratorService);
+				spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+					const result = await updateStatus(...args);
+					if (args[0] === narratorId && args[1] === "idle" && requests.length === 1 && !injected) {
+						injected = true;
+						expect(getExecutionOwner(narratorId)).toBeDefined();
+						await completeSource(source);
+						await until(() => notices().length === 1, "completion published before owner release");
+						expect(notices()[0].state).toBe("queued");
+						expect(notices()[0].adoptedAt).toBeNull();
+						await gate.promise;
+					}
+					return result;
+				});
+			}
+			await acceptUserMessage(narratorId, "finish the task after rebuilding workspace context");
+			if (arrival === "idle") {
+				await until(
+					() => cleanedUp() && requests.length === 1 && !getExecutionOwner(narratorId),
+					"legal recovery pass finishes before asynchronous completion",
+				);
+				const recovered = await narratorService.getById(narratorId);
+				expect(recovered.status).toBe("idle");
+				expect(recovered.substatus).not.toContain("error");
+				expect(recovered.errorMessage).toBeNull();
+				await completeSource(source);
+			} else {
+				await until(
+					() => injected && notices().length === 1,
+					"recovered pass reaches owner-release window",
+				);
+				expect(cleanedUp()).toBe(true);
+				gate.resolve();
+			}
+			// No wakeInboxIfEligible rescue: publication and owner-release must
+			// drive the same genuine unified inbox through a fresh model run.
+			await waitForAdoption(source === "watch" ? 2 : 3);
+			await assertAdoptedOnce(source === "watch" ? "bash" : "agent");
+			const final = await narratorService.getById(narratorId);
+			expect(final.lastStopReason).toBe("normal");
+			expect(final.errorMessage).toBeNull();
+		}, 15_000);
+	}
+}
+
+for (const source of ["watch", "agent"] as const) {
+	test(`${source} completion already queued before failure cannot authorize a recovery pass`, async () => {
+		const cleanedUp = injectCleanupFailure("error", async () => {
+			await completeSource(source);
+			await until(() => notices().length === 1, "completion is queued before the provider fails");
+			expect(getExecutionOwner(narratorId)).toBeDefined();
+			expect(notices()[0].state).toBe("queued");
+			expect(notices()[0].adoptedAt).toBeNull();
+		});
+		await acceptUserMessage(
+			narratorId,
+			"a queued notice is not permission to retry my failed task",
+		);
+		await until(
+			() => cleanedUp() && !getExecutionOwner(narratorId),
+			"unrecovered failure releases its owner without consuming the notice",
+		);
+		const stopped = await narratorService.getById(narratorId);
+		expect(stopped.status).toBe("idle");
+		expect(stopped.lastStopReason).toBe("error");
+		expect(stopped.substatus).toContain("error");
+		expect(stopped.errorMessage).toContain("HTTP 408");
+		expect(task()?.status).toBe("completed");
+		expect(notices()).toHaveLength(1);
+		expect(notices()[0].state).toBe("queued");
+		expect(notices()[0].adoptedAt).toBeNull();
+		// The only HTTP request allowed here is the background child's request.
+		expect(requests).toHaveLength(source === "watch" ? 0 : 1);
+	}, 15_000);
+}
+
+for (const outcome of ["error", "user-interrupt"] as const) {
+	for (const source of ["watch", "agent"] as const) {
+		test(`${source} completion cannot automatically retry a genuine ${outcome} ending`, async () => {
+			const cleanedUp = injectCleanupFailure(outcome);
+			await acceptUserMessage(narratorId, "finish without an authorized continuation");
+			await until(
+				() => cleanedUp() && !getExecutionOwner(narratorId),
+				"terminal failure releases its owner",
+			);
+			const stopped = await narratorService.getById(narratorId);
+			expect(stopped.lastStopReason).toBe(outcome === "error" ? "error" : "user_interrupt");
+			let checkedNotice = false;
+			const realWake = inbox.wakeInboxIfEligible;
+			spyOn(inbox, "wakeInboxIfEligible").mockImplementation(async (...args) => {
+				const started = await realWake(...args);
+				if (args[0] === narratorId && notices().length === 1) {
+					expect(started).toBe(false);
+					checkedNotice = true;
+				}
+				return started;
+			});
+			await completeSource(source);
+			// Observe the genuine publication-triggered eligibility check finishing;
+			// do not call the wake ourselves or rely on a sleep to infer rejection.
+			await until(() => checkedNotice, "automatic inbox wake rejects the terminal failure");
+			expect(task()?.status).toBe("completed");
+			expect(notices()).toHaveLength(1);
+			expect(notices()[0].state).toBe("queued");
+			expect(notices()[0].adoptedAt).toBeNull();
+			expect(getExecutionOwner(narratorId)).toBeUndefined();
+			expect(requests).toHaveLength(source === "watch" ? 0 : 1);
+			const stillStopped = await narratorService.getById(narratorId);
+			expect(stillStopped.substatus).toEqual(stopped.substatus);
+			expect(stillStopped.errorMessage).toBe(stopped.errorMessage);
+			expect(stillStopped.lastStopReason).toBe(stopped.lastStopReason);
+		}, 15_000);
+	}
+}
 
 async function completeWhileCompacting(): Promise<void> {
 	compactLocks.set(narratorId, {

@@ -46,6 +46,7 @@ port.on("message", async (message) => {
 							],
 							complete: true,
 							readFiles: 1,
+							readBytes: 4,
 						},
 		});
 });

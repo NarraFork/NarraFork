@@ -4,6 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import { isNugPaymentContext, type NugPaymentIntent } from "@shared/nug-payment";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
@@ -33,15 +34,12 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
-	DeepSeekBalanceCache,
 	HookApiRecord,
-	KimiUsageCache,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
-	OpencodeUsageCache,
 	PromptLibraryEntryData,
 	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
@@ -58,6 +56,72 @@ import type {
 	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
+
+function checkedNugPaymentIntent(intent: NugPaymentIntent): NugPaymentIntent {
+	if (intent?.mode === "standalone") return { mode: "standalone" };
+	if (
+		intent?.mode !== "request" ||
+		typeof intent.narratorId !== "string" ||
+		!intent.narratorId ||
+		intent.narratorId.length > 128 ||
+		!isNugPaymentContext(intent.paymentContext)
+	) {
+		throw new ApiError("失败请求缺少有效的充值上下文，请重新发起该请求", 409, {
+			code: "NUG_PAYMENT_CONTEXT",
+		});
+	}
+	return { mode: "request", narratorId: intent.narratorId, paymentContext: intent.paymentContext };
+}
+
+function nugPaymentIntentQuery(intent: NugPaymentIntent): string {
+	const checked = checkedNugPaymentIntent(intent);
+	return new URLSearchParams(
+		checked.mode === "request"
+			? {
+					mode: checked.mode,
+					narratorId: checked.narratorId,
+					paymentContext: checked.paymentContext,
+				}
+			: { mode: checked.mode },
+	).toString();
+}
+
+function nugPaymentBinding(binding: unknown): string {
+	if (typeof binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
+		throw new ApiError(
+			"NUG payment context is unavailable; update the backend and create a new order",
+			409,
+			{ code: "NUG_PAYMENT_CONTEXT" },
+		);
+	}
+	return binding;
+}
+
+function requireNugPaymentOrder<T extends { order: { id: string; binding: string } }>(
+	data: T,
+	orderId?: string,
+	binding?: string,
+): T {
+	const received = nugPaymentBinding(data?.order?.binding);
+	if (
+		typeof data.order.id !== "string" ||
+		(orderId !== undefined && data.order.id !== orderId) ||
+		(binding !== undefined && received !== binding)
+	) {
+		throw new ApiError("NUG payment response does not match this order", 409, {
+			code: "NUG_PAYMENT_RESPONSE",
+		});
+	}
+	return data;
+}
+
+/** OAuth state of a remote MCP server; `required` means it refused us until an admin authorizes. */
+export interface McpServerAuthStatus {
+	supported: boolean;
+	authorized: boolean;
+	hasClientSecret: boolean;
+	required?: boolean;
+}
 
 /**
  * One workspace with its membership and arrangement.
@@ -214,6 +278,7 @@ export const miscApi = {
 				location: string;
 				files: string[];
 				disabled?: boolean;
+				canUpdateFromUrl?: boolean;
 			}>
 		>(`/skills?projectId=${encodeURIComponent(projectId)}`),
 	getSkill: (projectId: string, name: string) =>
@@ -224,6 +289,7 @@ export const miscApi = {
 			content: string;
 			files: string[];
 			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
 		}>(`/skills/${encodeURIComponent(name)}?projectId=${encodeURIComponent(projectId)}`),
 	createProjectSkill: (
 		projectId: string,
@@ -239,6 +305,37 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	importProjectSkill: (projectId: string, data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+		}>(`/skills/import?projectId=${encodeURIComponent(projectId)}`, {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
+	updateProjectSkillFromUrl: (
+		projectId: string,
+		name: string,
+		data: { url: string },
+		signal?: AbortSignal,
+	) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
+		}>(
+			`/skills/${encodeURIComponent(name)}/update-from-url?projectId=${encodeURIComponent(projectId)}`,
+			{ method: "POST", body: JSON.stringify(data), signal },
+		),
 	updateProjectSkill: (
 		projectId: string,
 		currentName: string,
@@ -269,6 +366,7 @@ export const miscApi = {
 				location: string;
 				files: string[];
 				disabled: boolean;
+				canUpdateFromUrl?: boolean;
 			}>
 		>("/skills/global"),
 	getGlobalSkill: (name: string) =>
@@ -279,6 +377,7 @@ export const miscApi = {
 			content: string;
 			files: string[];
 			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
 		}>(`/skills/global/${encodeURIComponent(name)}`),
 	createGlobalSkill: (data: { name: string; description: string; content: string }) =>
 		request<{
@@ -288,6 +387,29 @@ export const miscApi = {
 			content: string;
 			files: string[];
 		}>("/skills/global", { method: "POST", body: JSON.stringify(data) }),
+	importGlobalSkill: (data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+		}>("/skills/global/import", { method: "POST", body: JSON.stringify(data), signal }),
+	updateGlobalSkillFromUrl: (name: string, data: { url: string }, signal?: AbortSignal) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+			disabled?: boolean;
+			canUpdateFromUrl?: boolean;
+		}>(`/skills/global/${encodeURIComponent(name)}/update-from-url`, {
+			method: "POST",
+			body: JSON.stringify(data),
+			signal,
+		}),
 	updateGlobalSkill: (
 		currentName: string,
 		data: { name: string; description: string; content: string },
@@ -402,6 +524,8 @@ export const miscApi = {
 				url?: string;
 				envKeys: string[];
 				headerKeys: string[];
+				oauth?: { clientId?: string; scope?: string };
+				auth?: McpServerAuthStatus;
 				mode?: McpLoadingMode;
 				enabled: boolean;
 				defaultBehavior?: string;
@@ -425,6 +549,17 @@ export const miscApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
+	// Returns the URL to open, or `authorized` when stored credentials were refreshed.
+	mcpStartOAuth: (id: string) =>
+		request<{ authorizationUrl: string } | { authorized: true }>(`/mcp/servers/${id}/oauth/start`, {
+			method: "POST",
+			// Built from the mount prefix the app runs under, so the provider returns behind the proxy.
+			body: JSON.stringify({
+				redirectUrl: new URL(`${apiBase()}/mcp/oauth/callback`, window.location.href).href,
+			}),
+		}),
+	mcpSignOutOAuth: (id: string) =>
+		request<{ ok: boolean }>(`/mcp/servers/${id}/oauth`, { method: "DELETE" }),
 	mcpDeleteServer: (id: string) =>
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
@@ -740,7 +875,12 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
-	nugGetQuota: (providerId: string) =>
+	/** Explicit payment confirmation refresh; ordinary quota readers use quotaSnapshots. */
+	nugGetQuota: (
+		providerId: string,
+		options?: object,
+		payment?: { orderId: string; binding: string },
+	) =>
 		request<{
 			balance: number;
 			totalGranted: number;
@@ -748,19 +888,18 @@ export const miscApi = {
 			extra?: unknown;
 			username?: string;
 			role?: string;
-		}>(`/nug/providers/${providerId}/quota`),
-	nugGetQuotas: () =>
-		request<
-			Record<
-				string,
-				{
-					balance: number | null;
-					totalGranted: number | null;
-					detailedQuotaBalance?: string | null;
-					extra?: unknown;
-				}
-			>
-		>("/nug/quotas"),
+			paymentCredentialIsPrimary?: boolean;
+		}>(
+			`/nug/providers/${providerId}/quota${payment ? `?orderId=${encodeURIComponent(payment.orderId)}&binding=${encodeURIComponent(nugPaymentBinding(payment.binding))}` : ""}`,
+			pickRequestOptions(options),
+		).then((data) => {
+			if (payment && typeof data.paymentCredentialIsPrimary !== "boolean") {
+				throw new ApiError("NUG payment balance context is unavailable; update the backend", 409, {
+					code: "NUG_PAYMENT_CONTEXT",
+				});
+			}
+			return data;
+		}),
 	// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md).
 	nugGetRelayStatus: () =>
 		request<
@@ -770,42 +909,11 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
-	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
-		request<Record<string, ProviderBalanceSnapshot>>(
-			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
-			pickRequestOptions(options),
-		),
 	providerProbeBalance: (providerId: string) =>
 		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
 			method: "POST",
 		}),
-	providerRefreshBalance: (providerId: string) =>
-		request<ProviderBalanceSnapshot>(
-			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
-			{ method: "POST" },
-		),
-
-	deepseekGetBalances: (options?: object) =>
-		request<Record<string, DeepSeekBalanceCache>>(
-			"/deepseek/balances",
-			pickRequestOptions(options),
-		),
-	deepseekRefreshBalances: () =>
-		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
-	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
-	kimiRefreshUsages: () =>
-		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
-
-	// OpenCode Go plan allowance — per-provider server-side cache
-	opencodeGetUsages: (options?: object) =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
-	opencodeRefreshUsages: () =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
-			method: "POST",
-		}),
-	nugGetBillingConfig: (providerId: string) =>
+	nugGetBillingConfig: (providerId: string, intent: NugPaymentIntent) =>
 		request<{
 			enabled: boolean;
 			providers: Array<{ name: string; displayName: string }>;
@@ -819,14 +927,16 @@ export const miscApi = {
 			detailedQuotaBalance?: string | null;
 			extra?: unknown;
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/config`),
+		}>(`/nug/providers/${providerId}/billing/config?${nugPaymentIntentQuery(intent)}`),
 	nugCreateBillingOrder: (
 		providerId: string,
 		body: { amount: number; provider: string; channel?: "alipay" | "wechat" | string },
+		intent: NugPaymentIntent,
 	) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -838,12 +948,13 @@ export const miscApi = {
 			pollIntervalMs?: number;
 		}>(`/nug/providers/${providerId}/billing/orders`, {
 			method: "POST",
-			body: JSON.stringify(body),
-		}),
-	nugGetBillingOrder: (providerId: string, orderId: string) =>
+			body: JSON.stringify({ ...body, intent: checkedNugPaymentIntent(intent) }),
+		}).then((data) => requireNugPaymentOrder(data)),
+	nugGetBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -854,11 +965,14 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}`),
-	nugRepayBillingOrder: (providerId: string, orderId: string) =>
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
+	nugRepayBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -868,9 +982,12 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay`, {
-			method: "POST",
-		}),
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+			{
+				method: "POST",
+			},
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
 	nugGetChannelsHealth: (providerId: string) =>
 		request<{
 			channels: Array<{
@@ -1118,6 +1235,43 @@ export const miscApi = {
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
 			body: JSON.stringify({ parent, name }),
+		}),
+	/**
+	 * Rename one file-tree entry in place.
+	 *
+	 * `name` is a NAME, not a path: the server derives the parent directory from `path`, so
+	 * a rename can never become a move. 409 `ALREADY_EXISTS` and 403 `WRITE_REFUSED` (the
+	 * path is outside the narrator's writable roots) are the two refusals worth showing as
+	 * they are.
+	 */
+	fsRename: (input: { narratorId: string; path: string; name: string }) =>
+		request<{ ok: true; path: string }>("/fs/rename", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/**
+	 * Copy or move one file into a directory — the file tree's paste.
+	 *
+	 * The destination name is always the source's own; a paste never renames. A taken name
+	 * answers 409 `ALREADY_EXISTS`; repeat the request with `overwrite` once the user has
+	 * confirmed which file is being replaced.
+	 */
+	fsTransferFile: (input: {
+		narratorId: string;
+		path: string;
+		targetDir: string;
+		mode: "copy" | "move";
+		overwrite?: boolean;
+	}) =>
+		request<{ ok: true; path: string }>("/fs/transfer", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/** Delete one file entry. The server refuses directories and symlinks. */
+	fsDeleteFile: (input: { narratorId: string; path: string }) =>
+		request<{ ok: true }>("/fs/delete", {
+			method: "POST",
+			body: JSON.stringify(input),
 		}),
 	/**
 	 * Open a directory, or select a file, in the server host's file manager.

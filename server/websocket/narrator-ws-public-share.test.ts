@@ -12,7 +12,7 @@
  *
  * The fake-ws pattern mirrors narrator-ws-acl.test.ts.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../tests/setup";
 import { narratorPublicShares, narrators, users } from "../db/schema";
@@ -45,6 +45,7 @@ type FakeNarratorWS = Parameters<typeof handleNarratorWS.open>[0];
 
 const NOW = "2026-07-19T00:00:00.000Z";
 const openedConnections: Array<FakeNarratorWS & { closedWith?: [number, string] }> = [];
+let restoreStatusCountReader: (() => void) | undefined;
 
 function openShareWs(publicShare?: {
 	shareId: string;
@@ -125,6 +126,8 @@ describe("public-share WebSocket scoping", () => {
 		cleanDb(sqlite);
 	});
 	afterEach(async () => {
+		restoreStatusCountReader?.();
+		restoreStatusCountReader = undefined;
 		for (const ws of openedConnections.splice(0)) handleNarratorWS.close(ws);
 	});
 
@@ -157,6 +160,87 @@ describe("public-share WebSocket scoping", () => {
 		} as never);
 		broadcastToChatRoom(f.roomId, { type: "chat:message_deleted", roomId: f.roomId } as never);
 		expect(sent).toHaveLength(2);
+	});
+
+	it("status snapshots and broadcasts keep committed fields private and preserve explicit null", async () => {
+		// This projection fixture is in-memory; exact Worker reads are covered by the runtime fixture.
+		const counts = await import("../services/narrator-message-count");
+		const reader = spyOn(counts, "readNarratorMessageRefCountSnapshot").mockImplementation(
+			async (_id, version) => ({ version: version ?? 0, count: 17 }),
+		);
+		restoreStatusCountReader = () => reader.mockRestore();
+		const f = await shareFixture();
+		const shared = openShareWs(f);
+		const regular = openShareWs();
+		regular.ws.data.userId = f.owner;
+		const state = {
+			status: "idle" as const,
+			substatus: "[]",
+			turnStartedAt: null,
+			updatedAt: NOW,
+			messageCount: 17,
+			errorMessage: "private upstream details",
+			errorRetryable: false,
+			archivedWithNarratorId: f.narratorId,
+		};
+		await db.update(narrators).set(state).where(eq(narrators.id, f.narratorId));
+		for (const { ws } of [shared, regular])
+			await handleNarratorWS.message(ws, {
+				type: "subscribe",
+				narratorIds: [f.narratorId],
+				kind: "panel",
+			});
+		const privateState = {
+			type: "status_change" as const,
+			narratorId: f.narratorId,
+			...state,
+			substatus: [],
+			statusEpoch: "test-epoch",
+			statusRevision: 10,
+		};
+		const publicState = {
+			type: "status_change",
+			narratorId: f.narratorId,
+			status: "idle",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: NOW,
+			messageCount: 17,
+			statusEpoch: "test-epoch",
+			statusRevision: 10,
+		};
+		expect(regular.sent.find((message) => message.type === "status_change")).toEqual({
+			...privateState,
+			statusEpoch: expect.any(String),
+			statusRevision: expect.any(Number),
+		});
+		expect(shared.sent.find((message) => message.type === "status_change")).toEqual({
+			...publicState,
+			statusEpoch: expect.any(String),
+			statusRevision: expect.any(Number),
+		});
+		regular.sent.length = 0;
+		shared.sent.length = 0;
+		broadcastToNarrator(f.narratorId, privateState);
+		expect(regular.sent).toEqual([privateState]);
+		expect(shared.sent).toEqual([publicState]);
+		// Account-only clears remain explicit instead of becoming missing fields.
+		broadcastToNarrator(f.narratorId, {
+			...privateState,
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+		});
+		expect(regular.sent.at(-1)).toMatchObject({
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+		});
+		expect(shared.sent.at(-1)).toEqual(publicState);
+		const substatus = { ...privateState, type: "substatus_change" as const };
+		broadcastToNarrator(f.narratorId, substatus);
+		expect(regular.sent.at(-1)).toEqual(substatus);
+		expect(shared.sent.at(-1)).toEqual({ ...publicState, type: "substatus_change" });
 	});
 
 	it("public message broadcasts strip replay metadata while private subscribers keep it", async () => {
@@ -229,6 +313,22 @@ describe("public-share WebSocket scoping", () => {
 		eventBus.emit({ type: "system:lifecycle_changed" });
 		expect(shared.sent).toEqual([]);
 		expect(regular.sent).toEqual([{ type: "system_lifecycle_changed" }]);
+		regular.sent.length = 0;
+		eventBus.emit({ type: "system:unattended_changed" });
+		expect(shared.sent).toEqual([]);
+		expect(regular.sent).toEqual([{ type: "unattended_mode_changed" }]);
+	});
+
+	it("device lifecycle invalidation is data-free and never reaches anonymous shares", async () => {
+		const shared = openShareWs(await shareFixture());
+		const regular = openShareWs();
+		shared.sent.length = 0;
+		regular.sent.length = 0;
+		eventBus.emit({ type: "device:changed", deviceId: "private-device" });
+		eventBus.emit({ type: "device:status", deviceId: "private-device", status: "offline" });
+		await new Promise((resolve) => setTimeout(resolve, 130));
+		expect(shared.sent).toEqual([]);
+		expect(regular.sent).toEqual([{ type: "execution_devices_changed" }]);
 	});
 
 	it("refuses stats and unrelated workspace subscriptions", async () => {

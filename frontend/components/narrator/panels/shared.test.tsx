@@ -17,6 +17,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { act } from "react";
 
 const DOM_KEYS = [
 	"window",
@@ -66,7 +67,7 @@ async function installDom(): Promise<() => void> {
 		requestAnimationFrame: (cb: FrameRequestCallback) =>
 			setTimeout(() => cb(Date.now()), 0) as unknown as number,
 		cancelAnimationFrame: (h: number) => clearTimeout(h),
-		IS_REACT_ACT_ENVIRONMENT: false,
+		IS_REACT_ACT_ENVIRONMENT: true,
 		MutationObserver: TestMutationObserver,
 	};
 	for (const key of DOM_KEYS) {
@@ -100,7 +101,6 @@ async function captureDrag(
 ) {
 	const React = await import("react");
 	const { createRoot } = await import("react-dom/client");
-	const { flushSync } = await import("react-dom");
 	const { usePanelHeaderDrag } = await import("./shared");
 	const { getPanelDrag } = await import("../../../lib/panel-drag");
 
@@ -129,7 +129,7 @@ async function captureDrag(
 	const host = document.getElementById("root");
 	if (!host) throw new Error("test host missing");
 	const root = createRoot(host);
-	flushSync(() => {
+	act(() => {
 		root.render(React.createElement(Probe));
 	});
 	if (!handler) throw new Error("hook did not return a handler");
@@ -145,15 +145,14 @@ async function captureDrag(
 	const state = getPanelDrag();
 	// Release so the singleton does not leak a live drag into the next test.
 	document.dispatchEvent(new window.Event("pointerup", { bubbles: true }));
-	flushSync(() => root.unmount());
+	act(() => root.unmount());
 	return state ? { ...state } : null;
 }
 
 /**
  * The DOM is installed for the whole file, not per test: react-dom queues a
- * scheduler callback that reads `window` AFTER the test body returns, so tearing
- * the DOM down between tests surfaces as an unhandled ReferenceError rather than
- * a failure. `afterAll` also drains the queue before restoring.
+ * scheduler callback that reads `window` AFTER the test body returns. All React
+ * work stays inside `act` so it is flushed before restoring the globals.
  */
 let restoreDom: (() => void) | undefined;
 
@@ -162,14 +161,13 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await act(async () => {});
 	restoreDom?.();
 });
 
 async function mountGeometryProbe(style?: string) {
 	const React = await import("react");
 	const { createRoot } = await import("react-dom/client");
-	const { flushSync } = await import("react-dom");
 	const { usePanelGeometryReady } = await import("./shared");
 	const container = document.createElement("div");
 	if (style !== undefined) {
@@ -197,7 +195,7 @@ async function mountGeometryProbe(style?: string) {
 		return <div ref={ref}>{geometryReady && <Content />}</div>;
 	}
 	const observerStart = TestMutationObserver.instances.length;
-	flushSync(() => root.render(<Probe />));
+	act(() => root.render(<Probe />));
 	return {
 		container,
 		get mounts() {
@@ -213,13 +211,13 @@ async function mountGeometryProbe(style?: string) {
 			return TestMutationObserver.instances.slice(observerStart);
 		},
 		update(style: string) {
-			flushSync(() => {
+			act(() => {
 				container.setAttribute("style", style);
 				for (const observer of this.observers) observer.notify();
 			});
 		},
 		dispose() {
-			flushSync(() => root.unmount());
+			act(() => root.unmount());
 			container.remove();
 		},
 	};
@@ -324,7 +322,6 @@ describe("usePanelCompact retained hidden surfaces", () => {
 	it("keeps the last visible breakpoint through zero-width parking and resumes normally", async () => {
 		const React = await import("react");
 		const { createRoot } = await import("react-dom/client");
-		const { flushSync } = await import("react-dom");
 		const { usePanelCompact } = await import("./shared");
 		const previous = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
 		let callback: ResizeObserverCallback | undefined;
@@ -348,11 +345,11 @@ describe("usePanelCompact retained hidden surfaces", () => {
 			return React.createElement("div", { ref: state.ref });
 		}
 		const resize = (width: number) =>
-			flushSync(() =>
+			act(() =>
 				callback?.([{ contentRect: { width } } as ResizeObserverEntry], {} as ResizeObserver),
 			);
 		try {
-			flushSync(() => root.render(React.createElement(Probe)));
+			act(() => root.render(React.createElement(Probe)));
 			expect(compact).toBe(true);
 			resize(0);
 			expect(compact).toBe(true);
@@ -365,7 +362,7 @@ describe("usePanelCompact retained hidden surfaces", () => {
 			resize(640);
 			expect(compact).toBe(false);
 		} finally {
-			flushSync(() => root.unmount());
+			act(() => root.unmount());
 			expect(disconnected).toBe(true);
 			element.remove();
 			if (previous) Object.defineProperty(globalThis, "ResizeObserver", previous);

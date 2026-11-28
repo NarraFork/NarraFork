@@ -1,22 +1,32 @@
-import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { createMailboxStore } from "../agent-runtime/mailbox";
 import type { MailboxClaim, MailboxRow } from "../agent-runtime/mailbox-types";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	expectRuntimeTestFailure,
+	getRuntimeTestDb as getTestDb,
+} from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+	postgresRuntime: null,
 }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
@@ -44,7 +54,7 @@ beforeEach(() => {
 	for (const id of ["recipient", "sender", "fork"])
 		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
 });
-afterAll(() => sqlite.close());
+afterAll(async () => await closeRuntimeTestDb(sqlite, { sessionTails: true }));
 
 test("SQL ref-insert failure cannot leave an orphan history message", async () => {
 	const { row, claim } = enqueue();
@@ -57,7 +67,7 @@ test("SQL ref-insert failure cannot leave an orphan history message", async () =
 		sqlite.exec("DROP TRIGGER fail_receipt_ref");
 	}
 	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
-	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
+	expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("claimed");
 	await persist(row, claim);
 	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 });
@@ -69,22 +79,67 @@ test("adoption bookkeeping failure retries only the receipt, never history input
 		"CREATE TEMP TRIGGER fail_receipt_ack BEFORE UPDATE OF injection_consumed_at ON narrator_message_refs BEGIN SELECT RAISE(ABORT, 'ack write fault'); END",
 	);
 	try {
-		await markAgentMessageConsumed(delivery(row));
+		await expectRuntimeTestFailure(() => markAgentMessageConsumed(delivery(row)), {
+			kind: "marker",
+			caller: "agent-message-delivery.ts",
+		});
 	} finally {
 		sqlite.exec("DROP TRIGGER fail_receipt_ack");
 	}
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	expect(ref(message.id)?.injectionConsumedAt).toBeNull();
 	await markAgentMessageConsumed(delivery(row));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedRevision).toBe(1);
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedRevision).toBe(1);
 	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 });
+
+for (const mode of ["current", "mailbox", "agent", "adopted"] as const)
+	test(`${mode} adoption rejects a concurrent mailbox revision after its Worker observation`, async () => {
+		const { row, claim } = enqueue(mode === "mailbox");
+		const message = await persist(row, claim);
+		if (mode === "adopted")
+			db.update(narratorMessageRefs)
+				.set({ injectionConsumedAt: new Date(time) })
+				.where(eq(narratorMessageRefs.messageId, message.id))
+				.run();
+		const original = workerRead.readQueryFirst;
+		let injected = false;
+		const probe = spyOn(workerRead, "readQueryFirst").mockImplementation(async (query, options) => {
+			const result = await original(query, options);
+			if (!injected && result && typeof result === "object" && "deliveryId" in result) {
+				injected = true;
+				db.update(narratorBufferedMessages)
+					.set({ currentRevision: 2 })
+					.where(eq(narratorBufferedMessages.deliveryId, row.deliveryId as string))
+					.run();
+			}
+			return result;
+		});
+		try {
+			const error = await expectRuntimeTestFailure(
+				() =>
+					markAgentMessageConsumed({
+						...delivery(row),
+						recipientRefId: ref(message.id)?.id,
+						...(mode === "current" ? { currentRevisionOnly: true } : {}),
+						...(mode === "mailbox" ? { mailboxOnly: true } : {}),
+					}).catch((error) => error),
+				{ kind: "marker", caller: "agent-message-delivery.ts" },
+			);
+			expect(injected).toBe(true);
+			expect(error).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+			expect((await store.getByDelivery(row.deliveryId as string))?.currentRevision).toBe(2);
+			expect(ref(message.id)?.injectionConsumedAt != null).toBe(mode === "adopted");
+		} finally {
+			probe.mockRestore();
+		}
+	});
 
 test("semantic block deletion keeps original adopted fact and invalidates sender receipt page", async () => {
 	const { row, claim } = enqueue();
 	const message = await persist(row, claim);
 	await markAgentMessageConsumed(delivery(row));
-	const adoptedAt = store.getByDelivery(row.deliveryId as string)?.adoptedAt;
+	const adoptedAt = (await store.getByDelivery(row.deliveryId as string))?.adoptedAt;
 	const before =
 		db
 			.select({ version: narrators.messageVersion })
@@ -92,7 +147,7 @@ test("semantic block deletion keeps original adopted fact and invalidates sender
 			.where(eq(narrators.id, "sender"))
 			.get()?.version ?? 0;
 	await messageService.deleteMessageBlock("recipient", message.id, 0, { skipRevert: true });
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		receiptDisposition: "superseded",
 		adoptedAt,
 	});
@@ -292,8 +347,8 @@ test("source COW copy cannot authorize a new Send execution or duplicate its ori
 			"original",
 		),
 	).toThrow();
-	expect(store.list("recipient")).toHaveLength(1);
-	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("materialized");
+	expect(await store.list("recipient")).toHaveLength(1);
+	expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("materialized");
 });
 
 test("legacy ref-only consumption upgrades mailbox adoption using its original timestamp", async () => {
@@ -305,7 +360,7 @@ test("legacy ref-only consumption upgrades mailbox adoption using its original t
 		.where(eq(narratorMessageRefs.messageId, message.id))
 		.run();
 	await markAgentMessageConsumed(delivery(row));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		adoptedRevision: 1,
 		adoptedAt: original.toISOString(),
 	});
@@ -320,12 +375,12 @@ test("wrong source attempt and content revision cannot acknowledge a stable deli
 		...delivery(row),
 		senderToolCallBinding: { toolCallId: "tool", attempt: 2 },
 	});
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	await markAgentMessageConsumed({
 		...delivery(row),
 		senderToolCallBinding: { toolCallId: "tool", attempt: 1 },
 	});
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedRevision).toBe(1);
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedRevision).toBe(1);
 });
 
 test("child user_input without agent envelope materializes through the real subagent writer", async () => {
@@ -339,7 +394,7 @@ test("child user_input without agent envelope materializes through the real suba
 	);
 	expect(message.parentToolUseId).toBe("origin");
 	expect(message.id).toBe(row.recipientMessageId as string);
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		state: "materialized",
 		recipientRefId: ref(message.id)?.id,
 	});
@@ -348,9 +403,9 @@ test("child user_input without agent envelope materializes through the real suba
 test("clearContext hides old history without acknowledging, deleting or requeueing its delivery", async () => {
 	const { row, claim } = enqueue();
 	const message = await persist(row, claim);
-	const before = store.getByDelivery(row.deliveryId as string);
+	const before = await store.getByDelivery(row.deliveryId as string);
 	await narratorPersistence.clearContext("recipient");
-	expect(store.getByDelivery(row.deliveryId as string)).toEqual(before);
+	expect(await store.getByDelivery(row.deliveryId as string)).toEqual(before);
 	expect(ref(message.id)?.injectionConsumedAt).toBeNull();
 	const postCompact = await messageService._getPostCompactTopLevelRefs("recipient");
 	expect(postCompact.some((item) => item.messageId === message.id)).toBe(false);
@@ -405,22 +460,21 @@ test.each([
 		},
 	];
 	const abortedHistory: unknown[] = [];
-	trackAgentMessageHistory("recipient", abortedHistory, candidates);
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
-	consumeAgentMessageHistory(abortedHistory);
+	await trackAgentMessageHistory("recipient", abortedHistory, candidates);
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	await Promise.resolve();
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	const coldHistory: unknown[] = [];
-	trackAgentMessageHistory("recipient", coldHistory, candidates);
-	consumeAgentMessageHistory(coldHistory);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeString();
+	await trackAgentMessageHistory("recipient", coldHistory, candidates);
+	await consumeAgentMessageHistory(coldHistory);
+	await drainRuntimeTestWork();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeString();
 	await markMailboxDeliveryConsumed({
 		deliveryId: row.deliveryId as string,
 		recipientNarratorId: "recipient",
 		revision: row.contentRevision,
 	});
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		adoptedRevision: row.contentRevision,
 		state: "materialized",
 	});
@@ -479,13 +533,13 @@ test.each([
 	const { row, claim } = enqueue();
 	const message = await persist(row, claim);
 	if (adopted) await markAgentMessageConsumed(delivery(row));
-	const originalAt = store.getByDelivery(row.deliveryId as string)?.adoptedAt;
+	const originalAt = (await store.getByDelivery(row.deliveryId as string))?.adoptedAt;
 	await narratorPersistence.copyOnWriteMessage("recipient", message.id, {
 		contentText: "edited second",
 		contentJson: [{ type: "text", text: "edited second" }],
 	});
 	const history2: unknown[] = [];
-	trackAgentMessageHistory("recipient", history2, [
+	await trackAgentMessageHistory("recipient", history2, [
 		{
 			id: message.id,
 			narratorId: "recipient",
@@ -493,7 +547,7 @@ test.each([
 			contentJson: [{ type: "text", text: "edited second" }],
 		},
 	]);
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentRevision: 2,
 		currentAdoptedAt: null,
 	});
@@ -501,15 +555,15 @@ test.each([
 		contentText: "edited third",
 		contentJson: [{ type: "text", text: "edited third" }],
 	});
-	consumeAgentMessageHistory(history2);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	await consumeAgentMessageHistory(history2);
+	await drainRuntimeTestWork();
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentRevision: 3,
 		currentAdoptedAt: null,
 		adoptedAt: originalAt,
 	});
 	const history3: unknown[] = [];
-	trackAgentMessageHistory("recipient", history3, [
+	await trackAgentMessageHistory("recipient", history3, [
 		{
 			id: message.id,
 			narratorId: "recipient",
@@ -517,16 +571,16 @@ test.each([
 			contentJson: [{ type: "text", text: "edited third" }],
 		},
 	]);
-	consumeAgentMessageHistory(history3);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	await consumeAgentMessageHistory(history3);
+	await drainRuntimeTestWork();
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		contentRevision: 1,
 		currentRevision: 3,
 		currentAdoptedRevision: 3,
 		adoptedAt: originalAt,
 		receiptDisposition: "superseded",
 	});
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeString();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeString();
 	expect(ref(message.id)?.injectionConsumedAt).toBeInstanceOf(Date);
 	const [receipt] = await loadSendTargetDetails(
 		[{ id: "recipient", deliveryMessageId: message.id }],
@@ -548,7 +602,7 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 		.run();
 	const forkMessageId = await narratorPersistence.copyOnWriteMessage("fork", message.id);
 	const forkHistory: unknown[] = [];
-	trackAgentMessageHistory("fork", forkHistory, [
+	await trackAgentMessageHistory("fork", forkHistory, [
 		{
 			id: forkMessageId,
 			narratorId: "fork",
@@ -556,11 +610,11 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 			contentJson: [{ type: "text", text: "edited" }],
 		},
 	]);
-	consumeAgentMessageHistory(forkHistory);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
+	await consumeAgentMessageHistory(forkHistory);
+	await drainRuntimeTestWork();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeNull();
 	const recipientHistory: unknown[] = [];
-	trackAgentMessageHistory("recipient", recipientHistory, [
+	await trackAgentMessageHistory("recipient", recipientHistory, [
 		{
 			id: message.id,
 			narratorId: "recipient",
@@ -569,9 +623,9 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 		},
 	]);
 	await messageService.deleteMessage("recipient", message.id, { skipRevert: true });
-	consumeAgentMessageHistory(recipientHistory);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	await consumeAgentMessageHistory(recipientHistory);
+	await drainRuntimeTestWork();
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		receiptDisposition: "recipient_deleted",
 		currentAdoptedAt: null,
 		adoptedAt: null,
@@ -590,7 +644,7 @@ test("ordinary user input materializes with message/ref in the real persistence 
 		{ mailboxClaim: claim },
 	);
 	expect(message.id).toBe(row.recipientMessageId as string);
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		state: "materialized",
 		text: "",
 		recipientRefId: ref(message.id)?.id,
@@ -617,7 +671,7 @@ test("fault after mailbox materialization rolls message/ref/mailbox back togethe
 	).rejects.toThrow("injected transaction failure");
 	expect(ref(row.recipientMessageId as string)).toBeUndefined();
 	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
-	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
+	expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("claimed");
 	await narratorPersistence.persistUserMessage(
 		"recipient",
 		"original",
@@ -637,7 +691,7 @@ test("released owner cannot materialize even while its persistent claim token re
 	expect(successor?.epoch).not.toBe(claim.epoch);
 	await expect(persist(row, claim)).rejects.toThrow("Stale mailbox claim execution owner");
 	expect(ref(row.recipientMessageId as string)).toBeUndefined();
-	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
+	expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("claimed");
 });
 
 test("stale claim cannot leave a recipient history row", async () => {
@@ -658,7 +712,7 @@ test("structural recipient COW resolves stable navigation and adopts the origina
 	const current = await narratorPersistence.copyOnWriteMessage("recipient", message.id);
 	expect(current).not.toBe(message.id);
 	await markAgentMessageConsumed(delivery(row));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		recipientRefId: originalRef?.id,
 		currentMessageId: current,
 		adoptedRevision: 1,
@@ -691,7 +745,7 @@ test("semantic edit supersedes an unadopted Send; edited text is never old consu
 		contentJson: [{ type: "text", text: "edited" }],
 	});
 	await markAgentMessageConsumed(delivery(row));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		receiptDisposition: "superseded",
 		adoptedAt: null,
 	});
@@ -707,16 +761,16 @@ test("fork COW cannot acknowledge another recipient even with the same envelope"
 	const current = await narratorPersistence.copyOnWriteMessage("fork", message.id);
 	const content = db.select().from(narratorMessages).where(eq(narratorMessages.id, current)).get();
 	const history: unknown[] = [];
-	trackAgentMessageHistory("fork", history, [
+	await trackAgentMessageHistory("fork", history, [
 		{ id: current, narratorId: "fork", role: "user", contentJson: content?.contentJson },
 	]);
-	consumeAgentMessageHistory(history);
+	await consumeAgentMessageHistory(history);
 	await markAgentMessageConsumed({
 		...delivery(row),
 		recipientNarratorId: "fork",
 		recipientMessageId: current,
 	});
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	expect(ref(current)?.injectionConsumedAt).toBeNull();
 });
 
@@ -727,12 +781,12 @@ test("real deleteMessage leaves a negative receipt and does not delete a shared 
 		.values({ id: "fork-ref", narratorId: "fork", messageId: message.id, seq: 0 })
 		.run();
 	await messageService.deleteMessage("recipient", message.id, { skipRevert: true });
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		state: "materialized",
 		receiptDisposition: "recipient_deleted",
 		currentMessageId: null,
 	});
 	expect(ref(message.id)?.narratorId).toBe("fork");
 	await markAgentMessageConsumed(delivery(row));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 });

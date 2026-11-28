@@ -40,6 +40,7 @@ function relayFixture() {
 
 const options = (fixture: ReturnType<typeof mirrorFixture>) => ({
 	kind: "main" as const,
+	patchOnly: false,
 	repository,
 	tag: fixture.release.tag,
 	config,
@@ -198,6 +199,34 @@ describe("canonical independent main mirror", () => {
 				.filter((c) => c.method === "PUT")
 				.every((c) => c.headers.get("authorization") === `Bearer ${config.token}`),
 		).toBe(true);
+	});
+	test("default mirror commits a v1 projection without downloading or uploading the full binary", async () => {
+		const f = mirrorFixture();
+		const receipt = await mirrorPublishedGitHubRelease({ ...options(f), patchOnly: undefined });
+		expect(receipt.status).toBe("MIRRORED");
+		expect(receipt.snapshotCommitted).toBe(true);
+		expect(f.committed?.schemaVersion).toBe(1);
+		expect(f.committed?.assets.map((asset) => asset.kind).sort()).toEqual([
+			"binary-sidecar",
+			"notes",
+			"patch",
+			"patch-meta",
+		]);
+		expect(f.downloaded).toHaveLength(1);
+		expect(receipt.verified).not.toContain(f.name);
+		expect(f.stored.has(f.release.files[0].sha256)).toBe(false);
+	});
+	test("patch-only commits metadata when the release has no patches", async () => {
+		const f = mirrorFixture(false);
+		const receipt = await mirrorPublishedGitHubRelease({ ...options(f), patchOnly: true });
+		expect(receipt.status).toBe("METADATA_ONLY");
+		expect(receipt.snapshotCommitted).toBe(true);
+		expect(f.downloaded).toHaveLength(0);
+		expect(f.committed?.schemaVersion).toBe(1);
+		expect(f.committed?.assets.map((asset) => asset.kind).sort()).toEqual([
+			"binary-sidecar",
+			"notes",
+		]);
 	});
 	test.each([
 		true,

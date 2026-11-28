@@ -6,11 +6,13 @@ import type {
 	PersistedRecentTab,
 	RecentTabFolderColor,
 	RecentTabFolderIcon,
+	RecentTabStateResult,
 	RecentTabsMutationResult,
 	RecentTabsPageResult,
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import type { GitIdentity } from "./auth";
 import {
 	ApiError,
@@ -22,6 +24,53 @@ import {
 } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
+
+/** The explicit lightweight UI projection: never add secrets, layouts or command bodies here. */
+export interface UIPreferences {
+	autoLoadOlderMessages: boolean;
+	fastModeDefault: boolean;
+	treatAsLocalAccess: boolean;
+	language: Locale;
+	wordWrapMarkdown: boolean;
+	wordWrapCode: boolean;
+	wordWrapDiff: boolean;
+	replyInUserLanguage: boolean;
+	showTokenUsage: boolean;
+	showOutputStats: boolean;
+	compactAuxiliaryContent: boolean;
+	appearancePreferences: AppearanceValues;
+	terminalTheme: string;
+	terminalFontSize: number;
+	narratorFontScalePercent: number;
+	narratorLetterSpacingPercent: number;
+	narratorLineHeightV2Percent: number;
+	narratorParagraphScalePercent: number;
+	recentTabsShowDirectory: boolean;
+	addSubagentToRecentTabs: boolean;
+	recentTabsGroupMode: "flat" | "directory";
+	notifyOnDone: boolean;
+	notifyOnWaiting: boolean;
+	notifyPwaEnabled: boolean;
+	notifySoundEnabled: boolean;
+	notifySoundType: "builtin" | "custom";
+	notifySoundBuiltin: string;
+	notifySoundFileId: string | null;
+	notifySoundVolume: number;
+	notifySoundMaxConcurrent: number;
+	notifyDingtalkEnabled: boolean;
+	notifyFeishuEnabled: boolean;
+	enterQueueMode: "turn" | "tool" | "interrupt";
+	ctrlEnterQueueMode: "turn" | "tool" | "interrupt";
+	setupWizardCompleted: boolean;
+	navLayout: { items: Array<{ id: string; hidden?: boolean }> };
+	narratorToolbarLayout: { items: Array<{ id: string }> };
+	hiddenPluginOverlays: string[];
+	gitIdentityContextMenu: boolean;
+	gitIdentityCreateModal: boolean;
+	gitIdentityFolderContextMenu: boolean;
+}
+
+export type UIPreferencesPatch = Partial<Omit<UIPreferences, "hiddenPluginOverlays">>;
 
 export type SearchChannelKind = "native" | "nug-mcp" | "custom-api" | "subagent" | "plugin";
 
@@ -58,6 +107,8 @@ export interface RecentTabsPageResponse {
 export type RecentTabsMutationResponse = RecentTabsMutationResult;
 export type RecentTabUpsertInput = PersistedRecentTab & {
 	updateOnly?: boolean;
+	/** Pin (or unpin) in the same revision as the upsert; omitted keeps the stored pin. */
+	pin?: boolean;
 	/**
 	 * Place the tab relative to an existing one in the SAME revision that creates it.
 	 * Mutually exclusive. Only the single-tab endpoint is used with these; the batch
@@ -173,6 +224,17 @@ export interface ModelTestResponse {
 	diagnostics?: ModelTestDiagnostics;
 }
 
+function runtimeRequestOptions(options?: object) {
+	const picked = pickRequestOptions(options);
+	return {
+		...picked,
+		maxResponseBytes: 8 * 1024,
+		signal: picked.signal
+			? AbortSignal.any([picked.signal, AbortSignal.timeout(15_000)])
+			: AbortSignal.timeout(15_000),
+	};
+}
+
 export const settingsApi = {
 	getDataDirectorySecurity: (signal?: AbortSignal) =>
 		request<DataDirectorySecurityStatus>("/settings/data-directory-security", { signal }),
@@ -181,6 +243,8 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ confirmed: true }),
 		}),
+	getRuntimeSettings: (options?: object) =>
+		request<RuntimeSettings>("/settings/runtime", runtimeRequestOptions(options)),
 	getSettings: (options?: object) =>
 		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>(
 			"/settings",
@@ -190,6 +254,12 @@ export const settingsApi = {
 		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
+	updateRuntimeSettings: (data: Record<string, unknown>, options?: object) =>
+		request<RuntimeSettings>("/settings?view=runtime", {
+			method: "PATCH",
+			body: JSON.stringify(data),
+			...runtimeRequestOptions(options),
+		}),
 	updateSettings: (data: Record<string, unknown>, options?: object) =>
 		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>("/settings", {
 			method: "PATCH",
@@ -321,6 +391,22 @@ export const settingsApi = {
 		>("/settings/search/protocols"),
 
 	// User Preferences
+	getUIPreferences: (options?: { signal?: AbortSignal }) =>
+		request<UIPreferences>("/user-preferences/ui", {
+			maxResponseBytes: 64 * 1024,
+			signal: options?.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
+				: AbortSignal.timeout(10_000),
+		}),
+	updateUIPreferences: (data: UIPreferencesPatch, options?: { signal?: AbortSignal }) =>
+		request<UIPreferences>("/user-preferences/ui", {
+			method: "PATCH",
+			body: JSON.stringify(data),
+			maxResponseBytes: 64 * 1024,
+			signal: options?.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
+				: AbortSignal.timeout(10_000),
+		}),
 	getUserPreferences: (options?: { signal?: AbortSignal }) =>
 		request<{
 			autoLoadOlderMessages: boolean;
@@ -349,6 +435,8 @@ export const settingsApi = {
 			narratorParagraphScalePercent: number;
 			recentTabsShowDirectory: boolean;
 			addSubagentToRecentTabs: boolean;
+			recentTabsGroupMode: "flat" | "directory";
+			gatewayConfig: Record<string, unknown>;
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -429,6 +517,8 @@ export const settingsApi = {
 			narratorParagraphScalePercent?: number;
 			recentTabsShowDirectory?: boolean;
 			addSubagentToRecentTabs?: boolean;
+			recentTabsGroupMode?: "flat" | "directory";
+			gatewayConfig?: Record<string, unknown>;
 			// Notification preferences
 			notifyOnDone?: boolean;
 			notifyOnWaiting?: boolean;
@@ -512,21 +602,17 @@ export const settingsApi = {
 	): Promise<RecentTabsPageResponse> => {
 		const search = new URLSearchParams({ section, limit: String(params.limit ?? 50) });
 		if (params.cursor) search.set("cursor", params.cursor);
-		const result = await request<RecentTabsPageResult>(
+		const { nextCursor, ...page } = await request<RecentTabsPageResult>(
 			`/user-preferences/recent-tabs?${search.toString()}`,
 			params.signal ? { signal: params.signal } : undefined,
 		);
-		return {
-			items: result.items,
-			hasMore: result.hasMore,
-			revision: result.revision,
-			...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
-		};
+		return nextCursor ? { ...page, nextCursor } : page;
 	},
-	getRecentTabsRuntime: (keys: string[]) =>
+	getRecentTabsRuntime: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsRuntimeResult>("/user-preferences/recent-tabs/runtime", {
 			method: "POST",
 			body: JSON.stringify({ keys }),
+			signal,
 		}),
 	upsertRecentTab: (tab: RecentTabUpsertInput) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs", {
@@ -563,6 +649,12 @@ export const settingsApi = {
 			body: JSON.stringify({ key, ...target }),
 			signal,
 		}),
+	/** Whether one tab is in the sidebar and pinned, wherever it sits in the list. */
+	getRecentTabState: (type: "project" | "team", id: string, signal?: AbortSignal) =>
+		request<RecentTabStateResult>(
+			`/user-preferences/recent-tabs/state?${new URLSearchParams({ type, id }).toString()}`,
+			signal ? { signal } : undefined,
+		),
 	pinRecentTab: (key: string, pinned: boolean) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
 			method: "PATCH",
@@ -602,10 +694,28 @@ export const settingsApi = {
 	 * 保存某个叙述者的大纲标签排布。服务端按 narratorId 合并写入，
 	 * 不会覆盖其他叙述者的记录。
 	 */
-	saveSpecTabLayout: (narratorId: string, layout: { order: string[]; pinned: string[] }) =>
+	getSpecTabLayout: (narratorId: string, options?: { signal?: AbortSignal }) =>
+		request<{ order: string[]; pinned: string[] }>(
+			`/user-preferences/spec-tab-layout?${new URLSearchParams({ narratorId })}`,
+			{
+				signal: options?.signal
+					? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
+					: AbortSignal.timeout(10_000),
+				maxResponseBytes: 64 * 1024,
+			},
+		),
+	saveSpecTabLayout: (
+		narratorId: string,
+		layout: { order: string[]; pinned: string[] },
+		options?: { signal?: AbortSignal },
+	) =>
 		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
 			method: "PATCH",
 			body: JSON.stringify({ narratorId, ...layout }),
+			signal: options?.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
+				: AbortSignal.timeout(10_000),
+			maxResponseBytes: 64 * 1024,
 		}),
 	/** Show or hide one plugin's overlay views for the current user only. */
 	setPluginOverlayHidden: (pluginId: string, hidden: boolean) =>

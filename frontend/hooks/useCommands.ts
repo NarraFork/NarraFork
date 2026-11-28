@@ -88,8 +88,8 @@ function useSlashMenuItems({
 					name: "modeltrace",
 					prompt: "",
 					description: localize(
-						"Trace the model's current task in a one-turn child session without interrupting it",
-						"在单轮子会话中追踪模型当前任务，不中断原会话",
+						"Sample the model fingerprint. --fork reuses the conversation prefix; --calibrate takes three samples.",
+						"采样模型指纹。--fork 复用当前会话前缀；--calibrate 采样三次。",
 					),
 					source: "builtin",
 					type: "command" as const,

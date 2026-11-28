@@ -13,6 +13,17 @@ import { createTheme } from "@mantine/core";
 export const mantineTheme = createTheme({
 	primaryColor: "indigo",
 	defaultRadius: "sm",
+	/*
+	 * The same stacks as `--nf-font-ui` / `--nf-font-mono` in `styles/tokens.css`, written out.
+	 * A `var()` here is invalid in any document that has not loaded that stylesheet (the
+	 * permission-card browser tests, the plugin iframe), and the textarea then falls back to
+	 * the UA serif, which wraps a line the height model did not predict. `fontSizes` /
+	 * `lineHeights` / `spacing` are deliberately NOT set: overrides that merely restate
+	 * Mantine's defaults still shift the scale.
+	 */
+	fontFamily:
+		'ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif',
+	fontFamilyMonospace: 'ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace',
 	colors: {
 		/*
 		 * Blue-toned neutral for "the system is waiting on itself" states — e.g. a

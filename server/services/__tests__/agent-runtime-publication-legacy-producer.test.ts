@@ -1,6 +1,5 @@
 import { afterAll, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -8,9 +7,11 @@ import {
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import { MAILBOX_LIMITS as L } from "../agent-runtime/limits";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
 // Seed old accepted tasks BEFORE importing the producer captures its immutable upgrade watermark.
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 const time = "2025-01-01T00:00:00.000Z";
 db.insert(narrators).values({ id: "parent", createdAt: time, updatedAt: time }).run();
 db.insert(backgroundTasks)
@@ -49,14 +50,19 @@ db.insert(backgroundTasks)
 		},
 	])
 	.run();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher } = await import("../agent-runtime/publication");
 publisher.stop();
 tasks.setBroadcastFnForTests(() => {});
 afterAll(async () => {
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.restore();
 });
 
@@ -106,7 +112,7 @@ test("real pre-upgrade live completion and unknown crash are grandfathered even 
 	);
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
-	publisher.flushRecipient("parent");
+	await publisher.flushRecipient("parent");
 	const notices = db
 		.select()
 		.from(narratorBufferedMessages)

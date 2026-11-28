@@ -39,6 +39,8 @@ export const OutlineDigestInbox = RemoteUnsupported;
 export const DirectoryPicker = RemoteUnsupported;
 export const DirectoryBrowserModal = RemoteUnsupported;
 export const DirectoryBrowser = RemoteUnsupported;
+export const DeviceDirectoryBrowser = RemoteUnsupported;
+export const DeviceDirectoryModal = RemoteUnsupported;
 export function loadMonaco(): Promise<never> {
 	return Promise.reject(new Error("REMOTE_EDITOR_UNSUPPORTED"));
 }

@@ -18,10 +18,10 @@
  * via a shared temp directory.
  *
  * Bounded work: the packages are a handful of text files (enforced at generation time), the
- * write happens once per version per process, and each file is compared by size before being
- * rewritten so a restart does not touch unchanged files.
+ * write happens once per version per process, and each file is compared by content before
+ * being rewritten so a restart does not touch unchanged files. Equal length is not equality.
  */
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -80,11 +80,7 @@ export function materializeBuiltinPlugins(): Promise<readonly string[]> {
 			dirs.push(dir);
 			for (const file of pkg.files) {
 				const target = join(dir, file.path);
-				const expected = Buffer.byteLength(file.content, "utf8");
-				const existing = await sizeOf(target);
-				// Same size is the cheap, sufficient check for generated content: the bytes come
-				// from this build, so an equal length means an equal file.
-				if (existing === expected) continue;
+				if (await materializedFileMatches(target, file.content)) continue;
 				await mkdir(join(target, ".."), { recursive: true });
 				await writeFile(target, file.content, "utf8");
 			}
@@ -102,16 +98,17 @@ export function materializeBuiltinPlugins(): Promise<readonly string[]> {
 	return materializing;
 }
 
-async function sizeOf(path: string): Promise<number | undefined> {
-	try {
-		const info = await stat(path);
-		return info.isFile() ? info.size : undefined;
-	} catch {
-		return undefined;
-	}
+/**
+ * Whether the file already holds this exact text.
+ *
+ * A shared byte length is not enough: a later build can ship different bytes of
+ * the same size under the same plugin version path.
+ */
+export async function materializedFileMatches(path: string, content: string): Promise<boolean> {
+	return (await readMaterialized(path)) === content;
 }
 
-/** Whether the materialized copy on disk matches the embedded content. */
+/** Read the materialized file as text, or undefined when it cannot be read. */
 export async function readMaterialized(path: string): Promise<string | undefined> {
 	try {
 		return await readFile(path, "utf8");

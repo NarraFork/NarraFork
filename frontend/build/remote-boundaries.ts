@@ -30,6 +30,7 @@ export const REMOTE_MODULE_REPLACEMENTS: Readonly<Record<string, string>> = {
 	"components/narrator/SaveDumpModal.tsx": "remote/plugin-boundary.tsx",
 	"components/outline/OpenInOutline.tsx": "remote/plugin-boundary.tsx",
 	"components/common/DirectoryPicker.tsx": "remote/plugin-boundary.tsx",
+	"components/common/DeviceDirectoryPicker.tsx": "remote/plugin-boundary.tsx",
 	"components/outline/digest/OutlineDigestInbox.tsx": "remote/plugin-boundary.tsx",
 	"components/narrator/vlist/vlist-outline-ask-bridge.tsx":
 		"components/narrator/vlist/remote-outline-ask-bridge.tsx",

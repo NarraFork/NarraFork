@@ -13,6 +13,7 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { CodexProvider } from "../codex-provider";
+import { createProviderTurnContext, getCodexTurnState } from "../codex-turn-state";
 import * as websocket from "../codex-websocket";
 import { ProviderInvalidStateError } from "../error-handling";
 import { OpenAIProvider } from "../openai-provider";
@@ -370,4 +371,65 @@ describe("CodexProvider policy-violation capture", () => {
 			restore();
 		}
 	});
+});
+
+describe("built-in Codex routing identity across transports", () => {
+	for (const fallback of ["unsupported upgrade", "expected 101"] as const) {
+		test(`${fallback}: same-turn SSE retains the WS token, a new turn starts empty`, async () => {
+			const provider = new CodexProvider({
+				useWebSocket: true,
+				useWebSearch: false,
+				useImageGeneration: false,
+			});
+			const ctx = fakeContext();
+			const { calls, restore } = stubManager(provider, ctx);
+			const headers: Headers[] = [];
+			let wsCalls = 0;
+			const ws = spyOn(websocket, "streamCodexResponsesWebSocket").mockImplementation(
+				async function* (options) {
+					if (++wsCalls === 1) {
+						getCodexTurnState(options.turnContext, {
+							baseUrl: options.baseUrl,
+							credentialId: options.credentialId,
+							headers: websocket.buildHandshakeHeaders(options),
+						}).capture("ws-seeded-route");
+						yield { text: "first response", stopReason: "stop" };
+						return;
+					}
+					if (fallback === "expected 101") throw new Error("Expected 101 status code");
+					throw new websocket.CodexWebSocketFallbackError("Upgrade unavailable", 426);
+				},
+			);
+			globalThis.fetch = (async (_input, init) => {
+				headers.push(new Headers(init?.headers));
+				return new Response(
+					'data: {"type":"response.completed","response":{"id":"resp_sse","status":"completed","output":[]}}\n\n',
+					{
+						headers: { "content-type": "text/event-stream" },
+					},
+				);
+			}) as typeof fetch;
+			const turnContext = createProviderTurnContext();
+			try {
+				for (const context of [turnContext, turnContext, createProviderTurnContext()]) {
+					for await (const _event of provider.chat({ ...makeChatParams(), turnContext: context })) {
+						// Exercise the built-in adapter's actual SSE delegate after a WS attempt.
+					}
+				}
+				expect(headers).toHaveLength(2);
+				expect(headers[0].get("x-codex-turn-state")).toBe("ws-seeded-route");
+				expect(headers[1].get("x-codex-turn-state")).toBeNull();
+				for (const requestHeaders of headers) {
+					expect(requestHeaders.get("authorization")).toBe(ctx.authorization);
+					expect(requestHeaders.get("chatgpt-account-id")).toBe(ctx.credential.accountId);
+				}
+				expect(calls.failure).toEqual([]);
+				expect(calls.quota).toEqual([]);
+			} finally {
+				ws.mockRestore();
+				restore();
+				globalThis.fetch = realFetch;
+			}
+		});
+	}
 });

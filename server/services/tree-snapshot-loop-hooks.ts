@@ -30,13 +30,12 @@
  *   do nothing", so the loop never awaits a call that cannot produce anything.
  * - The hooks never throw. A capture failure degrades that boundary to null;
  *   snapshotting must not break a turn.
- * - Capture runs through `tryCaptureHot`, so an over-budget scan returns null
- *   and continues in the background instead of stalling tool execution indefinitely
- *   (see `worktree-tree-snapshot.tryCaptureHot`). The
- *   `workspace.treeSnapshotsEnabled` escape hatch is honoured inside
- *   `captureSessionTree`, so it applies to every caller of this module.
+ * - Local content capture and Bash observation windows are disabled independently
+ *   of the legacy setting. These hooks still register and seal local write claims;
+ *   neither primary nor subagent runners may bypass that cleanup contract.
  */
 import { lstat } from "node:fs/promises";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { GEN_UI_TOOL_NAME, isGenUiReadAction } from "@shared/gen-ui-tool-policy";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
@@ -347,7 +346,7 @@ export function buildTreeSnapshotEventHooks(
 			}
 			const declared = admission.declared;
 			localCalls.set(toolUseId, session.cwd);
-			if (toolName === SHELL_TOOL_NAME) {
+			if (toolName === SHELL_TOOL_NAME && isFileHistoryEnabledForDevice(session._defaultDeviceId)) {
 				const window = beginBashCaptureWindow(session.cwd, toolUseId);
 				bashCaptureWindows.set(toolUseId, window);
 				if (!window.eligible) {
@@ -453,6 +452,11 @@ export function buildTreeSnapshotExecutionHooks(
 	// pair must remain attached to the pass that admitted the original attempt.
 	const sourceSession = opts.session;
 	const passCwd = sourceSession.cwd;
+	if (!isFileHistoryEnabledForDevice(sourceSession._defaultDeviceId)) {
+		sourceSession._treeHashBefore?.clear();
+		sourceSession._lastTreeHash = undefined;
+		sourceSession._lastTreeHashAt = undefined;
+	}
 	sourceSession._treeHashBefore ??= new Map();
 	const beforeHashes = sourceSession._treeHashBefore;
 	const calls = new WeakMap<AgentToolUse, ReturnType<typeof buildTreeSnapshotEventHooks>>();

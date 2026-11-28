@@ -64,7 +64,8 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 
 ## 已实现能力
 
-- 连接按 session / credential / model 缓存；复用前比较 URL、代理及最终握手头的规范化摘要。UA、凭据或额外头变化会安全重连，不把凭据原文保存在身份摘要/缓存键中
+- 连接按 session / credential / model 缓存；复用前比较 URL、有效代理及最终握手头的规范化摘要。有效代理先应用 loopback、`NO_PROXY` 与 `settings.proxy.noProxyRules` 豁免，同一结果用于摘要和实际握手；路由变化重连，仍被豁免的代理配置变化不打断连接。UA、凭据或额外头变化会安全重连，不把凭据原文保存在身份摘要/缓存键中
+- `ephemeralSession` 使用独立连接，不读取、加入或淘汰共享连接缓存；同 key 的嵌套请求也保留独立 socket。`validateBeforeDispatch` 在复用检查、新握手建立和每次发送前校验诊断凭据，异步请求/证据编码或回调期间撤销会阻止发送
 - `previous_response_id` 增量续写
 - `response.output_item.done` 基线跟踪
 - `x-codex-turn-state` 来自握手/HTTP 响应头或 `response.metadata`，首个非空值锁定。按显式逻辑用户轮次和认证归属隔离，工具续写、同轮重试及 HTTP/WS 切换共享；独立新输入重置，UA 更新不清同轮 token

@@ -4,6 +4,8 @@ import type { ToolCallDetailRef } from "../../../lib/api/narrators";
 export interface ToolEditReference extends ToolCallDetailRef {
 	narratorId: string;
 	toolUseId: string;
+	/** Captured from the persisted tool target, never from the current layout host. */
+	deviceId?: string;
 }
 
 export function toolEditReferenceKey(ref: ToolEditReference): string {
@@ -13,6 +15,7 @@ export function toolEditReferenceKey(ref: ToolEditReference): string {
 		ref.toolCallId ?? null,
 		ref.messageId ?? null,
 		ref.executionAttempt ?? null,
+		...(ref.deviceId === undefined ? [] : [ref.deviceId]),
 	]);
 }
 
@@ -23,6 +26,8 @@ export function isToolEditReference(value: unknown): value is ToolEditReference 
 	return (
 		validId(ref.narratorId) &&
 		validId(ref.toolUseId) &&
+		(ref.deviceId === undefined ||
+			(validId(ref.deviceId) && (ref.deviceId as string).trim().length > 0)) &&
 		(ref.toolCallId === undefined || validId(ref.toolCallId)) &&
 		(ref.messageId === undefined || validId(ref.messageId)) &&
 		(ref.executionAttempt === undefined ||

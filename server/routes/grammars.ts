@@ -13,7 +13,6 @@
  */
 import { Hono } from "hono";
 import {
-	clearOutlineCache,
 	downloadGrammar,
 	EXCLUDED_GRAMMARS,
 	getGrammarEntry,
@@ -58,7 +57,6 @@ grammarRoutes.post("/:lang/download", async (c) => {
 	// A freshly downloaded grammar has to displace the negative cache entry left by
 	// earlier calls, or parsing stays degraded until the process restarts.
 	invalidateParser(lang);
-	clearOutlineCache();
 	return c.json({ ok: true, languageId: result.languageId, sizeBytes: result.sizeBytes });
 });
 
@@ -73,6 +71,5 @@ grammarRoutes.delete("/:lang", async (c) => {
 	}
 	const removed = removeGrammar(lang);
 	invalidateParser(lang);
-	clearOutlineCache();
 	return c.json({ ok: true, removed });
 });

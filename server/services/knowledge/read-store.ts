@@ -1,3 +1,6 @@
+import type { ReadQueryOptions } from "../../db/worker-read";
+export type KnowledgeReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
+
 /**
  * The knowledge base's READ capability, stated without a dialect.
  *
@@ -267,113 +270,207 @@ export type LinkListDirection = "out" | "in" | "both";
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface KnowledgeReadStore {
-	getPersonalEntryById(id: string): Promise<KnowledgeDraftRow | null>;
-	listPersonalEntries(opts: {
-		userId: string;
-		status?: "active" | "archived";
-		limit: number;
-	}): Promise<(Omit<KnowledgeDraftRow, "content"> & { contentLength: number })[]>;
+	getPersonalEntryById(
+		id: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeDraftRow | null>;
+	listPersonalEntries(
+		opts: {
+			userId: string;
+			status?: "active" | "archived";
+			limit: number;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<(Omit<KnowledgeDraftRow, "content"> & { contentLength: number })[]>;
 	getEntryRevisionPointers(
 		ids: string[],
+		options?: KnowledgeReadOptions,
 	): Promise<{ id: string; currentRevisionId: string | null }[]>;
 	// ── entries ──
 	/** Full row by id, or null. The caller decides whether the content blob is needed. */
-	getEntryById(entryId: string): Promise<KnowledgeEntryRow | null>;
+	getEntryById(entryId: string, options?: KnowledgeReadOptions): Promise<KnowledgeEntryRow | null>;
+	getEntryDetailById(
+		entryId: string,
+		signal?: AbortSignal,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryRow | null>;
 	/** The ACL gate fields of one entry, or null. */
-	getEntryAclById(entryId: string): Promise<KnowledgeEntryAclRow | null>;
+	getEntryAclById(
+		entryId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryAclRow | null>;
 	/** The ACL + display fields of one entry (link/graph endpoint), or null. */
-	getEntryGraphById(entryId: string): Promise<KnowledgeEntryGraphRow | null>;
+	getEntryGraphById(
+		entryId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryGraphRow | null>;
 	/** Batch: ACL fields of many entries (the filterReadable projection). */
-	getEntriesAclByIds(entryIds: string[]): Promise<KnowledgeEntryAclRow[]>;
+	getEntriesAclByIds(
+		entryIds: string[],
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryAclRow[]>;
 	/** Batch: ACL + display fields of many entries (graph traversal preload). */
-	getEntriesGraphByIds(entryIds: string[]): Promise<KnowledgeEntryGraphRow[]>;
+	getEntriesGraphByIds(
+		entryIds: string[],
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryGraphRow[]>;
 	/**
 	 * List-view rows ordered by (updatedAt DESC, id DESC), bounded by `limit`. When `after`
 	 * is given, only rows strictly after that keyset position are returned (keyset
 	 * pagination — the `id` tie-break keeps equal timestamps from being skipped/duplicated).
 	 */
-	listEntries(opts: {
-		collectionId?: string;
-		limit: number;
-		after?: KnowledgeEntryListCursor;
-	}): Promise<KnowledgeEntryListRow[]>;
+	listEntries(
+		opts: {
+			collectionId?: string;
+			limit: number;
+			after?: KnowledgeEntryListCursor;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryListRow[]>;
 	/**
 	 * {@link listEntries} with an explicit order and SQL-side filters (the paginated browse list).
 	 * Same projection; bounded by `limit`; rows strictly after `order.after` in that order.
 	 */
 	listEntriesOrdered(
 		opts: KnowledgeEntryListFilter & { limit: number; order: KnowledgeEntryListOrder },
+		options?: KnowledgeReadOptions,
 	): Promise<KnowledgeEntryListRow[]>;
 	/** The slug pre-check before an entry insert. Only the id crosses back. */
-	findEntryBySlug(collectionId: string, slug: string): Promise<{ id: string } | null>;
+	findEntryBySlug(
+		collectionId: string,
+		slug: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string } | null>;
 
 	// ── collections ──
 	/** Full row by id, or null. */
-	getCollectionById(collectionId: string): Promise<KnowledgeCollectionRow | null>;
+	getCollectionById(
+		collectionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeCollectionRow | null>;
 	/** The ACL gate fields of one collection, or null. */
-	getCollectionAclById(collectionId: string): Promise<KnowledgeCollectionAclRow | null>;
+	getCollectionAclById(
+		collectionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeCollectionAclRow | null>;
 	/** The ACL fields plus name/slug (admin ACL echo-back), or null. */
-	getCollectionSummaryById(collectionId: string): Promise<KnowledgeCollectionSummaryRow | null>;
+	getCollectionSummaryById(
+		collectionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeCollectionSummaryRow | null>;
 	/** Batch: ACL fields of many collections. */
-	getCollectionsAclByIds(collectionIds: string[]): Promise<KnowledgeCollectionAclRow[]>;
+	getCollectionsAclByIds(
+		collectionIds: string[],
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeCollectionAclRow[]>;
 	/** All collections (optionally of one project), name-ordered, bounded by `limit`. */
-	listCollections(opts: { projectId?: string; limit: number }): Promise<KnowledgeCollectionRow[]>;
+	listCollections(
+		opts: { projectId?: string; limit: number },
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeCollectionRow[]>;
 	/**
 	 * The slug pre-check before a collection insert. `projectId: null` matches by slug
 	 * alone (the historical global-collection pre-check; the unique index is
 	 * (project_id, slug) and treats NULLs as distinct, so the last line of defence for
 	 * the global race is the write store's conflict vocabulary).
 	 */
-	findCollectionBySlug(opts: {
-		projectId: string | null;
-		slug: string;
-	}): Promise<{ id: string } | null>;
+	findCollectionBySlug(
+		opts: {
+			projectId: string | null;
+			slug: string;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string } | null>;
 	/** Existence probe for FK-style validation. */
-	collectionExists(collectionId: string): Promise<boolean>;
+	collectionExists(collectionId: string, options?: KnowledgeReadOptions): Promise<boolean>;
 
 	// ── revisions ──
 	/** Full row by id (content included — single-row diff reads), or null. */
-	getRevisionById(revisionId: string): Promise<KnowledgeRevisionRow | null>;
+	getRevisionById(
+		revisionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeRevisionRow | null>;
 	/** The (id, entryId) pair of a revision — the link-pin ownership check. */
-	getRevisionEntryId(revisionId: string): Promise<{ id: string; entryId: string } | null>;
+	getRevisionEntryId(
+		revisionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string; entryId: string } | null>;
 	/** History list: metadata only, version-descending, `contentLength` from SQL. */
-	listRevisionMeta(entryId: string, limit: number): Promise<KnowledgeRevisionMetaRow[]>;
+	listRevisionMeta(
+		entryId: string,
+		limit: number,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeRevisionMetaRow[]>;
 
 	// ── users (the knowledge services only ever need identity columns) ──
-	userExists(userId: string): Promise<boolean>;
-	getUserRoleById(userId: string): Promise<{ id: string; role: string } | null>;
-	getUsernameById(userId: string): Promise<{ username: string } | null>;
+	userExists(userId: string, options?: KnowledgeReadOptions): Promise<boolean>;
+	getUserRoleById(
+		userId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string; role: string } | null>;
+	getUsernameById(
+		userId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ username: string } | null>;
 	/** Batch: usernames of the given ids (display only; one `IN` lookup bounded by the caller). */
-	listUsernamesByIds(userIds: string[]): Promise<{ id: string; username: string }[]>;
+	listUsernamesByIds(
+		userIds: string[],
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string; username: string }[]>;
 	/** Bounded user listing for batch cap resolution / role-scoped notify fan-out. */
-	listUserIdsAndRoles(opts: {
-		role?: string;
-		limit?: number;
-	}): Promise<{ id: string; role: string }[]>;
+	listUserIdsAndRoles(
+		opts: {
+			role?: string;
+			limit?: number;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string; role: string }[]>;
 	/** Which of the given user ids exist (bulk-grant pre-validation, one query). */
-	listExistingUserIds(userIds: string[]): Promise<{ id: string }[]>;
+	listExistingUserIds(userIds: string[], options?: KnowledgeReadOptions): Promise<{ id: string }[]>;
 	/** The admin "who can read this entry" population: id + username + role. */
-	listUsersDetailed(): Promise<{ id: string; username: string; role: string }[]>;
+	listUsersDetailed(
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string; username: string; role: string }[]>;
 
 	// ── levels / tags / tag types (ACL admin reads) ──
 	/** Every level, rank-ascending (the rank map and the admin list share this). */
-	listKnowledgeLevels(): Promise<KnowledgeLevelRow[]>;
-	getKnowledgeLevelById(levelId: string): Promise<KnowledgeLevelRow | null>;
+	listKnowledgeLevels(options?: KnowledgeReadOptions): Promise<KnowledgeLevelRow[]>;
+	getKnowledgeLevelById(
+		levelId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeLevelRow | null>;
 	/** Name uniqueness pre-check; `excludeId` keeps a rename from clashing with itself. */
-	findKnowledgeLevelByName(name: string, excludeId?: string): Promise<{ id: string } | null>;
+	findKnowledgeLevelByName(
+		name: string,
+		excludeId?: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string } | null>;
 	/** Rank uniqueness pre-check; same self-exclusion rule. */
-	findKnowledgeLevelByRank(rank: number, excludeId?: string): Promise<{ id: string } | null>;
+	findKnowledgeLevelByRank(
+		rank: number,
+		excludeId?: string,
+		options?: KnowledgeReadOptions,
+	): Promise<{ id: string } | null>;
 	/**
 	 * Whether any entry, collection (either axis) or clearance credential still names
 	 * this level. Levels are referenced BY NAME, so deleting a referenced one would
 	 * fail `rankOf` closed and lock that content to admins — the service refuses on
 	 * `true`.
 	 */
-	knowledgeLevelInUse(levelName: string): Promise<boolean>;
-	listKnowledgeTags(collectionId?: string): Promise<KnowledgeTagRow[]>;
-	getKnowledgeTagById(tagId: string): Promise<KnowledgeTagRow | null>;
-	listKnowledgeTagTypes(): Promise<KnowledgeTagTypeRow[]>;
-	getKnowledgeTagTypeById(tagTypeId: string): Promise<KnowledgeTagTypeRow | null>;
+	knowledgeLevelInUse(levelName: string, options?: KnowledgeReadOptions): Promise<boolean>;
+	listKnowledgeTags(
+		collectionId?: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeTagRow[]>;
+	getKnowledgeTagById(
+		tagId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeTagRow | null>;
+	listKnowledgeTagTypes(options?: KnowledgeReadOptions): Promise<KnowledgeTagTypeRow[]>;
+	getKnowledgeTagTypeById(
+		tagTypeId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeTagTypeRow | null>;
 
 	// ── grants (read side of the unified `acl_grants` table) ──
 	/**
@@ -382,38 +479,67 @@ export interface KnowledgeReadStore {
 	 * returned), optionally narrowed to any of the given principals (OR-ed). The
 	 * knowledge-vocabulary folding stays in the service.
 	 */
-	listKnowledgeAclGrantRows(opts?: {
-		principals?: { principalType: string; principalId: string }[];
-	}): Promise<AclGrantReadRow[]>;
-	getAclGrantById(grantId: string): Promise<AclGrantReadRow | null>;
+	listKnowledgeAclGrantRows(
+		opts?: {
+			principals?: { principalType: string; principalId: string }[];
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<AclGrantReadRow[]>;
+	getAclGrantById(grantId: string, options?: KnowledgeReadOptions): Promise<AclGrantReadRow | null>;
 
 	// ── entry links ──
-	findEntryLink(input: {
-		fromEntryId: string;
-		toEntryId: string;
-		linkType: string;
-	}): Promise<KnowledgeEntryLinkRow | null>;
-	getEntryLinkById(linkId: string): Promise<KnowledgeEntryLinkRow | null>;
+	findEntryLink(
+		input: {
+			fromEntryId: string;
+			toEntryId: string;
+			linkType: string;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryLinkRow | null>;
+	getEntryLinkById(
+		linkId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryLinkRow | null>;
 	/** Links touching one entry, newest first. */
-	listEntryLinks(entryId: string, direction: LinkListDirection): Promise<KnowledgeEntryLinkRow[]>;
+	listEntryLinks(
+		entryId: string,
+		direction: LinkListDirection,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryLinkRow[]>;
 	/** One graph-traversal hop: every link whose either endpoint is in `entryIds`,
 	 *  bounded by `limit` (the per-hop fan-out cap). */
-	listEntryLinksTouching(entryIds: string[], limit: number): Promise<KnowledgeEntryLinkRow[]>;
+	listEntryLinksTouching(
+		entryIds: string[],
+		limit: number,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeEntryLinkRow[]>;
 
 	// ── notification routing ──
 	/** The routing scalars of a submission (never the proposed content), or null. */
-	getSubmissionRoutingById(submissionId: string): Promise<KnowledgeSubmissionRoutingRow | null>;
+	getSubmissionRoutingById(
+		submissionId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<KnowledgeSubmissionRoutingRow | null>;
 	/** Authors holding an ACTIVE draft pinned to a base revision of this entry —
 	 *  the drift-notification population, bounded by `limit`. */
-	listActiveDraftHolderIds(entryId: string, limit: number): Promise<{ authorUserId: string }[]>;
+	listActiveDraftHolderIds(
+		entryId: string,
+		limit: number,
+		options?: KnowledgeReadOptions,
+	): Promise<{ authorUserId: string }[]>;
 	/** The id of `authorUserId`'s ACTIVE personal version of this entry, or null. One lookup on
 	 *  the (entry_id, author_user_id) index — powers `viewerCaps.myPersonalEntryId`. */
-	findActivePersonalEntryId(entryId: string, authorUserId: string): Promise<string | null>;
+	findActivePersonalEntryId(
+		entryId: string,
+		authorUserId: string,
+		options?: KnowledgeReadOptions,
+	): Promise<string | null>;
 	/** Batch form for a list page: `authorUserId`'s ACTIVE personal versions of the given entries
 	 *  (one `IN` lookup on the same index; the caller bounds `entryIds` by its page size). */
 	listActivePersonalEntriesForEntries(
 		entryIds: string[],
 		authorUserId: string,
+		options?: KnowledgeReadOptions,
 	): Promise<{ id: string; entryId: string; baseRevisionId: string | null }[]>;
 
 	// ── audit read ──
@@ -425,56 +551,79 @@ export interface KnowledgeReadStore {
 	 * knowledge audit view, and leaking other domains' events into it would be a
 	 * disclosure, not a feature.
 	 */
-	listKnowledgeAclEventRows(opts: {
-		limit: number;
-		eventType?: string;
-		subjectId?: string;
-		scopeId?: string;
-		actorUserId?: string;
-		cursor?: { createdAt: string; id: string };
-	}): Promise<AclEventReadRow[]>;
+	listKnowledgeAclEventRows(
+		opts: {
+			limit: number;
+			eventType?: string;
+			subjectId?: string;
+			scopeId?: string;
+			actorUserId?: string;
+			cursor?: { createdAt: string; id: string };
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<AclEventReadRow[]>;
 
 	// ── passive keyword injection ──
-	listPersonalKeywordInjectionCandidates(opts: {
-		userId: string;
-		collectionId?: string;
-		projectId?: string;
-		limit: number;
-	}): Promise<KeywordInjectionCandidateRow[]>;
-	personalKeywordInjectionSignature(opts: {
-		userId: string;
-		collectionId?: string;
-		projectId?: string;
-	}): Promise<string>;
+	listPersonalKeywordInjectionCandidates(
+		opts: {
+			userId: string;
+			collectionId?: string;
+			projectId?: string;
+			limit: number;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<KeywordInjectionCandidateRow[]>;
+	personalKeywordInjectionSignature(
+		opts: {
+			userId: string;
+			collectionId?: string;
+			projectId?: string;
+			signal?: AbortSignal;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<string>;
 	personalInjectionSnippets(
 		userId: string,
 		ids: string[],
 		maxChars: number,
+		options?: KnowledgeReadOptions,
 	): Promise<{ id: string; snippet: string | null }[]>;
 	/**
 	 * Active entries that carry keywords: the injection candidate scan. Metadata and
 	 * keyword JSON only — never the body — ordered newest-updated first and bounded
 	 * by `limit`. `projectId` narrows to that project's collections plus global ones.
 	 */
-	listKeywordInjectionCandidates(opts: {
-		collectionId?: string;
-		projectId?: string;
-		limit: number;
-	}): Promise<KeywordInjectionCandidateRow[]>;
+	listKeywordInjectionCandidates(
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			limit: number;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<KeywordInjectionCandidateRow[]>;
 	/**
 	 * The change-detection signature of the same candidate set (`count:maxUpdatedAt`
 	 * from one indexed aggregate), so callers can reuse a compiled matcher until the
 	 * set actually changes.
 	 */
-	keywordInjectionCandidatesSignature(opts: {
-		collectionId?: string;
-		projectId?: string;
-	}): Promise<string>;
+	keywordInjectionCandidatesSignature(
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			signal?: AbortSignal;
+		},
+		options?: KnowledgeReadOptions,
+	): Promise<string>;
 	/** Bounded body prefixes for the final injected hits only. */
 	snippetsByEntryIds(
 		entryIds: string[],
 		maxChars: number,
+		options?: KnowledgeReadOptions,
 	): Promise<{ id: string; snippet: string | null }[]>;
 	/** Entries already injected for (narrator, compactSeq) — the dedupe read. */
-	listInjectedEntryIds(narratorId: string, compactSeq: number): Promise<string[]>;
+	listInjectedEntryIds(
+		narratorId: string,
+		compactSeq: number,
+		options?: KnowledgeReadOptions,
+	): Promise<string[]>;
 }

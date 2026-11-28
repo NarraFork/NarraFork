@@ -85,6 +85,8 @@ async function fixture(
 		shareMaxBytes?: () => number;
 		moveArtifact?: typeof rename;
 		cleanupMs?: number;
+		/** Only the startup-timeout test races the startup budget; others must not hinge on it. */
+		startMs?: number;
 		stopMs?: number;
 		workerCleanupMs?: number;
 		replyGraceMs?: number;
@@ -168,7 +170,7 @@ async function fixture(
 			return null;
 		},
 		limits: {
-			startTimeoutMs: 50,
+			startTimeoutMs: options.startMs ?? 2_000,
 			stopTimeoutMs: options.stopMs ?? 50,
 			workerCleanupTimeoutMs: options.workerCleanupMs ?? 30,
 			replyGraceMs: options.replyGraceMs ?? 20,
@@ -186,8 +188,15 @@ async function fixture(
 		revoked,
 		counts: () => ({ detached, confirmed, uncertain, leases }),
 		async dispose() {
-			if (session.memoryJob)
-				await cancelMemoryProfile(session, session.memoryProfile?.view.profileId as string);
+			const job = session.memoryJob;
+			if (job) {
+				// Cancel's reply is bounded and rejects at once if this job's response budget already
+				// expired. Wait for done instead, so the next test never meets this job's global slot.
+				await cancelMemoryProfile(session, session.memoryProfile?.view.profileId as string).catch(
+					() => {},
+				);
+				await job.done;
+			}
 			await rm(root, { recursive: true, force: true });
 			thread.mockRestore();
 		},
@@ -294,11 +303,14 @@ describe("memory profile supervisor", () => {
 	test("startup timeout cancels worker and keeps endpoint out of thrown errors", async () => {
 		const worker = new FakeWorker();
 		worker.record = false;
-		const f = await fixture({ worker });
+		const f = await fixture({ worker, startMs: 50 });
 		try {
-			await expect(f.api.startMemoryProfile(f.session)).rejects.toThrow(
-				"Memory profile failed (timeout)",
-			);
+			const pending = f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
+			await expect(pending).rejects.toThrow("Memory profile failed (timeout)");
+			// The rejection is bounded by the 30ms response budget, not by cleanup: on a busy runner
+			// it arrives while worker teardown still owns the job and the global diagnostic slot.
+			await done;
 			expect(statusMemoryProfile(f.session).state).toBe("failed");
 			expect(f.session.memoryJob).toBeUndefined();
 			expect(f.counts().confirmed).toBe(1);
@@ -814,8 +826,11 @@ describe("memory profile supervisor", () => {
 		}
 	});
 	test("fixed artifact names, exact sizes and no symlinks are enforced", async () => {
+		// Publication rejects these artifacts immediately, then worker teardown still
+		// runs inside the response budget. On a loaded CI runner that teardown exceeded
+		// the 30ms default and the supervisor reported "timeout" instead of "bytes".
 		for (const variant of ["name", "size", "symlink"]) {
-			const f = await fixture();
+			const f = await fixture({ cleanupMs: 1_000 });
 			try {
 				const view = await f.api.startMemoryProfile(f.session);
 				const request = required(f.worker.request);
@@ -1000,12 +1015,15 @@ describe("memory profile supervisor", () => {
 		const f = await fixture();
 		try {
 			const started = await f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
 			required(f.session.memoryProfile).done = new Promise<void>(() => {});
 			const began = Date.now();
 			await expect(stopMemoryProfile(f.session, required(started.profileId))).rejects.toThrow(
 				"Memory profile failed (timeout)",
 			);
 			expect(Date.now() - began).toBeLessThan(300);
+			// The stop reply has its own deadline; the job's cleanup may still be finishing after it.
+			await done;
 			expect(f.session.memoryJob).toBeUndefined();
 			expect(statusMemoryProfile(f.session).state).toBe("failed");
 		} finally {

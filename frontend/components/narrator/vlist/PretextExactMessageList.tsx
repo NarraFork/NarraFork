@@ -17,12 +17,14 @@ import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
+import { useSubagentOutputCounts } from "@frontend/hooks/useSubagentOutputCounts";
 import { useNarratorCurrentTask } from "@frontend/hooks/useTaskBoard";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { subscribeAskInPassingEvents } from "@frontend/lib/ask-in-passing-events";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
+import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
@@ -86,6 +88,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useTeamConversationMode } from "../team-conversation-mode";
 import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
@@ -106,9 +109,14 @@ import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
+import {
+	ReasoningTranslationVisibilityContext,
+	useReasoningTranslationVisibility,
+} from "./reasoning-translation-visibility";
 import { resolveRenderExtra } from "./render-registry";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
+import { useReasoningTranslationLivePatches } from "./useReasoningTranslationLivePatches";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
@@ -178,12 +186,14 @@ import {
 } from "./vlist-exact-row-state";
 import {
 	applyExactScrollCorrection,
+	createPinnedBottomFrame,
 	getDistanceFromBottom,
 	getScrollBottomTarget,
 	isBottomLostToContentGrowth,
 	isBottomLostToViewportResize,
 	isSuppressedScrollEcho,
 	isUpwardHistoryScroll,
+	scrollExactListToLoadedTop,
 } from "./vlist-exact-scroll";
 import {
 	type FoldRowGeometry,
@@ -287,6 +297,7 @@ import {
 	useTracePermissionSlots,
 } from "./vlist-permission-bridge";
 import { predictInlinePermission } from "./vlist-permission-prediction";
+import { usePersistedToolLive } from "./vlist-persisted-tool-live";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
@@ -396,6 +407,10 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Pause transport/subscriptions without unmounting the loaded document or anchor. */
+	suspended?: boolean;
+	/** Chat rooms have no narrator identity for error diagnostics or model actions. */
+	enableNarratorErrorActions?: boolean;
 	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
 	deferInteractions?: boolean;
 	isSubagent?: boolean;
@@ -527,6 +542,8 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				suspended = false,
+				enableNarratorErrorActions = true,
 				deferInteractions = true,
 				isSubagent,
 				isActive = false,
@@ -599,6 +616,8 @@ export const PretextExactMessageList = memo(
 			 * navigating away) and stop scrolling instead of fighting the new target.
 			 */
 			const jumpTokenRef = useRef(0);
+			// An explicit loaded-top destination outlives pages already fetching for an older intent.
+			const loadedTopNarratorRef = useRef<string | null>(null);
 			/**
 			 * Compact-progress keys this panel has written into the module store.
 			 * `compact_done` often carries no marker id (non-retry path), so cleanup
@@ -607,6 +626,8 @@ export const PretextExactMessageList = memo(
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const panelVisible = useNarratorPanelVisible();
+			const suspendedRef = useRef(suspended);
+			suspendedRef.current = suspended;
 			const interactionOwner = useMemo(
 				() => ({
 					narratorId,
@@ -840,10 +861,16 @@ export const PretextExactMessageList = memo(
 
 			const onScrollTopCorrection = useCallback(
 				(nextTop: number, anchorKind: "bottom" | "item", smoothFollow?: boolean) => {
+					// A correction captured before an explicit history navigation cannot re-pin it.
+					if (anchorKind === "bottom" && !pinnedToBottomRef.current) return;
+					// Native reader movement can precede its coalesced scroll frame.
+					if (viewportRef.current && viewportRef.current.scrollTop !== scrollTopRef.current)
+						loadedTopNarratorRef.current = null;
+					const correctionTop = loadedTopNarratorRef.current === narratorId ? 0 : nextTop;
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) {
 						getSmoothFollower().cancel();
 						visibleViewportRef.current.deferCorrection(
-							applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current),
+							applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
 							anchorKind,
 							readViewportView(),
 						);
@@ -865,9 +892,11 @@ export const PretextExactMessageList = memo(
 					// Every other correction owns geometry (anchored rebuild, fold, LOD,
 					// removal): it must land in the same commit, so a chase in flight dies here.
 					getSmoothFollower().cancel();
-					writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));
+					writeScrollTop(
+						applyExactScrollCorrection(correctionTop, anchorKind, footerHeightRef.current),
+					);
 				},
-				[getSmoothFollower, readViewportView, writeScrollTop],
+				[getSmoothFollower, narratorId, readViewportView, writeScrollTop],
 			);
 			const [interaction, setInteraction] = useState<VListInteractionState>(() =>
 				createVListInteractionState(lod),
@@ -1389,6 +1418,7 @@ export const PretextExactMessageList = memo(
 			 * force a synchronous layout for information we already have.
 			 */
 			const captureFoldBefore = useCallback((key: string) => {
+				loadedTopNarratorRef.current = null;
 				// A fold owns its own FLIP geometry, planned (while pinned) against the
 				// PREDICTED bottom scrollTop — a chase still gliding towards it would
 				// move the rows under the running animation. Land the chase first.
@@ -1605,7 +1635,7 @@ export const PretextExactMessageList = memo(
 			const resumeRecoveryRef = useRef(resumeRecovery);
 			resumeRecoveryRef.current = resumeRecovery;
 			const handleResumeSubagentRecovery = useCallback(
-				(messageId: string, specKey: string, mode: "notify" | "await") => {
+				(messageId: string, specKey: string, mode: "notify" | "watch") => {
 					const measured = measuredByKeyRef.current.get(specKey) as
 						| { blocks?: Array<{ data?: { subagents?: Array<{ id?: string }> } }> }
 						| undefined;
@@ -1625,6 +1655,7 @@ export const PretextExactMessageList = memo(
 			// deletes the display row server-side, so identity stability matters here for
 			// the same reason as above: every mounted row receives this callback.
 			const dismissSubagentRecovery = useSubagentRecoveryDismiss(narratorId);
+			useSubagentOutputCounts(narratorId);
 
 			// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
 			// owns that panel, and the chunked card reaches it by bubbling a DOM
@@ -1643,7 +1674,7 @@ export const PretextExactMessageList = memo(
 			// close button deletes the notice. The dialog is one shell-level instance
 			// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
 			// callbacks.
-			const errorNotice = useVListErrorNoticeActions(narratorId);
+			const errorNotice = useVListErrorNoticeActions(narratorId, enableNarratorErrorActions);
 
 			// Interrupt task-guard reminder cards: the heading-row close button deletes
 			// the notice. No dialog, so the resolver alone is all the shell needs.
@@ -1985,7 +2016,11 @@ export const PretextExactMessageList = memo(
 				[narratorId, truncatedToolCalls, ensureWriteSource, writeSources.isWrite],
 			);
 			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
-				useVListToolDetails(narratorId, fullDetailRequests, dataSource?.fetchToolDetail);
+				useVListToolDetails(
+					narratorId,
+					suspended ? [] : fullDetailRequests,
+					dataSource?.fetchToolDetail,
+				);
 			const resolveDocumentToolInput = useCallback(
 				(
 					toolUseId: string | undefined,
@@ -2145,10 +2180,41 @@ export const PretextExactMessageList = memo(
 				() => ({
 					...(dataSource?.fetchPage ? { fetchPage: dataSource.fetchPage } : {}),
 					...(dataSource?.locateMessage ? { locateMessage: dataSource.locateMessage } : {}),
+					refreshWindow: dataSource?.refreshWindow,
+					finalizeRefreshWindow: dataSource?.finalizeRefreshWindow,
+					refreshFailurePolicy: dataSource?.refreshFailurePolicy,
+					onRefreshError: dataSource?.onRefreshError,
 				}),
-				[dataSource?.fetchPage, dataSource?.locateMessage],
+				[
+					dataSource?.fetchPage,
+					dataSource?.locateMessage,
+					dataSource?.refreshWindow,
+					dataSource?.finalizeRefreshWindow,
+					dataSource?.refreshFailurePolicy,
+					dataSource?.onRefreshError,
+				],
+			);
+			// Team mode (the team page's coordinator column only; null on every other host).
+			// Only the coordinator's own top-level list: a subagent or nested list under the same
+			// provider builds exactly as on the session page.
+			const providedTeamMode = useTeamConversationMode();
+			const teamMode =
+				providedTeamMode && !isSubagent && providedTeamMode.narratorId === narratorId
+					? providedTeamMode
+					: null;
+			const teamConversation = useMemo(
+				() =>
+					teamMode
+						? {
+								events: teamMode.events,
+								chipLabels: teamMode.chipLabels,
+								revision: teamMode.revision,
+							}
+						: undefined,
+				[teamMode],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				suspended,
 				compactAuxiliaryContent,
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
@@ -2209,7 +2275,30 @@ export const PretextExactMessageList = memo(
 				formatUsageNumber: formatLocaleNumber,
 				onScrollTopCorrection,
 				isSubagent,
+				...(teamConversation ? { teamConversation } : {}),
 			});
+			// Team mode: report the loaded window so its events page together with the messages.
+			const teamWindowReport = teamMode?.onWindowChange;
+			const teamWindowOldestAt = pretextDocument.document?.messages[0]?.createdAt ?? null;
+			const teamWindowHasPrev = pretextDocument.document?.hasPrev ?? false;
+			useEffect(() => {
+				teamWindowReport?.({ oldestAt: teamWindowOldestAt, hasPrev: teamWindowHasPrev });
+			}, [teamWindowReport, teamWindowOldestAt, teamWindowHasPrev]);
+			useEffect(() => {
+				if (!dataSource?.onWindowChange) return;
+				if (pretextDocument.document) {
+					dataSource.onWindowChange(pretextDocument.document);
+				} else {
+					const status = (pretextDocument.error as { status?: number })?.status;
+					if (status === 401 || status === 403)
+						dataSource.onWindowChange({
+							messages: [],
+							messageVersion: 0,
+							oldestLoadedSeq: null,
+							hasPrev: false,
+						});
+				}
+			}, [dataSource?.onWindowChange, pretextDocument.document, pretextDocument.error]);
 			upsertMessageRef.current = pretextDocument.upsertMessage;
 			insertMessageRef.current = pretextDocument.insertMessage;
 			removeMessagesRef.current = pretextDocument.removeMessages;
@@ -2228,6 +2317,10 @@ export const PretextExactMessageList = memo(
 			);
 			const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq, getLastTrimAt } =
 				pretextDocument;
+			const loadOlderManually = useCallback(() => {
+				loadedTopNarratorRef.current = null;
+				loadOlder();
+			}, [loadOlder]);
 			const hasPrevRef = useRef(hasPrev);
 			hasPrevRef.current = hasPrev;
 			const loadingOlderRef = useRef(loadingOlder);
@@ -2269,6 +2362,7 @@ export const PretextExactMessageList = memo(
 				appliedMessageRevisionRef.current = 0;
 				initialRevisionSyncRef.current = true;
 				textReadingDetachedRef.current = false;
+				loadedTopNarratorRef.current = null;
 				setMessageRevision(0);
 				// The shell is NOT remounted per narrator (no `key={narratorId}`), so the
 				// per-row handler caches keyed by spec.key would otherwise accumulate every
@@ -2289,7 +2383,9 @@ export const PretextExactMessageList = memo(
 			}, [narratorId]);
 
 			const revisionSubscriptionId =
-				pretextDocument.index && pretextDocument.status !== "loading" ? narratorId : undefined;
+				!suspended && pretextDocument.index && pretextDocument.status !== "loading"
+					? narratorId
+					: undefined;
 			// Cursor AND version travel together: the server needs both to decide whether this
 			// subscriber is behind. Passing a bare cursor made `useNarratorWS` read `.cursor`
 			// off a `CatchUpCursor` and get `undefined`, silently disabling catch-up for this
@@ -2437,7 +2533,12 @@ export const PretextExactMessageList = memo(
 			// control stream once a complete document exists. Realtime mutations reload
 			// the full exact input; reconnect catch-up reloads only when it reports data.
 			const externalSubscribeMessages = dataSource?.subscribeMessages;
+			const translationVisibility = useReasoningTranslationVisibility(
+				dataSource ? undefined : revisionSubscriptionId,
+			);
 			const messageWsCallbacks: NarratorWSCallbacks = {
+				onStreamingSnapshot: translationVisibility?.resume,
+				onReasoningTranslationStatus: translationVisibility?.receive,
 				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 					upsertOrReload(wsData.message),
 				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
@@ -2493,9 +2594,11 @@ export const PretextExactMessageList = memo(
 					if (messageId) compactProgressKeysRef.current.delete(messageId);
 				},
 				onFullReload: () => {
+					translationVisibility?.resume();
 					clearAllCompactProgress();
 					compactProgressKeysRef.current.clear();
-					bumpMessageRevision();
+					if (dataSource?.refreshWindow) pretextDocumentRef.current.reload();
+					else bumpMessageRevision();
 				},
 				// Live compact-progress ticks repaint only the mounted fixed-height marker.
 				// They never enter the pretext document or its measurement cache.
@@ -2520,6 +2623,7 @@ export const PretextExactMessageList = memo(
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
 				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
+					translationVisibility?.resume();
 					const initialSync = initialRevisionSyncRef.current;
 					initialRevisionSyncRef.current = false;
 					let applied = false;
@@ -2537,6 +2641,7 @@ export const PretextExactMessageList = memo(
 					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
 				},
 				onSyncOk: () => {
+					translationVisibility?.resume();
 					initialRevisionSyncRef.current = false;
 				},
 				// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
@@ -2544,6 +2649,7 @@ export const PretextExactMessageList = memo(
 				// receive, and refetch — the REST call now answers 404 and the surrounding
 				// route renders its "not found" state instead of an endless spinner.
 				onSubscribeDenied: () => {
+					translationVisibility?.pause();
 					initialRevisionSyncRef.current = false;
 					bumpMessageRevision();
 				},
@@ -2561,6 +2667,7 @@ export const PretextExactMessageList = memo(
 			const stableExternalHandlers = useMemo<NarratorWSCallbacks>(() => {
 				const forward = <K extends keyof NarratorWSCallbacks>(key: K) =>
 					((...args: unknown[]) => {
+						if (suspendedRef.current) return;
 						const handler = messageWsCallbacksRef.current[key];
 						if (typeof handler === "function") (handler as (...a: unknown[]) => void)(...args);
 					}) as never;
@@ -2580,9 +2687,9 @@ export const PretextExactMessageList = memo(
 				};
 			}, []);
 			useEffect(() => {
-				if (!externalSubscribeMessages) return;
+				if (suspended || !externalSubscribeMessages) return;
 				return externalSubscribeMessages(stableExternalHandlers);
-			}, [externalSubscribeMessages, stableExternalHandlers]);
+			}, [suspended, externalSubscribeMessages, stableExternalHandlers]);
 			// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
 			// decisions, background terminals, subagent activity). These mutate an
 			// already-loaded message in place, so they are applied as anchor-preserving
@@ -2595,6 +2702,7 @@ export const PretextExactMessageList = memo(
 			// browsing history still sees tool/reflection state advance correctly.
 			useVListLivePatches(revisionSubscriptionId, {
 				enabled: !!revisionSubscriptionId,
+				messages: pretextDocument.messages,
 				isSubagent: !!isSubagent,
 				applyLivePatch: pretextDocument.applyLivePatch,
 				// A terminal event can race the initial exact-document load: the synthetic
@@ -2604,6 +2712,11 @@ export const PretextExactMessageList = memo(
 				// the pre-completion empty detail.
 				onUnappliedToolCompletion: bumpMessageRevision,
 			});
+			useReasoningTranslationLivePatches(
+				revisionSubscriptionId,
+				pretextDocument.messages,
+				pretextDocument.applyLivePatch,
+			);
 
 			// Structural reload gate — now the FALLBACK, not the normal path.
 			//
@@ -3149,7 +3262,7 @@ export const PretextExactMessageList = memo(
 			onVisibleMessagesChangeRef.current = onVisibleMessagesChange;
 			useEffect(() => {
 				const callback = onVisibleMessagesChangeRef.current;
-				if (!callback) return;
+				if (suspended || !callback) return;
 				const manifestItems = pretextDocument.manifest?.items ?? [];
 				const lastItem = manifestItems[seenWindow.end - 1];
 				const lastId = lastItem?.sourceMessageIds.at(-1) ?? null;
@@ -3161,7 +3274,7 @@ export const PretextExactMessageList = memo(
 							}
 						: null,
 				);
-			}, [seenWindow.end, pretextDocument.manifest]);
+			}, [suspended, seenWindow.end, pretextDocument.manifest]);
 
 			/**
 			 * Identity of the currently committed DOCUMENT (not its geometry).
@@ -3903,11 +4016,19 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				setStreamAnimMountEpoch(nextStreamAnimEpoch());
 			}, [narratorId]);
+			// A tool still executing after its message persisted has no synthetic card
+			// left; its live output reaches the committed card through a coalesced patch.
+			const onPersistedToolLive = usePersistedToolLive(
+				narratorId,
+				pretextDocument.applyLivePatch,
+				pretextDocument.messages,
+			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,
 				committedMessages: pretextDocument.messages,
 				fetchTextDocumentRange: textDocumentRangeReader,
+				onPersistedToolLive,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {
@@ -4175,7 +4296,7 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				void scrollGeometryRevision;
 				if (!pinnedToBottom || !exactLayout) return;
-				const frame = requestAnimationFrame(() => {
+				const snap = () => {
 					// SNAPS, and must keep snapping. This effect is the catch-all for EVERY
 					// geometry change, so most of what reaches it is a document being
 					// ESTABLISHED or SETTLING rather than content arriving for a reader who is
@@ -4196,7 +4317,8 @@ export const PretextExactMessageList = memo(
 					if (!visibleViewportRef.current.isVisible(viewportRef.current)) return;
 					if (smoothFollowerRef.current?.isActive() === true) return;
 					writeScrollTop(getScrollBottomTarget(viewportRef.current));
-				});
+				};
+				const frame = requestAnimationFrame(createPinnedBottomFrame(pinnedToBottomRef, snap));
 				return () => cancelAnimationFrame(frame);
 			}, [exactLayout, pinnedToBottom, scrollGeometryRevision, writeScrollTop]);
 
@@ -4206,9 +4328,9 @@ export const PretextExactMessageList = memo(
 			// exhausted). Each load grows totalHeight or clears hasPrev, so this settles.
 			// Gated on !loadingOlder so one page is in flight at a time (no request storm).
 			useEffect(() => {
-				if (pretextDocument.status !== "ready") return;
+				if (suspended || pretextDocument.status !== "ready") return;
 				if (!hasPrev || loadingOlder) return;
-				if (!pinnedToBottom) return;
+				if (!pinnedToBottom || !pinnedToBottomRef.current) return;
 				if (viewportHeight <= 0) return;
 				const totalHeight = exactLayout?.totalHeight ?? 0;
 				if (totalHeight > viewportHeight + ITEM_OVERSCAN) return;
@@ -4233,6 +4355,7 @@ export const PretextExactMessageList = memo(
 				loadingOlder,
 				pinnedToBottom,
 				pretextDocument.status,
+				suspended,
 				viewportHeight,
 			]);
 
@@ -4241,6 +4364,7 @@ export const PretextExactMessageList = memo(
 			// uses the header button instead. The exact rebuild anchors on the viewport
 			// top, so the prepended page grows the canvas upward with zero visible shift.
 			const maybeAutoLoadOlder = useCallback((scrollTopNow: number, atBottom: boolean) => {
+				if (suspendedRef.current) return;
 				const decision = resolveOlderHistoryAutoLoad({
 					intentAt: olderHistoryIntentAtRef.current,
 					now: Date.now(),
@@ -4261,6 +4385,7 @@ export const PretextExactMessageList = memo(
 			// do at most one window computation.
 			const processScrollFrame = useCallback(() => {
 				scrollRafRef.current = 0;
+				if (suspendedRef.current) return;
 				const node = viewportRef.current;
 				// A queued scroll rAF can run after the host parks in display:none.
 				// Zero geometry must not change pin, unread count, intent or window.
@@ -4308,6 +4433,7 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
+				if (!isEcho && nextTop !== previousTop) loadedTopNarratorRef.current = null;
 				// Classify before React mounts a new band. Only optional cold controllers
 				// subscribe to admission; this never invalidates the body/row element cache.
 				interactionAdmissionRef.current?.observeScroll({
@@ -4433,11 +4559,13 @@ export const PretextExactMessageList = memo(
 					// chase drifting in afterwards would fight the write.
 					getSmoothFollower().cancel();
 					textReadingDetachedRef.current = false;
+					loadedTopNarratorRef.current = null;
 					interactionAdmissionRef.current?.setAtBottom(true);
 					pinnedToBottomRef.current = true;
 					visibleViewportRef.current.setPinned(true);
 					setPinnedToBottom(true);
 					const land = () => {
+						if (!pinnedToBottomRef.current) return;
 						const node = viewportRef.current;
 						if (!node || !visibleViewportRef.current.isVisible(node)) {
 							visibleViewportRef.current.deferCorrection(0, "bottom", readViewportView());
@@ -4460,6 +4588,30 @@ export const PretextExactMessageList = memo(
 				visibleViewportRef.current.setPinned(false);
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
+			const handleIOSScrollToTop = useCallback(() => {
+				scrollExactListToLoadedTop({
+					jumpTokenRef,
+					detachFromBottom,
+					textReadingDetachedRef,
+					loadedTopNarratorRef,
+					narratorId,
+					olderHistoryIntentAtRef,
+					writeScrollTop,
+				});
+			}, [detachFromBottom, narratorId, writeScrollTop]);
+			useLayoutEffect(() => {
+				if (!viewportNode) return;
+				return registerIOSScrollToTopTarget(
+					viewportNode,
+					() => {
+						if (viewportRef.current !== viewportNode) return;
+						handleIOSScrollToTop();
+					},
+					// Writes update scrollTopRef immediately; momentum moves the DOM first.
+					() =>
+						viewportRef.current !== viewportNode || viewportNode.scrollTop !== scrollTopRef.current,
+				);
+			}, [viewportNode, handleIOSScrollToTop]);
 
 			// Quick index of user turns beside the scrollbar (parity with the chunked
 			// path's ScrollbarUserMarkers). Positions come from the exact layout's real
@@ -4495,6 +4647,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleUserMarkerJump = useCallback(
 				(marker: VListUserMarker) => {
+					loadedTopNarratorRef.current = null;
 					// A jump is an explicit reading action: unpin so streaming output cannot
 					// immediately pull the reader back to the tail.
 					getSmoothFollower().cancel();
@@ -4508,6 +4661,7 @@ export const PretextExactMessageList = memo(
 			);
 			const handleCompactMarkerJump = useCallback(
 				(marker: VListCompactMarker) => {
+					loadedTopNarratorRef.current = null;
 					getSmoothFollower().cancel();
 					interactionAdmissionRef.current?.markHistoryIntent();
 					pinnedToBottomRef.current = false;
@@ -4546,6 +4700,7 @@ export const PretextExactMessageList = memo(
 				const emit = (dir: 1 | -1, clientY: number | null) => {
 					const now = Date.now();
 					if (!throttle.tryStep(now)) return;
+					loadedTopNarratorRef.current = null;
 					// The LOD morph diffs viewport geometry across the level switch; a chase
 					// still gliding through the rebuild would move rows under the morph.
 					smoothFollowerRef.current?.snapToTarget();
@@ -4559,6 +4714,7 @@ export const PretextExactMessageList = memo(
 				// when it reaches the top. Intent expires (chunk-list parity) so momentum
 				// alone never keeps paging.
 				const markUpwardIntent = () => {
+					loadedTopNarratorRef.current = null;
 					olderHistoryIntentAtRef.current = Date.now();
 				};
 				const onWheel = (event: WheelEvent) => {
@@ -4640,6 +4796,7 @@ export const PretextExactMessageList = memo(
 					// first is still paging through history) invalidates the first, which must
 					// then stop scrolling and stop paging rather than fight the new target.
 					const token = ++jumpTokenRef.current;
+					loadedTopNarratorRef.current = null;
 					const cancelled = () => token !== jumpTokenRef.current;
 					// A jump navigates AWAY from the bottom: any chase still gliding towards
 					// it would fight the reveal's scrollIntoView / layout writes.
@@ -4795,6 +4952,7 @@ export const PretextExactMessageList = memo(
 			// the wheel/pinch handlers, so they publish their focus point here instead —
 			// same field the gesture writes, same TTL, so the rebuild path is identical.
 			const prepareLodChange = useCallback((clientY: number) => {
+				loadedTopNarratorRef.current = null;
 				const node = viewportRef.current;
 				if (!node) return;
 				// Same landing the gesture path does: the morph diffs viewport geometry
@@ -5380,6 +5538,7 @@ export const PretextExactMessageList = memo(
 						rowInteraction: traceBinding?.rowInteraction,
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
+						canCalibrateModelTrace: item.spec.kind === "modeltrace-result" && !dataSource,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
 						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,
@@ -5525,7 +5684,7 @@ export const PretextExactMessageList = memo(
 											hasOlder={hasPrev}
 											loading={loadingOlder}
 											label={t("loadOlderMessages")}
-											onLoad={loadOlder}
+											onLoad={loadOlderManually}
 										/>
 									</div>
 								) : null}
@@ -5561,9 +5720,11 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
-									{windowRowElements}
-								</VListInteractionAdmissionContext.Provider>
+								<ReasoningTranslationVisibilityContext.Provider value={translationVisibility}>
+									<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+										{windowRowElements}
+									</VListInteractionAdmissionContext.Provider>
+								</ReasoningTranslationVisibilityContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

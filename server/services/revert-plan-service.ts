@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 // A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
 // long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
 import { setTimeout as yieldToEventLoop } from "node:timers/promises";
+import { readDomainTask, readQuery } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
@@ -11,7 +12,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { alias } from "drizzle-orm/sqlite-core";
 import {
@@ -25,6 +26,7 @@ import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
+import type { RevertReadSnapshot } from "./file-read-snapshots";
 
 export const REVERT_PLAN_BATCH_ITEMS = 32;
 type Executor = Pick<BunSQLiteDatabase, "select" | "insert" | "update">;
@@ -367,7 +369,7 @@ export class RevertPlanService {
 			);
 		options.signal?.throwIfAborted();
 		this.assertRoot();
-		const original = requireOwner(this.database, context, planId);
+		const original = await this.readOwner(context, planId, options.signal);
 		assertPlanned(original);
 		this.assertFresh(original);
 		options.signal?.throwIfAborted();
@@ -468,9 +470,10 @@ export class RevertPlanService {
 		const proof = normalizeProof(manifestProof);
 		options.signal?.throwIfAborted();
 		this.assertRoot();
-		const original = requireOwner(this.database, context, planId);
+		const initialSnapshot = await this.readSnapshot(context, planId, null, 0, options.signal);
+		const original = initialSnapshot.operation;
 		this.assertFresh(original);
-		this.assertProof(this.database, original, proof);
+		this.assertSnapshotProof(initialSnapshot, original, proof);
 		if (
 			(original.status !== "planned" && original.status !== "prepared") ||
 			original.appliedFileCount !== 0 ||
@@ -482,34 +485,39 @@ export class RevertPlanService {
 		let cursor: RevertPlanFileCursor | undefined;
 		for (;;) {
 			options.signal?.throwIfAborted();
-			const page = this.transaction((tx) => {
-				const operation = requireOwner(tx, context, planId);
-				assertSameRevision(original, operation);
-				this.assertFresh(operation);
-				this.assertProof(tx, operation, proof);
-				const rows = selectFiles(tx, planId, cursor, REVERT_PLAN_BATCH_ITEMS + 1);
-				for (const row of rows.slice(0, REVERT_PLAN_BATCH_ITEMS)) {
-					metadata(row);
-					const file = normalizeFile({
-						sequence: row.sequence,
-						identity: row.identityJson,
-						expected: row.expectedStateJson,
-						desired: row.desiredStateJson,
-					});
-					integer(file.sequence, "sequence", 0, operation.fileCount - 1);
-					assertFileValues(row, fileValues(operation, file));
-					assertScope(tx, file.identity);
-					const desiredRef = requiredDesiredRef(file);
-					if (desiredRef) requireReadyRef(tx, desiredRef);
-					if (entries.has(file.sequence))
-						throw fail("DUPLICATE_FILE", "Stored manifest positions repeat");
-					entries.set(file.sequence, digest(file));
-					integer(entries.size, "verified files", 0, operation.fileCount);
-					fileBytes += requiredDesiredRef(file)?.sizeBytes ?? 0;
-					evidenceBudget(fileBytes);
-				}
-				return rows;
-			});
+			const snapshot = await this.readSnapshot(
+				context,
+				planId,
+				cursor?.fileKey ?? null,
+				REVERT_PLAN_BATCH_ITEMS + 1,
+				options.signal,
+			);
+			const operation = snapshot.operation;
+			assertSameRevision(original, operation);
+			this.assertFresh(operation);
+			this.assertSnapshotProof(snapshot, operation, proof);
+			const page = snapshot.files;
+			for (const row of page.slice(0, REVERT_PLAN_BATCH_ITEMS)) {
+				metadata(row);
+				const file = normalizeFile({
+					sequence: row.sequence,
+					identity: row.identityJson,
+					expected: row.expectedStateJson,
+					desired: row.desiredStateJson,
+				});
+				integer(file.sequence, "sequence", 0, operation.fileCount - 1);
+				assertFileValues(row, fileValues(operation, file));
+				this.assertSnapshotScope(snapshot, file.identity);
+				const desiredRef = requiredDesiredRef(file);
+				if (desiredRef && !equal(this.snapshotRef(snapshot, desiredRef.digest), desiredRef))
+					throw fail("BLOB_NOT_READY", "Published object size does not match the fixed reference");
+				if (entries.has(file.sequence))
+					throw fail("DUPLICATE_FILE", "Stored manifest positions repeat");
+				entries.set(file.sequence, digest(file));
+				integer(entries.size, "verified files", 0, operation.fileCount);
+				fileBytes += requiredDesiredRef(file)?.sizeBytes ?? 0;
+				evidenceBudget(fileBytes);
+			}
 			if (page.length <= REVERT_PLAN_BATCH_ITEMS) break;
 			cursor = fileCursor(page[REVERT_PLAN_BATCH_ITEMS - 1]);
 			await yieldToEventLoop(0);
@@ -607,47 +615,121 @@ export class RevertPlanService {
 		return this.finalize(fixed, plan.id, fixed.manifestProof, options);
 	}
 
-	getSummary(owner: RevertPlanOwner, planId: string): RevertPlanSummary {
-		return this.summary(requireOwner(this.database, normalizeOwner(owner), planId));
+	private async readSnapshot(
+		owner: RevertPlanOwner,
+		planId: string,
+		cursor: string | null,
+		limit: number,
+		signal?: AbortSignal,
+	) {
+		this.assertRoot();
+		text(planId, "planId");
+		const snapshot = await readDomainTask(
+			this.database.$client,
+			"revertPlanSnapshot",
+			{ owner: normalizeOwner(owner), planId, cursor, limit },
+			{ executionPolicy: "worker-required", signal },
+		).catch((error) => {
+			signal?.throwIfAborted();
+			throw error;
+		});
+		signal?.throwIfAborted();
+		if (!snapshot.operation) throw fail("NOT_FOUND", "Plan not found in the owning context");
+		metadata(snapshot.operation);
+		return { ...snapshot, operation: snapshot.operation };
+	}
+	private async readOwner(owner: RevertPlanOwner, planId: string, signal?: AbortSignal) {
+		return (await this.readSnapshot(owner, planId, null, 0, signal)).operation;
+	}
+	private snapshotRef(snapshot: RevertReadSnapshot, digestValue: string | null): FileChangeBlobRef {
+		if (!digestValue) throw fail("LEGACY_UNVERIFIED", "Original manifest references are required");
+		const blob = snapshot.blobs.find((row) => row.digest === digestValue);
+		if (!blob || blob.status !== "ready")
+			throw fail("BLOB_NOT_READY", "A referenced published object is not ready");
+		return normalizeRef({ algorithm: "sha256", digest: blob.digest, sizeBytes: blob.sizeBytes });
+	}
+	private assertSnapshotProof(
+		snapshot: RevertReadSnapshot,
+		row: PlanRecord,
+		proof: RevertPlanManifestProof,
+	) {
+		if (!snapshot.budget || snapshot.budget.namespaceKey !== this.namespaceKey)
+			throw fail("CATALOG_UNVERIFIED", "The physical blob namespace must be reconciled and ready");
+		const refs = {
+			selector: this.snapshotRef(snapshot, row.selectorBlobDigest),
+			plan: this.snapshotRef(snapshot, row.planBlobDigest),
+			historyManifest: this.snapshotRef(snapshot, row.historyManifestBlobDigest),
+		};
+		const header = headerFromRow(row, refs);
+		if (
+			proof.headerDigest !== digest(header) ||
+			row.planHash !== planHash(header, refs.plan, proof)
+		)
+			throw fail("REQUEST_CONFLICT", "The complete manifest/header commitment changed");
+		evidenceBudget(refBytes(refs) + proof.fileEvidenceBytes);
+	}
+	private assertSnapshotScope(snapshot: RevertReadSnapshot, identity: FileChangeIdentity) {
+		const scope = snapshot.scopes.find((row) => row.id === identity.scopeId);
+		if (!scope) throw fail("TARGET_UNVERIFIED", "Recorded scope metadata is required");
+		if (!equal(createFileChangeIdentity(scope, identity), identity))
+			throw fail(
+				"IDENTITY_CONFLICT",
+				"Identity does not match its actual source/device/workspace/path scope",
+			);
+	}
+	async getSummary(
+		owner: RevertPlanOwner,
+		planId: string,
+		options: { signal?: AbortSignal } = {},
+	): Promise<RevertPlanSummary> {
+		return this.summary(await this.readOwner(owner, planId, options.signal));
 	}
 
-	listSummaries(
+	async listSummaries(
 		owner: RevertPlanOwner,
-		options: { cursor?: RevertPlanSummaryCursor; limit?: number } = {},
-	): RevertPlanPage<RevertPlanSummary, RevertPlanSummaryCursor> {
+		options: { cursor?: RevertPlanSummaryCursor; limit?: number; signal?: AbortSignal } = {},
+	): Promise<RevertPlanPage<RevertPlanSummary, RevertPlanSummaryCursor>> {
+		this.assertRoot();
 		const context = normalizeOwner(owner);
 		const limit = pageLimit(options.limit);
 		if (options.cursor) text(options.cursor.idempotencyKey, "cursor idempotencyKey");
-		const rows = this.database
-			.select()
-			.from(revertOperations)
-			.where(
-				and(
-					eq(revertOperations.requestedBySubjectKey, context.subjectKey),
-					sql`${revertOperations.narratorId} IS ${context.narratorId}`,
-					sql`${revertOperations.projectId} IS ${context.projectId}`,
-					options.cursor
-						? sql`${revertOperations.idempotencyKey} > ${options.cursor.idempotencyKey}`
-						: undefined,
-				),
-			)
-			.orderBy(asc(revertOperations.idempotencyKey))
-			.limit(limit + 1)
-			.all();
+		const rows = await readQuery(
+			this.database
+				.select()
+				.from(revertOperations)
+				.where(
+					and(
+						eq(revertOperations.requestedBySubjectKey, context.subjectKey),
+						sql`${revertOperations.narratorId} IS ${context.narratorId}`,
+						sql`${revertOperations.projectId} IS ${context.projectId}`,
+						options.cursor
+							? sql`${revertOperations.idempotencyKey} > ${options.cursor.idempotencyKey}`
+							: undefined,
+					),
+				)
+				.orderBy(asc(revertOperations.idempotencyKey))
+				.limit(limit + 1),
+			{ executionPolicy: "worker-required", maxRows: limit + 1, signal: options.signal },
+		);
 		const result = boundedPage(rows, limit, (row) => ({ idempotencyKey: row.idempotencyKey }));
 		return { ...result, items: result.items.map((row) => this.summary(row)) };
 	}
 
-	listFiles(
+	async listFiles(
 		owner: RevertPlanOwner,
 		planId: string,
-		options: { cursor?: RevertPlanFileCursor; limit?: number } = {},
-	): RevertPlanPage<RevertPlanFileMetadata, RevertPlanFileCursor> {
-		requireOwner(this.database, normalizeOwner(owner), planId);
+		options: { cursor?: RevertPlanFileCursor; limit?: number; signal?: AbortSignal } = {},
+	): Promise<RevertPlanPage<RevertPlanFileMetadata, RevertPlanFileCursor>> {
 		const limit = pageLimit(options.limit);
 		if (options.cursor) sha256(options.cursor.fileKey);
-		const rows = selectFiles(this.database, planId, options.cursor, limit + 1);
-		const page = boundedPage(rows, limit, fileCursor);
+		const snapshot = await this.readSnapshot(
+			owner,
+			planId,
+			options.cursor?.fileKey ?? null,
+			limit + 1,
+			options.signal,
+		);
+		const page = boundedPage(snapshot.files, limit, fileCursor);
 		return {
 			...page,
 			items: page.items.map((row) => ({
@@ -664,6 +746,51 @@ export class RevertPlanService {
 				status: row.status,
 			})),
 		};
+	}
+
+	async readFilePage(
+		owner: RevertPlanOwner,
+		planId: string,
+		options: { cursor?: RevertPlanFileCursor; limit?: number; signal: AbortSignal },
+	): Promise<RevertPlanPage<RevertPlanFileMetadata, RevertPlanFileCursor>> {
+		options.signal.throwIfAborted();
+		const context = normalizeOwner(owner);
+		text(planId, "planId");
+		const limit = pageLimit(options.limit);
+		if (options.cursor) sha256(options.cursor.fileKey);
+		// Authorize and page in the same statement. A left join distinguishes an
+		// owned empty page from a missing/foreign plan, even at the end of a cursor.
+		const rows = await readQuery(
+			this.database
+				.select({
+					plan: getTableColumns(revertOperations),
+					file: getTableColumns(revertOperationFiles),
+				})
+				.from(revertOperations)
+				.leftJoin(
+					revertOperationFiles,
+					and(
+						eq(revertOperationFiles.revertOperationId, revertOperations.id),
+						afterFileCursor(options.cursor),
+					),
+				)
+				.where(ownedPlan(context, planId))
+				.orderBy(asc(revertOperationFiles.fileKey))
+				.limit(limit + 1),
+			{
+				executionPolicy: "worker-required",
+				signal: options.signal,
+				maxRows: limit + 1,
+				timeoutMs: 30_000,
+			},
+		);
+		options.signal.throwIfAborted();
+		if (!rows.length) throw fail("NOT_FOUND", "Plan not found in the owning context");
+		metadata(rows[0].plan);
+		return planFilePage(
+			rows.flatMap(({ file }) => (file ? [file] : [])),
+			limit,
+		);
 	}
 
 	private summary(row: PlanRecord): RevertPlanSummary {
@@ -1029,21 +1156,18 @@ function assertSameRevision(before: PlanRecord, after: PlanRecord) {
 }
 function requireOwner(tx: Executor, owner: RevertPlanOwner, planId: string): PlanRecord {
 	text(planId, "planId");
-	const row = tx
-		.select()
-		.from(revertOperations)
-		.where(
-			and(
-				eq(revertOperations.id, planId),
-				eq(revertOperations.requestedBySubjectKey, owner.subjectKey),
-				sql`${revertOperations.narratorId} IS ${owner.narratorId}`,
-				sql`${revertOperations.projectId} IS ${owner.projectId}`,
-			),
-		)
-		.get();
+	const row = tx.select().from(revertOperations).where(ownedPlan(owner, planId)).get();
 	if (!row) throw fail("NOT_FOUND", "Plan not found in the owning context");
 	metadata(row);
 	return row;
+}
+function ownedPlan(owner: RevertPlanOwner, planId: string) {
+	return and(
+		eq(revertOperations.id, planId),
+		eq(revertOperations.requestedBySubjectKey, owner.subjectKey),
+		sql`${revertOperations.narratorId} IS ${owner.narratorId}`,
+		sql`${revertOperations.projectId} IS ${owner.projectId}`,
+	);
 }
 function catalogRef(tx: Executor, digestValue: string | null): FileChangeBlobRef {
 	if (!digestValue) throw fail("LEGACY_UNVERIFIED", "Original manifest references are required");
@@ -1116,15 +1240,33 @@ function selectFiles(
 	return tx
 		.select()
 		.from(revertOperationFiles)
-		.where(
-			and(
-				eq(revertOperationFiles.revertOperationId, planId),
-				cursor ? sql`${revertOperationFiles.fileKey} > ${cursor.fileKey}` : undefined,
-			),
-		)
+		.where(and(eq(revertOperationFiles.revertOperationId, planId), afterFileCursor(cursor)))
 		.orderBy(asc(revertOperationFiles.fileKey))
 		.limit(limit)
 		.all();
+}
+function afterFileCursor(cursor: RevertPlanFileCursor | undefined) {
+	return cursor ? sql`${revertOperationFiles.fileKey} > ${cursor.fileKey}` : undefined;
+}
+
+function planFilePage(rows: FileRecord[], limit: number) {
+	const page = boundedPage(rows, limit, fileCursor);
+	return {
+		...page,
+		items: page.items.map((row) => ({
+			id: row.id,
+			fileKey: row.fileKey,
+			sequence: row.sequence,
+			identityJson: row.identityJson,
+			expectedStateJson: row.expectedStateJson,
+			desiredStateJson: row.desiredStateJson,
+			applyMutationId: row.applyMutationId,
+			applyRequestDigest: row.applyRequestDigest,
+			compensateMutationId: row.compensateMutationId,
+			compensateRequestDigest: row.compensateRequestDigest,
+			status: row.status,
+		})),
+	};
 }
 function fileCursor(row: FileRecord): RevertPlanFileCursor {
 	return { fileKey: row.fileKey };

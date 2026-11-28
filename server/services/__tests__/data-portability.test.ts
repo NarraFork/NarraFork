@@ -18,6 +18,8 @@ process.env.NARRAFORK_HOME = testHome;
 const { sqlite } = await import("../../db");
 const { SNAPSHOT_TABLES } = await import("../../db/snapshot-protocol");
 const { saveSettings, settings } = await import("../../lib/settings");
+const { getProviderKeyStore } = await import("../../lib/provider-keys");
+const { resolveNarratorFastMode } = await import("../narrator-fast-mode");
 const { getModelOverride, replaceModelOverridesForTests, setModelCatalogAutoUpdate } = await import(
 	"../../lib/model-catalog"
 );
@@ -129,6 +131,21 @@ beforeEach(async () => {
 });
 
 describe("data portability · 全链路", () => {
+	test("overwriting imported sessions refreshes cached primary and inherited fast mode", async () => {
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'off' WHERE id = 'sess-1'");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, acl_root_narrator_id, created_at, updated_at)
+			 VALUES ('fast-child', 'subagent', 'sess-1', '2026-10-01', '2026-10-01')`,
+		);
+		const zip = await readFile((await exportData()).zipPath);
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'on' WHERE id = 'sess-1'");
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(true);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(true);
+		const preview = await previewImport(toArrayBuffer(zip), "fast-mode.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(false);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(false);
+	});
 	test("会话导入覆盖与清空只使本地 workspace 候选失效，不改已有名字", async () => {
 		sqlite.run(
 			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('workspace-owner', 'workspace-owner', 'x', '2026-10-01T00:00:00Z')",
@@ -850,6 +867,74 @@ describe("逐模型设置随供应商一起导出", () => {
 			expect(agent().autoExcludedProviders).toEqual(["openai-2", "openai-extra"]);
 		} finally {
 			while (restores.length) restores.pop()?.();
+			saveSettings(original);
+		}
+	});
+
+	test("跨 custom/NUG 的 id 与前缀冲突统一避让，会话跟随新前缀", async () => {
+		const original = structuredClone(settings);
+		try {
+			await seed(1);
+			sqlite.run(
+				`INSERT INTO narrators (id, type, model, created_at, updated_at)
+				 VALUES ('sess-cross', 'primary', 'cross:gpt', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')`,
+			);
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote-custom", "cross", "remote-key", "https://remote.example/v1"),
+			];
+			exported.nugProviders = [
+				{
+					id: "remote-nug",
+					name: "remote-nug",
+					prefix: "nug-cross",
+					baseUrl: "https://nug.example",
+					apiKey: "nug-key",
+					defaultModel: "",
+				},
+			];
+			saveSettings(exported);
+			const passphrase = "cross-provider-pass";
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: true, providers: true }, { passphrase }))
+					.zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "cross-provider.zip");
+
+			sqlite.run("DELETE FROM narrator_message_refs");
+			sqlite.run("DELETE FROM narrator_tool_calls");
+			sqlite.run("DELETE FROM narrator_messages");
+			sqlite.run("DELETE FROM narrators");
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local-other", "nug-cross", "local-key", "https://local.example/v1"),
+			];
+			local.nugProviders = [
+				{
+					id: "remote-custom",
+					name: "local-nug",
+					prefix: "cross",
+					baseUrl: "https://local-nug.example",
+					apiKey: "local-nug-key",
+					defaultModel: "",
+				},
+			];
+			saveSettings(local);
+			await applyImport(preview.token, { conflictDefault: "skip", passphrase });
+
+			const custom = settings.customApiProviders?.find((item) => item.prefix === "cross-2");
+			expect(custom).toBeDefined();
+			expect(custom?.id).not.toBe("remote-custom");
+			expect(settings.nugProviders?.some((item) => item.prefix === "nug-cross-2")).toBe(true);
+			expect(
+				(
+					sqlite.prepare("SELECT model FROM narrators WHERE id = 'sess-cross'").get() as {
+						model: string;
+					}
+				).model,
+			).toBe("cross-2:gpt");
+			expect(getProviderKeyStore().firstGroupKey(custom?.id ?? "")).toBe("remote-key");
+		} finally {
 			saveSettings(original);
 		}
 	});

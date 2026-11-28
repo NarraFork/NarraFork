@@ -21,7 +21,6 @@ import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useNarrator } from "../../hooks/useNarrator";
 import { lazyWithRetry } from "../../lib/lazy-with-retry";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import type { OutlinePanelState } from "../../lib/outline-panel";
 import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceScope";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
@@ -152,10 +151,6 @@ function usePanelWindowTitle(descriptor: PanelWindowDescriptor): string {
 }
 
 export function StandalonePanelWindow({ descriptor }: { descriptor: PanelWindowDescriptor }) {
-	useEffect(() => {
-		narratorWSManager.connect();
-		return () => narratorWSManager.disconnect();
-	}, []);
 	useStandaloneWindowTitle(usePanelWindowTitle(descriptor));
 	return (
 		<Box

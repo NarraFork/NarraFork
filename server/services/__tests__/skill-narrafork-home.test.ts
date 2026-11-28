@@ -8,12 +8,12 @@
  * written into a directory nothing read back. No error, no empty-state hint: the skill
  * appeared in the UI list (which reads the same scan) as simply absent.
  *
- * The test preload already puts `NARRAFORK_HOME` in a temp dir while `homedir()` keeps
- * reading the host account (Bun resolves it from passwd, not `$HOME`), so this process is
- * itself the divergent configuration — no environment fixture needed.
+ * Use a separate fixture directory explicitly: on Windows and newer Bun releases,
+ * homedir() follows the preload's HOME/USERPROFILE overrides, so the default
+ * preload directory alone no longer guarantees different read and write roots.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -23,6 +23,19 @@ import { loadGlobalSkills, loadProjectSkills } from "../skill-service";
 const NAME = `narrafork-home-probe-${process.pid}`;
 
 const cleanup: string[] = [];
+const originalNarraforkHome = process.env.NARRAFORK_HOME;
+let customHome: string;
+
+beforeAll(async () => {
+	customHome = await mkdtemp(join(tmpdir(), "skill-custom-home-"));
+	process.env.NARRAFORK_HOME = customHome;
+});
+
+afterAll(async () => {
+	if (originalNarraforkHome === undefined) delete process.env.NARRAFORK_HOME;
+	else process.env.NARRAFORK_HOME = originalNarraforkHome;
+	await rm(customHome, { recursive: true, force: true });
+});
 
 afterEach(async () => {
 	await Promise.all(cleanup.splice(0).map((p) => rm(p, { recursive: true, force: true })));

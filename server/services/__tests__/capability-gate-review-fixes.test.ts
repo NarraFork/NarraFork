@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -36,12 +36,13 @@ import {
 	runDeliverToOf,
 } from "../../lib/runtime-source";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { handlePermission, resolvePermission } = await import("../narrator-permission");
+const { pendingPermissions } = await import("../narrator-session-state");
 const { buildFinalToolStartAuthorization } = await import("../tool-final-start-authorization");
 const { resolveNarratorCapabilities, resetTraitLayerCaches } = await import(
 	"../trait-layer-service"
@@ -92,7 +93,10 @@ afterEach(async () => {
 	cleanDb(sqlite);
 	await rm(cwd, { recursive: true, force: true });
 });
-afterAll(() => mock.module("../../db", () => realDb));
+afterAll(() => {
+	mock.module("../../db", () => realDb);
+	dispose();
+});
 
 async function actor(extra: Partial<typeof narrators.$inferInsert> = {}) {
 	const id = generateId();
@@ -233,7 +237,7 @@ describe("explore delegate Bash follows the permission mode", () => {
 			const call = await db.query.narratorToolCalls.findFirst({
 				where: eq(narratorToolCalls.id, toolCallId),
 			});
-			if (call?.status === "pending") return;
+			if (call?.status === "pending" && pendingPermissions.has(toolCallId)) return;
 			await new Promise((r) => setTimeout(r, 20));
 		}
 		throw new Error("tool call never reached a pending approval");

@@ -133,6 +133,17 @@ describe("advanced row promotion", () => {
 		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: "bogus" })).toBe(false);
 	});
 
+	test("unavailable fast-mode inheritance stays visible alongside explicit choices", () => {
+		for (const fastModeOverride of ["inherit", "on", "off"]) {
+			expect(
+				shouldPromoteAdvancedRow("fastMode", { fastModeOverride, fastModeSource: "unavailable" }),
+			).toBe(true);
+		}
+		expect(
+			collapsedAdvancedRows({ fastModeOverride: "inherit", fastModeSource: "unavailable" }),
+		).not.toContain("fastMode");
+	});
+
 	test("backgroundStatus promotes on presence, since the column has no none value", () => {
 		expect(shouldPromoteAdvancedRow("backgroundStatus", { backgroundStatus: null })).toBe(false);
 		expect(shouldPromoteAdvancedRow("backgroundStatus", { backgroundStatus: undefined })).toBe(

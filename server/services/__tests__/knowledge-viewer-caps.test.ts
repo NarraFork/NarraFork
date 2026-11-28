@@ -11,17 +11,22 @@
  * delete or transfer by one principal cannot change what the next one sees. Grants are
  * collection-scoped so nothing leaks into other test files sharing the process database.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../../db";
-import { knowledgeTags, users } from "../../db/schema";
+import { db, sqlite } from "../../db";
+import { knowledgeEntries, knowledgeTags, users } from "../../db/schema";
+import { readKnowledgeEntryDetail } from "../../lib/db-worker/knowledge-entry-query";
+import * as pool from "../../lib/db-worker/pool";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
+import { sqliteKnowledgeReadStore } from "../knowledge/sqlite-read-store";
 import { knowledgeAcl, type Principal } from "../knowledge-acl";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeLinkService } from "../knowledge-link-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = `vc-${Date.now()}`;
 
@@ -176,6 +181,106 @@ beforeAll(async () => {
 	for (const role of ROLES.filter((r) => r !== "admin")) ids[role] = await makeUser("user", role);
 	authorId = await makeUser("user", "author");
 	transferTargetId = await makeUser("user", "target");
+});
+
+describe("entry detail Worker", () => {
+	test("returns the entire committed row even when metadata exceeds generic SELECT limits", async () => {
+		const { entryId } = await makeFixture();
+		const payload = "测".repeat(1_500_000);
+		await db
+			.update(knowledgeEntries)
+			.set({ metadataJson: { payload }, keywordsJson: ["测试"], tagsJson: ["read"] })
+			.where(eq(knowledgeEntries.id, entryId));
+		const dispatch = spyOn(pool, "runReadTask");
+		try {
+			const detail = await sqliteKnowledgeReadStore.getEntryDetailById(entryId);
+			const legacy = await sqliteKnowledgeReadStore.getEntryById(entryId);
+			expect(detail).toEqual(legacy);
+			expect(dispatch).toHaveBeenCalledWith(
+				sqlite.filename,
+				{ kind: "knowledgeEntryDetail", entryId },
+				expect.objectContaining({ timeoutMs: 10_000 }),
+			);
+			expect(() =>
+				readKnowledgeEntryDetail(sqlite, entryId, new AbortController().signal, 1024),
+			).toThrow("Knowledge entry exceeds its detail byte budget");
+			const missing = await sqliteKnowledgeReadStore.getEntryDetailById(generateId());
+			expect(missing).toBeNull();
+		} finally {
+			dispatch.mockRestore();
+		}
+	});
+
+	test("does not dispatch unreadable entries or return a snapshot after access changes", async () => {
+		const { entryId } = await makeFixture();
+		const app = appFor(principalFor("reader"));
+		const path = `/knowledge/entries/${entryId}`;
+		const read = sqliteKnowledgeReadStore.getEntryDetailById.bind(sqliteKnowledgeReadStore);
+		const detail = spyOn(sqliteKnowledgeReadStore, "getEntryDetailById");
+		const classify = (classificationLevel: string | null) =>
+			db
+				.update(knowledgeEntries)
+				.set({ classificationLevel })
+				.where(eq(knowledgeEntries.id, entryId))
+				.run();
+		try {
+			classify("confidential");
+			expect((await app.request(path)).status).toBe(404);
+			expect(detail).not.toHaveBeenCalled();
+			classify(null);
+			detail.mockImplementationOnce(async (...args) => {
+				const snapshot = await read(...args);
+				classify("confidential");
+				return snapshot;
+			});
+			expect((await app.request(path)).status).toBe(404);
+			expect(detail).toHaveBeenCalledWith(entryId, expect.any(AbortSignal));
+		} finally {
+			detail.mockRestore();
+		}
+	});
+
+	test("cancellation and unavailable or failed Workers do not read the body inline", async () => {
+		const { entryId } = await makeFixture();
+		const inline = spyOn(sqliteKnowledgeReadStore, "getEntryById");
+		const dispatch = spyOn(pool, "runReadTask");
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		try {
+			const abort = new AbortController();
+			abort.abort(new Error("request gone"));
+			expect(
+				await captureWorkerRejectionThrower(
+					sqliteKnowledgeReadStore.getEntryDetailById(entryId, abort.signal),
+				),
+			).toThrow("request gone");
+			process.env.NARRAFORK_DB_WORKER = "off";
+			expect(
+				await captureWorkerRejection(sqliteKnowledgeReadStore.getEntryDetailById(entryId)),
+			).toBeInstanceOf(pool.WorkersUnavailableError);
+			const inTransaction = sqlite.transaction(() =>
+				sqliteKnowledgeReadStore.getEntryDetailById(entryId),
+			)();
+			expect(await captureWorkerRejection(inTransaction)).toBeInstanceOf(
+				pool.WorkersUnavailableError,
+			);
+			for (const error of [
+				new pool.WorkersUnavailableError("worker_create_failed"),
+				new pool.DbReadTaskExecutionError("worker exited"),
+				new pool.DbReadTaskTimeoutError("timed out"),
+			]) {
+				dispatch.mockRejectedValueOnce(error);
+				expect(
+					await captureWorkerRejection(sqliteKnowledgeReadStore.getEntryDetailById(entryId)),
+				).toBe(error);
+			}
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			inline.mockRestore();
+			dispatch.mockRestore();
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
 });
 
 describe("entry viewerCaps ⇔ write paths", () => {

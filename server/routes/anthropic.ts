@@ -7,6 +7,12 @@ import {
 } from "../lib/agent/anthropic-api-version";
 import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
@@ -16,6 +22,9 @@ import {
 	registerAnthropicModelLister,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { getHttpClaudeCliUserAgent, resolveHttpUserAgent } from "../lib/user-agent";
 
 export const anthropicRoutes = new Hono();
@@ -29,7 +38,7 @@ export interface AnthropicModelInfo {
 }
 
 /** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, AnthropicModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, AnthropicModelInfo[]>();
 
 // Load cache on startup
 loadAllCachedModels();
@@ -68,6 +77,17 @@ function saveAllCachedModels(): void {
 export function getAnthropicCachedModelsByProvider(providerId: string): AnthropicModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];
 }
+
+registerModelOptionsCapture("anthropic-messages", (group) =>
+	captureModelOptionsArray(
+		cachedModelsByProvider.get(group.id),
+		(model) => optionInput(group, model.id, model.display_name ?? model.id),
+		cachedModelsByProvider.generation,
+	),
+);
+registerModelListReader("anthropic-messages", (group) =>
+	getAnthropicCachedModelsByProvider(group.id),
+);
 
 function activeAnthropicProviderIds(): Set<string> {
 	return new Set((settings.anthropicProviders ?? []).filter((p) => !p.disabled).map((p) => p.id));
@@ -299,9 +319,26 @@ anthropicRoutes.post("/models/refresh", async (c) => {
 	return c.json({ results, models: getAnthropicCachedModels(), fromCache: false });
 });
 
-anthropicRoutes.get("/providers/:id/models", (c) => {
+anthropicRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getAnthropicCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.anthropicProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{
+			id,
+			name: config?.name ?? id,
+			...config,
+			prefix: config ? anthropicProviderPrefix(config) : id,
+		},
+		"anthropic-messages",
+	);
+	return c.json({
+		models: await getServiceTemplate(group.templateId).listModels(
+			group,
+			undefined,
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 anthropicRoutes.post("/providers/:id/models/refresh", async (c) => {

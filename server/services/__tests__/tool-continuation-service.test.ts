@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileChangeOperations,
 	narratorMessages,
@@ -8,8 +8,15 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../../db/schema";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -90,10 +97,10 @@ beforeEach(() => {
 	resetRecoveryHandoffForTests();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	cleanDb(sqlite);
+	await fixture.close();
 });
 
 async function ordinaryFixture() {
@@ -138,12 +145,13 @@ const ordinaryPass = () =>
 		toolCallId: "tc1",
 	});
 
+// Native settlement avoids Bun's reused-Worker `.rejects` matcher stall.
 describe("ordinary single-record cold adoption", () => {
 	test("fresh ordinary authority adopts an unstarted approval without registering the old planned epoch", async () => {
 		const input = await ordinaryFixture();
 		const pass = await ordinaryPass();
 		expect(getRegisteredRecoverySource("old-planned")).toBeUndefined();
-		await expect(toolContinuationService.upsert(input)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(toolContinuationService.upsert(input))).toThrow();
 		expect(
 			await toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
 		).toMatchObject({
@@ -152,54 +160,66 @@ describe("ordinary single-record cold adoption", () => {
 			claimToken: null,
 			payloadJson: { executionAttempt: 1 },
 		});
-		await expect(
-			toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
-		).rejects.toThrow("single-record");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
+			),
+		).toThrow("single-record");
 	});
 
 	test("unregistered roots, planned roots, no lock, hot handoffs, closed passes and forged booleans never authorize adoption", async () => {
 		const input = await ordinaryFixture();
 		const original = await toolContinuationService.getByToolCallId("tc1");
-		await expect(
-			toolContinuationService.beginOrdinaryColdAdoptionPass({
-				rootEpoch: "missing",
-				toolCallId: "tc1",
-			}),
-		).rejects.toThrow("registered ordinary");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.beginOrdinaryColdAdoptionPass({
+					rootEpoch: "missing",
+					toolCallId: "tc1",
+				}),
+			),
+		).toThrow("registered ordinary");
 		registerSource("planned");
-		await expect(
-			toolContinuationService.beginOrdinaryColdAdoptionPass({
-				rootEpoch: "planned",
-				toolCallId: "tc1",
-			}),
-		).rejects.toThrow("registered ordinary");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.beginOrdinaryColdAdoptionPass({
+					rootEpoch: "planned",
+					toolCallId: "tc1",
+				}),
+			),
+		).toThrow("registered ordinary");
 		const prior = process.env.NARRAFORK_ALLOW_MULTIPLE;
 		process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 		try {
-			await expect(ordinaryPass()).rejects.toThrow("exclusive instance");
+			expect(await captureWorkerRejectionThrower(ordinaryPass())).toThrow("exclusive instance");
 		} finally {
 			if (prior === undefined) delete process.env.NARRAFORK_ALLOW_MULTIPLE;
 			else process.env.NARRAFORK_ALLOW_MULTIPLE = prior;
 		}
 		const pass = await ordinaryPass();
 		pass.close();
-		await expect(
-			toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
-		).rejects.toThrow("single-record");
-		await expect(
-			toolContinuationService.controlledOrdinaryColdAdoption(
-				input,
-				true as unknown as typeof pass.authorization,
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
 			),
-		).rejects.toThrow("single-record");
+		).toThrow("single-record");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.controlledOrdinaryColdAdoption(
+					input,
+					true as unknown as typeof pass.authorization,
+				),
+			),
+		).toThrow("single-record");
 		const hotPass = await ordinaryPass();
 		finishRecoveryDiscovery();
 		const ticket = reserveRecoveryHandoff();
 		try {
-			await expect(ordinaryPass()).rejects.toThrow("discovery");
-			await expect(
-				toolContinuationService.controlledOrdinaryColdAdoption(input, hotPass.authorization),
-			).rejects.toThrow("discovery");
+			expect(await captureWorkerRejectionThrower(ordinaryPass())).toThrow("discovery");
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.controlledOrdinaryColdAdoption(input, hotPass.authorization),
+				),
+			).toThrow("discovery");
 		} finally {
 			releaseRecoveryHandoff(ticket);
 			hotPass.close();
@@ -214,6 +234,7 @@ describe("ordinary single-record cold adoption", () => {
 		"started",
 		"file-change",
 		"cancelled",
+		"deleted",
 		"owner-started",
 		"user-interrupt",
 		"manual-override",
@@ -269,6 +290,10 @@ describe("ordinary single-record cold adoption", () => {
 					.update(narratorToolContinuations)
 					.set({ state: "cancelled" })
 					.where(eq(narratorToolContinuations.toolCallId, "tc1"));
+			} else if (boundary === "deleted") {
+				await db
+					.delete(narratorToolContinuations)
+					.where(eq(narratorToolContinuations.toolCallId, "tc1"));
 			} else if (boundary === "owner-started") {
 				await db
 					.update(narratorToolContinuations)
@@ -292,9 +317,17 @@ describe("ordinary single-record cold adoption", () => {
 			}
 			const original = await toolContinuationService.getByToolCallId("tc1");
 			try {
-				expect(
-					await toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
-				).toBeNull();
+				if (["changed-attempt", "cancelled", "owner-started", "deleted"].includes(boundary)) {
+					expect(
+						await captureWorkerRejection(
+							toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
+						),
+					).toMatchObject({ code: "RUNTIME_READ_CONFLICT", statusCode: 409 });
+				} else {
+					expect(
+						await toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
+					).toBeNull();
+				}
 			} finally {
 				pass.close();
 			}
@@ -349,12 +382,14 @@ describe("ordinary single-record cold adoption", () => {
 					pass.authorization,
 				),
 			).toBeNull();
-			await expect(
-				toolContinuationService.controlledOrdinaryColdAdoption(
-					{ ...input, toolCallId: "foreign" },
-					pass.authorization,
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.controlledOrdinaryColdAdoption(
+						{ ...input, toolCallId: "foreign" },
+						pass.authorization,
+					),
 				),
-			).rejects.toThrow("single-record");
+			).toThrow("single-record");
 			expect(
 				await toolContinuationService.controlledOrdinaryColdAdoption(input, pass.authorization),
 			).toMatchObject({
@@ -455,14 +490,16 @@ describe("tool continuation claims", () => {
 				(await toolContinuationService.listByEpoch(["new", "old"])).map((row) => row.toolCallId),
 			).toEqual(["tc1"]);
 			expect(await toolContinuationService.listByEpoch("new")).toEqual([]);
-			await expect(
-				toolContinuationService.upsert({
-					toolCallId: "tc1",
-					narratorId: "n1",
-					updateEpoch: "old",
-					kind: "send_await",
-				}),
-			).rejects.toThrow("active claim");
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.upsert({
+						toolCallId: "tc1",
+						narratorId: "n1",
+						updateEpoch: "old",
+						kind: "send_await",
+					}),
+				),
+			).toThrow("active claim");
 		} finally {
 			releaseRecoveryHandoff(ticket);
 		}
@@ -518,9 +555,11 @@ describe("tool continuation claims", () => {
 		} finally {
 			pass.close();
 		}
-		await expect(toolContinuationService.controlledColdTakeover(input, evidence)).rejects.toThrow(
-			"live authorized",
-		);
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.controlledColdTakeover(input, evidence),
+			),
+		).toThrow("live authorized");
 	});
 
 	test("cold started Agent reattaches only its durable child and logical run", async () => {
@@ -670,18 +709,20 @@ describe("tool continuation claims", () => {
 		} finally {
 			releaseRecoveryHandoff(ticket);
 		}
-		await expect(
-			toolContinuationService.controlledColdTakeover(
-				{ toolCallId: "tc1", narratorId: "n1", updateEpoch: "old", kind: "deferred_tool" },
-				{
-					sourceEpoch: "old",
-					executionAttempt: 1,
-					authorization: {} as Parameters<
-						typeof toolContinuationService.controlledColdTakeover
-					>[1]["authorization"],
-				},
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.controlledColdTakeover(
+					{ toolCallId: "tc1", narratorId: "n1", updateEpoch: "old", kind: "deferred_tool" },
+					{
+						sourceEpoch: "old",
+						executionAttempt: 1,
+						authorization: {} as Parameters<
+							typeof toolContinuationService.controlledColdTakeover
+						>[1]["authorization"],
+					},
+				),
 			),
-		).rejects.toThrow("live authorized");
+		).toThrow("live authorized");
 	});
 
 	test("a real retry uses a new tool PK and leaves already-delivered history intact", async () => {
@@ -696,14 +737,16 @@ describe("tool continuation claims", () => {
 			state: "completed",
 			payloadJson: { recoveryPhase: "owner_continuation_started" },
 		});
-		await expect(
-			toolContinuationService.upsert({
-				toolCallId: "tc1",
-				narratorId: "n1",
-				updateEpoch: "new",
-				kind: "deferred_tool",
-			}),
-		).rejects.toThrow("epoch");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.upsert({
+					toolCallId: "tc1",
+					narratorId: "n1",
+					updateEpoch: "new",
+					kind: "deferred_tool",
+				}),
+			),
+		).toThrow("epoch");
 		await seedToolCall({
 			id: "tc2",
 			narratorId: "n1",
@@ -739,15 +782,17 @@ describe("tool continuation claims", () => {
 			payloadJson: { permissionGranted: false },
 			deadlineAt: RECLAIMED_UNTIL,
 		});
-		await expect(
-			toolContinuationService.upsert({
-				toolCallId: "tc1",
-				narratorId: "n1",
-				updateEpoch: "new",
-				kind: "deferred_tool",
-				payloadJson: { permissionGranted: true },
-			}),
-		).rejects.toThrow("epoch");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.upsert({
+					toolCallId: "tc1",
+					narratorId: "n1",
+					updateEpoch: "new",
+					kind: "deferred_tool",
+					payloadJson: { permissionGranted: true },
+				}),
+			),
+		).toThrow("epoch");
 		expect(await toolContinuationService.getByToolCallId("tc1")).toEqual(original);
 	});
 
@@ -770,15 +815,17 @@ describe("tool continuation claims", () => {
 			payloadJson: { requestId: "original" },
 			deadlineAt: RECLAIMED_UNTIL,
 		});
-		await expect(
-			toolContinuationService.checkpointSendAwait({
-				toolCallId: "tc1",
-				narratorId: "n1",
-				updateEpoch: "new",
-				payloadJson: {},
-				deadlineAt: null,
-			}),
-		).rejects.toThrow("epoch");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.checkpointSendAwait({
+					toolCallId: "tc1",
+					narratorId: "n1",
+					updateEpoch: "new",
+					payloadJson: {},
+					deadlineAt: null,
+				}),
+			),
+		).toThrow("epoch");
 		expect(await toolContinuationService.getByToolCallId("tc1")).toEqual(original);
 	});
 	test("upsert CAS does not overwrite or clear an unexpired resuming claim", async () => {
@@ -798,15 +845,17 @@ describe("tool continuation claims", () => {
 			deadlineAt: RECLAIMED_UNTIL,
 		});
 
-		await expect(
-			toolContinuationService.upsert({
-				toolCallId: "tc1",
-				narratorId: "n1",
-				updateEpoch: "epoch-b",
-				kind: "await_agent",
-				state: "waiting",
-			}),
-		).rejects.toThrow("active claim is resuming");
+		expect(
+			await captureWorkerRejectionThrower(
+				toolContinuationService.upsert({
+					toolCallId: "tc1",
+					narratorId: "n1",
+					updateEpoch: "epoch-b",
+					kind: "await_agent",
+					state: "waiting",
+				}),
+			),
+		).toThrow("active claim is resuming");
 
 		const current = await toolContinuationService.getByToolCallId("tc1");
 		expect(current).toMatchObject({
@@ -1168,20 +1217,25 @@ describe("bounded continuation read races", () => {
 		const insertRow = sqlite.prepare(
 			"INSERT INTO narrator_tool_continuations (id, tool_call_id, narrator_id, update_epoch, kind, state, payload_json, created_at, updated_at) VALUES (?, ?, 'n1', ?, 'deferred_tool', 'completed', ?, ?, ?)",
 		);
-		sqlite.transaction(() => {
-			for (let index = 0; index < count; index++) {
-				const id = `tc-${index.toString().padStart(3, "0")}`;
-				insertTool.run(id, id, NOW);
-				insertRow.run(
-					id,
-					id,
-					index % 2 ? "source" : "root",
-					JSON.stringify({ data: "x".repeat((payloadBytes?.(index) ?? 11) - 11) }),
-					NOW,
-					NOW,
-				);
-			}
-		})();
+		try {
+			sqlite.transaction(() => {
+				for (let index = 0; index < count; index++) {
+					const id = `tc-${index.toString().padStart(3, "0")}`;
+					insertTool.run(id, id, NOW);
+					insertRow.run(
+						id,
+						id,
+						index % 2 ? "source" : "root",
+						JSON.stringify({ data: "x".repeat((payloadBytes?.(index) ?? 11) - 11) }),
+						NOW,
+						NOW,
+					);
+				}
+			})();
+		} finally {
+			insertTool.finalize();
+			insertRow.finalize();
+		}
 	}
 
 	// Keep every query real: write only after metadata has completed, immediately before
@@ -1195,9 +1249,10 @@ describe("bounded continuation read races", () => {
 	}
 
 	const updatePayload = (payload: Record<string, unknown>, id = "tc-000") =>
-		sqlite
-			.prepare("UPDATE narrator_tool_continuations SET payload_json = ? WHERE id = ?")
-			.run(JSON.stringify(payload), id);
+		sqlite.run("UPDATE narrator_tool_continuations SET payload_json = ? WHERE id = ?", [
+			JSON.stringify(payload),
+			id,
+		]);
 
 	for (const reader of ["listByEpoch", "listRecoveryQueueByEpoch"] as const) {
 		test(`${reader} restarts all metadata after legal recovery payload growth in a later page`, async () => {
@@ -1248,9 +1303,9 @@ describe("bounded continuation read races", () => {
 			const inputRead = spyOn(narratorToolCalls.inputJson, "mapFromDriverValue");
 			const contentRead = spyOn(narratorMessages.contentJson, "mapFromDriverValue");
 			try {
-				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
-					"payload budget exceeded",
-				);
+				expect(
+					await captureWorkerRejectionThrower(toolContinuationService[reader](["root", "source"])),
+				).toThrow("payload budget exceeded");
 				expect(select.mock.calls.map(([fields]) => !!fields && "bytes" in fields)).toEqual([
 					true,
 					false,
@@ -1275,9 +1330,9 @@ describe("bounded continuation read races", () => {
 			);
 			const payloadRead = spyOn(narratorToolContinuations.payloadJson, "mapFromDriverValue");
 			try {
-				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
-					"payload budget exceeded",
-				);
+				expect(
+					await captureWorkerRejectionThrower(toolContinuationService[reader](["root", "source"])),
+				).toThrow("payload budget exceeded");
 				// The first guarded batch can read only unchanged, already-budgeted rows.
 				expect(
 					payloadRead.mock.calls.every(([value]) => !String(value).includes("recoveryToken")),
@@ -1299,9 +1354,9 @@ describe("bounded continuation read races", () => {
 				updatePayload({ recoveryToken: "t".repeat(++writes), recoveryPhase: "result_written" });
 			});
 			try {
-				await expect(toolContinuationService[reader](["root", "source"])).rejects.toThrow(
-					"Continuation recovery scope changed during bounded read",
-				);
+				expect(
+					await captureWorkerRejectionThrower(toolContinuationService[reader](["root", "source"])),
+				).toThrow("Continuation recovery scope changed during bounded read");
 				expect(writes).toBe(3);
 				expect(select.mock.calls.map(([fields]) => !!fields && "bytes" in fields)).toEqual([
 					true,
@@ -1447,14 +1502,18 @@ describe("tool continuation recovery ordering and epoch isolation", () => {
 		})();
 		const select = spyOn(db, "select");
 		try {
-			await expect(toolContinuationService.listByEpoch(["root", "source"])).rejects.toThrow(
-				"10000-row",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.listByEpoch(["root", "source"]),
+				),
+			).toThrow("10000-row");
 			expect(select.mock.calls.every((args) => args[0] && "bytes" in args[0])).toBe(true);
 			select.mockClear();
-			await expect(
-				toolContinuationService.listRecoveryQueueByEpoch(["root", "source"]),
-			).rejects.toThrow("10000-row");
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.listRecoveryQueueByEpoch(["root", "source"]),
+				),
+			).toThrow("10000-row");
 			expect(select.mock.calls.every((args) => args[0] && "bytes" in args[0])).toBe(true);
 		} finally {
 			select.mockRestore();
@@ -1477,7 +1536,9 @@ describe("tool continuation recovery ordering and epoch isolation", () => {
 			.where(eq(narratorToolContinuations.toolCallId, "tc1"));
 		const select = spyOn(db, "select");
 		try {
-			await expect(toolContinuationService.listByEpoch("old")).rejects.toThrow("payload budget");
+			expect(
+				await captureWorkerRejectionThrower(toolContinuationService.listByEpoch("old")),
+			).toThrow("payload budget");
 			expect(select.mock.calls.every((args) => args[0] && "bytes" in args[0])).toBe(true);
 		} finally {
 			select.mockRestore();
@@ -1509,14 +1570,18 @@ describe("tool continuation recovery ordering and epoch isolation", () => {
 		})();
 		const select = spyOn(db, "select");
 		try {
-			await expect(toolContinuationService.listByEpoch(["root", "source"])).rejects.toThrow(
-				"payload budget",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.listByEpoch(["root", "source"]),
+				),
+			).toThrow("payload budget");
 			expect(select.mock.calls.every((args) => args[0] && "bytes" in args[0])).toBe(true);
 			select.mockClear();
-			await expect(
-				toolContinuationService.listRecoveryQueueByEpoch(["root", "source"]),
-			).rejects.toThrow("payload budget");
+			expect(
+				await captureWorkerRejectionThrower(
+					toolContinuationService.listRecoveryQueueByEpoch(["root", "source"]),
+				),
+			).toThrow("payload budget");
 			expect(select.mock.calls.every((args) => args[0] && "bytes" in args[0])).toBe(true);
 		} finally {
 			select.mockRestore();

@@ -55,8 +55,20 @@ import { FragmentGap, LineFragments } from "./line-fragments";
  * transcript (`TYPE_ROLE_STYLE.textarea`, D49) — the box's height is the measured one either
  * way — with Mantine's own where the `--nf-type-*` variables are not published.
  */
-const TEXTAREA_TEXT = `var(${TYPOGRAPHY_CSS_VARS.xsSize}, var(--mantine-font-size-xs))/var(${TYPOGRAPHY_CSS_VARS.xsBaseLine}, 1.55)`;
+const TEXTAREA_FONT_SIZE = `var(${TYPOGRAPHY_CSS_VARS.xsSize}, var(--mantine-font-size-xs))`;
+const TEXTAREA_LINE_HEIGHT = `var(${TYPOGRAPHY_CSS_VARS.xsBaseLine}, 1.55)`;
 const TEXTAREA_LETTER_SPACING = `var(${TYPOGRAPHY_CSS_VARS.letterSpacing}, normal)`;
+/**
+ * Size and family are separate properties. The `font` shorthand rejects a family that
+ * arrives as a `var()` of a comma-separated stack (`--mantine-font-family` is the UI
+ * stack, the same list as `--nf-font-ui`), and the whole declaration is then dropped —
+ * the stand-in inherits 16px instead of the xs size the live textarea paints.
+ */
+const textareaFont = (family: string) => ({
+	fontSize: TEXTAREA_FONT_SIZE,
+	lineHeight: TEXTAREA_LINE_HEIGHT,
+	fontFamily: family,
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared inline-line materialization (mirrors RenderMarkdown InlineBlockView).
@@ -330,7 +342,7 @@ function AskFixedRow({
 							background: "var(--mantine-color-body)",
 							boxSizing: "border-box",
 							padding: "4.5px 8px",
-							font: `${TEXTAREA_TEXT} var(--mantine-font-family)`,
+							...textareaFont("var(--mantine-font-family)"),
 							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-placeholder)",
 							overflow: "hidden",
@@ -519,7 +531,7 @@ function PermFixedRow({
 							background: "var(--mantine-color-body)",
 							boxSizing: "border-box",
 							padding: "5.5px 12px",
-							font: `${TEXTAREA_TEXT} monospace`,
+							...textareaFont("monospace"),
 							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-text)",
 							overflow: "hidden",
@@ -545,7 +557,7 @@ function PermFixedRow({
 							background: "var(--mantine-color-body)",
 							boxSizing: "border-box",
 							padding: "4.5px 8px",
-							font: `${TEXTAREA_TEXT} var(--mantine-font-family)`,
+							...textareaFont("var(--mantine-font-family)"),
 							letterSpacing: TEXTAREA_LETTER_SPACING,
 							color: "var(--mantine-color-placeholder)",
 							overflow: "hidden",

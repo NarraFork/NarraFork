@@ -12,6 +12,14 @@ import {
 	Title,
 	UnstyledButton,
 } from "@mantine/core";
+import type { SourceRegion } from "@shared/sourcing/identify";
+import type {
+	AddProviderType,
+	ProviderBilling,
+	ProviderCluster,
+	ProviderConnectionSelection,
+	ProviderPreset,
+} from "@shared/sourcing/presets";
 import { IconArrowLeft, IconDownload, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -31,23 +39,15 @@ import {
 	updateDraftConnection,
 } from "./provider-add-draft";
 import {
-	getConnectionFamily,
-	getInitialConnectionSelection,
-	getPopularProviderPresets,
-	type ProviderBilling,
-	type ProviderCluster,
-	type ProviderConnectionSelection,
-	type ProviderRegion,
-	resolveProviderConnection,
-} from "./provider-connection-presets";
-import {
-	type AddProviderType,
+	connectionClusters,
 	getProviderPresetName,
+	initialConnectionSelection,
 	isProviderPresetAvailable,
-	PROVIDER_PRESETS,
-	type ProviderPreset,
+	popularProviderPresets,
+	resolveProviderConnection,
 	searchProviderPresets,
-} from "./provider-presets";
+	useProviderPresets,
+} from "./provider-catalog";
 
 const PROTOCOL_KEYS: Record<AddProviderType, string> = {
 	"anthropic-messages": "addProviderAnthropicMessages",
@@ -57,9 +57,17 @@ const PROTOCOL_KEYS: Record<AddProviderType, string> = {
 	nug: "addProviderNug",
 };
 
+const CLUSTER_KEYS: Record<ProviderCluster, string> = {
+	sgp: "addProviderClusterSgp",
+	ams: "addProviderClusterAms",
+};
+
 /** The preset preselected when there is nothing to import: TokenDance where offered, else DeepSeek. */
-export function defaultAddProviderPresetId(language: string): string {
-	const tokenDance = PROVIDER_PRESETS.find((item) => item.id === "tokendance");
+export function defaultAddProviderPresetId(
+	presets: readonly ProviderPreset[],
+	language: string,
+): string {
+	const tokenDance = presets.find((item) => item.id === "tokendance");
 	return tokenDance && isProviderPresetAvailable(tokenDance, language) ? "tokendance" : "deepseek";
 }
 
@@ -73,15 +81,17 @@ export function AddProviderPage({
 	const { t, i18n } = useTranslation("settings");
 	const tokenDance = useTokenDanceAdd();
 	const importContext = useProviderImport();
+	const catalogQuery = useProviderPresets();
+	const catalog = catalogQuery.data;
 	const restoredRef = useRef(false);
 	const locallyEditedRef = useRef(false);
 	useEffect(() => {
 		const restored = tokenDance?.restoredAddPage;
-		if (!restored || restoredRef.current || locallyEditedRef.current) return;
+		if (!restored || !catalog || restoredRef.current || locallyEditedRef.current) return;
 		restoredRef.current = true;
 		setQuery(String(restored.query ?? ""));
 		setCategory(restored.category === "all" ? "all" : "popular");
-		setPreset(PROVIDER_PRESETS.find((p) => p.id === restored.presetId) ?? null);
+		setPreset(catalog.find((p) => p.id === restored.presetId) ?? null);
 		setDraft((restored.draft as AddProviderDraft | null) ?? null);
 		setConnectionSelection(
 			(restored.connectionSelection as ProviderConnectionSelection | null) ?? null,
@@ -89,7 +99,7 @@ export function AddProviderPage({
 		setShowConfig(!!restored.showConfig);
 		setImportSelected(false);
 		tokenDance?.consumeRestoredAddPage?.();
-	}, [tokenDance?.restoredAddPage, tokenDance?.consumeRestoredAddPage]);
+	}, [catalog, tokenDance?.restoredAddPage, tokenDance?.consumeRestoredAddPage]);
 	const [query, setQuery] = useState("");
 	const [category, setCategory] = useState<"popular" | "all">("popular");
 	const [connectionSelection, setConnectionSelection] =
@@ -128,10 +138,10 @@ export function AddProviderPage({
 	const presets = useMemo(
 		() =>
 			(category === "popular" && !query.trim()
-				? getPopularProviderPresets()
-				: searchProviderPresets(query, t)
+				? popularProviderPresets(catalog ?? [])
+				: searchProviderPresets(catalog ?? [], query, t)
 			).filter((item) => isProviderPresetAvailable(item, language)),
-		[category, query, t, language],
+		[catalog, category, query, t, language],
 	);
 	const connection =
 		preset && connectionSelection
@@ -143,11 +153,8 @@ export function AddProviderPage({
 	const protocolOptions = activePreset
 		? (Object.keys(activePreset.endpoints) as AddProviderType[])
 		: [];
-	const requiresCluster =
-		preset &&
-		getConnectionFamily(preset.id) === "mimo" &&
-		connectionSelection?.region === "international" &&
-		connectionSelection.billing === "token-plan";
+	const clusters =
+		preset && connectionSelection ? connectionClusters(preset, connectionSelection) : [];
 	/** Select a preset; `reveal` switches narrow layouts to its form (a user pick). */
 	const selectPreset = (next: ProviderPreset, reveal: boolean) => {
 		setSubmitError(null);
@@ -157,8 +164,8 @@ export function AddProviderPage({
 			if (reveal) setShowConfig(true);
 			return;
 		}
-		const selection = getConnectionFamily(next.id)
-			? getInitialConnectionSelection(next.id, i18n.resolvedLanguage ?? i18n.language)
+		const selection = next.connections
+			? initialConnectionSelection(next, i18n.resolvedLanguage ?? i18n.language)
 			: null;
 		const resolved = selection
 			? resolveProviderConnection(next, selection)
@@ -191,19 +198,25 @@ export function AddProviderPage({
 	// else DeepSeek. A restored draft or a choice the user already made wins.
 	const autoSelectedRef = useRef(false);
 	const detecting = !!importContext?.detecting;
-	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once when detection settles
+	// biome-ignore lint/correctness/useExhaustiveDependencies: runs once when detection and the catalog settle
 	useEffect(() => {
 		if (autoSelectedRef.current || detecting) return;
-		autoSelectedRef.current = true;
-		if (restoredRef.current || tokenDance?.restoredAddPage || locallyEditedRef.current) return;
+		if (restoredRef.current || tokenDance?.restoredAddPage || locallyEditedRef.current) {
+			autoSelectedRef.current = true;
+			return;
+		}
+		// Import needs no catalog, so a failed preset fetch must not hide it.
 		if (importAvailable) {
+			autoSelectedRef.current = true;
 			setImportSelected(true);
 			return;
 		}
-		const fallback = defaultAddProviderPresetId(language);
-		const next = PROVIDER_PRESETS.find((item) => item.id === fallback);
+		if (!catalog) return;
+		autoSelectedRef.current = true;
+		const fallback = defaultAddProviderPresetId(catalog, language);
+		const next = catalog.find((item) => item.id === fallback);
 		if (next) selectPreset(next, false);
-	}, [detecting, importAvailable]);
+	}, [detecting, importAvailable, catalog]);
 	const changeConnection = (selection: ProviderConnectionSelection) => {
 		if (!preset || submittingRef.current) return;
 		setSubmitError(null);
@@ -311,6 +324,16 @@ export function AddProviderPage({
 								</Button>
 							))}
 						</Group>
+						{catalogQuery.isError && (
+							<Alert color="red" role="alert">
+								<Group justify="space-between" wrap="nowrap">
+									<Text size="sm">{t("addProviderCatalogLoadFailed")}</Text>
+									<Button size="xs" variant="light" onClick={() => void catalogQuery.refetch()}>
+										{t("retry", { ns: "common" })}
+									</Button>
+								</Group>
+							</Alert>
+						)}
 						<Text fw={600} size="sm">
 							{t(
 								query.trim()
@@ -322,7 +345,7 @@ export function AddProviderPage({
 							· {presets.length}
 						</Text>
 						<div className={classes.catalogList}>
-							{presets.length === 0 && (
+							{catalog && presets.length === 0 && (
 								<Text c="dimmed" size="sm">
 									{t("addProviderNoResults")}
 								</Text>
@@ -480,7 +503,7 @@ export function AddProviderPage({
 												if (value && value !== connectionSelection.region)
 													changeConnection({
 														...connectionSelection,
-														region: value as ProviderRegion,
+														region: value as SourceRegion,
 														cluster: undefined,
 													});
 											}}
@@ -505,17 +528,14 @@ export function AddProviderPage({
 										/>
 									</Group>
 								)}
-								{requiresCluster && connectionSelection && (
+								{clusters.length > 0 && connectionSelection && (
 									<Select
 										required
 										allowDeselect={false}
 										label={t("addProviderCluster")}
 										placeholder={t("addProviderClusterPlaceholder")}
 										value={connectionSelection.cluster ?? null}
-										data={[
-											{ value: "sgp", label: t("addProviderClusterSgp") },
-											{ value: "ams", label: t("addProviderClusterAms") },
-										]}
+										data={clusters.map((value) => ({ value, label: t(CLUSTER_KEYS[value]) }))}
 										onChange={(value) => {
 											if (value && value !== connectionSelection.cluster)
 												changeConnection({

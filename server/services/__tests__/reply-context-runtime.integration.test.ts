@@ -34,6 +34,17 @@ const { createAsyncQuestion, answerAsyncQuestion } = await import("../narrator-q
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
+async function expectRejectedMessage(work: PromiseLike<unknown>, message: string): Promise<void> {
+	let rejected = false;
+	try {
+		await work;
+	} catch (error) {
+		rejected = true;
+		expect(String(error)).toContain(message);
+	}
+	expect(rejected).toBe(true);
+}
+
 const recipient = "reply-context-recipient";
 const sender = "reply-context-sender";
 const model = "replycontextfixture:model";
@@ -102,20 +113,20 @@ function languageUpdates(request: CapturedRequest) {
 		.map(([text]) => text)
 		.filter((text) => text.includes("[language]\n"));
 }
-async function waitUntil(check: () => boolean, label: string) {
+async function waitUntil(check: () => boolean | Promise<boolean>, label: string) {
 	const deadline = Date.now() + 8_000;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() >= deadline) throw new Error(`Timed out: ${label}; requests=${requests.length}`);
 		await Bun.sleep(10);
 	}
 }
 async function idle(count: number) {
 	await waitUntil(
-		() =>
+		async () =>
 			requests.length === count &&
 			recipientRow().status === "idle" &&
 			!getExecutionOwner(recipient) &&
-			!hasPendingBufferedWork(recipient),
+			!(await hasPendingBufferedWork(recipient)),
 		"recipient idle",
 	);
 }
@@ -281,6 +292,14 @@ test("adopts queued human pairs only on consumption; Send, answers, completion a
 	await idle(2);
 
 	// The real Send agent lane has sender provenance, not a human language adoption.
+	const { ensureCommunicationNodeTx, seedFixtureCommunicationPeer } = await import(
+		"./runtime-communication-fixtures"
+	);
+	db.transaction((tx) => {
+		ensureCommunicationNodeTx(tx, sender, null);
+		ensureCommunicationNodeTx(tx, recipient, null);
+		seedFixtureCommunicationPeer(tx, sender, recipient, "user-a");
+	});
 	seedTool(sender, "send-source", "Send");
 	const text = "中文发送者的消息，不应替换收件会话语言";
 	const delivery = createAgentMessageDelivery(
@@ -451,17 +470,18 @@ test("HTTP Continue adopts at unfinished Await recovery admission, not at a dela
 	const baseline = await initialChineseTurn();
 	await persistUnfinishedAwait();
 	await englishOwnerPreference();
-	const communication = await import("../agent-communication");
+	const { watchTool } = await import("../../lib/agent/tools/watch");
 	const release = Promise.withResolvers<void>();
 	releases.add(release.resolve);
-	const wait = spyOn(communication, "awaitAgentResultDetailed").mockImplementation(async () => {
+	const wait = spyOn(watchTool, "execute").mockImplementation(async () => {
 		await release.promise;
-		throw new Error("Fixture missing agent");
+		return { output: "Observation registered", metadata: { kind: "watch", status: "watching" } };
 	});
 	const app = await ownerRoutes();
 	const response = await app.request(`/${recipient}/continue`, { method: "POST" });
 	expect(response.status).toBe(200);
 	expect(await response.json()).toMatchObject({ recovering: 1 });
+	await waitUntil(() => wait.mock.calls.length === 1, "recovery Watch registration");
 	expect(wait).toHaveBeenCalledTimes(1);
 	expect(recipientRow().replyContext).toEqual(en);
 	expect(requests).toHaveLength(1);
@@ -480,7 +500,7 @@ test("HTTP Continue adopts at unfinished Await recovery admission, not at a dela
 
 test("recovery without candidates or with a live owner never adopts the human pair", async () => {
 	await initialChineseTurn();
-	const { resumeIncompleteAgentWorkForContinue, startRecoveryAwaitBatch } = await import(
+	const { resumeIncompleteAgentWorkForContinue, startRecoveryWatchBatch } = await import(
 		"../narrator-subagent-recovery"
 	);
 	const input = {
@@ -499,7 +519,8 @@ test("recovery without candidates or with a live owner never adopts the human pa
 	const owner = tryClaimExecution(recipient, "run");
 	if (!owner) throw new Error("Could not claim fixture owner");
 	try {
-		await expect(startRecoveryAwaitBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
+		await expectRejectedMessage(
+			startRecoveryWatchBatch({ ...input, aliases: ["missing"] }),
 			"already running",
 		);
 		expect(recipientRow().replyContext).toEqual(zh);
@@ -512,10 +533,10 @@ test("recovery without candidates or with a live owner never adopts the human pa
 test.each([
 	true,
 	false,
-])("recovery await batch adopts only explicit human policy (human=%s)", async (human) => {
+])("recovery Watch registration adopts only explicit human policy (human=%s)", async (human) => {
 	const baseline = await initialChineseTurn();
-	const { startRecoveryAwaitBatch } = await import("../narrator-subagent-recovery");
-	await startRecoveryAwaitBatch({
+	const { startRecoveryWatchBatch } = await import("../narrator-subagent-recovery");
+	await startRecoveryWatchBatch({
 		narratorId: recipient,
 		aliases: ["fixture-missing-agent"],
 		locale: "en",
@@ -523,6 +544,12 @@ test.each([
 		userId: "user-a",
 		...(human ? { humanReplyContext: en } : {}),
 	});
+	// Recovery only registers Watch and releases the parent. A later explicit
+	// continuation (or a real completion notice) starts the next model request.
+	expect(requests).toHaveLength(1);
+	expect(recipientRow().status).toBe("idle");
+	expect(recipientRow().replyContext).toEqual(human ? en : zh);
+	await continueNarrator(recipient, "en", true);
 	await idle(2);
 	if (human) expectRecoveredEnglish(baseline);
 	else {
@@ -645,7 +672,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 		const owner = tryClaimExecution(recipient, "run");
 		if (!owner) throw new Error("Could not claim recovery fixture owner");
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"already running",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);
@@ -659,7 +687,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 			throw new Error("fixture registration failed");
 		});
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"fixture registration failed",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);

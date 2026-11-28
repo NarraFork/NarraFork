@@ -3,7 +3,8 @@
  *
  * Rooted at the narrator's cwd, lazily reads one directory level per expand, and
  * patches individual levels from the watcher's path events. Clicking a file opens it
- * in the existing read-only viewer panel; this component never writes.
+ * in the existing read-only viewer panel; right-clicking one opens the entry menu
+ * (`FileContextMenu`), which is the only place this component mutates the filesystem.
  *
  * Built on Mantine's `Tree` rather than a hand-rolled or third-party tree: keyboard
  * navigation, range selection and the ARIA tree semantics are already covered there,
@@ -33,9 +34,20 @@ import {
 	IconEyeOff,
 	IconRefresh,
 } from "@tabler/icons-react";
-import { useCallback, useEffect, useMemo } from "react";
+import {
+	type MouseEvent as ReactMouseEvent,
+	useCallback,
+	useEffect,
+	useMemo,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
+import { useFileReferenceScope } from "../composer/FileReferenceScope";
+import { createFileReferenceId } from "../composer/file-reference-input";
+import { FileContextMenu } from "./FileContextMenu";
+import { FileRenameModal } from "./FileRenameModal";
 import { FileTreeIcon } from "./file-icons";
+import type { FileMenuTarget } from "./file-menu-target";
 import { TREE_ROOT_KEY } from "./tree-patch";
 import type { TreeEntry, TreeLineStats, TreeState } from "./tree-store";
 import { useFileTree } from "./useFileTree";
@@ -60,6 +72,14 @@ const TRUNCATED_PREFIX = "\u0000truncated:";
 export interface FileTreeContentProps {
 	/** Absolute path of the tree root — the narrator's cwd. */
 	root: string;
+	/**
+	 * The narrator this tree belongs to.
+	 *
+	 * Required, not decorative: every mutating entry in the row menu is bounded by this
+	 * narrator's writable roots on the server, so a tree without one could only offer
+	 * actions that fail.
+	 */
+	narratorId: string;
 	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
 	contextKey?: string;
 	showHidden: boolean;
@@ -116,6 +136,7 @@ function buildNodes(
 
 export function FileTreeContent({
 	root,
+	narratorId,
 	contextKey,
 	showHidden,
 	onToggleShowHidden,
@@ -131,6 +152,50 @@ export function FileTreeContent({
 		root,
 		showHidden,
 		contextKey,
+	);
+	const fileScope = useFileReferenceScope();
+
+	// The right-click menu's position and target, and the rename dialog's target. Two
+	// pieces of state rather than one "action" because the rename dialog must OUTLIVE the
+	// menu: the menu closes on select, the dialog stays up until the rename resolves.
+	const [menu, setMenu] = useState<{
+		x: number;
+		y: number;
+		target: FileMenuTarget;
+	} | null>(null);
+	const [renameTarget, setRenameTarget] = useState<FileMenuTarget | null>(null);
+	const closeMenu = useCallback(() => setMenu(null), []);
+
+	/**
+	 * Re-read one directory after a mutation.
+	 *
+	 * The watcher announces the change too, but it arrives after the round trip and is
+	 * coalesced with unrelated paths; re-reading here is what makes the row the user acted
+	 * on disappear (or appear) immediately. A root-level change passes "", which IS
+	 * `TREE_ROOT_KEY` — the store's key for the root listing.
+	 */
+	const handleChanged = useCallback(
+		(relativeDirectory: string) => {
+			void reload(relativeDirectory);
+			onRefreshLineStats?.();
+		},
+		[onRefreshLineStats, reload],
+	);
+
+	// Reference-in-composer is offered only when the composer in scope belongs to this
+	// narrator: the reference is inserted into that narrator's draft, so a tree shown for a
+	// different one would otherwise add a file to somebody else's prompt.
+	const canReference = !!fileScope.addReference && fileScope.narratorId === narratorId;
+	const referenceFile = useCallback(
+		(target: FileMenuTarget) => {
+			fileScope.addReference?.({
+				id: createFileReferenceId(),
+				deviceId: "local",
+				path: target.absolutePath,
+				label: target.relativePath,
+			});
+		},
+		[fileScope],
 	);
 
 	// Hand the patch entry point to the panel, which owns the WS subscription. In an
@@ -180,6 +245,7 @@ export function FileTreeContent({
 				lineStatsTruncated={lineStatsTruncated}
 				onOpenFile={onOpenFile}
 				onReload={reload}
+				onOpenMenu={setMenu}
 			/>
 		),
 		[changedPaths, errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
@@ -267,6 +333,24 @@ export function FileTreeContent({
 					renderNode={renderNode}
 				/>
 			)}
+			{menu && (
+				<FileContextMenu
+					x={menu.x}
+					y={menu.y}
+					target={menu.target}
+					narratorId={narratorId}
+					onReference={canReference ? () => referenceFile(menu.target) : null}
+					onRename={setRenameTarget}
+					onChanged={handleChanged}
+					onClose={closeMenu}
+				/>
+			)}
+			<FileRenameModal
+				target={renameTarget}
+				narratorId={narratorId}
+				onClose={() => setRenameTarget(null)}
+				onRenamed={handleChanged}
+			/>
 		</Box>
 	);
 }
@@ -281,6 +365,8 @@ interface FileTreeRowProps {
 	lineStatsTruncated: boolean;
 	onOpenFile: (absolutePath: string, fileName: string) => void;
 	onReload: (dir: string) => Promise<void>;
+	/** Right-click on a FILE row; directories keep the browser's own menu. */
+	onOpenMenu: (menu: { x: number; y: number; target: FileMenuTarget }) => void;
 }
 
 function FileTreeRow({
@@ -293,6 +379,7 @@ function FileTreeRow({
 	lineStatsTruncated,
 	onOpenFile,
 	onReload,
+	onOpenMenu,
 }: FileTreeRowProps) {
 	const { t } = useTranslation("narrator");
 	const { node, expanded, elementProps, tree } = payload;
@@ -329,12 +416,36 @@ function FileTreeRow({
 		onOpenFile(`${root}/${entry.path}`, entry.name);
 	};
 
+	/**
+	 * Right-click opens the entry menu — for FILES only.
+	 *
+	 * A directory is left to the browser's own menu on purpose: the menu this offers
+	 * (rename against a bounded file, copy, delete, reference in the composer) is defined
+	 * per file, and `/api/fs/transfer` and `/api/fs/delete` refuse directories, so offering
+	 * it there would only produce refusals.
+	 */
+	const handleContextMenu = (event: ReactMouseEvent) => {
+		if (entry.isDirectory) return;
+		event.preventDefault();
+		event.stopPropagation();
+		onOpenMenu({
+			x: event.clientX,
+			y: event.clientY,
+			target: {
+				absolutePath: `${root}/${entry.path}`,
+				relativePath: entry.path,
+				name: entry.name,
+			},
+		});
+	};
+
 	return (
 		<Group
 			{...elementProps}
 			gap={6}
 			wrap="nowrap"
 			onClick={handleClick}
+			onContextMenu={handleContextMenu}
 			style={{ ...elementProps.style, cursor: "pointer" }}
 		>
 			{entry.isDirectory ? (

@@ -362,7 +362,7 @@ let result;
 try {
   const started = await connectCompiledWorker(specifiers, { timeoutMs: 1500 });
   const reply = once(started.worker, "message", { signal: AbortSignal.timeout(2000) });
-  started.worker.postMessage({ action: "read", cwd: process.cwd(), paths: [] });
+  started.worker.postMessage({ action: "read", cwd: process.cwd(), paths: [], remainingBytes: 0, deadlineAt: Date.now() + 3000 });
   const [message] = await reply;
   await started.handle.close();
   const attemptsBeforeCache = attempts.length;
@@ -491,7 +491,9 @@ await compileRuntimeBundle({ ...JSON.parse(process.argv[2]), modules: new Map() 
 				if (!result.specifier) throw new Error("Compiled probe returned no worker entry");
 				// Both current recipes preserve the common server/ root on this real entry graph.
 				expect(result.specifier).toBe(result.specifiers[0]);
-				expect(result.message).toEqual({ value: { complete: true, files: [], readFiles: 0 } });
+				expect(result.message).toEqual({
+					value: { complete: true, files: [], readFiles: 0, readBytes: 0 },
+				});
 				expect(result.posts.filter((post) => post.action !== "ping")).toEqual([
 					{ entry: result.specifier, action: "read" },
 				]);

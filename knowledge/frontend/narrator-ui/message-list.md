@@ -1,0 +1,136 @@
+---
+id: frontend.narrator-ui.message-list
+title: 消息列表
+summary: 虚拟列表、细节级别、滚动、消息与内容渲染、Markdown、流式输出。
+anchors:
+  - shared/agent-reference.ts
+  - frontend/components/narrator/vlist/measure/
+  - frontend/components/narrator/vlist/render/R*.tsx
+  - frontend/components/narrator/vlist/render/[!R]*
+  - frontend/components/narrator/vlist/vlist-{lod,morph,drill,fold,lifecycle,motion,stream-anim,swipe,width,resize,pointer,text-drag}*
+  - frontend/components/narrator/vlist/vlist-{exact,virtualization,height,visible,unpredictable,jump,visual,window,row,trace,token,typography,highlight,selection,block,copy}*
+  - frontend/components/narrator/vlist/{pretext,prepared,measure-cache,usePretext,segment,source-slice,parse-markdown,katex,message-math,guard-source,registry,render-registry,ExactRow,PretextExact,VListHarness}*
+  - frontend/components/narrator/vlist/{vlist-live,vlist-message,vlist-data,vlist-reload,vlist-pipeline,vlist-persisted,vlist-head,vlist-tail,vlist-tool,streaming,exact-streaming,useVList,useReasoning,reasoning-translation,compact-progress,communication-navigation}*
+  - frontend/components/narrator/vlist/{VList,Question,Reminder,auxiliary,markdown-images,outline,permission-textarea,remote-outline,spec-carryover,task-notice}*
+  - frontend/components/narrator/vlist/{team-conversation.,team-conversation-}*
+  - frontend/components/narrator/team-conversation-mode.ts
+  - frontend/components/narrator/vlist/vlist-{ask,compact,content,edit,error,injection,interaction,outline,permission,reflection,spec,subagent,user}*
+  - frontend/components/narrator/lod/
+  - frontend/components/narrator/scroll/
+  - frontend/components/narrator/message/
+  - frontend/components/narrator/markdown/
+  - frontend/components/narrator/content/
+  - frontend/components/narrator/streaming/
+  - frontend/components/narrator/history/
+  - frontend/components/narrator/selection/
+  - frontend/components/narrator/trace/
+  - frontend/components/narrator/NarratorMessageListSkeleton.tsx
+  - frontend/components/narrator/HistoryRecoveryPanel.tsx
+  - frontend/components/narrator/narrator-warning.ts
+  - frontend/components/narrator/progress-label.ts
+  - frontend/components/narrator/reflection-progress-store.ts
+  - frontend/components/narrator/preload-panel-tail.ts
+  - frontend/components/narrator/TurnElapsedTime.tsx
+  - frontend/hooks/useNarratorLod.ts
+  - frontend/hooks/scroll-parent.ts
+  - frontend/hooks/useLodAnchor.ts
+  - frontend/hooks/useLodIndicatorTrigger.ts
+  - frontend/hooks/useShikiTokens.ts
+  - frontend/lib/file-link-target.ts
+  - frontend/lib/markdown-anchor-scroll.ts
+  - frontend/lib/narrator-content-column.ts
+  - frontend/lib/pretext-document-cache-invalidation.ts
+  - frontend/lib/pretext-document-cache-invalidation.test.ts
+  - frontend/lib/shiki-lang.ts
+  - frontend/lib/shiki-language-aliases.ts
+  - frontend/lib/shiki-language-loader.ts
+  - frontend/lib/shiki-loader.ts
+  - frontend/lib/shiki-token-cache.ts
+  - frontend/lib/shiki-token-worker-client.ts
+  - frontend/lib/shiki-token-worker-protocol.ts
+  - frontend/lib/shiki-token.worker.ts
+  - frontend/lib/stream-anim-duration.ts
+  - frontend/lib/struct-view-tokens.ts
+  - frontend/routes/dev-vlist-harness.tsx
+  - shared/markdown-emphasis-compat.ts
+  - shared/markdown-file-path.ts
+  - shared/reasoning-content.ts
+  - shared/reasoning-translation.ts
+keywords:
+  - PretextExactMessageList
+  - 虚拟列表
+  - LOD
+  - 细节级别
+  - narrafork_lod
+  - narrafork_lod_alt_gesture
+  - preparedBlock
+  - 零 DOM 测量
+  - 展开折叠
+  - 活动轨迹
+  - 流式输出
+  - EXACT_RELOAD_COALESCE_MS
+  - 历史加载
+  - MarkdownContent
+  - TeamConversationModeContext
+  - team-chip
+  - team-event
+status: draft
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+---
+# 消息列表
+
+叙述者面板里的消息区。它是一个"精确虚拟列表"：整段文档在当前 LOD 和宽度下用纯算术预测量，每行绝对定位，高度不靠 DOM 读取。`vlist/` 里既有这套布局内核的前端侧（`measure/`、`render/`），也有把 WebSocket 事件、权限/提问/压缩等交互接进列表的桥接模块。
+
+## 关键规则
+- 懒加载边界：`NarratorPanel.tsx` 用 `lazy(() => import("./vlist/PretextExactMessageList"))`；`vlist/vlist-isolation.guard.test.ts` 扫描 `frontend/`，vlist 之外任何文件静态 import vlist 即失败（动态 `import()`、`*.test.*`、`*.browser-fixture.*` 放行）。`PretextExactMessageList.tsx` 文件头自称“experimental/opt-in”，已与此不符（以懒加载与守卫测试为准）。
+- 列表外的缓存失效只能经零依赖 `lib/pretext-document-cache-invalidation.ts` facade，不为清缓存静态 import vlist。未加载 lazy cache 时同步 no-op；cache 真正加载后安装唯一 owner，聊天撤权仍同步失效。HMR dispose 注销 owner/会话监听并清旧缓存；旧 cleanup 只能移除自己的 registration，不能卸掉新 owner（`pretext-document-cache-invalidation.test.ts`），OFF/未加载路径不因此拉取 vlist chunk。
+- 尾部摘要（`vlist/vlist-tail-meta.ts:buildTailMeta`，供重试/继续按钮与状态栏）从末尾往前找最后一条真实消息，跳过流式占位、错误卡、隐藏 epoch 标记，以及宿主写的非回合行（团队升级/解散说明、重建工具声明通知，`continue-tail.ts:isNonTurnHostRow`，见[中断与恢复](../../narrator/recovery.md)）。
+- 零 DOM 测量：`vlist/zero-dom-measure.guard.test.ts` 扫 `measure/*`、`registry.ts`、`vlist-pipeline.ts`、`vlist-tail-meta.ts`、`vlist-live-patch.ts` 等纯路径文件，禁止 `getBoundingClientRect`/`offsetHeight`/`ResizeObserver`/`getComputedStyle`；布局内核在 `shared/pretext-layout/`，由其 `shared-core.guard.test.ts` 枚举扫描。例外：渲染层对 mermaid/katex/未知尺寸图片的一次性局部修正（`PreparedUnknownBlock`）、滚动容器外壳、`VListHarness.tsx`（开发期校准）。
+- 已提交行的高度只在用户操作后才变：`vlist-stable-height.guard.test.ts`（截断详情按完整上限预留高度、详情抓取要显式请求；反思通知不得渲染后再测量）。
+- 每个 LOD 下每个工具调用都必须可寻址（有自己的卡片，或是轨迹里的具名行，不能只落进“工具调用 ×N”计数行）：`every-call-addressable.guard.test.ts`。
+- LOD 取值 1–5，默认 4（`lod/RenderLodCtx.ts`）：
+  - L5：未被用户手动折叠的工具卡片都展开（`measure-tool-call.ts:resolveToolCallOpened`，`lod >= 5` 返回 `!userCollapsed`）。
+  - L4：最近两个 assistant run-segment（`trace/run-segments.ts:recentRunSegmentMessageIds`，count=2，在 `PretextExactMessageList.tsx` 调用）里的卡片按各自默认展开态，更早的折叠为头部。
+  - L3：所有工具卡片折叠为头部（lodExempt / lodUserOverride 的卡片除外，恒展开）。
+  - L2：推理与已完成工具合并成一条活动轨迹（`trace/render-units.ts`），文本完整。
+  - L1：活动轨迹默认折叠；`measure-reasoning.ts` 在 `lod <= 2` 时推理走计数行。RenderLodCtx 注释所说的“L1 长助手文本截断”未核实。
+- LOD 存取（`hooks/useNarratorLod.ts`）：每个叙述者各记一个 `narrafork_lod:<id>`；只有“设为默认”才写 `narrafork_lod_default`；打开时先用叙述者自己的，其次全局默认，再次 4。`narrafork_lod_schema`=2 标记存储档位已从旧 1–6 迁到 1–5（旧值 ≥4 减 1），迁移只做一次。
+- LOD 手势（`vlist/vlist-lod-gesture.ts`）：Alt+滚轮（deltaY>0 降一级，否则升一级；`narrafork_lod_alt_gesture` 关闭时返回 null，不拦截滚动）、双指捏合（比例 >1.2 升、<1/1.2 降）；两次步进至少间隔 140ms。指示器 `lod/lod-indicator.ts`：按住 Alt 常驻，手势触发则短暂显示后淡出，指针在其上时不淡出。
+- 结构性变更（新消息、编辑、删除、压缩完成）触发整窗重载，规则在 `vlist-reload-policy.ts`：
+  - 读者在底部：重载；合并窗口 `EXACT_RELOAD_COALESCE_MS`=120ms，从第一个待处理修订起最迟 `EXACT_RELOAD_MAX_DELAY_MS`=1000ms 必须提交。
+  - 读者已上滚：推迟（`deferred`），驱动“有新消息”提示，回到底部再评估。
+  - 工具完成、反思裁决、权限决策等生命周期事件不重载，走 `vlist-live-patch.ts` 原地补丁；补丁层拒绝终态回退成非终态（`vlist-live-events.ts` 头注释，防重连重放把完成卡片翻回转圈）。
+- canonical 窗口重验与纯几何重排分离（`pretext-layout-coordinator.ts`）：宽度/字体/头部等 rebuild 通过保留窗口读取来 retarget commit generation，不中止并重发相同 locate/page 链；完成时取最新 buildOptions、viewport 与 anchor。loadOlder/真实结构变更、强制 reload、会话/来源/授权变化仍取消旧数据读取；401/403 清无权缓存。`setSuspended` 取消 transport/older/refresh，但保留 loaded input 与滚动锚点。
+- `VListDataSource` 可由宿主提供 `refreshWindow/finalizeRefreshWindow/refreshFailurePolicy:retain/onWindowChange`：聊天用自己的 ACK+固定 seq 恢复，临时错误保留旧历史并报错，不能静默退化成新 tail；narrator 默认 locate+canonical 分页路径仍保留原 32 MiB/100 页/10 秒预算。
+- 宿主 finalizer 在最后一次异步 `prepareKatex` 与 current 检查后同步执行，再复查 current 并捕获最新锚点提交，finalizer 与 commit 之间无 await；用于聊天叠加读中到达的删除屏障，不能改成早于异步准备的旧投影（`pretext-layout-coordinator.ts:refreshCurrentWindow`）。
+- 更早历史的自动加载（`history/older-history-auto-load.ts`）：需要最近 2500ms 内有朝向历史的用户手势。分支：
+  - 无手势、手势已过期、或在底部：不加载，清空手势记录。
+  - 关闭自动加载、无更早数据、正在展开、scrollTop 超过触发像素：不加载，但保留手势记录。
+  - 其余：加载并清空记录。
+  - 偏好查询未完成时视为不启用，查询结束但无数据则回落为启用。
+- 流式：`streaming/streaming-delta-fold.ts` 按元素 id + 修订号 + 原始字符偏移折叠增量；`streaming-block-supersede.ts` 判断持久化块是否取代流式块；`vlist/streaming-handoff.ts` 与 `trace/render-units.ts` 保证流式行与落库行同 key（`tool-<toolUseId>`），交接时不换元素；`streaming-markdown-split.ts` 把增长文本切成“稳定前缀 + 活动尾部”，切点只落在空行处且不在围栏代码内，前缀含引用式链接/脚注定义则整条禁用切分。
+- 团队模式（只在团队页协调者一栏，`team-conversation-mode.ts` 的 `TeamConversationModeContext` 由团队路由提供；会话页不提供，构建选项 `teamConversation` 缺省，变换根本不调用）：`buildPretextDocumentLayout` 在分组后对渲染单元跑 `vlist/team-conversation-transform.ts:applyTeamConversationMode`，产出 `element` 单元：
+  - 芯片（L3 及以上；L1/L2 的活动轨迹已是一行一调用，重切会破坏交接稳定的键）：相邻 tool-run 里连续、同一动作（`@shared/team-tool-actions:teamToolActionKey`：`input.action`，被截断的输入从 `preview` 读，`brief` 分读/写）的已结束 `Team` 调用合成一个 `team-chip`（「建立工作项 ×7」）。“已结束”是紧凑行的终态集合（`@shared/tool-row-status` 的 `TERMINAL_TOOL_ROW_STATUSES`，标记取 `resolveToolRowStatusMark`：failed/timeout 红色、cancelled/denied/aborted 灰色，取消不画绿勾）；运行中、流式（`__streaming__`）、等权限（`resolveHasPendingPermission`）或状态未知的调用永不进芯片，保持卡片并把组切开。芯片键 `team-chip-<成员身份>`（成员身份是 `toolUseId`，同一 id 在文档里第 n 次重复时加 `#n`）；展开状态在每个成员的键上查，芯片取持有显式状态的（最后一个）成员的键、以它的值为准，都没有时取最后一个成员的键——所以加载更早一页、实时追加或 `trimHead` 砍掉头部都不会把已展开的芯片合上，在新键上折叠也确实合上。芯片在 `TOGGLEABLE_CARD_KINDS` 里，走外壳普通的 `expanded[key]` 折叠；展开时芯片后面紧跟它折叠的原 tool-run，即普通工具卡片。
+  - 分隔线（各级别）：事件插在第一个开始时间严格晚于它的单元之前（同一时刻排在消息后），单元时间取首条源消息的 `createdAt`；中间没有时间的单元沿用前一个单元的时间，只有末尾的（流式行）算 +∞，开头的取第一个已知时间；`hasPrev`（由协调器每次构建填入）时早于首个已加载单元的事件留给那一页。
+  - 两种行都是固定一行（`measure/measure-team-row.ts`：芯片 `traceMetrics().headerBandHeight`，分隔线 `countLineHeight`，随字号缩放），绘制在 `render/RenderTeamRow.tsx`。来源归属：芯片归其调用的消息，分隔线归前一个单元，seq 保持单调。清单身份（`documentRevision`）带上 `~team:<修订号>`，测量一律用 `team-conversation-transform.ts:measureRevisionOf` 去掉它的修订号（构建与 `vlist-resize-preview.ts` 都是），事件到来或缩放预览不重量整篇，芯片/分隔线的 `data.text` 自己进缓存键。只在协调者自己的顶层列表启用（`PretextExactMessageList` 核对上下文的 `narratorId` 且非子代理）。列表经 `onWindowChange` 报告最旧已加载消息与 `hasPrev`，事件读取按它分页（见[团队页](../../collaboration/teams/page.md)）。测试：`team-conversation-transform.test.ts`、`render/RenderTeamRow.test.tsx`、`team-conversation.browser.test.ts`（Chromium，`NF_TEST_CHROMIUM_PATH`）。
+- 嵌套行是扁平的（`message/nested-rows.ts`：有 `parentMessageId` 即嵌套，只通过父工具调用读取）；WS 事件对已加载行的不可变更新在 `message/message-tree-utils.ts`，分页查询缓存的删除裁剪在 `message/messages-query-cache.ts`。
+- Markdown：`markdown/MarkdownContent.tsx`（remark-math 等动态加载）、代码高亮缓存 `highlight-cache.ts`（上限 64 条 / 1MB，单段可缓存 ≤20000 字符，文件面板上限 200000）；本地文件链接由 `remark-local-file-links.ts` 只对显式 `file:`/`nf-file:`/盘符目标改写，不从正文或行内代码推断。
+
+## 从哪读起
+- `vlist/PretextExactMessageList.tsx`（近 6000 行外壳）：滚动坐标系、可见窗口、WS 接线。
+- `vlist/CONTRACT.md`：高度模型协议（文档，需回到 `measure/` 核对）；样板实现 `vlist/measure/measure-markdown.ts`。
+- `vlist/registry.ts`、`vlist/vlist-pipeline.ts`：元件类型到测量函数的注册与管线。
+- `vlist/vlist-live-patch.ts`、`vlist-live-events.ts`：实时补丁；`vlist/render/`：每种元件的绘制。
+- `scroll/AutoFollowScroll.tsx`：自动跟随与“回到底部”；`message/message-list-handle.ts`：列表命令句柄（跳转到消息）。
+
+## 改它时
+- 新增一种行元件：`measure/measure-xxx.ts` + `render/RenderXxx.tsx` + `registry.ts`/`render-registry.tsx` 注册；测量文件放进 `zero-dom-measure.guard.test.ts` 的纯路径清单后必须零 DOM API。
+- 改 LOD 档位或数量：同步 `lod/RenderLodCtx.ts`、`hooks/useNarratorLod.ts` 的迁移与 `SCHEMA_VERSION`，否则已存的档位会被误读。
+- 从 vlist 之外引用 vlist 内容必须动态 import，否则 `vlist-isolation.guard.test.ts` 失败。
+- 移动 `vlist/*.ts` 前全仓搜旧路径：多个守卫测试用 `readFileSync` 读源文件（`guard-source.ts`）。
+- 改折叠逻辑要过 `every-call-addressable.guard.test.ts`。
+
+## 相关
+- [输入框与交互](composer.md)
+- [工具卡片](tool-cards.md)
+- [会话界面总览](index.md)

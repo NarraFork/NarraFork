@@ -13,7 +13,8 @@
  */
 
 import { useCurrentUser } from "@frontend/hooks/useAuth";
-import { useAllModels } from "@frontend/hooks/useModels";
+import { useRuntimeModel } from "@frontend/hooks/useModelCatalog";
+import { useModelRuntimeSettings } from "@frontend/hooks/useModels";
 import { useNarrator } from "@frontend/hooks/useNarrator";
 import { isModelNetworkError, resolveModelTestTarget } from "@frontend/lib/model-network-error";
 import { useCallback, useMemo, useState } from "react";
@@ -36,23 +37,31 @@ export interface NarratorModelTest {
 	label: string;
 }
 
-export function useNarratorModelTest(narratorId: string): NarratorModelTest {
+export function useNarratorModelTest(narratorId: string, enabled = true): NarratorModelTest {
 	const { t } = useTranslation("narrator");
 	const { data: currentUser } = useCurrentUser();
-	const { data: narrator } = useNarrator(narratorId);
-	const { defaultModelValue } = useAllModels();
+	const { data: narrator } = useNarrator(enabled ? narratorId : "");
+	const { defaultModelValue } = useModelRuntimeSettings(enabled);
+	const { data: summary } = useRuntimeModel({
+		model: typeof narrator?.model === "string" ? narrator.model : undefined,
+		narratorId,
+		summary: narrator?.modelSummary,
+		enabled: enabled && !!narrator,
+	});
 	const [target, setTarget] = useState<string | null>(null);
 
 	const narratorModel = typeof narrator?.model === "string" ? narrator.model.trim() : "";
-	const selectedModelValue = narratorModel || defaultModelValue;
+	const selectedModelValue = narratorModel || defaultModelValue || "";
 	// Prefer the concrete member the failed turn dispatched to, exactly as the
 	// deleted chunked action did — "which provider served this turn" has one answer,
 	// and probing the aggregation instead would test a different thing than failed.
-	const modelValue = resolveModelTestTarget(selectedModelValue, narrator?.runtimeModel);
+	const modelValue = summary
+		? (summary.concreteValue ?? "")
+		: resolveModelTestTarget(selectedModelValue, narrator?.runtimeModel);
 	// Admin-only, and only when there is something to probe. Both were conditions of
 	// the chunked action too: the dialog reports provider-level reachability, which is
 	// operator information, and it needs a resolved model to aim at.
-	const eligible = currentUser?.role === "admin" && modelValue.length > 0;
+	const eligible = enabled && !!narrator && currentUser?.role === "admin" && modelValue.length > 0;
 
 	const canTest = useMemo(
 		() => (errorText: string) => eligible && isModelNetworkError(errorText),

@@ -50,6 +50,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	userchat: PANEL_COMPONENT.userchat,
 	appearance: PANEL_COMPONENT.appearance,
 	timeline: PANEL_COMPONENT.timeline,
+	communication: PANEL_COMPONENT.communication,
 	filetree: PANEL_COMPONENT.filetree,
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
@@ -194,6 +195,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	userchat: PANEL_DEFAULT_TITLE.userchat,
 	appearance: PANEL_DEFAULT_TITLE.appearance,
 	timeline: PANEL_DEFAULT_TITLE.timeline,
+	communication: PANEL_DEFAULT_TITLE.communication,
 	filetree: PANEL_DEFAULT_TITLE.filetree,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
@@ -214,6 +216,7 @@ const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"userchat",
 	"appearance",
 	"timeline",
+	"communication",
 	"filetree",
 	// TEMPORARY: the streaming harness participates in the toolbar's
 	// open/close/toggle vocabulary so its button can show active state.

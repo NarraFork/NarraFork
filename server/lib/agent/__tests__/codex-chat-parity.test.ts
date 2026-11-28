@@ -119,14 +119,9 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
-	/**
-	 * Codex 0.171.0 puts nonempty instructions in the input prefix for both contracts.
-	 * Non-lite retains top-level tools and parallel calls; the lite header must
-	 * not be paired with this body.
-	 */
+	/** Non-lite retains top-level tools; empty base instructions create no prefix. */
 	test("does not claim the responses-lite contract while sending a non-lite body", async () => {
 		const req = await captureChat();
-
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 		expect(req.body.tools).toBeDefined();
 		expect(req.body.instructions).toBeUndefined();
@@ -374,13 +369,16 @@ describe("codex HTTP chat request parity", () => {
 		}
 	});
 
-	test("ordinary Responses keeps root instructions", async () => {
+	test("ordinary Responses keeps upstream's cacheable developer instruction prefix", async () => {
 		const req = await captureChat({
 			config: { apiMode: "responses" },
 			chat: { history: [{ role: "developer", content: "ordinary instructions" }] },
 		});
-		expect(req.body.instructions).toBe("ordinary instructions");
-		expect(req.body.input).toHaveLength(1);
+		expect(req.body.instructions).toBeUndefined();
+		expect(req.body.input).toEqual([
+			{ role: "developer", content: [{ type: "input_text", text: "ordinary instructions" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+		]);
 	});
 
 	test("final headers apply case-insensitive fingerprint and dynamic overrides", async () => {
@@ -408,7 +406,6 @@ describe("codex HTTP chat request parity", () => {
 	test("correlates the conversation identity across headers and body", async () => {
 		const req = await captureChat();
 		const clientMetadata = req.body.client_metadata as Record<string, string>;
-
 		expect(req.headers["session-id"]).toBe("conv-http-1");
 		expect(req.headers["thread-id"]).toBe("conv-http-1");
 		expect(req.body.prompt_cache_key).toBe("conv-http-1");

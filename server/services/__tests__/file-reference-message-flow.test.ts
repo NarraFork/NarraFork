@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
-import { getTestDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import * as schema from "../../db/schema";
 import {
 	getFileReferenceSnapshots,
@@ -29,7 +29,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 } else {
 	// A serialization fixture, not the application DB. Mock persistence writes the
 	// exact text/blocks the REAL send/edit/queue services supply, then reads JSON back.
-	const { sqlite, db: fixtureDb } = getTestDb();
+	const { sqlite, db: fixtureDb, disposeWorkerDb } = getWorkerTestDb();
 	sqlite.exec("CREATE TABLE saved_messages (id TEXT PRIMARY KEY, row_json TEXT NOT NULL)");
 	for (const id of ["n", "child", "resume-official", "resume-child", "resume-followup"]) {
 		fixtureDb
@@ -77,6 +77,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 
 	mock.module("../../db", () => ({
 		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
 		sqlite,
 		databaseMaintenance: createSqliteMaintenance(() => sqlite),
 		db: new Proxy(fixtureDb, {
@@ -85,6 +86,8 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 					return {
 						...target.query,
 						narrators: {
+							// Worker-read lookups (`findMany({ limit: 1 })`) read the real fixture row.
+							findMany: target.query.narrators.findMany.bind(target.query.narrators),
 							findFirst: async () => ({
 								id: "n",
 								variant: "primary",
@@ -281,10 +284,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		return active;
 	}
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		sqlite.exec("DELETE FROM saved_messages");
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
+		await buffer.clearBufferedMessages("child");
 		frames.length = 0;
 		failPersist = false;
 		suppressLoop = false;
@@ -302,10 +305,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			},
 		];
 	});
-	afterAll(() => {
+	afterAll(async () => {
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
-		sqlite.close();
+		await buffer.clearBufferedMessages("child");
+		await disposeWorkerDb();
 	});
 
 	describe("send/save/edit fixed file references", () => {

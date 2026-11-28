@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/narrafork/remote-executor/internal/handlers"
@@ -37,6 +38,27 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 	} {
 		if !containsFeature(decoded.Features, feature) {
 			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)
+		}
+	}
+}
+
+func TestCapabilitiesKeepChangeListsLocal(t *testing.T) {
+	encoded, err := json.Marshal(Capabilities{Features: []string{"git.workspace.staging-lists.v1", "git.workspace.staging-files.v2", "git.workspace.staging-files.v3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for key := range decoded {
+		if strings.HasPrefix(key, "gitStaging") {
+			t.Fatalf("unexpected remote ChangeList capability %q", key)
+		}
+	}
+	for _, feature := range decoded["features"].([]any) {
+		if strings.Contains(feature.(string), "staging") {
+			t.Fatalf("unexpected remote ChangeList feature %q", feature)
 		}
 	}
 }

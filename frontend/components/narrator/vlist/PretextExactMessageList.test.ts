@@ -54,7 +54,211 @@ function makeManifest(): PretextLayoutManifest {
 	};
 }
 
+function shellEffectHarness(marker: string) {
+	const source = shellModule("PretextExactMessageList.tsx");
+	const markerAt = source.indexOf(marker);
+	if (markerAt < 0) throw new Error(`Missing effect marker: ${marker}`);
+	const start = source.lastIndexOf("useEffect(", markerAt);
+	const effect = sliceBracketedRegion(source.slice(start), "useEffect(");
+	if (!effect) throw new Error("Missing shell effect");
+	const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${effect};`);
+	let previous: unknown[] | undefined;
+	let cleanup: (() => void) | undefined;
+	return (scope: Record<string, unknown>) => {
+		new Function("useEffect", ...Object.keys(scope), code)(
+			(setup: () => (() => void) | undefined, deps: unknown[]) => {
+				if (
+					previous &&
+					deps.length === previous.length &&
+					deps.every((v, i) => Object.is(v, previous?.[i]))
+				)
+					return;
+				cleanup?.();
+				previous = deps;
+				cleanup = setup();
+			},
+			...Object.values(scope),
+		);
+		return cleanup;
+	};
+}
+
 describe("PretextExactMessageList", () => {
+	it("suspension tears down the external subscription and resume installs exactly one owner", () => {
+		const run = shellEffectHarness("return externalSubscribeMessages(stableExternalHandlers);");
+		let owners = 0;
+		let joins = 0;
+		const externalSubscribeMessages = () => {
+			owners++;
+			joins++;
+			return () => {
+				owners--;
+			};
+		};
+		const scope = { suspended: false, externalSubscribeMessages, stableExternalHandlers: {} };
+		run(scope);
+		expect({ owners, joins }).toEqual({ owners: 1, joins: 1 });
+		run({ ...scope, suspended: true });
+		expect({ owners, joins }).toEqual({ owners: 0, joins: 1 });
+		run({ ...scope, suspended: true });
+		expect(owners).toBe(0);
+		const cleanup = run(scope);
+		expect({ owners, joins }).toEqual({ owners: 1, joins: 2 });
+		cleanup?.();
+		expect(owners).toBe(0);
+	});
+
+	it("suspension prevents visible/read callbacks and resume republishes the retained visible row", () => {
+		const run = shellEffectHarness("const callback = onVisibleMessagesChangeRef.current;");
+		const calls: unknown[] = [];
+		const scope = {
+			suspended: false,
+			onVisibleMessagesChangeRef: { current: (value: unknown) => calls.push(value) },
+			pretextDocument: { manifest: { items: [{ sourceMessageIds: ["chat-1"], lastSeq: 1 }] } },
+			seenWindow: { end: 1 },
+		};
+		run(scope);
+		expect(calls).toEqual([{ id: "chat-1", seq: 1 }]);
+		run({ ...scope, suspended: true });
+		expect(calls).toHaveLength(1);
+		run(scope);
+		expect(calls).toEqual([
+			{ id: "chat-1", seq: 1 },
+			{ id: "chat-1", seq: 1 },
+		]);
+	});
+
+	it("a retained short canvas cannot fill while suspended, and resumes the normal fill gate", () => {
+		const run = shellEffectHarness('if (suspended || pretextDocument.status !== "ready") return;');
+		let pages = 0;
+		const scope = {
+			suspended: true,
+			pretextDocument: { status: "ready" },
+			hasPrev: true,
+			loadingOlder: false,
+			pinnedToBottom: true,
+			pinnedToBottomRef: { current: true },
+			viewportHeight: 720,
+			exactLayout: { totalHeight: 40 },
+			ITEM_OVERSCAN: 100,
+			getLastTrimAt: () => 0,
+			trimClockNow: () => 1000,
+			TRIM_FILL_COOLDOWN_MS: 500,
+			loadOlder: () => {
+				pages++;
+			},
+		};
+		run(scope);
+		expect(pages).toBe(0);
+		run({ ...scope, suspended: false });
+		expect(pages).toBe(1);
+		run(scope);
+		expect(pages).toBe(1);
+	});
+
+	it("host mirrors follow canonical patches/trims, not geometry/suspension; denial clears the mirror", () => {
+		const run = shellEffectHarness("if (!dataSource?.onWindowChange) return;");
+		const mirrors: unknown[] = [];
+		const document = {
+			messages: [{ id: "chat-1" }, { id: "chat-2" }],
+			messageVersion: 0,
+			oldestLoadedSeq: 1,
+			hasPrev: true,
+		};
+		const scope = {
+			dataSource: { onWindowChange: (window: unknown) => mirrors.push(window) },
+			pretextDocument: { document, error: undefined as unknown },
+		};
+		run(scope);
+		run({ ...scope, pretextDocument: { ...scope.pretextDocument } });
+		expect(mirrors).toEqual([document]);
+		const trimmed = { ...document, messages: document.messages.slice(1), oldestLoadedSeq: 2 };
+		run({ ...scope, pretextDocument: { document: trimmed, error: undefined } });
+		expect(mirrors).toEqual([document, trimmed]);
+		run({ ...scope, pretextDocument: { document: undefined, error: { status: 403 } } });
+		expect(mirrors.at(-1)).toEqual({
+			messages: [],
+			messageVersion: 0,
+			oldestLoadedSeq: null,
+			hasPrev: false,
+		});
+	});
+	it("registers the actual viewport, follows replacement callbacks and unregisters each target", () => {
+		const source = shellModule("PretextExactMessageList.tsx");
+		const registration = source.indexOf("return registerIOSScrollToTopTarget(");
+		expect(registration).toBeGreaterThan(-1);
+		const effectStart = source.lastIndexOf("useLayoutEffect(", registration);
+		const effect = sliceBracketedRegion(source.slice(effectStart), "useLayoutEffect(");
+		if (!effect) throw new Error("Missing iOS scroll-to-top registration effect");
+		const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${effect};`);
+		const firstNode = { scrollTop: 100 };
+		const secondNode = { scrollTop: 100 };
+		const viewportRef = { current: firstNode as object | null };
+		const scrollTopRef = { current: 100 };
+		const targets = new Map<object, () => void>();
+		const unprocessedScroll = new Map<object, () => boolean>();
+		const calls: string[] = [];
+		const register = (node: object, callback: () => void, hasUnprocessedScroll: () => boolean) => {
+			targets.set(node, callback);
+			unprocessedScroll.set(node, hasUnprocessedScroll);
+			return () => {
+				targets.delete(node);
+				unprocessedScroll.delete(node);
+			};
+		};
+		const install = (node: object | null, callback: () => void) => {
+			const lifecycle = { cleanup: undefined as (() => void) | undefined };
+			new Function(
+				"useLayoutEffect",
+				"viewportNode",
+				"viewportRef",
+				"scrollTopRef",
+				"handleIOSScrollToTop",
+				"registerIOSScrollToTopTarget",
+				code,
+			)(
+				(setup: () => (() => void) | undefined) => {
+					lifecycle.cleanup = setup();
+				},
+				node,
+				viewportRef,
+				scrollTopRef,
+				callback,
+				register,
+			);
+			return lifecycle.cleanup;
+		};
+		const firstCleanup = install(firstNode, () => calls.push("first"));
+		const firstCallback = targets.get(firstNode);
+		firstCallback?.();
+		expect(calls).toEqual(["first"]);
+		expect(unprocessedScroll.get(firstNode)?.()).toBe(false);
+		firstNode.scrollTop = 75;
+		expect(unprocessedScroll.get(firstNode)?.()).toBe(true);
+		scrollTopRef.current = 75;
+		expect(unprocessedScroll.get(firstNode)?.()).toBe(false);
+		viewportRef.current = secondNode;
+		firstCallback?.();
+		expect(calls).toEqual(["first"]);
+		firstCleanup?.();
+		expect(targets.size).toBe(0);
+		const secondCleanup = install(secondNode, () => calls.push("second"));
+		targets.get(secondNode)?.();
+		expect(calls).toEqual(["first", "second"]);
+		viewportRef.current = null;
+		secondCleanup?.();
+		expect(targets.size).toBe(0);
+		install(null, () => calls.push("detached"));
+		expect(targets.size).toBe(0);
+		expect(effect).toContain("[viewportNode, handleIOSScrollToTop]");
+		expect(effect).not.toContain("isActive");
+		const action = sliceBracketedRegion(source, "const handleIOSScrollToTop = useCallback(");
+		if (!action) throw new Error("Missing iOS scroll-to-top state action");
+		expect(action).toContain("scrollExactListToLoadedTop({");
+		expect(action).toContain("detachFromBottom,");
+		expect(action).toContain("writeScrollTop,");
+	});
+
 	it("resolves the current body's canonical owner and slot before a full-text toggle", () => {
 		const toggle = sliceBracketedRegion(
 			shellModule("PretextExactMessageList.tsx"),

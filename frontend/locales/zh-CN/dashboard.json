@@ -14,6 +14,7 @@
 		"start": "开始",
 		"chooseDirectory": "选择工作目录",
 		"directoryRequired": "尚未设置默认项目目录。请为本次会话选择工作目录，或在设置中设定默认目录。",
+		"deviceUnavailable": "执行设备「{{device}}」已离线或不可用。请先改选设备再开始。",
 		"advanced": "更多会话选项",
 		"sendFailed": "会话已创建，但消息发送失败"
 	}

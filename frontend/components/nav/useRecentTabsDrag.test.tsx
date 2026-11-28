@@ -6,8 +6,19 @@ import { createElement } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
+import { recentTabsSectionQueryKey } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
-import { cancelDrag, getPanelDrag, onPanelDragEnd, startDragManual } from "../../lib/panel-drag";
+import { clearToken, confirmAuthUser, setToken } from "../../lib/api/client";
+import {
+	cancelDrag,
+	getPanelDrag,
+	onPanelDragEnd,
+	PANEL_DROP_PRIORITY,
+	registerPanelDropTarget,
+	startDragManual,
+} from "../../lib/panel-drag";
+import { getRecentTabsScope } from "../../lib/recent-tabs-owner";
+import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { type UseRecentTabsDragOptions, useRecentTabsDrag } from "./useRecentTabsDrag";
 
 const tab = (id: string, fields: Partial<RecentTab> = {}): RecentTab => ({
@@ -22,6 +33,7 @@ let result: ReturnType<typeof useRecentTabsDrag>;
 let options: UseRecentTabsDragOptions;
 let restore: () => void;
 const spies: { mockRestore: () => void }[] = [];
+const subscriptions: (() => void)[] = [];
 function render() {
 	flushSync(() => root.render(createElement(StableHarness)));
 }
@@ -44,7 +56,13 @@ beforeEach(() => {
 	const { window } = parseHTML(
 		'<html><body><div id="root"></div><nav data-auto-scroll-gate><div id="list"></div></nav><main></main></body></html>',
 	);
+	const storage = new Map<string, string>();
 	const values = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -88,7 +106,11 @@ beforeEach(() => {
 		list.append(row);
 	}
 	root = createRoot(window.document.getElementById("root") as unknown as HTMLElement);
+	confirmAuthUser(setToken("fixture-auth"), "fixture-user");
+	const scope = getRecentTabsScope();
+	if (!scope) throw Error("Missing drag test scope");
 	options = {
+		scope,
 		tabs: [tab("a"), tab("b"), tab("c")],
 		folderOptions: { displayOf: () => "expanded", defaultPreview: 3 },
 		containerRef: { current: list },
@@ -99,10 +121,12 @@ beforeEach(() => {
 	render();
 });
 afterEach(async () => {
+	for (const off of subscriptions.splice(0)) off();
 	flushSync(() => root.unmount());
 	cancelDrag();
 	for (const spy of spies.splice(0)) spy.mockRestore();
 	await new Promise((resolve) => setTimeout(resolve, 0));
+	clearToken();
 	restore();
 });
 
@@ -164,6 +188,38 @@ it("awaits a single mutation, clears drag synchronously and gates new drags duri
 	expect(result.pending).toBe(false);
 	unsubscribe();
 });
+it("a late drag result cannot reorder a replacement credential's cache", async () => {
+	let resolve!: (value: Awaited<ReturnType<typeof api.moveRecentTab>>) => void;
+	const move = spyOn(api, "moveRecentTab").mockImplementation(
+		() =>
+			new Promise((done) => {
+				resolve = done;
+			}),
+	);
+	spies.push(move);
+	start();
+	const submitted = end();
+	const oldKey = recentTabsSectionQueryKey(options.scope, "work");
+	const before = {
+		pages: [{ items: options.tabs, revision: 1, hasMore: false }],
+		pageParams: [undefined],
+	};
+	options.qc.setQueryData(oldKey, before);
+	confirmAuthUser(setToken("fixture-auth-rotated"), "fixture-user");
+	const replacement = getRecentTabsScope();
+	if (!replacement) throw Error("Missing replacement scope");
+	const nextKey = recentTabsSectionQueryKey(replacement, "work");
+	options.qc.setQueryData(nextKey, before);
+	resolve({
+		changed: true,
+		baseRevision: 1,
+		revision: 2,
+		operations: [{ type: "remove", key: "narrator:a" }],
+	});
+	await submitted;
+	expect(options.qc.getQueryData(oldKey)).toBe(before);
+	expect(options.qc.getQueryData(nextKey)).toBe(before);
+});
 function StableHarness() {
 	result = useRecentTabsDrag(options);
 	return null;
@@ -175,6 +231,27 @@ it("outside release only notifies panels, never sorts", async () => {
 	await end(0, 300);
 	expect(move).not.toHaveBeenCalled();
 	expect(result.pending).toBe(false);
+	expect(getPanelDrag()).toBeNull();
+});
+it("a team row bridges its coordinator as a narrator and does not reorder outside", async () => {
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(move);
+	options = {
+		...options,
+		tabs: [
+			tab("coordinator", { type: "team", title: "Release crew", projectId: "project" }),
+			...options.tabs,
+		],
+	};
+	render();
+	start("team:coordinator");
+	expect(getPanelDrag()).toMatchObject({
+		id: "coordinator",
+		title: "Release crew",
+		subjectKind: "narrator",
+	});
+	await end(0, 300);
+	expect(move).not.toHaveBeenCalled();
 	expect(getPanelDrag()).toBeNull();
 });
 it("source removal and grouping changes cancel, while unmount does not cancel another owner", () => {
@@ -312,6 +389,176 @@ function dispatchMouse(type: string, fields: Record<string, number>) {
 	document.dispatchEvent(event);
 }
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function watchOtherTargets() {
+	const calls: { target: string; x: number; y: number }[] = [];
+	for (const target of ["page", "dock", "topology", "composer"] as const) {
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: `other:${target}`,
+				priority: PANEL_DROP_PRIORITY[target],
+				hitTest: (state) =>
+					(target === "composer" || target === "topology") && state.subjectKind !== "narrator"
+						? null
+						: { x: state.x, y: state.y },
+				onDrop: (_state, hit) => calls.push({ target, ...hit }),
+			}),
+		);
+	}
+	return calls;
+}
+
+it("an in-sidebar no-op is consumed, not cancelled or passed to composer/dock/page", async () => {
+	const calls = watchOtherTargets();
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(move);
+	options = { ...options, tabs: [tab("a")] };
+	const list = options.containerRef.current as HTMLElement;
+	for (const row of [...list.querySelectorAll("[data-tab-sort-id]")].slice(1)) row.remove();
+	render();
+	let final: unknown = "unseen";
+	subscriptions.push(
+		onPanelDragEnd((state) => {
+			final = state;
+		}),
+	);
+	start();
+	await end(0);
+	expect(final).toMatchObject({ id: "a", x: 50, y: 15 });
+	expect(calls).toEqual([]);
+	expect(move).not.toHaveBeenCalled();
+	expect(result.draggingId).toBeNull();
+});
+
+it("@dnd-kit release outside the sidebar reaches one composer hit with actual mouseup coordinates", async () => {
+	const calls = watchOtherTargets();
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(move);
+	start();
+	// No HTML5 drop is dispatched. The captured release, not dnd-kit's stale delta, wins.
+	dispatchMouse("mouseup", { clientX: 350, clientY: 80, buttons: 0 });
+	await end(0, 0);
+	expect(calls).toEqual([{ target: "composer", x: 350, y: 80 }]);
+	expect(move).not.toHaveBeenCalled();
+	expect(result.draggingRef.current).toBe(false);
+	expect(getPanelDrag()).toBeNull();
+});
+
+it.each([
+	{ type: "narrator" as const, narratorId: undefined, expected: "a" },
+	{ type: "subagent" as const, narratorId: "stable-subagent", expected: "stable-subagent" },
+	{ type: "subagent" as const, narratorId: undefined, expected: "a" },
+])("$type with narratorId=$narratorId reaches a strict narrator consumer by stable identity", async ({
+	type,
+	narratorId,
+	expected,
+}) => {
+	options = { ...options, tabs: [tab("a", { type, narratorId }), tab("b"), tab("c")] };
+	render();
+	const references: string[] = [];
+	subscriptions.push(
+		registerPanelDropTarget({
+			id: "strict-composer",
+			priority: PANEL_DROP_PRIORITY.composer,
+			hitTest: (state) => (state.subjectKind === "narrator" ? { narratorId: state.id } : null),
+			onDrop: (_state, hit) => references.push(hit.narratorId),
+		}),
+	);
+	start(`${type}:a`);
+	expect(getPanelDrag()).toMatchObject({ id: expected, subjectKind: "narrator" });
+	await end(0, 300);
+	expect(references).toEqual([expected]);
+	expect(getPanelDrag()).toBeNull();
+});
+
+it("subagent sorting keeps its tab key while global references use its narrator identity", async () => {
+	options = {
+		...options,
+		tabs: [tab("a", { type: "subagent", narratorId: "stable-subagent" }), tab("b"), tab("c")],
+	};
+	const row = options.containerRef.current?.querySelector<HTMLElement>("[data-tab-sort-id]");
+	if (!row) throw new Error("missing subagent row");
+	row.dataset.tabSortId = "subagent:a";
+	render();
+	const lower = watchOtherTargets();
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: true,
+		baseRevision: 0,
+		revision: 1,
+		operations: [],
+	});
+	spies.push(move);
+	start("subagent:a");
+	expect(getPanelDrag()).toMatchObject({ id: "stable-subagent", subjectKind: "narrator" });
+	await end();
+	expect(move.mock.calls[0]?.slice(0, 2)).toEqual(["subagent:a", { afterKey: "narrator:c" }]);
+	expect(lower).toEqual([]);
+});
+
+it("an internal mutation and an external sidebar receiver cannot both consume one release", async () => {
+	const external: unknown[] = [];
+	function CombinedHarness() {
+		result = useRecentTabsDrag(options);
+		useRecentTabExternalDrop({
+			containerRef: options.containerRef,
+			enabled: true,
+			suspended: result.draggingId !== null,
+			suspendedRef: result.draggingRef,
+			measureRows: result.measureRows,
+			sourceFor: (id) => ({ key: `narrator:${id}`, kind: "tab", pinned: false, canNest: true }),
+			onDrop: (drop) => external.push(drop),
+		});
+		return null;
+	}
+	flushSync(() => root.render(createElement(CombinedHarness)));
+	const calls = watchOtherTargets();
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: true,
+		baseRevision: 0,
+		revision: 1,
+		operations: [],
+	});
+	spies.push(move);
+	start();
+	await end();
+	expect(move).toHaveBeenCalledTimes(1);
+	expect(external).toEqual([]);
+	expect(calls).toEqual([]);
+});
+
+it("a project sorts locally but is never bridged as a narrator reference", async () => {
+	const calls = watchOtherTargets();
+	options = {
+		...options,
+		tabs: [tab("a", { type: "project", narratorId: "not-a-session" }), tab("b"), tab("c")],
+	};
+	const row = options.containerRef.current?.querySelector<HTMLElement>("[data-tab-sort-id]");
+	if (!row) throw new Error("missing project row");
+	row.dataset.tabSortId = "project:a";
+	render();
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: true,
+		baseRevision: 0,
+		revision: 1,
+		operations: [],
+	});
+	spies.push(move);
+	start("project:a");
+	expect(getPanelDrag()).toBeNull();
+	await end();
+	expect(move.mock.calls[0]?.slice(0, 2)).toEqual(["project:a", { afterKey: "narrator:c" }]);
+	expect(calls).toEqual([]);
+});
+
+it("a replaced global drag is neither completed nor reinterpreted as a local reorder", async () => {
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(move);
+	start();
+	startDragManual("other", "Other owner", 400, 80);
+	await end();
+	expect(move).not.toHaveBeenCalled();
+	expect(getPanelDrag()?.id).toBe("other");
+});
 
 it("a release @dnd-kit never reports (quick click/double click) still ends the drag", async () => {
 	let final: unknown = "unseen";

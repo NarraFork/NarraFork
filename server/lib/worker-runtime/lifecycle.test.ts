@@ -401,6 +401,56 @@ describe("WorkerPool with real thread handles", () => {
 			await stalled.close();
 		}
 	});
+	test("reserved native capacity survives failed startup and wakes normal work after observed exit", async () => {
+		const stalled = own(WorkerHandle.thread(echoSource, { eval: true }));
+		let creates = 0;
+		const connectedHandles: WorkerHandle<import("node:worker_threads").Worker>[] = [];
+		const pool = new WorkerPool<number, number>({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (context) => {
+				if (++creates === 1)
+					throw new WorkerCleanupError(stalled, new Error("unconfirmed shared startup"));
+				const connected = await connectCompiledWorker([echoSource], {
+					signal: context.signal,
+					deadlineAt: context.deadlineAt,
+					workerOptions: { eval: true },
+				});
+				const handle = own(connected.handle);
+				connectedHandles.push(handle);
+				return {
+					get closed() {
+						return handle.closed;
+					},
+					close: () => handle.close(),
+					run: async (value, task) => {
+						const reply = once(handle.resource, "message", { signal: task.signal });
+						handle.resource.postMessage({ id: value, value });
+						return (await reply)[0].value as number;
+					},
+				};
+			},
+		});
+		pools.add(pool);
+		try {
+			await expect(pool.run(1)).rejects.toBeInstanceOf(WorkerCleanupError);
+			expect(pool.stats.reservation?.shared).toMatchObject({ quarantined: 1, claimed: 0 });
+			const normal = pool.run(2);
+			void normal.catch(() => {});
+			await expect(pool.run(3, { taskClass: "short" })).resolves.toBe(6);
+			expect(creates).toBe(2);
+			expect(pool.stats).toMatchObject({ active: 0, queued: 1, workers: 2 });
+			await stalled.close();
+			await stalled.exited;
+			await expect(normal).resolves.toBe(4);
+			expect(creates).toBe(3);
+			expect(connectedHandles).toHaveLength(2);
+			expect(pool.stats.reservation?.shared.quarantined).toBe(0);
+		} finally {
+			await stalled.close();
+		}
+	});
+
 	test("a real flush ACK and exit must both precede one-shot capacity release", async () => {
 		const created: WorkerHandle<import("node:worker_threads").Worker>[] = [];
 		const exited = new Set<WorkerHandle<import("node:worker_threads").Worker>>();

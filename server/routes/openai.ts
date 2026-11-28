@@ -3,9 +3,16 @@ import { resolve } from "node:path";
 import { Hono } from "hono";
 import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
+	customApiProtocolFromOpenAI,
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
 	openaiProviderPrefix,
@@ -13,6 +20,9 @@ import {
 	registerOpenaiModelLister,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import {
 	applyExplicitUserAgent,
 	getHttpCodexUserAgent,
@@ -35,7 +45,7 @@ export interface OpenAIModelInfo {
 }
 
 /** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, OpenAIModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, OpenAIModelInfo[]>();
 
 // Load legacy flat cache and per-provider cache on startup
 loadAllCachedModels();
@@ -89,6 +99,17 @@ function saveAllCachedModels(): void {
 /** Get cached models for a specific provider. */
 export function getOpenaiCachedModelsByProvider(providerId: string): OpenAIModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];
+}
+
+for (const protocol of ["openai-responses", "completions-compatible"] as const) {
+	registerModelOptionsCapture(protocol, (group) =>
+		captureModelOptionsArray(
+			cachedModelsByProvider.get(group.id),
+			(model) => optionInput(group, model.id),
+			cachedModelsByProvider.generation,
+		),
+	);
+	registerModelListReader(protocol, (group) => getOpenaiCachedModelsByProvider(group.id));
 }
 
 function activeOpenaiProviderIds(): Set<string> {
@@ -376,9 +397,21 @@ openaiRoutes.post("/models/refresh", async (c) => {
 });
 
 // Per-provider endpoints
-openaiRoutes.get("/providers/:id/models", (c) => {
+openaiRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getOpenaiCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.openaiProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? openaiProviderPrefix(config) : id },
+		config ? customApiProtocolFromOpenAI(config) : "completions-compatible",
+	);
+	return c.json({
+		models: await getServiceTemplate(group.templateId).listModels(
+			group,
+			undefined,
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 openaiRoutes.post("/providers/:id/models/refresh", async (c) => {

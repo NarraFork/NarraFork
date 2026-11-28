@@ -35,6 +35,24 @@ export function createNarratorWorktreeRoutes<Principal>(
 	routes.get(path, async (c) =>
 		c.json(await service.list(principalOf(c), c.req.param("id"), c.req.query(), c.req.raw.signal)),
 	);
+	// Read-only removal preflight: blockers, dependents and what would be closed.
+	routes.post(`${path}/removal/plan`, async (c) =>
+		c.json(
+			await service.planRemoval(
+				principalOf(c),
+				c.req.param("id"),
+				await c.req.json(),
+				c.req.raw.signal,
+			),
+		),
+	);
+	// Explicit destructive command. POST keeps the structured request body (revision, force,
+	// acknowledgement) in one place; a retry is idempotent, never a second deletion.
+	routes.post(`${path}/removal`, async (c) =>
+		c.json(
+			await service.remove(principalOf(c), c.req.param("id"), await c.req.json(), c.req.raw.signal),
+		),
+	);
 	routes.post(path, async (c) => {
 		const result = await service.create(
 			principalOf(c),

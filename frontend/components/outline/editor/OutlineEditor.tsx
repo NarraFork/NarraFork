@@ -575,7 +575,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 											name: p.name || t("editor.someone"),
 										})}
 									>
-										<Avatar size={22} radius="xl" style={{ background: p.color, color: "#fff" }}>
+										<Avatar
+											size={22}
+											radius="xl"
+											style={{ background: p.color, color: "var(--nf-on-solid)" }}
+										>
 											{(p.name || "?").slice(0, 1).toUpperCase()}
 										</Avatar>
 									</Tooltip>
@@ -677,7 +681,7 @@ function AgentAvatar({ peer }: { peer: Peer }) {
 		: t("editor.agentHidden");
 	// The first character, not the first UTF-16 unit (an emoji is one character).
 	const initial = narratorId && title ? (Array.from(title)[0] ?? "").toUpperCase() : "";
-	const style = { background: peer.color, color: "#fff" };
+	const style = { background: peer.color, color: "var(--nf-on-solid)" };
 	const face = (
 		<>
 			{initial ? <span className="nf-outline-agent-initial">{initial}</span> : null}

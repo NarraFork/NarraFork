@@ -231,6 +231,9 @@ func (h *Handlers) gitFilePaths(g *workspaceGit, root string, params map[string]
 		if err := validateGitFilePath(path); err != nil {
 			return nil, err
 		}
+		if stringParam(params, "operation") == "stage" && stagingInternalPath(path) {
+			return nil, fmt.Errorf("staging internal project files cannot be staged")
+		}
 		joined, err := h.checkGitEntryPath(root, path)
 		if err != nil {
 			return nil, err
@@ -429,6 +432,10 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	if !filepath.IsAbs(gitDir) {
 		gitDir = filepath.Join(root, gitDir)
 	}
+	gitDir, err = h.guard.CheckExisting(gitDir)
+	if err != nil {
+		return probeFailure("access_denied", err)
+	}
 	if err := h.checkGitTree(gitDir); err != nil {
 		return probeFailure("access_denied", err)
 	}
@@ -569,6 +576,8 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	case "fullDiff":
 		var parts []string
 		for _, args := range [][]string{{"diff", "--no-ext-diff", "--no-textconv", "--cached"}, {"diff", "--no-ext-diff", "--no-textconv"}} {
+			args = append([]string{"--no-literal-pathspecs"}, args...)
+			args = append(args, "--", ".", stagingExcludeSpec())
 			part, e := run(args...)
 			if e != nil {
 				return nil, e
@@ -579,7 +588,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 			// List is bounded separately; it is not included in the returned patch.
 			remaining := g.remaining
 			g.remaining = gitWorkspaceMaxBytes
-			paths, e := run("ls-files", "--others", "--exclude-standard", "-z")
+			paths, e := run("--no-literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z", "--", ".", stagingExcludeSpec())
 			if e != nil {
 				return nil, e
 			}
@@ -607,7 +616,9 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		}
 		args := []string{"add"}
 		if op == "stage" && boolParam(params, "all") {
-			args = append(args, "-A")
+			// Only these fixed pathspecs use magic; explicit user paths remain literal.
+			out, err = run("--no-literal-pathspecs", "add", "-A", "--", ".", stagingStashExcludeSpec())
+			break
 		}
 		if op == "unstage" {
 			if hasHead {
@@ -656,10 +667,11 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 			g.truncated = true
 		}
 	case "stashPush":
-		args := []string{"stash", "push", "--include-untracked"}
+		args := []string{"--no-literal-pathspecs", "stash", "push", "--include-untracked"}
 		if message != "" {
 			args = append(args, "-m", message)
 		}
+		args = append(args, "--", ":/", stagingStashExcludeSpec())
 		out, err = run(args...)
 	case "stashPop":
 		out, err = run("stash", "pop")

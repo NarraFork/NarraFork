@@ -212,6 +212,17 @@ describe("InjectionSpeakerHeader — a knowledge hit is a document, not a speake
 		expect(container.textContent ?? "").toContain("charge_manager 日志说明");
 	});
 
+	test("a Watch result shows the watch glyph, not the terminal one", () => {
+		renderHeader({ speaker: "Fix login", speakerId: "watch-task", source: "bg_bash", watch: true });
+		const container = currentContainer;
+		if (!container) throw new Error("expected a rendered container");
+		expect(container.querySelector(".tabler-icon-eye")).not.toBeNull();
+		expect(container.querySelector(".tabler-icon-terminal-2")).toBeNull();
+		expect(container.querySelectorAll("img").length).toBe(0);
+		renderHeader({ speaker: "checks", speakerId: "bash-task", source: "bg_bash" });
+		expect(currentContainer?.querySelector(".tabler-icon-terminal-2")).not.toBeNull();
+	});
+
 	test("a subagent with the same shape still gets its identicon", () => {
 		// The contrast that keeps the knowledge rule meaningful rather than arbitrary: the
 		// only difference between these two rows is the producer tag.

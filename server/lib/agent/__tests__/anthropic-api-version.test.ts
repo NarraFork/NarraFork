@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { fetchAnthropicModels } from "../../../routes/anthropic";
 import type { AnthropicProviderConfig } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
+import type { ChatParams } from "../provider";
 
 const DIRECT = "https://api.anthropic.com/v1";
 const RELAY = "https://relay.invalid/v1";
@@ -70,7 +71,11 @@ function config(overrides: Partial<AnthropicProviderConfig> = {}): AnthropicProv
 	};
 }
 
-async function chat(provider: AnthropicProvider, history: unknown[] = []) {
+async function chat(
+	provider: AnthropicProvider,
+	history: unknown[] = [],
+	overrides: Partial<ChatParams> = {},
+) {
 	for await (const _ of provider.chat({
 		model: "version:opaque-model",
 		conversationId: "version-test",
@@ -81,6 +86,7 @@ async function chat(provider: AnthropicProvider, history: unknown[] = []) {
 		toolResults: [],
 		reasoningEffort: "none",
 		signal: AbortSignal.timeout(3000),
+		...overrides,
 	})) {
 		// Drain through the normal parser.
 	}
@@ -138,6 +144,53 @@ describe("Anthropic API version and request body", () => {
 			for (const key of ["top_p", "top_k"]) expect(body).not.toHaveProperty(key);
 		});
 	}
+
+	test.each([
+		LEGACY,
+		CURRENT,
+	])("%s: diagnostic requests share one isolated header/metadata session and keep their version and UA", async (version) => {
+		const requests = captureRequests();
+		const provider = new AnthropicProvider(
+			config({
+				baseUrl: "https://opencode.ai/zen/go/v1",
+				officialApi: true,
+				userAgentMode: "custom",
+				customUserAgent: "selected/1",
+				extraHeaders: { "Anthropic-Version": version, "USER-AGENT": "operator/2" },
+			}),
+		);
+		const transportSessionKey = "version-probe";
+		await chat(provider, [], { transportSessionKey });
+		for (let i = 0; i < 2; i++) {
+			await chat(provider, [], {
+				transportSessionKey,
+				diagnosticFork: { suffix: "diagnostic suffix" },
+			});
+		}
+		expect(requests).toHaveLength(3);
+		const [parent, diagnostic, repeated] = requests;
+		for (const header of ["x-claude-code-session-id", "x-opencode-session"]) {
+			expect(parent.headers.get(header)).toBeTruthy();
+			expect(diagnostic.headers.get(header)).not.toBe(parent.headers.get(header));
+			expect(repeated.headers.get(header)).toBe(diagnostic.headers.get(header));
+		}
+		for (const { headers, body } of requests) {
+			const metadata = body.metadata as { user_id: string };
+			expect(JSON.parse(metadata.user_id).session_id).toBe(headers.get("x-claude-code-session-id"));
+			expect(headers.get("anthropic-version")).toBe(version);
+			expect(headers.get("user-agent")).toBe("operator/2");
+			if (version === CURRENT) expect(body).not.toHaveProperty("temperature");
+			else expect(body.temperature).toBe(1);
+		}
+		const parentMessages = parent.body.messages as Array<{ role: string; content: unknown[] }>;
+		expect(diagnostic.body.messages).toEqual([
+			{
+				...parentMessages[0],
+				content: [...parentMessages[0].content, { type: "text", text: "diagnostic suffix" }],
+			},
+		]);
+		expect(diagnostic.body.system).toEqual(parent.body.system);
+	});
 
 	test("utility and native search requests honor an explicit upgrade on a relay", async () => {
 		const requests = captureRequests();

@@ -1,9 +1,13 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import * as pool from "../../lib/db-worker/pool";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 // Preserve the existing service/persistence import-cycle initialization order.
 const { narratorService } = await import("../narrator-service");
 const { getNarratorPanelState } = await import("../narrator-panel-state");
@@ -52,6 +56,11 @@ function buffer(id: string, seq: number, priority = false, state = "queued", tex
 function driverQueries() {
 	const queries: string[] = [];
 	const prepare = sqlite.prepare.bind(sqlite);
+	const run = pool.runReadTask;
+	spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+		if (params.kind === "selectRows" || params.kind === "selectValues") queries.push(params.sql);
+		return run(path, params, options);
+	}) as typeof pool.runReadTask);
 	spyOn(sqlite, "prepare").mockImplementation((...args: Parameters<typeof sqlite.prepare>) => {
 		queries.push(args[0]);
 		return prepare(...args);
@@ -63,10 +72,10 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	narrator();
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
-	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("bounded narrator panel state", () => {
@@ -140,22 +149,17 @@ describe("bounded narrator panel state", () => {
 		type Bindings = Parameters<ReturnType<typeof sqlite.prepare>["values"]>;
 		let executed: { query: string; bindings: Bindings } | undefined;
 		const prepare = sqlite.prepare.bind(sqlite);
-		// Preserve the driver's generic row signature; the spy only observes bindings.
-		const tracePrepare = ((...args: Parameters<typeof sqlite.prepare>) => {
-			const statement = prepare(...args);
-			const values = statement.values.bind(statement);
-			spyOn(statement, "values").mockImplementation((...bindings: Bindings) => {
-				if (
-					!executed &&
-					args[0].includes('from "narrator_tool_calls"') &&
-					args[0].includes("length(CAST(")
-				)
-					executed = { query: args[0], bindings };
-				return values(...bindings);
-			});
-			return statement;
-		}) as typeof sqlite.prepare;
-		spyOn(sqlite, "prepare").mockImplementation(tracePrepare);
+		const run = pool.runReadTask;
+		spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+			if (
+				!executed &&
+				(params.kind === "selectValues" || params.kind === "selectRows") &&
+				params.sql.includes('from "narrator_tool_calls"') &&
+				params.sql.includes("length(CAST(")
+			)
+				executed = { query: params.sql, bindings: params.params as Bindings };
+			return run(path, params, options);
+		}) as typeof pool.runReadTask);
 		await getNarratorPanelState("n1", "viewer");
 		const getExecution = (): { query: string; bindings: Bindings } | undefined => executed;
 		const actual = getExecution();
@@ -231,12 +235,14 @@ describe("bounded narrator panel state", () => {
 		expect(second.hasMore).toEqual({ permissions: false, buffer: false });
 		expect(second.buffer).toHaveLength(1);
 		sqlite.prepare("UPDATE narrator_buffered_messages SET priority = 1 WHERE id = 'b-32'").run();
-		await expect(
-			getNarratorPanelState("n1", "viewer", {
-				permissionsCursor: "end",
-				bufferCursor: first.nextCursor?.buffer,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "PANEL_STATE_CHANGED" });
+		expect(
+			await captureWorkerRejection(
+				getNarratorPanelState("n1", "viewer", {
+					permissionsCursor: "end",
+					bufferCursor: first.nextCursor?.buffer,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "PANEL_STATE_CHANGED" });
 	});
 
 	test("large queued text and command-only fields never enter a full-row read before budget validation", async () => {

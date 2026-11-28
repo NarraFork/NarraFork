@@ -43,6 +43,16 @@ async function openFixture() {
 			#overlay { height:40px; background:#ddd; pointer-events:none; }
 		</style><div id="root"></div>`);
 	await page.evaluate(async (moduleSource) => {
+		// about:blank has an opaque origin; provide only the Web Storage surface used by auth.
+		const storage = new Map<string, string>();
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => storage.get(key) ?? null,
+				setItem: (key: string, value: string) => storage.set(key, value),
+				removeItem: (key: string) => storage.delete(key),
+			},
+		});
 		const url = URL.createObjectURL(new Blob([moduleSource], { type: "text/javascript" }));
 		(window as unknown as FixtureWindow).fixture = await import(url);
 		URL.revokeObjectURL(url);

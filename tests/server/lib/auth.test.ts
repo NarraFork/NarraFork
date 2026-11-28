@@ -1,7 +1,7 @@
 /**
  * Opaque session tokens, end to end through the SQLite session store.
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on a file-backed fixture, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -9,9 +9,14 @@ import { ABSOLUTE_SESSION_MAX_SECONDS, SESSION_TOKEN_TTL_SECONDS } from "@shared
 import { eq } from "drizzle-orm";
 import { authSessions, users } from "../../../server/db/schema";
 import { generateId } from "../../../server/lib/id";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -25,7 +30,8 @@ const {
 } = await import("../../../server/lib/auth");
 const { hashSessionToken } = await import("../../../server/lib/session-token-hash");
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });

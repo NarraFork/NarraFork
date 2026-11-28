@@ -126,9 +126,15 @@ export interface AuthSessionStore {
 	/** Persist a freshly issued session. */
 	createSession(session: NewAuthSession): Promise<void>;
 	/** Resolve a session by token hash, joined with its account. Unknown → null. */
-	findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null>;
+	findSessionByTokenHash(
+		tokenHash: string,
+		options?: { signal?: AbortSignal },
+	): Promise<AuthSessionRecord | null>;
 	/** Resolve a session by id, joined with its account (long-lived sockets). Unknown → null. */
-	findSessionById(sessionId: string): Promise<AuthSessionRecord | null>;
+	findSessionById(
+		sessionId: string,
+		options?: { signal?: AbortSignal },
+	): Promise<AuthSessionRecord | null>;
 	/**
 	 * Slide a live session's expiry forward. Never revives a revoked session and never
 	 * shortens one (a concurrent renewal that already went further wins).

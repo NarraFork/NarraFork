@@ -161,7 +161,9 @@ describe("native content boundaries", () => {
 			},
 		});
 		expect(checkpoint.at(-1)?.contentBoundary?.phase).toBe("checkpoint");
+		expect(checkpoint.at(-1)?.contentBoundary?.reasoningSummaryEnd).toBe(5);
 		expect(second.find((event) => event.reasoning)?.reasoning).toBe("\n\nsecond");
+		expect(second.at(-1)?.contentBoundary?.reasoningSummaryEnd).toBe(13);
 		expect(first[0].reasoningBlockId).toBe(second[0].reasoningBlockId);
 		expect(done.some((event) => event.reasoning)).toBe(false);
 		expect(done.at(-2)?.reasoningMetadata?.openai?.reasoningEncryptedContent).toBe("final");
@@ -178,6 +180,26 @@ describe("native content boundaries", () => {
 			delta: "next",
 		});
 		expect(another[0].reasoningBlockId).not.toBe(first[0].reasoningBlockId);
+	});
+
+	test("Responses does not seal an incomplete or contradictory summary prefix", () => {
+		const parse = responsesParser();
+		const part = { output_index: 0, item_id: "rs_1", summary_index: 0 };
+		const later = { ...part, summary_index: 1 };
+		parse({ ...part, type: "response.reasoning_summary_text.delta", delta: "first" });
+		parse({ ...later, type: "response.reasoning_summary_text.delta", delta: "second" });
+		expect(
+			parse({ ...later, type: "response.reasoning_summary_text.done", text: "second" })[0]
+				.contentBoundary?.reasoningSummaryEnd,
+		).toBeUndefined();
+		expect(
+			parse({ ...part, type: "response.reasoning_summary_text.done", text: "missing bytes" })[0]
+				.contentBoundary?.reasoningSummaryEnd,
+		).toBeUndefined();
+		expect(
+			parse({ ...part, type: "response.reasoning_summary_part.done" })[0].contentBoundary
+				?.reasoningSummaryEnd,
+		).toBe(13);
 	});
 
 	test("Responses text items and content_index have distinct identities and citations precede complete", () => {

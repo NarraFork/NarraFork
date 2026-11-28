@@ -46,6 +46,7 @@ import {
 	users,
 } from "../../db/schema";
 import { ForbiddenError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import {
 	assertCanRead,
@@ -58,6 +59,7 @@ import {
 	chatSummarizeRateLimitTesting,
 	createChatAttachment,
 	discardChatAttachment,
+	ensureNarratorDiscussionRoomForShare,
 	getUnreadSummary,
 	hydrateMessageForBroadcast,
 	listConversationRooms,
@@ -71,6 +73,8 @@ import {
 	resolveNarratorRoom,
 	softDeleteMessage,
 } from "../chat-service";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -144,7 +148,7 @@ describe("DM room resolution", () => {
 	});
 
 	test("refuses a DM with yourself", async () => {
-		expect(resolveDmRoom(alice, alice)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(resolveDmRoom(alice, alice))).toThrow();
 	});
 
 	test("peer resolution returns the other participant, per viewer", async () => {
@@ -153,6 +157,37 @@ describe("DM room resolution", () => {
 		expect(fromAlice.peer?.id).toBe(bob);
 		expect(fromBob.peer?.id).toBe(alice);
 	});
+});
+
+test("discussion creation notifies once for resolver and share creation, never repeat opens", async () => {
+	type RoomCreated = { type: "chat:room_created"; narratorId: string; roomId: string };
+	const created: RoomCreated[] = [];
+	const capture = (event: RoomCreated) => {
+		created.push(event);
+	};
+	eventBus.on("chat:room_created", capture);
+	try {
+		for (const viaShare of [false, true]) {
+			const id = generateId();
+			await db.insert(narrators).values({
+				id,
+				ownerUserId: alice,
+				visibility: "public",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			});
+			const roomId = viaShare
+				? await ensureNarratorDiscussionRoomForShare(id)
+				: (await resolveNarratorRoom(id, alice)).id;
+			await resolveNarratorRoom(id, bob);
+			await ensureNarratorDiscussionRoomForShare(id);
+			expect(created.filter((event) => event.narratorId === id)).toEqual([
+				{ type: "chat:room_created", narratorId: id, roomId },
+			]);
+		}
+	} finally {
+		eventBus.off("chat:room_created", capture);
+	}
 });
 
 // ─── 2. seq allocation ───────────────────────────────────────────────────
@@ -213,14 +248,16 @@ describe("assertCanRead", () => {
 
 	test("a non-member is refused a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(assertCanRead(room.id, carol)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(assertCanRead(room.id, carol))).toThrow();
 	});
 
 	test("a non-member cannot post into a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		expect(
-			postMessage({ roomId: room.id, senderUserId: carol, text: "intruding" }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: carol, text: "intruding" }),
+			),
+		).toThrow();
 	});
 
 	test("a narrator room is readable without a pre-existing member row", async () => {
@@ -253,7 +290,12 @@ describe("assertCanRead", () => {
 		});
 
 		const room = await resolveNarratorRoom(privateNarratorId, alice);
-		expect(assertCanRead(room.id, carol)).rejects.toThrow();
+		// Settle the Worker-backed ACL before invoking Bun's synchronous matcher.
+		const error = await assertCanRead(room.id, carol).then(
+			() => null,
+			(error) => error,
+		);
+		expect(error).toMatchObject({ statusCode: 404 });
 	});
 
 	test("opening a private narrator's room does not create it for an outsider", async () => {
@@ -270,7 +312,9 @@ describe("assertCanRead", () => {
 			updatedAt: new Date().toISOString(),
 		});
 
-		expect(resolveNarratorRoom(privateNarratorId, carol)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(resolveNarratorRoom(privateNarratorId, carol)),
+		).toThrow();
 		const room = await db.query.chatRooms.findFirst({
 			where: eq(chatRooms.narratorId, privateNarratorId),
 		});
@@ -317,6 +361,87 @@ describe("assertCanRead", () => {
 // ─── 4. Pagination ───────────────────────────────────────────────────────
 
 describe("pagination", () => {
+	test("forward pages stay inside both fixed bounds and include deletion tombstones", async () => {
+		const a = await makeUser("range-a");
+		const b = await makeUser("range-b");
+		const room = await resolveDmRoom(a, b);
+		const rows = [];
+		for (let i = 0; i < 7; i++) {
+			rows.push(await postMessage({ roomId: room.id, senderUserId: a, text: `r${i}` }));
+		}
+		await softDeleteMessage(room.id, rows[2].id, a, false);
+		const input = { roomId: room.id, userId: a, beforeSeq: 7, limit: 2 };
+		const first = await listMessages({ ...input, afterSeq: 1 });
+		expect(first.messages.map((m) => m.seq)).toEqual([2, 3]);
+		expect(first.messages[1]).toMatchObject({
+			deletedAt: expect.any(String),
+			contentText: "",
+			attachments: [],
+		});
+		expect(first).toMatchObject({ hasNext: true, nextAfterSeq: 3, nextBeforeSeq: null });
+		const second = await listMessages({ ...input, afterSeq: first.nextAfterSeq ?? undefined });
+		expect(second.messages.map((m) => m.seq)).toEqual([4, 5]);
+		expect(second.hasNext).toBe(true);
+		const last = await listMessages({ ...input, afterSeq: second.nextAfterSeq ?? undefined });
+		expect(last.messages.map((m) => m.seq)).toEqual([6]);
+		expect(last).toMatchObject({ hasNext: false, nextAfterSeq: 6 });
+		const empty = await listMessages({ ...input, afterSeq: 6 });
+		expect(empty).toMatchObject({ messages: [], hasNext: false, nextAfterSeq: null });
+	});
+
+	test("forward pages reauthorize and reject an already-aborted read", async () => {
+		const a = await makeUser("range-auth-a");
+		const b = await makeUser("range-auth-b");
+		const room = await resolveDmRoom(a, b);
+		await postMessage({ roomId: room.id, senderUserId: a, text: "one" });
+		await listMessages({ roomId: room.id, userId: b, afterSeq: 0 });
+		await db
+			.delete(chatRoomMembers)
+			.where(and(eq(chatRoomMembers.roomId, room.id), eq(chatRoomMembers.userId, b)));
+		const denied = await listMessages({ roomId: room.id, userId: b, afterSeq: 0 }).then(
+			() => null,
+			(error) => error,
+		);
+		expect(denied).toMatchObject({ statusCode: 404 });
+		await expect(
+			listMessages({ roomId: room.id, userId: a, afterSeq: 0, signal: AbortSignal.abort() }),
+		).rejects.toThrow();
+	});
+
+	test("forward reads retain the 100-message page cap with a limit-plus-one sentinel", async () => {
+		const a = await makeUser("range-cap-a");
+		const b = await makeUser("range-cap-b");
+		const room = await resolveDmRoom(a, b);
+		await db.insert(chatMessages).values(
+			Array.from({ length: 101 }, (_, index) => ({
+				id: generateId(),
+				roomId: room.id,
+				seq: index + 1,
+				senderUserId: a,
+				contentText: `range-${index}`,
+				createdAt: new Date().toISOString(),
+			})),
+		);
+		const page = await listMessages({
+			roomId: room.id,
+			userId: a,
+			afterSeq: 0,
+			beforeSeq: 102,
+			limit: 1000,
+		});
+		expect(page.messages).toHaveLength(100);
+		expect(page).toMatchObject({ hasNext: true, nextAfterSeq: 100 });
+		const last = await listMessages({
+			roomId: room.id,
+			userId: a,
+			afterSeq: 100,
+			beforeSeq: 102,
+			limit: 1000,
+		});
+		expect(last.messages.map((row) => row.seq)).toEqual([101]);
+		expect(last.hasNext).toBe(false);
+	});
+
 	test("walking pages covers every message exactly once", async () => {
 		const a = await makeUser("page-a");
 		const b = await makeUser("page-b");
@@ -557,7 +682,9 @@ describe("room list and deletion", () => {
 		const row = await postMessage({ roomId: room.id, senderUserId: alice, text: "mine" });
 		// The status matters: a client cannot distinguish "fix your input" from
 		// "this was never yours" if both surface as a validation error.
-		expect(softDeleteMessage(room.id, row.id, bob, false)).rejects.toBeInstanceOf(ForbiddenError);
+		expect(
+			await captureWorkerRejection(softDeleteMessage(room.id, row.id, bob, false)),
+		).toBeInstanceOf(ForbiddenError);
 		try {
 			await softDeleteMessage(room.id, row.id, bob, false);
 			throw new Error("expected a refusal");
@@ -579,21 +706,29 @@ describe("room list and deletion", () => {
 		const roomB = await resolveDmRoom(alice, carol);
 		const inA = await postMessage({ roomId: roomA.id, senderUserId: alice, text: "in A" });
 		expect(
-			postMessage({
-				roomId: roomB.id,
-				senderUserId: alice,
-				text: "cross-room reply",
-				replyToMessageId: inA.id,
-			}),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: roomB.id,
+					senderUserId: alice,
+					text: "cross-room reply",
+					replyToMessageId: inA.id,
+				}),
+			),
+		).toThrow();
 	});
 
 	test("empty and oversized bodies are refused", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(postMessage({ roomId: room.id, senderUserId: alice, text: "   " })).rejects.toThrow();
 		expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "x".repeat(8_001) }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "   " }),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "x".repeat(8_001) }),
+			),
+		).toThrow();
 	});
 
 	test("posting into a room that vanished is a 404, not a TypeError", async () => {
@@ -603,7 +738,11 @@ describe("room list and deletion", () => {
 		// Simulates the room being deleted between the access check and the write
 		// transaction: the `UPDATE ... RETURNING` matches nothing.
 		await db.delete(chatRooms).where(eq(chatRooms.id, room.id));
-		expect(postMessage({ roomId: room.id, senderUserId: a, text: "orphan" })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: a, text: "orphan" }),
+			),
+		).toThrow();
 	});
 });
 
@@ -827,7 +966,9 @@ describe("attachments", () => {
 		});
 		// Fail-closed matters more here than for narrator uploads: this file would be
 		// served back to other members of the room under an image content type.
-		await expect(createChatAttachment(room.id, alice, spoofed)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(createChatAttachment(room.id, alice, spoofed)),
+		).toThrow();
 	});
 
 	test("a non-image is stored as an opaque file, never under an image type", async () => {
@@ -863,22 +1004,26 @@ describe("attachments", () => {
 		// Inside the SUPPORTED image set the pipeline fails closed: the user's intent
 		// was "an image", so silently storing it as a download would hide a corrupt or
 		// deliberately disguised file.
-		await expect(
-			createChatAttachment(
-				room.id,
-				alice,
-				new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "not-really.png", {
-					type: "image/png",
-				}),
+		expect(
+			await captureWorkerRejectionThrower(
+				createChatAttachment(
+					room.id,
+					alice,
+					new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "not-really.png", {
+						type: "image/png",
+					}),
+				),
 			),
-		).rejects.toThrow();
+		).toThrow();
 	});
 
 	test("a non-member cannot upload into a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		// Checked BEFORE the disk write, so an unauthorized upload cannot consume
 		// storage on its way to being rejected.
-		await expect(createChatAttachment(room.id, carol, pngFile())).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(createChatAttachment(room.id, carol, pngFile())),
+		).toThrow();
 	});
 
 	test("posting claims the attachment and returns it with the message", async () => {
@@ -915,9 +1060,11 @@ describe("attachments", () => {
 
 	test("a message with neither text nor attachments is refused", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		await expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "  ", attachmentIds: [] }),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "  ", attachmentIds: [] }),
+			),
+		).toThrow();
 	});
 
 	test("claiming someone else's draft is refused and posts nothing", async () => {
@@ -925,14 +1072,16 @@ describe("attachments", () => {
 		const draft = await createChatAttachment(room.id, alice, pngFile("alices.png"));
 		const before = await listMessages({ roomId: room.id, userId: bob });
 
-		await expect(
-			postMessage({
-				roomId: room.id,
-				senderUserId: bob,
-				text: "stealing",
-				attachmentIds: [draft.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: room.id,
+					senderUserId: bob,
+					text: "stealing",
+					attachmentIds: [draft.id],
+				}),
+			),
+		).toThrow();
 
 		// The whole write is rolled back, not just the claim: a message that posted
 		// without its attachments would be worse than a failed send.
@@ -951,14 +1100,16 @@ describe("attachments", () => {
 
 		// Without the room predicate this would smuggle content from a conversation
 		// `bob` cannot read into one he can.
-		await expect(
-			postMessage({
-				roomId: roomA.id,
-				senderUserId: alice,
-				text: "cross-room",
-				attachmentIds: [foreign.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: roomA.id,
+					senderUserId: alice,
+					text: "cross-room",
+					attachmentIds: [foreign.id],
+				}),
+			),
+		).toThrow();
 	});
 
 	test("an attachment cannot be claimed twice", async () => {
@@ -970,14 +1121,16 @@ describe("attachments", () => {
 			text: "first",
 			attachmentIds: [attachment.id],
 		});
-		await expect(
-			postMessage({
-				roomId: room.id,
-				senderUserId: alice,
-				text: "second",
-				attachmentIds: [attachment.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: room.id,
+					senderUserId: alice,
+					text: "second",
+					attachmentIds: [attachment.id],
+				}),
+			),
+		).toThrow();
 	});
 
 	test("a soft delete removes the attachment rows and the files", async () => {
@@ -999,7 +1152,9 @@ describe("attachments", () => {
 			where: eq(chatAttachments.id, attachment.id),
 		});
 		expect(row).toBeUndefined();
-		await expect(loadChatAttachmentForRead(attachment.id, bob)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(loadChatAttachmentForRead(attachment.id, bob)),
+		).toThrow();
 	});
 
 	test("a soft-deleted message reports no attachments", async () => {
@@ -1032,13 +1187,17 @@ describe("attachments", () => {
 		expect((await loadChatAttachmentForRead(attachment.id, bob)).filename).toBe("private.png");
 		// An outsider may not — and is told "not found", not "forbidden", which would
 		// confirm the attachment (and thus the conversation) exists.
-		await expect(loadChatAttachmentForRead(attachment.id, carol)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(loadChatAttachmentForRead(attachment.id, carol)),
+		).toThrow();
 	});
 
 	test("only the uploader can discard a draft, and only before it is claimed", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		const draft = await createChatAttachment(room.id, alice, pngFile("draft.png"));
-		await expect(discardChatAttachment(draft.id, bob)).rejects.toBeInstanceOf(ForbiddenError);
+		expect(await captureWorkerRejection(discardChatAttachment(draft.id, bob))).toBeInstanceOf(
+			ForbiddenError,
+		);
 		await discardChatAttachment(draft.id, alice);
 		expect(
 			await db.query.chatAttachments.findFirst({ where: eq(chatAttachments.id, draft.id) }),
@@ -1053,7 +1212,7 @@ describe("attachments", () => {
 		});
 		// Once a message owns it, removal is that message's delete — not a separate
 		// operation that would leave the message referencing a missing file.
-		await expect(discardChatAttachment(claimed.id, alice)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(discardChatAttachment(claimed.id, alice))).toThrow();
 	});
 
 	test("two files with the same name do not overwrite each other", async () => {

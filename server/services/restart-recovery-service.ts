@@ -5,13 +5,17 @@ import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators, narratorToolCalls } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
+import { runDeliverToOf } from "../lib/runtime-source";
 import type { RunDeliverTo } from "../lib/validators/runtime-registration";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
+import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { narratorPersistence } from "./narrator-persistence";
 import {
 	getRecoverySource,
@@ -20,6 +24,14 @@ import {
 	registerRecoverySource,
 	withRecoveryAdvance,
 } from "./recovery-handoff";
+import {
+	assertRestartRecoveryObservation,
+	RESTART_NARRATOR_COLUMNS,
+	RESTART_TASK_COLUMNS,
+	RESTART_TOOL_COLUMNS,
+	type RestartNarrator,
+	type RestartTool,
+} from "./recovery-observation";
 import {
 	isToolContinuationOwnerMounted,
 	type ToolContinuationProtectionSets,
@@ -37,6 +49,88 @@ import { restoreNarratorsAfterPlannedUpdate } from "./update-recovery-service";
 export const NO_AUTO_RESUME_FLAG = "--no-auto-resume";
 const MAX_TARGETS = 1_000;
 const MAX_MANIFEST_BYTES = 256 * 1024;
+type RecoveryReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
+function narratorObservation(row: RestartNarrator): RestartNarrator {
+	return {
+		id: row.id,
+		status: row.status,
+		substatus: row.substatus,
+		logicalRunId: row.logicalRunId,
+		runtimeRegistrationJson: row.runtimeRegistrationJson,
+	};
+}
+
+async function readRestartCalls(
+	ids: string[],
+	options: RecoveryReadOptions,
+): Promise<RestartTool[]> {
+	const calls: RestartTool[] = [];
+	for (let start = 0; start < ids.length; start += 100) {
+		const owners = ids.slice(start, start + 100);
+		for (let after = ""; ; ) {
+			const page = await readQuery(
+				db
+					.select(RESTART_TOOL_COLUMNS)
+					.from(narratorToolCalls)
+					.where(
+						and(
+							inArray(narratorToolCalls.narratorId, owners),
+							gt(narratorToolCalls.id, after),
+							isNull(narratorToolCalls.executionOriginToolCallId),
+							eq(narratorToolCalls.executionIdentityVersion, 1),
+							inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+						),
+					)
+					.orderBy(asc(narratorToolCalls.id))
+					.limit(100),
+				{ ...options, executionPolicy: "worker-required", maxRows: 100 },
+			);
+			calls.push(...page);
+			if (calls.length > 10_000) throw new Error("Too many interrupted tools");
+			if (page.length < 100) break;
+			after = page[page.length - 1].id;
+		}
+	}
+	return calls;
+}
+
+async function readDestinationCalls(destinations: RunDeliverTo[], options: RecoveryReadOptions) {
+	const calls: RestartTool[] = [];
+	for (let start = 0; start < destinations.length; start += 100) {
+		const page = await readQuery(
+			db
+				.select(RESTART_TOOL_COLUMNS)
+				.from(narratorToolCalls)
+				.where(
+					or(
+						...destinations
+							.slice(start, start + 100)
+							.map((target) =>
+								target.toolCallId
+									? eq(narratorToolCalls.id, target.toolCallId)
+									: and(
+											eq(narratorToolCalls.narratorId, target.narratorId),
+											eq(narratorToolCalls.toolUseId, target.toolUseId),
+										),
+							),
+					),
+				)
+				.limit(MAX_TARGETS + 1),
+			{ ...options, executionPolicy: "worker-required", maxRows: MAX_TARGETS + 1 },
+		);
+		if (page.length > MAX_TARGETS) throw new Error("Too many restart destination calls");
+		calls.push(...page);
+	}
+	return calls;
+}
+
+function destinationCall(calls: RestartTool[], target: RunDeliverTo) {
+	return calls.find((call) =>
+		target.toolCallId
+			? call.id === target.toolCallId
+			: call.narratorId === target.narratorId && call.toolUseId === target.toolUseId,
+	);
+}
 export const RESTART_EXECUTION_UNKNOWN =
 	"Interrupted by server restart. This tool started executing but its final result was not persisted. " +
 	"The outcome is unknown and side effects may already have occurred. It was not automatically retried; " +
@@ -170,37 +264,48 @@ async function removeManifest(epoch: string): Promise<void> {
  * Where the row's current run delivers its result, if anywhere: the one rule for
  * "this session is delegated" (`runDeliverToOf`), never its type or variant.
  */
-async function deliverToOf(narratorId: string): Promise<RunDeliverTo | undefined> {
-	const { readSessionDeliverTo } = await import("./narrator-session");
-	return readSessionDeliverTo(narratorId);
-}
-
 async function withDeliverTo<T extends { id: string }>(
 	rows: T[],
+	options: RecoveryReadOptions = {},
 ): Promise<Array<T & { deliverTo?: RunDeliverTo }>> {
-	const out: Array<T & { deliverTo?: RunDeliverTo }> = [];
-	for (const row of rows) out.push({ ...row, deliverTo: await deliverToOf(row.id) });
-	return out;
+	if (!rows.length) return [];
+	const registrations = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(
+				narrators.id,
+				rows.map((row) => row.id),
+			),
+			columns: { id: true, runtimeRegistrationJson: true },
+			limit: MAX_TARGETS + 1,
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: MAX_TARGETS + 1 },
+	);
+	const byId = new Map(registrations.map((row) => [row.id, runDeliverToOf(row)]));
+	return rows.map((row) => ({ ...row, deliverTo: byId.get(row.id) }));
 }
 
-async function loadActiveRows(includeTerminalCandidates = false) {
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.status, ["working", "waiting"]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			logicalRunId: true,
-		},
-		limit: MAX_TARGETS + 1,
-	});
+async function loadActiveRows(
+	includeTerminalCandidates = false,
+	options: RecoveryReadOptions = {},
+) {
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(narrators.status, ["working", "waiting"]),
+			columns: RESTART_NARRATOR_COLUMNS,
+			limit: MAX_TARGETS + 1,
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: MAX_TARGETS + 1 },
+	);
 	if (rows.length > MAX_TARGETS) throw new Error("Too many active restart recovery targets");
 	return includeTerminalCandidates ? rows : rows.filter(restartEligible);
 }
 
-async function loadRetainedRestartRows(previous: RestartManifest | null) {
+async function loadRetainedRestartRows(
+	previous: RestartManifest | null,
+	options: RecoveryReadOptions = {},
+) {
 	if (!previous?.targets.length) return [];
-	const records = await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch);
+	const records = await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch, options);
 	const recordTargets = (record: (typeof records)[number]) => [
 		record.narratorId,
 		...(record.kind === "foreground_agent" && typeof record.payloadJson?.subagentId === "string"
@@ -214,16 +319,14 @@ async function loadRetainedRestartRows(previous: RestartManifest | null) {
 		records.filter((record) => record.state === "cancelled").flatMap(recordTargets),
 	);
 	const targets = new Map(previous.targets.map((target) => [target.narratorId, target]));
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.id, [...targets.keys()]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			logicalRunId: true,
-		},
-		limit: MAX_TARGETS + 1,
-	});
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(narrators.id, [...targets.keys()]),
+			columns: RESTART_NARRATOR_COLUMNS,
+			limit: MAX_TARGETS + 1,
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: MAX_TARGETS + 1 },
+	);
 	return rows.filter((row) => {
 		const tags = parseSubstatus(row.substatus);
 		return (
@@ -238,7 +341,9 @@ async function loadRetainedRestartRows(previous: RestartManifest | null) {
 }
 
 /** Freeze tool/model admission before resource teardown; never wait for a tool to finish. */
-export async function prepareSignalRestartRecovery(): Promise<void> {
+export async function prepareSignalRestartRecovery(
+	options: RecoveryReadOptions = {},
+): Promise<void> {
 	const coordination = getUpdateCoordinationStatus();
 	// A scheduled update owns its own epoch and handoff authorization. Do not turn that
 	// operation's live snapshot into ordinary-restart authorization during signal teardown.
@@ -248,8 +353,8 @@ export async function prepareSignalRestartRecovery(): Promise<void> {
 		beginQuiescingTools();
 	}
 	const previous = await readManifest();
-	const rows = await loadActiveRows();
-	const retained = await loadRetainedRestartRows(previous);
+	const rows = await loadActiveRows(false, options);
+	const retained = await loadRetainedRestartRows(previous, options);
 	for (const row of retained) {
 		if (!rows.some((active) => active.id === row.id)) rows.push(row);
 	}
@@ -293,75 +398,80 @@ export function mergeStartupProtection(
 export async function protectHeldRunFacts(
 	protection: ToolContinuationProtectionSets,
 	hydratedRunIds?: ReadonlySet<string>,
+	options: RecoveryReadOptions = {},
 ): Promise<Set<string>> {
 	// Share only the snapshot explicitly passed by this cold-start orchestration. A later
 	// standalone caller must still read current durable holds, including newly taken-over runs.
 	const held = hydratedRunIds
 		? new Set(hydratedRunIds)
-		: await import("./agent-runtime/run").then(({ hydrateRunHolds }) => hydrateRunHolds());
-	for (const id of held) {
-		protection.narratorIds.add(id);
+		: await import("./agent-runtime/run").then(({ hydrateRunHolds }) => hydrateRunHolds(options));
+	if (held.size > MAX_TARGETS) throw new Error("Too many held restart targets");
+	const destinations = (
+		await withDeliverTo(
+			[...held].map((id) => ({ id })),
+			options,
+		)
+	).flatMap((row) => (row.deliverTo ? [row.deliverTo] : []));
+	for (const id of held) protection.narratorIds.add(id);
+	const ids = [...held];
+	for (let start = 0; start < ids.length; start += 100) {
+		const owners = ids.slice(start, start + 100);
 		for (let after = ""; ; ) {
-			const calls = await db
-				.select({ id: narratorToolCalls.id })
-				.from(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.narratorId, id),
-						gt(narratorToolCalls.id, after),
-						inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
-					),
-				)
-				.orderBy(asc(narratorToolCalls.id))
-				.limit(100);
+			const calls = await readQuery(
+				db
+					.select({ id: narratorToolCalls.id })
+					.from(narratorToolCalls)
+					.where(
+						and(
+							inArray(narratorToolCalls.narratorId, owners),
+							gt(narratorToolCalls.id, after),
+							inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+						),
+					)
+					.orderBy(asc(narratorToolCalls.id))
+					.limit(100),
+				{ ...options, executionPolicy: "worker-required", maxRows: 100 },
+			);
 			for (const call of calls) protection.toolCallIds.add(call.id);
 			if (calls.length < 100) break;
 			after = calls[calls.length - 1].id;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 		for (let after = ""; ; ) {
-			const tasks = await db
-				.select({ id: backgroundTasks.id })
-				.from(backgroundTasks)
-				.where(
-					and(
-						gt(backgroundTasks.id, after),
-						eq(backgroundTasks.status, "running"),
-						or(
-							eq(backgroundTasks.subagentNarratorId, id),
-							eq(backgroundTasks.id, id),
-							eq(backgroundTasks.parentNarratorId, id),
+			const tasks = await readQuery(
+				db
+					.select({ id: backgroundTasks.id })
+					.from(backgroundTasks)
+					.where(
+						and(
+							gt(backgroundTasks.id, after),
+							eq(backgroundTasks.status, "running"),
+							or(
+								inArray(backgroundTasks.subagentNarratorId, owners),
+								inArray(backgroundTasks.id, owners),
+								inArray(backgroundTasks.parentNarratorId, owners),
+							),
 						),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(100);
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(100),
+				{ ...options, executionPolicy: "worker-required", maxRows: 100 },
+			);
 			for (const task of tasks) protection.backgroundTaskIds.add(task.id);
 			if (tasks.length < 100) break;
 			after = tasks[tasks.length - 1].id;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
-		const deliverTo = await deliverToOf(id);
-		if (deliverTo) {
-			const call = await db.query.narratorToolCalls.findFirst({
-				where: deliverTo.toolCallId
-					? eq(narratorToolCalls.id, deliverTo.toolCallId)
-					: and(
-							eq(narratorToolCalls.narratorId, deliverTo.narratorId),
-							eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
-						),
-				columns: { id: true },
-			});
-			if (call) protection.toolCallIds.add(call.id);
-		}
 	}
+	for (const call of await readDestinationCalls(destinations, options))
+		protection.toolCallIds.add(call.id);
 	return held;
 }
 
 /** Runs under the database instance lock, before generic startup cleanup touches any rows. */
 export async function prepareOrdinaryRestartRecovery(
 	plannedProtection: ToolContinuationProtectionSets,
-	options: { onTargetsDiscovered?: (ids: readonly string[]) => void } = {},
+	options: RecoveryReadOptions & { onTargetsDiscovered?: (ids: readonly string[]) => void } = {},
 ): Promise<RestartStartupRecovery> {
 	const empty: RestartStartupRecovery = {
 		manifest: null,
@@ -369,341 +479,414 @@ export async function prepareOrdinaryRestartRecovery(
 	};
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
-	const held = await protectHeldRunFacts(empty.protection);
-	empty.heldRunIds = held;
-	const saved = await readManifest();
-	// A v3 planned root already owns this source; never load the ordinary file a second time.
-	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
-	// Publish only the validated, unclaimed ordinary source before bounded continuation reads.
-	if (previous) options.onTargetsDiscovered?.(previous.targets.map((target) => target.narratorId));
-	const unfinishedOwners = new Set(
-		previous
-			? (await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch))
-					.filter(
-						(record) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record),
-					)
-					.map((record) => record.narratorId)
-			: [],
-	);
-	const active = await loadActiveRows(true);
-	for (const row of await loadRetainedRestartRows(previous)) {
-		if (!active.some((entry) => entry.id === row.id)) active.push(row);
-	}
-	if (active.length > MAX_TARGETS) throw new Error("Too many restart recovery targets");
-	const candidates = [] as Awaited<ReturnType<typeof withDeliverTo<(typeof active)[number]>>>;
-	for (const row of await withDeliverTo(
-		active.filter((row) => !plannedProtection.narratorIds.has(row.id) && !held.has(row.id)),
-	)) {
-		const origin = row.deliverTo?.toolCallId
-			? await toolContinuationService.getByToolCallId(row.deliverTo.toolCallId)
-			: null;
-		// A dead process can leave an active status behind after a durable cancellation/delivery.
-		// It is not new ordinary authorization for that same delivering run.
-		if (
-			origin &&
-			isToolContinuationOwnerMounted(origin) &&
-			(origin.state === "cancelled" || origin.kind !== "background_agent") &&
-			origin.payloadJson?.subagentId === row.id &&
-			origin.payloadJson?.logicalRunId === row.logicalRunId
-		)
-			continue;
-		candidates.push(row);
-	}
-	const { getRuntimePublicationService } = await import("./agent-runtime/publication");
-	const publication = getRuntimePublicationService();
-	const rows: typeof candidates = [];
-	for (const row of candidates) {
-		const run =
-			row.logicalRunId && row.deliverTo
-				? {
-						producerKind: "agent" as const,
-						taskId: row.id,
-						logicalRunId: row.logicalRunId,
-						recipientId: row.deliverTo.narratorId,
-					}
-				: null;
-		const publicationState = run
-			? await publication.readRunPublicationState(run)
-			: { state: "none" as const };
-		if (publicationState.state !== "settled") {
-			// Idle rows entered this set only through the verified retained manifest.
-			if (restartEligible(row) || row.status === "idle") rows.push(row);
-			continue;
+	try {
+		const held = await protectHeldRunFacts(empty.protection, undefined, options);
+		empty.heldRunIds = held;
+		const saved = await readManifest();
+		// A v3 planned root already owns this source; never load the ordinary file a second time.
+		const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
+		// Publish only the validated, unclaimed ordinary source before bounded continuation reads.
+		if (previous)
+			options.onTargetsDiscovered?.(previous.targets.map((target) => target.narratorId));
+		const unfinishedOwners = new Set(
+			previous
+				? (await toolContinuationService.listByEpoch(previous.snapshot.updateEpoch, options))
+						.filter(
+							(record) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record),
+						)
+						.map((record) => record.narratorId)
+				: [],
+		);
+		const active = await loadActiveRows(true, options);
+		for (const row of await loadRetainedRestartRows(previous, options)) {
+			if (!active.some((entry) => entry.id === row.id)) active.push(row);
 		}
-		const result = run
-			? await publication.readAgentTerminalResult(run, { includeEventKind: true })
-			: null;
-		// A crash after the terminal transaction but before idle needs delivery only.
-		// The durable terminal evidence is authoritative; never execute the model again,
-		// even when the result snapshot itself can no longer be read.
-		const eventKind = result?.eventKind ?? publicationState.eventKind;
-		await db
-			.update(narrators)
-			.set({
-				status: "idle",
-				substatus: JSON.stringify([
-					!eventKind
-						? "interrupted"
-						: eventKind === "failed"
-							? "error"
-							: eventKind === "timed_out"
-								? "timeout"
-								: eventKind === "cancelled"
-									? "interrupted"
-									: "unread",
-				]),
-				...(!result
-					? {
-							errorMessage:
-								"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
-						}
-					: {}),
-			})
-			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
-		publication.schedule();
-		// A foreground caller may have crashed before saving its tool result. Preserve
-		// its continuation; run.ts observes this committed snapshot before any model pass.
-		if (row.deliverTo?.toolCallId) {
-			const call = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, row.deliverTo.toolCallId),
-				columns: { status: true },
-			});
-			if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
-		}
-	}
-	// A live loop recorded at shutdown also authorizes its own unchanged run, even
-	// when it delivers to nobody. Historical active rows (or rows without a run ID) do not.
-	const recordedRuns = new Map(
-		previous?.targets
-			.filter(
-				(target) =>
-					target.logicalRunId &&
-					previous.snapshot.narrators.some((entry) => entry.narratorId === target.narratorId),
+		if (active.length > MAX_TARGETS) throw new Error("Too many restart recovery targets");
+		const candidates = [] as Awaited<ReturnType<typeof withDeliverTo<(typeof active)[number]>>>;
+		const origins = new Map(
+			(
+				await toolContinuationService.getByToolCallIds(
+					active.flatMap((row) => {
+						const id = runDeliverToOf(row)?.toolCallId;
+						return id ? [id] : [];
+					}),
+					options,
+				)
+			).map((record) => [record.toolCallId, record]),
+		);
+		for (const row of active
+			.filter((row) => !plannedProtection.narratorIds.has(row.id) && !held.has(row.id))
+			.map((row) => ({ ...row, deliverTo: runDeliverToOf(row) }))) {
+			const origin = row.deliverTo?.toolCallId ? origins.get(row.deliverTo.toolCallId) : null;
+			// A dead process can leave an active status behind after a durable cancellation/delivery.
+			// It is not new ordinary authorization for that same delivering run.
+			if (
+				origin &&
+				isToolContinuationOwnerMounted(origin) &&
+				(origin.state === "cancelled" || origin.kind !== "background_agent") &&
+				origin.payloadJson?.subagentId === row.id &&
+				origin.payloadJson?.logicalRunId === row.logicalRunId
 			)
-			.map((target) => [target.narratorId, target.logicalRunId]),
-	);
-	const explicitIds = new Set(
-		rows
-			.filter((row) => row.logicalRunId && recordedRuns.get(row.id) === row.logicalRunId)
-			.map((row) => row.id),
-	);
-	// A run that delivers its result is resumed; the session it delivers to (and so on
-	// up) is selected too, because it waits for that result exactly once.
-	const delegated = rows.filter((row) => row.deliverTo);
-	const selectedIds = new Set([
-		...explicitIds,
-		...delegated.map((row) => row.id),
-		...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
-	]);
-	for (const row of delegated) {
-		let caller = rows.find((entry) => entry.id === row.deliverTo?.narratorId);
-		while (caller && !selectedIds.has(caller.id)) {
-			selectedIds.add(caller.id);
-			caller = rows.find((entry) => entry.id === caller?.deliverTo?.narratorId);
-		}
-	}
-	if (!selectedIds.size) {
-		if (previous) await removeManifest(previous.snapshot.updateEpoch);
-		return empty;
-	}
-	const selected = rows.filter((row) => selectedIds.has(row.id));
-	// If manifest publication or any repair fails, startup can still settle these known runs.
-	options.onTargetsDiscovered?.(selected.map((row) => row.id));
-	const snapshot: PlannedUpdateRecoverySnapshot = {
-		version: 2,
-		updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,
-		capturedAt: previous?.snapshot.capturedAt ?? new Date().toISOString(),
-		narrators: selected.flatMap((row) => {
-			const saved = previous?.targets.some(
-				(target) => target.narratorId === row.id && target.logicalRunId === row.logicalRunId,
-			)
-				? previous.snapshot.narrators.find((target) => target.narratorId === row.id)
-				: undefined;
-			// Caller discovery is not evidence that its independent loop was live. Keep
-			// its continuation, but do not manufacture standalone restart authorization.
-			return saved ? [saved] : row.deliverTo ? [{ narratorId: row.id, locale: "en" }] : [];
-		}),
-	};
-	const manifest: RestartManifest = {
-		version: 1,
-		snapshot,
-		targets: selected.map((row) => ({ narratorId: row.id, logicalRunId: row.logicalRunId })),
-	};
-	// Write eligibility before repairing tools. A crash between writes can safely repeat repair.
-	await writeManifest(manifest);
-	manifestIdentities.set(snapshot.updateEpoch, { text: JSON.stringify(manifest) });
-	registerRecoverySource(
-		{
-			updateEpoch: snapshot.updateEpoch,
-			kind: "ordinary",
-			capturedAt: snapshot.capturedAt,
-			narrators: selected.map(
-				(row) =>
-					snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
-						narratorId: row.id,
-						locale: "en",
-					},
-			),
-			pendingNarratorIds: manifest.targets.map((target) => target.narratorId),
-			logicalRuns: manifest.targets,
-		},
-		{ validateManifest: () => assertManifestIdentity(snapshot.updateEpoch) },
-	);
-	const { cleanupIncompleteNarratorOutput } = await import("./narrator-output-recovery");
-	for (const row of selected) await cleanupIncompleteNarratorOutput(row.id);
-	const protection = empty.protection;
-	for (const id of selectedIds) protection.narratorIds.add(id);
-
-	const representedChildren = new Set<string>();
-	for (const child of delegated) {
-		const deliverTo = child.deliverTo as RunDeliverTo;
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: deliverTo.toolCallId
-				? eq(narratorToolCalls.id, deliverTo.toolCallId)
-				: and(
-						eq(narratorToolCalls.narratorId, deliverTo.narratorId),
-						eq(narratorToolCalls.toolUseId, deliverTo.toolUseId),
-					),
-			columns: { id: true, narratorId: true, status: true },
-		});
-		if (!call || plannedProtection.toolCallIds.has(call.id)) continue;
-		const task = await db.query.backgroundTasks.findFirst({
-			where: and(
-				eq(backgroundTasks.type, "agent"),
-				or(eq(backgroundTasks.subagentNarratorId, child.id), eq(backgroundTasks.id, child.id)),
-			),
-			columns: { id: true, alias: true, status: true },
-		});
-		const background = task?.status === "running";
-		// A historical Agent result is not the owner of a later follow-up run.
-		if (!background && (call.status === "success" || call.status === "fail")) continue;
-		if (!background && !selectedIds.has(call.narratorId)) continue;
-		if (background && task) protection.backgroundTaskIds.add(task.id);
-		await putColdContinuation({
-			toolCallId: call.id,
-			narratorId: call.narratorId,
-			updateEpoch: snapshot.updateEpoch,
-			kind: background ? "background_agent" : "foreground_agent",
-			payloadJson: {
-				subagentId: child.id,
-				logicalRunId: child.logicalRunId,
-				ordinaryRestart: true,
-				...(background && task
-					? {
-							backgroundTaskId: task.id,
-							backgroundTaskAlias: task.alias,
-							parentNarratorId: call.narratorId,
-						}
-					: {}),
-			},
-		});
-		protection.toolCallIds.add(call.id);
-		representedChildren.add(child.id);
-	}
-	for (const row of selected) {
-		const calls = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, row.id),
-				isNull(narratorToolCalls.executionOriginToolCallId),
-				eq(narratorToolCalls.executionIdentityVersion, 1),
-				inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
-			),
-			columns: {
-				id: true,
-				toolUseId: true,
-				messageId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-				permissionSuggestions: true,
-			},
-			limit: 1_001,
-		});
-		if (calls.length > 1_000) throw new Error("Too many interrupted tools for one narrator");
-		for (const call of calls) {
-			if (protection.toolCallIds.has(call.id) || plannedProtection.toolCallIds.has(call.id))
 				continue;
-			const disposition = restartToolDisposition(call);
-			if (disposition === "execution_unknown") {
-				await narratorPersistence.updateToolCallResultIfActive(
-					call.toolUseId,
-					{
-						status: "fail",
-						output: RESTART_EXECUTION_UNKNOWN,
-						errorMessage: RESTART_EXECUTION_UNKNOWN,
-						completedAt: Date.now(),
-					},
-					call.messageId,
-					call.id,
-				);
+			candidates.push(row);
+		}
+		const { getRuntimePublicationService } = await import("./agent-runtime/publication");
+		const publication = getRuntimePublicationService();
+		const publicationRuns = candidates.flatMap((row) =>
+			row.logicalRunId && row.deliverTo
+				? [
+						{
+							producerKind: "agent" as const,
+							taskId: row.id,
+							logicalRunId: row.logicalRunId,
+							recipientId: row.deliverTo.narratorId,
+						},
+					]
+				: [],
+		);
+		const publicationStates = new Map(
+			(await publication.readRunPublicationStates(publicationRuns, options)).map((state, index) => [
+				publicationRuns[index].taskId,
+				state,
+			]),
+		);
+		const initialDestinationCalls = await readDestinationCalls(
+			candidates.flatMap((row) => (row.deliverTo ? [row.deliverTo] : [])),
+			options,
+		);
+		const rows: typeof candidates = [];
+		for (const row of candidates) {
+			const run =
+				row.logicalRunId && row.deliverTo
+					? {
+							producerKind: "agent" as const,
+							taskId: row.id,
+							logicalRunId: row.logicalRunId,
+							recipientId: row.deliverTo.narratorId,
+						}
+					: null;
+			const publicationState = publicationStates.get(row.id) ?? { state: "none" as const };
+			if (publicationState.state !== "settled") {
+				// Idle rows entered this set only through the verified retained manifest.
+				if (restartEligible(row) || row.status === "idle") rows.push(row);
 				continue;
 			}
-			if (!automaticResumeEnabled() && Array.isArray(call.permissionSuggestions)) {
-				for (const suggestion of call.permissionSuggestions) {
-					if (
-						suggestion &&
-						typeof suggestion === "object" &&
-						"requestId" in suggestion &&
-						typeof suggestion.requestId === "string"
-					) {
-						processState.permissionToolCalls.set(suggestion.requestId, call.id);
+			const result = run
+				? await publication.readAgentTerminalResult(run, { includeEventKind: true }, options)
+				: null;
+			// A crash after the terminal transaction but before idle needs delivery only.
+			// The durable terminal evidence is authoritative; never execute the model again,
+			// even when the result snapshot itself can no longer be read.
+			const eventKind = result?.eventKind ?? publicationState.eventKind;
+			const settled = runAtomicWrite(db, "restart.settledNarrator", (tx) => {
+				assertRestartRecoveryObservation(tx, { narrator: narratorObservation(row) });
+				return tx
+					.update(narrators)
+					.set({
+						status: "idle",
+						substatus: JSON.stringify([
+							!eventKind
+								? "interrupted"
+								: eventKind === "failed"
+									? "error"
+									: eventKind === "timed_out"
+										? "timeout"
+										: eventKind === "cancelled"
+											? "interrupted"
+											: "unread",
+						]),
+						...(!result
+							? {
+									errorMessage:
+										"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
+								}
+							: {}),
+					})
+					.where(eq(narrators.id, row.id))
+					.returning()
+					.get();
+			});
+			if (!settled) throw new RuntimeReadConflictError();
+			Object.assign(row, { status: settled.status, substatus: settled.substatus });
+			publication.schedule();
+			// A foreground caller may have crashed before saving its tool result. Preserve
+			// its continuation; run.ts observes this committed snapshot before any model pass.
+			if (row.deliverTo?.toolCallId) {
+				const call = destinationCall(initialDestinationCalls, row.deliverTo);
+				if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
+			}
+		}
+		// A live loop recorded at shutdown also authorizes its own unchanged run, even
+		// when it delivers to nobody. Historical active rows (or rows without a run ID) do not.
+		const recordedRuns = new Map(
+			previous?.targets
+				.filter(
+					(target) =>
+						target.logicalRunId &&
+						previous.snapshot.narrators.some((entry) => entry.narratorId === target.narratorId),
+				)
+				.map((target) => [target.narratorId, target.logicalRunId]),
+		);
+		const explicitIds = new Set(
+			rows
+				.filter((row) => row.logicalRunId && recordedRuns.get(row.id) === row.logicalRunId)
+				.map((row) => row.id),
+		);
+		// A run that delivers its result is resumed; the session it delivers to (and so on
+		// up) is selected too, because it waits for that result exactly once.
+		const delegated = rows.filter((row) => row.deliverTo);
+		const selectedIds = new Set([
+			...explicitIds,
+			...delegated.map((row) => row.id),
+			...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
+		]);
+		for (const row of delegated) {
+			let caller = rows.find((entry) => entry.id === row.deliverTo?.narratorId);
+			while (caller && !selectedIds.has(caller.id)) {
+				selectedIds.add(caller.id);
+				caller = rows.find((entry) => entry.id === caller?.deliverTo?.narratorId);
+			}
+		}
+		if (!selectedIds.size) {
+			if (previous) await removeManifest(previous.snapshot.updateEpoch);
+			return empty;
+		}
+		const selected = rows.filter((row) => selectedIds.has(row.id));
+		// If manifest publication or any repair fails, startup can still settle these known runs.
+		options.onTargetsDiscovered?.(selected.map((row) => row.id));
+		const snapshot: PlannedUpdateRecoverySnapshot = {
+			version: 2,
+			updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,
+			capturedAt: previous?.snapshot.capturedAt ?? new Date().toISOString(),
+			narrators: selected.flatMap((row) => {
+				const saved = previous?.targets.some(
+					(target) => target.narratorId === row.id && target.logicalRunId === row.logicalRunId,
+				)
+					? previous.snapshot.narrators.find((target) => target.narratorId === row.id)
+					: undefined;
+				// Caller discovery is not evidence that its independent loop was live. Keep
+				// its continuation, but do not manufacture standalone restart authorization.
+				return saved ? [saved] : row.deliverTo ? [{ narratorId: row.id, locale: "en" }] : [];
+			}),
+		};
+		const manifest: RestartManifest = {
+			version: 1,
+			snapshot,
+			targets: selected.map((row) => ({ narratorId: row.id, logicalRunId: row.logicalRunId })),
+		};
+		// Write eligibility before repairing tools. A crash between writes can safely repeat repair.
+		await writeManifest(manifest);
+		manifestIdentities.set(snapshot.updateEpoch, { text: JSON.stringify(manifest) });
+		registerRecoverySource(
+			{
+				updateEpoch: snapshot.updateEpoch,
+				kind: "ordinary",
+				capturedAt: snapshot.capturedAt,
+				narrators: selected.map(
+					(row) =>
+						snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
+							narratorId: row.id,
+							locale: "en",
+						},
+				),
+				pendingNarratorIds: manifest.targets.map((target) => target.narratorId),
+				logicalRuns: manifest.targets,
+			},
+			{ validateManifest: () => assertManifestIdentity(snapshot.updateEpoch) },
+		);
+		const { cleanupIncompleteNarratorOutput } = await import("./narrator-output-recovery");
+		for (const row of selected) await cleanupIncompleteNarratorOutput(row.id);
+		const protection = empty.protection;
+		for (const id of selectedIds) protection.narratorIds.add(id);
+
+		const destinationCalls = await readDestinationCalls(
+			delegated.map((child) => child.deliverTo as RunDeliverTo),
+			options,
+		);
+		const delegatedTasks = delegated.length
+			? await readQuery(
+					db
+						.select(RESTART_TASK_COLUMNS)
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.type, "agent"),
+								or(
+									inArray(
+										backgroundTasks.id,
+										delegated.map((row) => row.id),
+									),
+									inArray(
+										backgroundTasks.subagentNarratorId,
+										delegated.map((row) => row.id),
+									),
+								),
+							),
+						)
+						.limit(MAX_TARGETS + 1),
+					{ ...options, executionPolicy: "worker-required", maxRows: MAX_TARGETS + 1 },
+				)
+			: [];
+		if (delegatedTasks.length > MAX_TARGETS) throw new Error("Too many delegated restart tasks");
+		const interruptedCalls = await readRestartCalls(
+			selected.map((row) => row.id),
+			options,
+		);
+		const continuations = new Map(
+			(
+				await toolContinuationService.getByToolCallIds(
+					[...destinationCalls, ...interruptedCalls].map((call) => call.id),
+					options,
+				)
+			).map((record) => [record.toolCallId, record]),
+		);
+		const representedChildren = new Set<string>();
+		for (const child of delegated) {
+			const deliverTo = child.deliverTo as RunDeliverTo;
+			const call = destinationCall(destinationCalls, deliverTo);
+			if (!call || plannedProtection.toolCallIds.has(call.id)) continue;
+			const tasks = delegatedTasks.filter(
+				(task) => task.id === child.id || task.subagentNarratorId === child.id,
+			);
+			if (tasks.length > 1) throw new RuntimeReadConflictError();
+			const task = tasks[0];
+			const background = task?.status === "running";
+			// A historical Agent result is not the owner of a later follow-up run.
+			if (!background && (call.status === "success" || call.status === "fail")) continue;
+			if (!background && !selectedIds.has(call.narratorId)) continue;
+			if (background && task) protection.backgroundTaskIds.add(task.id);
+			await putColdContinuation(
+				{
+					recoveryObservation: {
+						narrator: narratorObservation(child),
+						tool: call,
+						task: task ?? null,
+					},
+					toolCallId: call.id,
+					narratorId: call.narratorId,
+					updateEpoch: snapshot.updateEpoch,
+					kind: background ? "background_agent" : "foreground_agent",
+					payloadJson: {
+						subagentId: child.id,
+						logicalRunId: child.logicalRunId,
+						ordinaryRestart: true,
+						...(background && task
+							? {
+									backgroundTaskId: task.id,
+									backgroundTaskAlias: task.alias,
+									parentNarratorId: call.narratorId,
+								}
+							: {}),
+					},
+				},
+				continuations.get(call.id) ?? null,
+				options,
+			);
+			protection.toolCallIds.add(call.id);
+			representedChildren.add(child.id);
+		}
+		for (const row of selected) {
+			const calls = interruptedCalls.filter((call) => call.narratorId === row.id);
+			if (calls.length > 1_000) throw new Error("Too many interrupted tools for one narrator");
+			for (const call of calls) {
+				if (protection.toolCallIds.has(call.id) || plannedProtection.toolCallIds.has(call.id))
+					continue;
+				const disposition = restartToolDisposition(call);
+				if (disposition === "execution_unknown") {
+					await narratorPersistence.updateToolCallResultIfActive(
+						call.toolUseId,
+						{
+							status: "fail",
+							output: RESTART_EXECUTION_UNKNOWN,
+							errorMessage: RESTART_EXECUTION_UNKNOWN,
+							completedAt: Date.now(),
+						},
+						call.messageId,
+						call.id,
+						{ narrator: narratorObservation(row), tool: call },
+					);
+					continue;
+				}
+				if (!automaticResumeEnabled() && Array.isArray(call.permissionSuggestions)) {
+					for (const suggestion of call.permissionSuggestions) {
+						if (
+							suggestion &&
+							typeof suggestion === "object" &&
+							"requestId" in suggestion &&
+							typeof suggestion.requestId === "string"
+						) {
+							processState.permissionToolCalls.set(suggestion.requestId, call.id);
+						}
 					}
 				}
+				await putColdContinuation(
+					{
+						recoveryObservation: { narrator: narratorObservation(row), tool: call },
+						toolCallId: call.id,
+						narratorId: row.id,
+						updateEpoch: snapshot.updateEpoch,
+						kind: disposition === "permission" ? "pending_permission" : "deferred_tool",
+						state: disposition === "permission" ? "waiting" : "paused",
+						payloadJson: {
+							permissionMode: "normal",
+							ordinaryRestart: true,
+							preservePendingPermission: disposition === "permission",
+						},
+					},
+					continuations.get(call.id) ?? null,
+					options,
+				);
+				protection.toolCallIds.add(call.id);
 			}
-			await putColdContinuation({
-				toolCallId: call.id,
-				narratorId: row.id,
-				updateEpoch: snapshot.updateEpoch,
-				kind: disposition === "permission" ? "pending_permission" : "deferred_tool",
-				state: disposition === "permission" ? "waiting" : "paused",
-				payloadJson: {
-					permissionMode: "normal",
-					ordinaryRestart: true,
-					preservePendingPermission: disposition === "permission",
-				},
+		}
+		const queuedOwners = new Set(
+			(await toolContinuationService.listByEpoch(snapshot.updateEpoch, options))
+				.filter((record) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record))
+				.map((record) => record.narratorId),
+		);
+		for (const row of selected) {
+			if (!row.deliverTo && !queuedOwners.has(row.id) && !explicitIds.has(row.id)) {
+				protection.narratorIds.delete(row.id);
+			}
+		}
+		// Ancestors discovered through a historical/finished Agent call have no loop to
+		// mount. Keep their run facts for tool adoption, but not as pending standalone work.
+		const source = getRegisteredRecoverySource(snapshot.updateEpoch);
+		if (source)
+			registerRecoverySource(source).update({
+				...source,
+				pendingNarratorIds: source.pendingNarratorIds.filter((id) =>
+					protection.narratorIds.has(id),
+				),
 			});
-			protection.toolCallIds.add(call.id);
-		}
-	}
-	const queuedOwners = new Set(
-		(await toolContinuationService.listByEpoch(snapshot.updateEpoch))
-			.filter((record) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record))
-			.map((record) => record.narratorId),
-	);
-	for (const row of selected) {
-		if (!row.deliverTo && !queuedOwners.has(row.id) && !explicitIds.has(row.id)) {
-			protection.narratorIds.delete(row.id);
-		}
-	}
-	// Ancestors discovered through a historical/finished Agent call have no loop to
-	// mount. Keep their run facts for tool adoption, but not as pending standalone work.
-	const source = getRegisteredRecoverySource(snapshot.updateEpoch);
-	if (source)
-		registerRecoverySource(source).update({
-			...source,
-			pendingNarratorIds: source.pendingNarratorIds.filter((id) => protection.narratorIds.has(id)),
+		// Represented children are driven by Agent continuations; standalone children mount independently.
+		logger.info("Prepared ordinary restart recovery", {
+			targetCount: selected.length,
+			agentCount: representedChildren.size,
+			toolCount: protection.toolCallIds.size,
+			automaticResume: automaticResumeEnabled(),
 		});
-	// Represented children are driven by Agent continuations; standalone children mount independently.
-	logger.info("Prepared ordinary restart recovery", {
-		targetCount: selected.length,
-		agentCount: representedChildren.size,
-		toolCount: protection.toolCallIds.size,
-		automaticResume: automaticResumeEnabled(),
-	});
-	const prepared = { manifest, protection, heldRunIds: held };
-	if (!automaticResumeEnabled()) {
-		processState.pausedRecovery = prepared;
-		// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
-		// while keeping permission/tool records protected and available for a manual resume.
-		return { manifest, protection: { ...protection, narratorIds: held }, heldRunIds: held };
+		const prepared = { manifest, protection, heldRunIds: held };
+		if (!automaticResumeEnabled()) {
+			processState.pausedRecovery = prepared;
+			// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
+			// while keeping permission/tool records protected and available for a manual resume.
+			return { manifest, protection: { ...protection, narratorIds: held }, heldRunIds: held };
+		}
+		return prepared;
+	} catch (error) {
+		processState.prepared = false;
+		throw error;
 	}
-	return prepared;
 }
 
-async function putColdContinuation(input: Parameters<typeof toolContinuationService.upsert>[0]) {
-	const previous = await toolContinuationService.getByToolCallId(input.toolCallId);
+async function putColdContinuation(
+	input: Parameters<typeof toolContinuationService.upsert>[0],
+	previous: Awaited<ReturnType<typeof toolContinuationService.getByToolCallId>>,
+	options: RecoveryReadOptions = {},
+) {
 	if (!previous) {
-		await toolContinuationService.upsert(input);
+		await toolContinuationService.upsert(input, previous, options);
 		return;
 	}
 	if (previous.state === "cancelled" || isToolContinuationOwnerMounted(previous)) return;
@@ -715,10 +898,16 @@ async function putColdContinuation(input: Parameters<typeof toolContinuationServ
 	)
 		return;
 	if (previous.updateEpoch !== input.updateEpoch) {
-		const pass = await toolContinuationService.beginOrdinaryColdAdoptionPass({
-			rootEpoch: input.updateEpoch,
-			toolCallId: input.toolCallId,
-		});
+		const pass = await toolContinuationService.beginOrdinaryColdAdoptionPass(
+			{
+				rootEpoch: input.updateEpoch,
+				toolCallId: input.toolCallId,
+				observation: input.recoveryObservation?.tool
+					? { continuation: previous, tool: input.recoveryObservation.tool }
+					: undefined,
+			},
+			options,
+		);
 		try {
 			const adopted = await toolContinuationService.controlledOrdinaryColdAdoption(
 				input,
@@ -735,10 +924,19 @@ async function putColdContinuation(input: Parameters<typeof toolContinuationServ
 		}
 		return;
 	}
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, input.toolCallId),
-		columns: { executionAttempt: true, executionStartedAt: true },
-	});
+	const call =
+		input.recoveryObservation?.tool ??
+		(await readQueryFirst(
+			db
+				.select({
+					executionAttempt: narratorToolCalls.executionAttempt,
+					executionStartedAt: narratorToolCalls.executionStartedAt,
+				})
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, input.toolCallId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		));
 	if (!call) return;
 	const pass = toolContinuationService.beginColdRecoveryPass({
 		rootEpoch: input.updateEpoch,
@@ -753,6 +951,7 @@ async function putColdContinuation(input: Parameters<typeof toolContinuationServ
 			sourceEpoch: previous.updateEpoch,
 			executionAttempt: call.executionAttempt,
 			authorization: pass.authorization,
+			observed: previous,
 		};
 		if (input.kind === "foreground_agent" || input.kind === "background_agent") {
 			const subagentId = input.payloadJson?.subagentId;
@@ -772,7 +971,7 @@ async function putColdContinuation(input: Parameters<typeof toolContinuationServ
 		if (previous.updateEpoch !== input.updateEpoch || previous.state === "resuming") {
 			throw new Error(`Cold recovery cannot prove execution identity for ${input.toolCallId}`);
 		}
-		await toolContinuationService.upsert(input);
+		await toolContinuationService.upsert(input, previous, options);
 	} finally {
 		pass.close();
 	}
@@ -788,28 +987,45 @@ export async function restoreCarriedOrdinaryTargets(
 	driven: ReadonlySet<string>,
 	includedNarratorIds?: ReadonlySet<string>,
 	humanReplyContext?: { narratorId: string; context: ReplyContext },
+	options: RecoveryReadOptions = {},
 ): Promise<void> {
 	const { continueNarrator } = await import("./narrator-session");
 	const failures: string[] = [];
-	for (const target of source.logicalRuns ?? []) {
-		if (
-			driven.has(target.narratorId) ||
-			(includedNarratorIds && !includedNarratorIds.has(target.narratorId))
-		)
-			continue;
+	const targets = (source.logicalRuns ?? []).filter(
+		(target) =>
+			!driven.has(target.narratorId) &&
+			(!includedNarratorIds || includedNarratorIds.has(target.narratorId)),
+	);
+	const observations = new Map<string, RestartNarrator>();
+	const ids = [...new Set(targets.map((target) => target.narratorId))];
+	for (let offset = 0; offset < ids.length; offset += 100) {
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, ids.slice(offset, offset + 100)),
+				columns: RESTART_NARRATOR_COLUMNS,
+			}),
+			{
+				signal: options.signal,
+				deadlineAt: options.deadlineAt,
+				timeoutMs: options.timeoutMs,
+				executionPolicy: "worker-required",
+				maxRows: 100,
+			},
+		);
+		for (const row of rows) observations.set(row.id, row);
+	}
+	for (const target of targets) {
 		try {
 			await withRecoveryAdvance(source.updateEpoch, async () => {
 				const current = getRecoverySource(source.updateEpoch);
 				if (!current?.pendingNarratorIds.includes(target.narratorId)) return;
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, target.narratorId),
-					columns: { id: true, logicalRunId: true, status: true, substatus: true },
-				});
+				options.signal?.throwIfAborted();
+				const row = observations.get(target.narratorId);
 				const saved = current.narrators.find((entry) => entry.narratorId === target.narratorId);
 				const valid =
 					row &&
 					row.logicalRunId === target.logicalRunId &&
-					(!!(await deliverToOf(row.id)) || (!!target.logicalRunId && !!saved)) &&
+					(!!runDeliverToOf(row) || (!!target.logicalRunId && !!saved)) &&
 					(restartEligible(row) ||
 						(row.status === "idle" &&
 							parseSubstatus(row.substatus).includes("interrupted") &&
@@ -828,6 +1044,8 @@ export async function restoreCarriedOrdinaryTargets(
 							resumeRunId: row.logicalRunId ?? undefined,
 							recovered: true,
 							deliver: false,
+							recoveryObservation: row,
+							cancelSignal: options.signal,
 						},
 						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
 					);
@@ -841,6 +1059,7 @@ export async function restoreCarriedOrdinaryTargets(
 					});
 			});
 		} catch (error) {
+			if (error instanceof RuntimeReadConflictError) throw error;
 			failures.push(target.narratorId);
 			logger.error("Could not resume interrupted standalone narrator", {
 				narratorId: target.narratorId,
@@ -854,7 +1073,7 @@ export async function restoreCarriedOrdinaryTargets(
 
 export async function restoreOrdinaryRestartRecovery(
 	prepared: RestartStartupRecovery,
-	options: {
+	options: RecoveryReadOptions & {
 		manual?: boolean;
 		includedNarratorIds?: ReadonlySet<string>;
 		humanReplyContext?: { narratorId: string; context: ReplyContext };
@@ -862,7 +1081,9 @@ export async function restoreOrdinaryRestartRecovery(
 ) {
 	if (!prepared.manifest || (!options.manual && !automaticResumeEnabled())) return null;
 	const { manifest, protection } = prepared;
-	const records = (await toolContinuationService.listByEpoch(manifest.snapshot.updateEpoch)).filter(
+	const records = (
+		await toolContinuationService.listByEpoch(manifest.snapshot.updateEpoch, options)
+	).filter(
 		(record) =>
 			record.state !== "cancelled" &&
 			!isToolContinuationOwnerMounted(record) &&
@@ -889,6 +1110,7 @@ export async function restoreOrdinaryRestartRecovery(
 					driven,
 					options.includedNarratorIds,
 					options.humanReplyContext,
+					options,
 				),
 			onQueueCompleted: async () => {
 				if (!options.includedNarratorIds) {
@@ -914,6 +1136,7 @@ export async function restoreOrdinaryRestartRecovery(
 export async function manuallyResumeRestartRecovery(
 	narratorId: string,
 	humanReplyContext?: ReplyContext,
+	options: RecoveryReadOptions = {},
 ): Promise<boolean> {
 	const context = parseReplyContext(humanReplyContext);
 	const prepared = processState.pausedRecovery;
@@ -921,6 +1144,7 @@ export async function manuallyResumeRestartRecovery(
 	const ids = new Set([narratorId]);
 	const rows = await withDeliverTo(
 		prepared.manifest.targets.slice(0, MAX_TARGETS).map((target) => ({ id: target.narratorId })),
+		options,
 	);
 	// The chosen session plus every run that (transitively) delivers to it.
 	for (let changed = true; changed; ) {
@@ -934,6 +1158,7 @@ export async function manuallyResumeRestartRecovery(
 		}
 	}
 	const handle = await restoreOrdinaryRestartRecovery(prepared, {
+		...options,
 		manual: true,
 		includedNarratorIds: ids,
 		humanReplyContext: context ? { narratorId, context } : undefined,

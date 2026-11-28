@@ -1,4 +1,12 @@
 import { lstat, realpath } from "node:fs/promises";
+import type {
+	GitStatusPageCacheState,
+	GitStatusPageQuery,
+	GitStatusPageScopeProof,
+	GitStatusPageStatsQuery,
+} from "@shared/git-status-page";
+import type { GitLineStats } from "../../shared/git-line-stats";
+import type { PathFlavor } from "../lib/agent/execution/path-semantics";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { gitDiscoveryCache } from "./git-discovery-cache";
@@ -6,25 +14,46 @@ import { getGitLineStats } from "./git-line-stats";
 import {
 	getGitLineStatsCached,
 	invalidateGitLineStats,
+	invalidateLocalGitLineStats,
 	validateGitLineStatsCache,
 } from "./git-line-stats-cache";
 import { gitService, withGitRequestContext } from "./git-service";
 import { invalidateStatus } from "./git-status-cache";
 import {
+	assertGitStatusPageScope,
+	type GitStatusPageSource,
+	getGitStatusPagesCacheState,
+	invalidateGitStatusPageStats,
+	invalidateGitStatusPages,
+	observeGitStatusPages,
+	readGitStatusPage,
+	readGitStatusPageStats,
+	releaseGitStatusPages,
+	retainGitStatusPages,
+	validateGitStatusPages,
+} from "./git-status-page";
+import {
 	getLocalGitStatusQueryKey,
 	invalidateGitStatusQuery,
+	invalidateLocalGitStatusQueries,
 	validateGitStatusQuery,
 } from "./git-status-query";
 import { type GitWorkspaceTarget, normalizeWorkspacePath } from "./git-workspace";
 import { createRemoteGitService, getRemoteGitStatusQueryKey } from "./remote-git-service";
 import type { WorkspaceAttributionScope } from "./workspace-modification-view";
 
+// All existing local writes, file mutations and remote writes publish this bounded identity.
+// Subscribe once for the service lifetime; authorization still runs before every page read.
+eventBus.on("git:workspace_invalidated", ({ queryKey }) => {
+	invalidateGitStatusPages(queryKey);
+	invalidateGitStatusPageStats(queryKey);
+});
+
 export function gitManagementService(target: GitWorkspaceTarget, signal?: AbortSignal) {
 	if (!target.backend)
 		throw new AppError("Git execution device unavailable", 409, "GIT_WORKSPACE_UNAVAILABLE");
-	return target.backend.kind === "remote"
-		? createRemoteGitService(target.backend, signal, target.beforeWrite)
-		: gitService;
+	if (target.backend.kind !== "remote") return gitService;
+	return createRemoteGitService(target.backend, signal, target.beforeWrite);
 }
 
 /** Caller must authorize the workspace on every request, before any cache lookup. */
@@ -38,6 +67,141 @@ export function getGitWorkspaceStatus(
 	const path = target.workspace.rootPath;
 	const read = () => gitManagementService(target, signal).getStatusSummary(path, { ttlMs });
 	return signal ? withGitRequestContext(signal, read) : read();
+}
+
+/** Build sources only from a freshly authorized canonical target, never a client cwd. */
+function gitStatusPageTarget(target: GitWorkspaceTarget) {
+	const { backend, workspace } = target;
+	if (!backend || !workspace.rootPath || !workspace.workspaceKey)
+		throw new AppError("Git execution device unavailable", 409, "GIT_WORKSPACE_UNAVAILABLE");
+	const cwd = workspace.rootPath;
+	const queryKey =
+		backend.kind === "remote"
+			? getRemoteGitStatusQueryKey(backend, cwd)
+			: getLocalGitStatusQueryKey(cwd);
+	const source: GitStatusPageSource =
+		backend.kind === "remote"
+			? {
+					kind: "remote",
+					identity: queryKey,
+					async read(readSignal) {
+						const result = await createRemoteGitService(backend, readSignal).getRawStatus(cwd);
+						const complete =
+							backend.supportsGitWorkspaceStatus === true &&
+							result.totalFilesExact === true &&
+							result.truncated === false &&
+							typeof result.outputs?.status === "string";
+						return {
+							stdout: result.outputs?.status ?? "",
+							complete,
+							...(!complete
+								? {
+										limitReason: result.truncated
+											? ("remote-truncated" as const)
+											: ("remote-incomplete" as const),
+									}
+								: {}),
+						};
+					},
+				}
+			: { kind: "local", cwd };
+	return { queryKey, source, workspaceKey: workspace.workspaceKey };
+}
+
+/** Every page is authorized independently before any snapshot lookup. */
+export function getGitWorkspaceStatusPage(
+	target: GitWorkspaceTarget,
+	actorId: string,
+	query: GitStatusPageQuery,
+	signal?: AbortSignal,
+) {
+	const { queryKey, source, workspaceKey } = gitStatusPageTarget(target);
+	return readGitStatusPage({ scope: { actorId, workspaceKey, queryKey }, source, query, signal });
+}
+
+/** Statistics share the authorized page identity and its pinned execution transport. */
+export function getGitWorkspaceStatusPageStats(
+	target: GitWorkspaceTarget,
+	actorId: string,
+	query: GitStatusPageStatsQuery,
+	signal?: AbortSignal,
+) {
+	const pinnedTarget = { ...target, workspace: { ...target.workspace } };
+	const { queryKey, source, workspaceKey } = gitStatusPageTarget(pinnedTarget);
+	return readGitStatusPageStats({
+		scope: { actorId, workspaceKey, queryKey },
+		source,
+		query,
+		signal,
+	});
+}
+
+/** Shared producer receives full measurements before the bounded WebSocket projection. */
+export function observeGitWorkspaceStatusPages(
+	target: GitWorkspaceTarget,
+	signal: AbortSignal,
+	readStats: (signal: AbortSignal) => Promise<GitLineStats>,
+	onPublished?: (cache: GitStatusPageCacheState) => void,
+) {
+	const { queryKey, source } = gitStatusPageTarget(target);
+	return observeGitStatusPages({ queryKey, source, signal, readStats, onPublished });
+}
+export function getGitWorkspaceStatusPagesCacheState(
+	target: GitWorkspaceTarget,
+	signal?: AbortSignal,
+) {
+	const { queryKey, source } = gitStatusPageTarget(target);
+	return getGitStatusPagesCacheState({ queryKey, source, signal });
+}
+export function retainGitWorkspaceStatusPages(target: GitWorkspaceTarget): void {
+	if (!target.backend || !target.workspace.rootPath || !target.workspace.workspaceKey) return;
+	const { queryKey, source } = gitStatusPageTarget(target);
+	retainGitStatusPages(queryKey, source);
+}
+export function releaseGitWorkspaceStatusPages(target: GitWorkspaceTarget): void {
+	if (!target.backend || !target.workspace.rootPath || !target.workspace.workspaceKey) return;
+	const { queryKey, source } = gitStatusPageTarget(target);
+	releaseGitStatusPages(queryKey, source);
+}
+
+/** Watch uncertainty is checked in the paging Worker, independently of summary revalidation. */
+export function validateGitWorkspaceStatusPages(target: GitWorkspaceTarget, signal?: AbortSignal) {
+	const { queryKey, source } = gitStatusPageTarget(target);
+	return validateGitStatusPages({ queryKey, source, signal });
+}
+
+/** Called within the existing repository write lock, before a scoped Git mutation. */
+export function assertGitWorkspaceStatusPageScope(
+	target: GitWorkspaceTarget,
+	actorId: string,
+	proof: GitStatusPageScopeProof,
+	files: string[],
+	signal?: AbortSignal,
+) {
+	const { queryKey, source, workspaceKey } = gitStatusPageTarget(target);
+	return assertGitStatusPageScope({
+		scope: { actorId, workspaceKey, queryKey },
+		source,
+		proof,
+		files,
+		signal,
+	});
+}
+
+/** Refresh summary/statistics without declaring that the file snapshot changed. */
+export function invalidateGitWorkspaceFacts(target: GitWorkspaceTarget): void {
+	const { backend, workspace } = target;
+	if (!backend || !workspace.rootPath) return;
+	if (backend.kind === "remote") {
+		const key = getRemoteGitStatusQueryKey(backend, workspace.rootPath);
+		invalidateGitStatusQuery(key);
+		invalidateGitLineStats(key);
+		invalidateGitStatusPageStats(key);
+	} else {
+		invalidateLocalGitStatusQueries(workspace.rootPath);
+		invalidateLocalGitLineStats(workspace.rootPath);
+		invalidateGitStatusPageStats(getLocalGitStatusQueryKey(workspace.rootPath));
+	}
 }
 
 /** Called only after per-request workspace authorization, independently of status. */
@@ -139,14 +303,19 @@ export function gitAttributionScopes(target: GitWorkspaceTarget, files: string[]
 	return { scopes: [...scopes.values()], truncated };
 }
 
-export function validateFilePaths(files: string[]): void {
-	if (files.length > 1000) throw new ValidationError("Too many file paths");
+export function validateFilePaths(
+	files: string[],
+	maxPaths = 1000,
+	pathFlavor: PathFlavor = process.platform === "win32" ? "windows" : "posix",
+): void {
+	if (files.length > maxPaths) throw new ValidationError("Too many file paths");
 	for (const path of files) {
 		if (
 			!path ||
 			path.length > 4096 ||
 			path.split(/[\\/]/).some((part) => part === ".." || part.toLowerCase() === ".git") ||
-			/^[\\/]|^[a-z]:/i.test(path) ||
+			/^[\\/]|^[a-z]:[\\/]/i.test(path) ||
+			(pathFlavor === "windows" && path.includes(":")) ||
 			path.includes("\0")
 		)
 			throw new ValidationError(`Invalid file path: ${path}`);
@@ -157,8 +326,9 @@ export function validateFilePaths(files: string[]): void {
 export async function validateGitFileTargets(
 	target: GitWorkspaceTarget,
 	files: string[],
+	maxPaths = 1000,
 ): Promise<void> {
-	validateFilePaths(files);
+	validateFilePaths(files, maxPaths, target.backend?.pathFlavor);
 	if (!target.backend || !target.workspace.rootPath)
 		throw new ValidationError("Git workspace unavailable");
 	if (target.backend.kind === "remote") return; // Atomic executor guards use the target OS and path policy.

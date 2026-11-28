@@ -98,6 +98,24 @@ export interface ToolExecutionLifecycleContext {
 	binding?: ToolCallBinding;
 }
 
+/** A finished tool call as `AgentConfig.annotateToolResult` sees it. */
+export interface ToolResultAnnotationInput {
+	toolName: string;
+	toolUseId: string;
+	/** The input the tool actually ran with. */
+	input: Record<string, unknown>;
+	/** The result text the model would get. */
+	output: string;
+	isError: boolean;
+	metadata?: Record<string, unknown>;
+	/** The working directory the call ran in. */
+	cwd: string;
+	/** The call ran on this server and the session's default device is this server too. */
+	local: boolean;
+	/** Where the executor's or the tool's own truncation saved the full output, if it did. */
+	fullOutputPath?: string;
+}
+
 /** Final authorization uses the immutable admitted input/target, never a live cwd hint. */
 export interface ToolFinalStartAuthorizationContext extends ToolExecutionLifecycleContext {
 	executionBackend?: import("./execution/backend").ExecutionBackend;
@@ -558,6 +576,7 @@ export type AgentEvent =
 	| {
 			type: "block_complete";
 			block: ContentBlock;
+			sealedReasoningLength?: number;
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
@@ -687,6 +706,8 @@ export type AgentEvent =
 	| {
 			type: "payment_required";
 			message: string;
+			/** 专用于该失败请求的钱包证明；不含公开 CID/私有 identity。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;
@@ -770,7 +791,13 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
-	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
+	| {
+			type: "quota_balance";
+			quotaBalance: string | null;
+			detailedQuotaBalance?: string | null;
+			/** Request-start credential identity; stale events cannot update a replacement key/network. */
+			providerIdentity?: string;
+	  }
 	| {
 			type: "invalid_state";
 			reason: string;
@@ -940,7 +967,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"ExtractPipeline",
 	"Bash",
 	"Agent",
-	"Await",
+	"Watch",
 	"Stop",
 	"Send",
 	"TeamStatus",
@@ -1171,6 +1198,13 @@ export interface AgentConfig {
 		context: ToolExecutionLifecycleContext & { result?: ToolResult; error?: unknown },
 	) => Promise<void> | void;
 	/**
+	 * Rewrite the text of a finished tool result before it is returned (and persisted): a
+	 * team coordinator's soft-limit reminders (Project Teams P2). Runs after the tool body,
+	 * so the call itself is never changed or refused. Null keeps the output; a throw is
+	 * logged and keeps the output.
+	 */
+	annotateToolResult?: (call: ToolResultAnnotationInput) => Promise<string | null>;
+	/**
 	 * Persist an already-started tool's final result after the bounded abort drain
 	 * closed its event consumer. Never routes through a newer run's streaming state
 	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
@@ -1211,6 +1245,12 @@ export interface AgentConfig {
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** Resolve a fresh tier per attempt; undefined disables the static tier. */
+	resolveServiceTier?: (request: {
+		provider: string;
+		model: string;
+		signal: AbortSignal;
+	}) => string | undefined | Promise<string | undefined>;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**
@@ -1282,8 +1322,8 @@ export interface AgentConfig {
 	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
 	/** Whether the initial history ends with tool results the model has not answered. */
 	historyEndsWithToolResults?: boolean;
-	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
-	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
+	/** Pending input or external work will wake this session; empty/reasoning-only replies may idle. */
+	hasPendingWake?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
@@ -1387,7 +1427,7 @@ export interface AgentConfig {
 	 * the response produced still runs, and the loop ends the turn once the step's tools
 	 * have settled instead of sending the next provider request. One-shot like shouldStop.
 	 */
-	shouldYieldToInput?: () => boolean;
+	shouldYieldToInput?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cut the provider response at the next tool-call
 	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
 	 * Supply a fresh signal for each loop invocation. */

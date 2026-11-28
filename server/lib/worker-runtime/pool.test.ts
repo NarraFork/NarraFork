@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { WorkerCleanupError, WorkerHandle } from "./lifecycle";
 import {
 	type PoolWorker,
 	WorkerPool,
@@ -699,7 +700,522 @@ for (const idleTimeoutMs of [0, -1, 0.5, Number.NaN, 2_147_483_648]) {
 	});
 }
 
+describe("WorkerPool reserved native capacity", () => {
+	test("normal starting owners saturate only shared cells and a later short task completes", async () => {
+		const ready = gate();
+		const starting = gate();
+		const fixture = setup({
+			concurrency: 4,
+			reservedCapacity: 1,
+			maxQueued: 64,
+			normalQueue: { maxQueued: 48, maxQueuedBytes: 6 * 1024 * 1024 },
+			create: async (_context, id) => {
+				if (id <= 3) {
+					if (id === 3) starting.open();
+					await ready.promise;
+				}
+				return new FakeWorker(id);
+			},
+		});
+		const normal = Array.from({ length: 12 }, (_, i) => observed(fixture.pool.run(i)));
+		await starting.promise;
+		expect(fixture.createCalls).toBe(3);
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ claimed: 3, starting: 3 });
+		expect(fixture.pool.stats.queuedByClass).toEqual({ normal: 9, short: 0 });
+		await expect(fixture.pool.run(99, { taskClass: "short" })).resolves.toBe("4:99");
+		expect(fixture.createCalls).toBe(4);
+		expect(fixture.pool.stats.reservation?.reserved).toMatchObject({ idle: 1, capacity: 1 });
+		ready.open();
+		await Promise.all(normal);
+		expect(fixture.createCalls).toBe(4);
+		expect(fixture.workers.find((worker) => worker.id === 4)?.runs).toHaveLength(1);
+		expect(fixture.pool.stats.reservation?.shared.claimed).toBe(0);
+	});
+
+	test("short tasks borrow all N cells while idle owners stay in their original region", async () => {
+		const running = gate();
+		const finish = gate();
+		let entered = 0;
+		const fixture = setup({
+			concurrency: 4,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				worker.onRun = async (request) => {
+					if (request < 10) {
+						if (++entered === 4) running.open();
+						await finish.promise;
+					}
+					return `${id}:${request}`;
+				};
+				return worker;
+			},
+		});
+		const tasks = Array.from({ length: 4 }, (_, i) =>
+			observed(fixture.pool.run(i, { taskClass: "short" })),
+		);
+		await running.promise;
+		expect(fixture.pool.stats.activeByClass).toEqual({ normal: 0, short: 4 });
+		expect(fixture.pool.stats.reservation?.shared.running).toBe(3);
+		const normal = observed(fixture.pool.run(10));
+		expect(fixture.pool.stats.queuedByClass.normal).toBe(1);
+		finish.open();
+		await Promise.all([...tasks, normal]);
+		await fixture.pool.run(11);
+		await fixture.pool.run(12, { taskClass: "short" });
+		expect(fixture.createCalls).toBe(4);
+		expect(fixture.workers[0]?.runs.map((run) => run.request)).toEqual([0, 12]);
+		expect(
+			fixture.workers
+				.slice(1)
+				.flatMap((worker) => worker.runs)
+				.some((run) => run.request === 10),
+		).toBe(true);
+	});
+
+	test("shared native capacity alternates eligible classes under sustained short traffic", async () => {
+		const reservedEntered = gate();
+		const sharedEntered = gate();
+		const reservedFinish = gate();
+		const sharedFinish = gate();
+		const order: number[] = [];
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				worker.onRun = async (request) => {
+					if (request === -1) {
+						reservedEntered.open();
+						await reservedFinish.promise;
+					} else if (request === -2) {
+						sharedEntered.open();
+						await sharedFinish.promise;
+					} else order.push(request);
+					return String(request);
+				};
+				return worker;
+			},
+		});
+		const reserved = observed(fixture.pool.run(-1, { taskClass: "short" }));
+		await reservedEntered.promise;
+		const shared = observed(fixture.pool.run(-2));
+		await sharedEntered.promise;
+		const n1 = observed(fixture.pool.run(1));
+		const n2 = observed(fixture.pool.run(2));
+		const s1 = observed(fixture.pool.run(101, { taskClass: "short" }));
+		const s2 = observed(fixture.pool.run(102, { taskClass: "short" }));
+		sharedFinish.open();
+		await Promise.all([shared, n1, n2, s1, s2]);
+		expect(order).toEqual([101, 1, 102, 2]);
+		expect(fixture.createCalls).toBe(2);
+		reservedFinish.open();
+		await reserved;
+	});
+
+	test.each([
+		false,
+		true,
+	])("grant-before-work abort restores an unused claim (idle=%s)", async (idle) => {
+		const fixture = setup({ concurrency: 2, reservedCapacity: 1 });
+		if (idle) await fixture.pool.run(1);
+		const controller = new AbortController();
+		const reason = new Error("abort after grant");
+		const events: string[] = [];
+		await expect(
+			fixture.pool.run(2, {
+				signal: controller.signal,
+				onAdmission: (event) => {
+					events.push(event.phase);
+					if (event.phase === "granted") controller.abort(reason);
+				},
+			}),
+		).rejects.toBe(reason);
+		expect(events).toEqual(["granted"]);
+		expect(fixture.createCalls).toBe(idle ? 1 : 0);
+		expect(fixture.pool.stats.reservation?.shared.claimed).toBe(0);
+		expect(fixture.pool.stats.idle).toBe(idle ? 1 : 0);
+		await expect(fixture.pool.run(3)).resolves.toBe("1:3");
+		expect(fixture.createCalls).toBe(1);
+		expect(fixture.workers[0]?.closeCalls).toBe(0);
+	});
+
+	test("failed startup returns its error while its original cell waits for actual exit", async () => {
+		const exit = gate();
+		let stops = 0;
+		const handle = new WorkerHandle(
+			{},
+			exit.promise.then(() => 0),
+			() => stops++,
+		);
+		const failure = new WorkerCleanupError(handle, new Error("startup stop failed"));
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				if (id === 1) throw failure;
+				return new FakeWorker(id);
+			},
+		});
+		await expect(fixture.pool.run(1)).rejects.toBe(failure);
+		expect(fixture.pool.stats).toMatchObject({ active: 0, workers: 1, starting: 0 });
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ quarantined: 1, claimed: 0 });
+		const normal = observed(fixture.pool.run(2));
+		expect(fixture.pool.stats.queued).toBe(1);
+		await expect(fixture.pool.run(3, { taskClass: "short" })).resolves.toBe("2:3");
+		expect(fixture.createCalls).toBe(2);
+		expect(stops).toBe(0);
+		exit.open();
+		await expect(normal).resolves.toBe("3:2");
+		expect(stops).toBe(0);
+		expect(fixture.pool.stats.reservation?.shared.quarantined).toBe(0);
+		expect(fixture.pool.stats.workers).toBe(2);
+	});
+
+	test("short failed startup cannot consume an additional shared owner before its exit", async () => {
+		const exit = gate();
+		const handle = new WorkerHandle(
+			{},
+			exit.promise.then(() => 0),
+			() => {},
+		);
+		const failure = new WorkerCleanupError(handle, new Error("reserved startup stop failed"));
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				if (id === 1) throw failure;
+				return new FakeWorker(id);
+			},
+		});
+		await expect(fixture.pool.run(1, { taskClass: "short" })).rejects.toBe(failure);
+		await expect(fixture.pool.run(2)).resolves.toBe("2:2");
+		await expect(fixture.pool.run(3, { taskClass: "short" })).resolves.toBe("2:3");
+		expect(fixture.pool.stats).toMatchObject({ workers: 2, created: 1 });
+		expect(fixture.pool.stats.reservation?.reserved.quarantined).toBe(1);
+		exit.open();
+		await handle.exited;
+	});
+
+	test("fresh replacement retains its exact cell through both confirmed exits", async () => {
+		const priorExit = gate();
+		const freshExit = gate();
+		const freshClose = gate();
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1) worker.onClose = () => priorExit.promise;
+				if (id === 3)
+					worker.onClose = () => {
+						freshClose.open();
+						return freshExit.promise;
+					};
+				return worker;
+			},
+		});
+		await fixture.pool.run(1);
+		const fresh = observed(fixture.pool.run(2, { fresh: true }));
+		await fixture.workers[0]?.closeStarted.promise;
+		const next = observed(fixture.pool.run(3));
+		await expect(fixture.pool.run(4, { taskClass: "short" })).resolves.toBe("2:4");
+		expect(fixture.createCalls).toBe(2);
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ claimed: 1, retiring: 1 });
+		priorExit.open();
+		await freshClose.promise;
+		expect(fixture.createCalls).toBe(3);
+		expect(fixture.pool.stats.queued).toBe(1);
+		expect(fixture.workers[0]?.stopped).toBe(true);
+		freshExit.open();
+		await expect(fresh).resolves.toBe("3:2");
+		await expect(next).resolves.toBe("4:3");
+		expect(fixture.workers[2]?.stopped).toBe(true);
+		expect(fixture.pool.stats.workers).toBe(2);
+	});
+
+	test("idle retirement blocks only its original region and late exit wakes existing waiters", async () => {
+		const exit = gate();
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			idleTimeoutMs: 15,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1) worker.onClose = () => exit.promise;
+				return worker;
+			},
+		});
+		await fixture.pool.run(1);
+		await fixture.workers[0]?.closeStarted.promise;
+		const next = observed(fixture.pool.run(2));
+		expect(fixture.pool.stats).toMatchObject({ active: 0, queued: 1 });
+		await expect(fixture.pool.run(3, { taskClass: "short" })).resolves.toBe("2:3");
+		expect(fixture.createCalls).toBe(2);
+		exit.open();
+		await expect(next).resolves.toBe("3:2");
+		expect(fixture.workers[0]?.closeCalls).toBe(1);
+	});
+
+	test("a synchronous idle claim clears its TTL before a long task begins", async () => {
+		const entered = gate();
+		const finish = gate();
+		const fixture = setup({ concurrency: 2, reservedCapacity: 1, idleTimeoutMs: 10 });
+		await fixture.pool.run(1);
+		const worker = fixture.workers[0];
+		worker.onRun = async () => {
+			entered.open();
+			await finish.promise;
+			return "held";
+		};
+		const next = observed(fixture.pool.run(2));
+		await entered.promise;
+		await Bun.sleep(25);
+		expect(worker.closeCalls).toBe(0);
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ claimed: 1, running: 1 });
+		finish.open();
+		await expect(next).resolves.toBe("held");
+		expect(fixture.createCalls).toBe(1);
+	});
+
+	test("failed close quarantines the cell without changing another class's capacity", async () => {
+		const failure = new Error("close has no exit proof");
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			reuse: false,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1)
+					worker.onClose = async () => {
+						throw failure;
+					};
+				return worker;
+			},
+		});
+		await expect(fixture.pool.run(1)).rejects.toBe(failure);
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ quarantined: 1, claimed: 0 });
+		const controller = new AbortController();
+		const normal = observed(fixture.pool.run(2, { signal: controller.signal }));
+		await expect(fixture.pool.run(3, { taskClass: "short" })).resolves.toBe("2:3");
+		expect(fixture.createCalls).toBe(2);
+		controller.abort(new Error("cancel only waiting normal"));
+		await expect(normal).rejects.toThrow("cancel only waiting normal");
+		await expect(fixture.pool.close()).rejects.toBe(failure);
+		expect(fixture.workers[0]?.closeCalls).toBe(1);
+		expect(fixture.pool.stats.workers).toBe(1);
+	});
+
+	test("warmup never waits for a busy shared cell and short warmup uses reserved capacity", async () => {
+		const entered = gate();
+		const finish = gate();
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				worker.onRun = async () => {
+					entered.open();
+					await finish.promise;
+					return "done";
+				};
+				return worker;
+			},
+		});
+		const normal = observed(fixture.pool.run(1));
+		await entered.promise;
+		await fixture.pool.warmup();
+		expect(fixture.createCalls).toBe(1);
+		expect(fixture.pool.stats.queued).toBe(0);
+		await fixture.pool.warmup({ taskClass: "short" });
+		expect(fixture.createCalls).toBe(2);
+		expect(fixture.workers[1]?.runs).toHaveLength(0);
+		finish.open();
+		await normal;
+	});
+
+	test.each([
+		"create",
+		"run",
+	] as const)("%s cancellation retains shared capacity until real cleanup", async (phase) => {
+		const entered = gate();
+		const ready = gate();
+		const exit = gate();
+		const closing = gate();
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			create: async (_context, id) => {
+				const worker = new FakeWorker(id);
+				if (id === 1) {
+					worker.onClose = () => {
+						closing.open();
+						return exit.promise;
+					};
+					if (phase === "create") {
+						entered.open();
+						await ready.promise;
+					} else {
+						worker.onRun = async (_request, context) => {
+							entered.open();
+							return aborted(context.signal);
+						};
+					}
+				}
+				return worker;
+			},
+		});
+		const controller = new AbortController();
+		const cancelled = observed(fixture.pool.run(1, { signal: controller.signal }));
+		await entered.promise;
+		const reason = new Error("cancel held owner");
+		controller.abort(reason);
+		const next = observed(fixture.pool.run(2));
+		await expect(fixture.pool.run(3, { taskClass: "short" })).resolves.toBe("2:3");
+		ready.open();
+		await closing.promise;
+		expect(fixture.pool.stats.reservation?.shared).toMatchObject({ claimed: 1, retiring: 1 });
+		expect(fixture.pool.stats.queued).toBe(1);
+		expect(fixture.createCalls).toBe(2);
+		exit.open();
+		await expect(cancelled).rejects.toBe(reason);
+		await expect(next).resolves.toBe("3:2");
+		expect(fixture.workers.find((worker) => worker.id === 1)?.stopped).toBe(true);
+	});
+
+	test("queue limits are frozen copies and statistics cannot change scheduling", async () => {
+		const normalQueue = { maxQueued: 0, maxQueuedBytes: 0 };
+		const fixture = setup({ concurrency: 2, reservedCapacity: 1, maxQueued: 1, normalQueue });
+		normalQueue.maxQueued = 99;
+		const stats = fixture.pool.stats;
+		if (stats.normalQueue) stats.normalQueue.maxQueued = 99;
+		if (stats.reservation) stats.reservation.shared.capacity = 99;
+		expect(fixture.pool.stats).toMatchObject({
+			concurrency: 2,
+			reservedCapacity: 1,
+			normalCapacity: 1,
+			maxQueued: 1,
+			normalQueue: { maxQueued: 0, maxQueuedBytes: 0 },
+			reservation: { shared: { capacity: 1 } },
+		});
+		const first = observed(fixture.pool.run(1));
+		await expect(fixture.pool.run(2)).rejects.toMatchObject({ reason: "normal-count" });
+		await first;
+	});
+
+	test.each([
+		-1,
+		1.5,
+		Number.NaN,
+		3,
+	])("rejects invalid reserved capacity %s", (reservedCapacity) => {
+		expect(() => setup({ concurrency: 2, reservedCapacity })).toThrow(RangeError);
+	});
+});
+
 describe("WorkerPool fixed diagnostics", () => {
+	test.each([
+		"initial",
+		"ready",
+		"execution",
+		"close",
+	] as const)("a failing %s observation clock preserves work, cleanup and original errors", async (stage) => {
+		const timings: WorkerTaskTiming[] = [];
+		const failure = new Error("domain validation failed");
+		const clock = spyOn(performance, "now");
+		const failClock = () =>
+			clock.mockImplementation(() => {
+				throw new Error("observer clock failed");
+			});
+		const fixture = setup({
+			concurrency: 2,
+			reservedCapacity: 1,
+			reuse: false,
+			onTaskComplete: (timing) => timings.push(timing),
+			create: async (_context, id) => {
+				if (stage === "ready") failClock();
+				const worker = new FakeWorker(id);
+				worker.onRun = async (request) => {
+					if (stage === "execution") failClock();
+					if (request === 2) throw failure;
+					return `${id}:${request}`;
+				};
+				worker.onClose = async () => {
+					if (stage === "close") failClock();
+				};
+				return worker;
+			},
+		});
+		try {
+			if (stage === "initial") failClock();
+			await expect(fixture.pool.run(1)).resolves.toBe("1:1");
+			await expect(fixture.pool.run(2)).rejects.toBe(failure);
+			expect(fixture.workers.map((worker) => worker.stopped)).toEqual([true, true]);
+			expect(fixture.workers.map((worker) => worker.closeCalls)).toEqual([1, 1]);
+			expect(fixture.pool.stats).toMatchObject({ active: 0, workers: 0, failed: 1 });
+			expect(fixture.pool.stats.reservation?.shared.claimed).toBe(0);
+			expect(timings.map((timing) => timing.outcome)).toEqual(["ok", "error"]);
+			expect(
+				timings.every((timing) =>
+					(["queueMs", "readyMs", "execMs", "closeMs", "totalMs"] as const).every((key) => {
+						const value = timing[key];
+						return Number.isFinite(value) && value >= 0;
+					}),
+				),
+			).toBe(true);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test.each([
+		"throw",
+		"nan",
+	] as const)("an initially unavailable %s clock cannot turn later process uptime into task elapsed time", async (mode) => {
+		const timings: WorkerTaskTiming[] = [];
+		const { pool } = setup({ onTaskComplete: (timing) => timings.push(timing) });
+		const clock = spyOn(performance, "now");
+		if (mode === "throw")
+			clock.mockImplementationOnce(() => {
+				throw new Error("first observation unavailable");
+			});
+		else clock.mockReturnValueOnce(Number.NaN);
+		clock.mockReturnValue(1_000_000);
+		try {
+			await expect(pool.run(1)).resolves.toBe("1:1");
+			expect(timings[0]).toMatchObject({
+				outcome: "ok",
+				queueMs: 0,
+				readyMs: 0,
+				execMs: 0,
+				closeMs: 0,
+				totalMs: 0,
+			});
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("a non-finite observation clock produces bounded timings without changing an unclassified task", async () => {
+		const timings: WorkerTaskTiming[] = [];
+		const { pool } = setup({ onTaskComplete: (timing) => timings.push(timing) });
+		const clock = spyOn(performance, "now").mockReturnValue(Number.NaN);
+		try {
+			await expect(pool.run(1)).resolves.toBe("1:1");
+			expect(timings[0]).toMatchObject({
+				outcome: "ok",
+				queueMs: 0,
+				readyMs: 0,
+				execMs: 0,
+				closeMs: 0,
+				totalMs: 0,
+			});
+			expect(pool.stats).toMatchObject({ active: 0, idle: 1, failed: 0 });
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test("separates queue, ready, execution and confirmed-close phases", async () => {
 		let now = 0;
 		const clock = spyOn(performance, "now").mockImplementation(() => now);

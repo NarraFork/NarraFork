@@ -2,9 +2,11 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
 	CallToolRequestSchema,
 	type CallToolResult,
+	type JSONRPCMessage,
 	ListToolsRequestSchema,
 	type ListToolsResult,
 	type Tool,
@@ -12,6 +14,7 @@ import {
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv-provider.js";
 import type { ToolContext } from "../../../server/lib/agent/types";
 import type { McpServerConfig } from "../../../server/lib/settings";
+import type { ToolProgressPayload } from "../../../shared/tool-progress";
 
 // Only configuration and transport selection are replaced. Protocol parsing, cancellation,
 // SDK Client/Server and the output-validator implementation are real.
@@ -26,7 +29,7 @@ const config: McpServerConfig = {
 	mode: "auto",
 };
 const settings = { mcpServers: [config] };
-let clientTransport: InMemoryTransport;
+let clientTransport: Transport;
 let server: Server;
 let pages: Map<string | undefined, ListToolsResult | Error>;
 let result: CallToolResult;
@@ -42,6 +45,63 @@ const { mcpManager } = await import("../../../server/lib/mcp/manager");
 
 function tool(name: string, extra: Partial<Tool> = {}): Tool {
 	return { name, inputSchema: { type: "object", properties: {} }, ...extra };
+}
+
+/**
+ * Delivers a progress notification and its tools/call result in one synchronous
+ * burst, the way `StdioClientTransport.processReadBuffer` walks one stdout read.
+ */
+class SameReadTransport implements Transport {
+	onmessage?: Transport["onmessage"];
+	onclose?: () => void;
+	onerror?: (error: Error) => void;
+
+	async start(): Promise<void> {}
+
+	async close(): Promise<void> {
+		this.onclose?.();
+	}
+
+	async send(message: JSONRPCMessage): Promise<void> {
+		const deliver = this.onmessage;
+		// Notifications such as `initialized` have a method and no id.
+		if (!deliver || !("method" in message) || !("id" in message)) return;
+		if (message.method === "initialize") {
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: {
+					protocolVersion: "2025-11-25",
+					capabilities: { tools: {} },
+					serverInfo: { name: "same-read", version: "1" },
+				},
+			});
+			return;
+		}
+		if (message.method === "tools/list") {
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { tools: [tool("plain")] },
+			});
+			return;
+		}
+		if (message.method === "tools/call") {
+			const token = (message.params as { _meta?: { progressToken?: unknown } } | undefined)?._meta
+				?.progressToken;
+			if (token === undefined) throw new Error("tools/call had no progressToken");
+			deliver({
+				jsonrpc: "2.0",
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 2, total: 3, message: "batch-3" },
+			});
+			deliver({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: { content: [{ type: "text", text: "ok" }] },
+			});
+		}
+	}
 }
 
 beforeEach(async () => {
@@ -260,15 +320,30 @@ describe("MCP uses one published directory without output-schema compilation", (
 		expect(calls).toHaveLength(2);
 	});
 
-	test("structured-only content is reported as completed but not displayed, without replay", async () => {
+	test("structured-only content is serialized as text, without replay", async () => {
 		await mcpManager.connect(config);
-		result = { content: [], structuredContent: { value: 42 } };
+		result = { content: [], structuredContent: { value: 42, nested: { ok: true } } };
 		const response = await mcpManager.callTool(config.id, "plain", {});
-		expect(response.content).toHaveLength(1);
-		expect(response.content[0].text).toContain("structured content only");
-		expect(response.content[0].text).toContain("call has completed");
+		expect(response.content).toEqual([{ type: "text", text: '{"value":42,"nested":{"ok":true}}' }]);
 		expect(response.isError).toBeUndefined();
-		expect(calls).toEqual(["plain"]);
+		const large = { value: "x".repeat(200_000) };
+		result = { content: [], structuredContent: large };
+		const capped = (await mcpManager.callTool(config.id, "plain", {})).content[0].text ?? "";
+		const [notice, excerpt] = capped.split("\n");
+		expect(notice).toBe("[structured content truncated: first 80000 of 200012 chars]");
+		expect(excerpt).toBe(JSON.stringify(large).slice(0, 80_000));
+		expect(calls).toEqual(["plain", "plain"]);
+	});
+
+	test("resource links and audio content pass through the validated envelope", async () => {
+		await mcpManager.connect(config);
+		result = {
+			content: [
+				{ type: "audio", data: "AA==", mimeType: "audio/wav" },
+				{ type: "resource_link", uri: "file:///a.txt", name: "a.txt" },
+			],
+		};
+		expect((await mcpManager.callTool(config.id, "plain", {})).content).toEqual(result.content);
 	});
 
 	test("discovery keeps its per-page timeout and tool calls forward AbortSignal", async () => {
@@ -300,5 +375,156 @@ describe("MCP uses one published directory without output-schema compilation", (
 			release.resolve();
 			await finished.promise;
 		}
+	});
+
+	test("tool calls without onProgress do not request progress notifications", async () => {
+		const requests = spyOn(Client.prototype, "request");
+		let progressToken: unknown = "handler-did-not-run";
+		server.setRequestHandler(CallToolRequestSchema, async (request) => {
+			progressToken = request.params._meta?.progressToken;
+			return result;
+		});
+		await mcpManager.connect(config);
+		const controller = new AbortController();
+		await mcpManager.callTool(config.id, "plain", {}, controller.signal);
+		const callRequest = requests.mock.calls.find(([request]) => request.method === "tools/call");
+		expect(callRequest?.[2]?.signal).toBe(controller.signal);
+		expect(callRequest?.[2]?.onprogress).toBeUndefined();
+		expect(callRequest?.[2]?.timeout).toBeUndefined();
+		expect(callRequest?.[2]?.resetTimeoutOnProgress).toBeUndefined();
+		expect(progressToken).toBeUndefined();
+	});
+
+	test("onProgress receives each notifications/progress payload", async () => {
+		const requests = spyOn(Client.prototype, "request");
+		server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+			const token = request.params._meta?.progressToken;
+			if (token === undefined) throw new Error("tools/call had no progressToken");
+			await extra.sendNotification({
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 1, total: 3, message: "batch-2" },
+			});
+			await extra.sendNotification({
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 2, total: 3, message: "batch-3" },
+			});
+			return result;
+		});
+		await mcpManager.connect(config);
+		const received: unknown[] = [];
+		await mcpManager.callTool(config.id, "plain", {}, undefined, (progress) => {
+			received.push(progress);
+		});
+		expect(received).toEqual([
+			{ progress: 1, total: 3, message: "batch-2" },
+			{ progress: 2, total: 3, message: "batch-3" },
+		]);
+		const callRequest = requests.mock.calls.find(([request]) => request.method === "tools/call");
+		expect(typeof callRequest?.[2]?.onprogress).toBe("function");
+		expect(callRequest?.[2]?.timeout).toBeUndefined();
+		expect(callRequest?.[2]?.resetTimeoutOnProgress).toBeUndefined();
+	});
+
+	test("execute turns MCP progress into structured progress and flushes the trailing frame", async () => {
+		const { prepareMcpTools } = await import("../../../server/lib/mcp/tool-bridge");
+		const { toolRegistry } = await import("../../../server/lib/agent/tool-registry");
+		mcpManager.prepareTools = prepareMcpTools;
+		server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+			const token = request.params._meta?.progressToken;
+			if (token === undefined) throw new Error("tools/call had no progressToken");
+			await extra.sendNotification({
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 1, total: 3, message: "batch-2" },
+			});
+			await extra.sendNotification({
+				method: "notifications/progress",
+				params: { progressToken: token, progress: 2, total: 3, message: "batch-3" },
+			});
+			return result;
+		});
+		await mcpManager.connect(config);
+		const definition = toolRegistry.all().find((tool) => tool.metadata?.mcpServerId === config.id);
+		if (!definition) throw new Error("MCP definition was not published");
+		const payloads: ToolProgressPayload[] = [];
+		const ctx = {
+			signal: new AbortController().signal,
+			emitStructuredProgress: (progress: ToolProgressPayload) => {
+				payloads.push(progress);
+			},
+		} as ToolContext;
+		await definition.execute({}, ctx);
+		expect(payloads).toEqual([
+			{ completed: 1, total: 3, currentItem: "batch-2" },
+			{ completed: 2, total: 3, currentItem: "batch-3" },
+		]);
+		await Bun.sleep(400);
+		expect(payloads).toEqual([
+			{ completed: 1, total: 3, currentItem: "batch-2" },
+			{ completed: 2, total: 3, currentItem: "batch-3" },
+		]);
+	});
+
+	test("execute skips empty progress, keeps a zero with a total, and clips long messages", async () => {
+		const { prepareMcpTools } = await import("../../../server/lib/mcp/tool-bridge");
+		const { toolRegistry } = await import("../../../server/lib/agent/tool-registry");
+		mcpManager.prepareTools = prepareMcpTools;
+		let script: Array<{ progress: number; total?: number; message?: string }> = [];
+		server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+			const token = request.params._meta?.progressToken;
+			if (token === undefined) throw new Error("tools/call had no progressToken");
+			for (const notice of script) {
+				await extra.sendNotification({
+					method: "notifications/progress",
+					params: { progressToken: token, ...notice },
+				});
+			}
+			return result;
+		});
+		await mcpManager.connect(config);
+		const definition = toolRegistry.all().find((tool) => tool.metadata?.mcpServerId === config.id);
+		if (!definition) throw new Error("MCP definition was not published");
+		const payloads: ToolProgressPayload[] = [];
+		const ctx = {
+			signal: new AbortController().signal,
+			emitStructuredProgress: (progress: ToolProgressPayload) => {
+				payloads.push(progress);
+			},
+		} as ToolContext;
+		const run = async (notices: typeof script) => {
+			payloads.length = 0;
+			script = notices;
+			await definition.execute({}, ctx);
+			return [...payloads];
+		};
+		expect(await run([{ progress: 0 }])).toEqual([]);
+		expect(await run([{ progress: 0, total: 3 }])).toEqual([{ completed: 0, total: 3 }]);
+		expect(await run([{ progress: 5, total: 0 }])).toEqual([{ completed: 5 }]);
+		const message = "𐍈".repeat(81);
+		expect(await run([{ progress: 1, total: 2, message }])).toEqual([
+			{ completed: 1, total: 2, currentItem: `${"𐍈".repeat(80)}…` },
+		]);
+	});
+
+	test("progress delivered in the same read as the tools/call result still reaches execute", async () => {
+		clientTransport = new SameReadTransport();
+		const { prepareMcpTools } = await import("../../../server/lib/mcp/tool-bridge");
+		const { toolRegistry } = await import("../../../server/lib/agent/tool-registry");
+		mcpManager.prepareTools = prepareMcpTools;
+		await mcpManager.connect(config);
+		const definition = toolRegistry
+			.all()
+			.find((entry) => entry.metadata?.mcpServerId === config.id);
+		if (!definition) throw new Error("MCP definition was not published");
+		const payloads: ToolProgressPayload[] = [];
+		const ctx = {
+			signal: new AbortController().signal,
+			emitStructuredProgress: (progress: ToolProgressPayload) => {
+				payloads.push(progress);
+			},
+		} as ToolContext;
+		const output = await definition.execute({}, ctx);
+		expect(payloads).toEqual([{ completed: 2, total: 3, currentItem: "batch-3" }]);
+		expect(output.output).toBe("ok");
+		expect(output.isError).toBeUndefined();
 	});
 });

@@ -6,10 +6,14 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { assembleContent } from "@shared/narrator-blocks/storage";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -52,6 +56,7 @@ const read = async (params: Parameters<typeof runBlockProjectionSlice>[1]) =>
 beforeEach(() => {
 	// Exercise the old dual-write/rollback path explicitly despite stable single-copy defaults.
 	settings.narratorBlocks.compactJson = false;
+	blockSync.stopBlockSyncSweep();
 	backfill.resetBlockJobPacingForTests();
 	cleanDb(sqlite);
 	sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('n1', 'N', ?, ?)", [
@@ -69,10 +74,10 @@ afterEach(async () => {
 	settings.narratorBlocks.read = true;
 	scans.noteRowsOnlyEnvelopes(undefined);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 async function conversation() {
@@ -572,6 +577,377 @@ describe("restore", () => {
 			rowsOnly: false,
 		});
 	});
+});
+
+test("job changes drain the old in-flight slice before starting a new reader", async () => {
+	await conversation();
+	await backfilled();
+	settings.narratorBlocks.compactJson = true;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const first = mock(async (params: Parameters<typeof read>[0]) => {
+		entered.resolve();
+		await release.promise;
+		return read(params);
+	});
+	const second = mock(read);
+	try {
+		backfill.startProjectionJob("clear", first);
+		await entered.promise;
+		settings.narratorBlocks.compactJson = false;
+		backfill.startProjectionJob("restore", second);
+		await Bun.sleep(1);
+		expect(second).not.toHaveBeenCalled();
+		release.resolve();
+		await settled();
+		expect(first).toHaveBeenCalledTimes(1);
+		expect(second).toHaveBeenCalledTimes(1);
+		expect(backfill.blockBackfillStatus().clear).toMatchObject({ paused: true, cursor: 0 });
+	} finally {
+		release.resolve();
+		backfill.stopProjectionJobs();
+		await settled();
+	}
+});
+
+/** Run the actual lifecycle/runner declarations against legacy hotSafe state and controlled turns. */
+function legacyProjectionHarness(normal = false) {
+	const source = readFileSync(new URL("../narrator-block-backfill.ts", import.meta.url), "utf8");
+	const section = (start: string, end: string) => {
+		const from = source.indexOf(start);
+		const to = source.indexOf(end, from);
+		if (from < 0 || to < from)
+			throw new Error(`Missing projection lifecycle declaration: ${start}`);
+		return source.slice(from, to).replace(/^export /gm, "");
+	};
+	const declarations = [
+		section("async function trackBlockSlice(", "/** Process-local shutdown gate"),
+		section("export async function stopBlockBackgroundJobs(", "\nconst state ="),
+		section("function cancelProjectionTurn()", "\nlet schema:"),
+		section("export function startProjectionJob(", "/** The projection job that was started"),
+		section(
+			"export function startBlockBackfill(",
+			"\nexport interface BlockBackfillStatus",
+		).replace("function startBlockBackfill(", "function requestBackfill("),
+		section("function upgradeLegacyProjectionRunner()", "\nupgradeLegacyProjectionRunner();"),
+	].join("\n");
+	const timers = new Map<number, { callback(): void; delay: number }>();
+	let nextTimer = 0;
+	const schedule = (callback: () => void, delay = 0) => {
+		const id = ++nextTimer;
+		timers.set(id, { callback, delay });
+		return id;
+	};
+	const release = Promise.withResolvers<void>();
+	const legacyBackgroundJobs = {
+		stopping: false,
+		controller: new AbortController(),
+		active: new Set<Promise<boolean>>(),
+	};
+	const backgroundJobs = {
+		stopping: false,
+		controller: new AbortController(),
+		active: new Set<Promise<boolean>>(),
+	};
+	const controller = legacyBackgroundJobs.controller;
+	const state = { running: normal };
+	const jobs = {
+		clear: { complete: false, paused: false },
+		restore: { complete: false, paused: true },
+	};
+	const empty = {
+		visited: [],
+		envelopes: [],
+		mismatched: [],
+		checked: 0,
+		lastRowid: 0,
+		done: true,
+	};
+	const defaultReader = mock(async () => empty);
+	const defaultBlockReader = {
+		backfill: mock(async () => empty),
+		verify: mock(async () => empty),
+		reindex: mock(async () => empty),
+	};
+	const projection = {
+		running: !normal,
+		inFlight: false,
+		epoch: 0,
+		timer: undefined as number | undefined,
+		pendingRead: undefined as typeof defaultReader | undefined,
+		upgrade: undefined as Promise<void> | undefined,
+		upgradeTimer: undefined as number | undefined,
+		upgradeResume: false,
+		upgradeBackfill: undefined as
+			| { reader: typeof defaultBlockReader; readProjection: typeof defaultReader }
+			| undefined,
+	};
+	const activeProjection = () =>
+		(["clear", "restore"] as const).find((job) => !jobs[job].complete && !jobs[job].paused);
+	let maxReads = 0;
+	let legacyReads = 0;
+	const runProjectionSlice = async (reader: typeof defaultReader) => {
+		const job = activeProjection();
+		if (backgroundJobs.stopping || !job) return false;
+		const pending = reader().then(() => {
+			jobs[job].complete = true;
+			return true;
+		});
+		backgroundJobs.active.add(pending);
+		maxReads = Math.max(maxReads, backgroundJobs.active.size + legacyBackgroundJobs.active.size);
+		try {
+			return await pending;
+		} finally {
+			backgroundJobs.active.delete(pending);
+		}
+	};
+	const legacySlice = async () => {
+		if (legacyBackgroundJobs.stopping) return false;
+		legacyReads++;
+		const pending = release.promise.then(() => true); // Deliberately ignores abort.
+		legacyBackgroundJobs.active.add(pending);
+		maxReads = Math.max(maxReads, backgroundJobs.active.size + legacyBackgroundJobs.active.size);
+		try {
+			return await pending;
+		} finally {
+			legacyBackgroundJobs.active.delete(pending);
+		}
+	};
+	// Frozen pre-epoch runner: its successful callback always queues one more untracked turn.
+	const legacyNext = () => {
+		void legacySlice().then((ran) => {
+			if (ran) schedule(legacyNext, 0);
+			else projection.running = false;
+		});
+	};
+	const automaticClears: string[] = [];
+	if (normal)
+		schedule(() => {
+			state.running = false;
+			if (!jobs.clear.paused) {
+				automaticClears.push("clear");
+				jobs.restore.paused = true;
+				jobs.clear.paused = false;
+			}
+		}, 0);
+	else legacyNext();
+	let resumeBackfill = (_read: typeof defaultReader) => {};
+	const resume = mock((_reader: typeof defaultBlockReader, readProjection: typeof defaultReader) =>
+		resumeBackfill(readProjection),
+	);
+	const dependencies = {
+		legacyBackgroundJobs,
+		backgroundJobs,
+		state,
+		projection,
+		legacyProjectionRunner: true,
+		setTimeout: schedule,
+		clearTimeout: (id: number) => timers.delete(id),
+		workerProjectionReader: defaultReader,
+		workerReader: defaultBlockReader,
+		getDbReadSchedulingPressure: () => ({ shouldYield: false }),
+		runProjectionSlice,
+		hasSchema: () => true,
+		activeProjection,
+		projectionBlocked: () => null,
+		jobState: (job: keyof typeof jobs) => jobs[job],
+		PROJECTION_JOBS: ["clear", "restore"],
+		pauseProjection: (job: keyof typeof jobs) => {
+			jobs[job].paused = true;
+		},
+		database: {
+			sqlite: {
+				prepare: () => ({
+					run: (_at: string, job: keyof typeof jobs) => {
+						jobs[job].paused = false;
+						jobs[job].complete = false;
+					},
+				}),
+			},
+		},
+		blockBackfillStatus: () => ({ projectionRunning: projection.running, ...jobs }),
+		startBlockBackfill: resume,
+		stopBlockIndexBackgroundJobs: async () => {},
+		logger: { warn: mock(() => {}) },
+		AppError: Error,
+	};
+	const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(declarations);
+	const api = new Function(
+		...Object.keys(dependencies),
+		`${compiled}\nreturn { upgradeLegacyProjectionRunner, startProjectionRunner, startProjectionJob,
+			stopProjectionJobs, stopBlockBackgroundJobs, requestBackfill };`,
+	)(...Object.values(dependencies)) as {
+		upgradeLegacyProjectionRunner(): void;
+		startProjectionRunner(reader?: typeof defaultReader): void;
+		startProjectionJob(job: keyof typeof jobs, reader?: typeof defaultReader): void;
+		stopProjectionJobs(): void;
+		stopBlockBackgroundJobs(options: { deadlineAt: number }): Promise<void>;
+		requestBackfill(reader: typeof defaultBlockReader, readProjection: typeof defaultReader): void;
+	};
+	resumeBackfill = (reader) => api.startProjectionRunner(reader);
+	return {
+		api,
+		jobs,
+		projection,
+		backgroundJobs,
+		legacyBackgroundJobs,
+		controller,
+		defaultReader,
+		defaultBlockReader,
+		timers,
+		release,
+		automaticClears,
+		resume,
+		maxReads: () => maxReads,
+		legacyReads: () => legacyReads,
+		async turn(delay: number) {
+			const entry = [...timers].find(([, timer]) => timer.delay === delay);
+			if (!entry) throw new Error(`Missing ${delay}ms lifecycle turn`);
+			timers.delete(entry[0]);
+			entry[1].callback();
+			for (let flush = 0; flush < 8; flush++) await Promise.resolve();
+		},
+		async flush() {
+			for (let flush = 0; flush < 8; flush++) await Promise.resolve();
+		},
+	};
+}
+
+describe("legacy projection runner upgrade", () => {
+	test("an ignoring-abort old slice and its final timer drain before a changed-job reader starts", async () => {
+		const fixture = legacyProjectionHarness();
+		const restore = mock(async () => ({
+			visited: [],
+			envelopes: [],
+			mismatched: [],
+			checked: 0,
+			lastRowid: 0,
+			done: true,
+		}));
+		fixture.api.upgradeLegacyProjectionRunner();
+		expect(fixture.controller.signal.aborted).toBe(true);
+		fixture.api.startProjectionJob("restore", restore);
+		await fixture.turn(500);
+		expect(restore).not.toHaveBeenCalled();
+		expect(fixture.projection.running).toBe(true);
+		fixture.release.resolve();
+		await fixture.flush();
+		await fixture.turn(500);
+		expect(restore).not.toHaveBeenCalled();
+		await fixture.turn(0); // Old runner observes stopping and sets its natural exit marker.
+		await fixture.turn(500);
+		expect(fixture.backgroundJobs.controller).not.toBe(fixture.controller);
+		expect(fixture.backgroundJobs.controller.signal.aborted).toBe(false);
+		expect(fixture.legacyBackgroundJobs.stopping).toBe(true);
+		expect(fixture.controller.signal.aborted).toBe(true);
+		await fixture.turn(0);
+		expect(restore).toHaveBeenCalledTimes(1);
+		expect(fixture.defaultReader).not.toHaveBeenCalled();
+		expect(fixture.legacyReads()).toBe(1);
+		expect(fixture.maxReads()).toBe(1);
+		expect(fixture.jobs.clear.paused).toBe(true);
+		expect(fixture.jobs.restore.complete).toBe(true);
+		expect(fixture.timers.size).toBe(0);
+	});
+
+	for (const action of ["stop", "shutdown"] as const) {
+		test(`${action} during upgrade drains old callbacks without restarting`, async () => {
+			const fixture = legacyProjectionHarness();
+			fixture.api.upgradeLegacyProjectionRunner();
+			let stopped: Promise<void> | undefined;
+			if (action === "stop") fixture.api.stopProjectionJobs();
+			else stopped = fixture.api.stopBlockBackgroundJobs({ deadlineAt: Date.now() + 10_000 });
+			expect(fixture.projection.running).toBe(true);
+			fixture.release.resolve();
+			await fixture.flush();
+			await fixture.turn(0);
+			await fixture.turn(500);
+			await stopped;
+			expect(fixture.defaultReader).not.toHaveBeenCalled();
+			expect(fixture.timers.size).toBe(0);
+			expect(fixture.projection.running).toBe(false);
+			expect(fixture.backgroundJobs.stopping).toBe(action === "shutdown");
+			if (action === "stop")
+				for (const job of Object.values(fixture.jobs)) expect(job.paused).toBe(true);
+		});
+	}
+
+	for (const normal of [false, true]) {
+		test(`an explicit backfill request preserves both injected readers during old ${normal ? "normal" : "projection"} work`, async () => {
+			const fixture = legacyProjectionHarness(normal);
+			const projectionReader = mock(async () => ({
+				visited: [],
+				envelopes: [],
+				mismatched: [],
+				checked: 0,
+				lastRowid: 0,
+				done: true,
+			}));
+			const blockReader = { ...fixture.defaultBlockReader };
+			fixture.api.upgradeLegacyProjectionRunner();
+			fixture.api.requestBackfill(blockReader, projectionReader);
+			expect(fixture.resume).not.toHaveBeenCalled();
+			fixture.release.resolve();
+			await fixture.flush();
+			await fixture.turn(0);
+			await fixture.turn(500);
+			expect(fixture.resume).toHaveBeenCalledWith(blockReader, projectionReader);
+			await fixture.turn(0);
+			expect(projectionReader).toHaveBeenCalledTimes(1);
+			expect(fixture.defaultReader).not.toHaveBeenCalled();
+			expect(fixture.timers.size).toBe(0);
+		});
+	}
+
+	for (const latest of ["projection", "backfill"] as const) {
+		test(`the latest ${latest} start supplies the reader after upgrade`, async () => {
+			const fixture = legacyProjectionHarness();
+			const result = {
+				visited: [],
+				envelopes: [],
+				mismatched: [],
+				checked: 0,
+				lastRowid: 0,
+				done: true,
+			};
+			const backfillReader = mock(async () => result);
+			const explicitReader = mock(async () => result);
+			fixture.api.upgradeLegacyProjectionRunner();
+			if (latest === "projection") {
+				fixture.api.requestBackfill(fixture.defaultBlockReader, backfillReader);
+				fixture.api.startProjectionJob("restore", explicitReader);
+			} else {
+				fixture.api.startProjectionJob("restore", explicitReader);
+				fixture.api.requestBackfill(fixture.defaultBlockReader, backfillReader);
+			}
+			fixture.release.resolve();
+			await fixture.flush();
+			await fixture.turn(0);
+			await fixture.turn(500);
+			await fixture.turn(0);
+			expect(latest === "projection" ? explicitReader : backfillReader).toHaveBeenCalledTimes(1);
+			expect(latest === "projection" ? backfillReader : explicitReader).not.toHaveBeenCalled();
+			expect(fixture.defaultReader).not.toHaveBeenCalled();
+			expect(fixture.timers.size).toBe(0);
+		});
+	}
+
+	for (const explicitRestore of [false, true]) {
+		test(`legacy normal exit preserves ${explicitRestore ? "explicit restore" : "automatic clear"} intent`, async () => {
+			const fixture = legacyProjectionHarness(true);
+			fixture.api.upgradeLegacyProjectionRunner();
+			if (explicitRestore) fixture.api.startProjectionJob("restore");
+			await fixture.turn(0); // Baseline normal runner's final metadata/automatic-clear branch.
+			await fixture.turn(500);
+			await fixture.turn(0);
+			expect(fixture.automaticClears).toEqual(explicitRestore ? [] : ["clear"]);
+			expect(fixture.jobs[explicitRestore ? "restore" : "clear"].complete).toBe(true);
+			expect(fixture.defaultReader).toHaveBeenCalledTimes(1);
+			expect(fixture.maxReads()).toBe(1);
+			expect(fixture.resume).toHaveBeenCalledTimes(1);
+			expect(fixture.timers.size).toBe(0);
+		});
+	}
 });
 
 describe("production projection reader never decodes on the service thread", () => {

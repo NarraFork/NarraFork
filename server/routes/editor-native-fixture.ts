@@ -215,21 +215,40 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 				handleDeviceWS.open(socket);
 			},
 			async message(ws, message) {
-				const frame = JSON.parse(String(message));
-				if (frame.type === "hello" && low)
-					frame.capabilities.features = frame.capabilities.features.filter(
-						(name: string) => name !== "editor.durable-write.v1",
-					);
-				if (frame.type === "hello" && withoutRawRead)
-					frame.capabilities.features = frame.capabilities.features.filter(
-						(name: string) => name !== "editor.raw-read.v1",
-					);
-				if (frame.type === "rpc_result" && applyIds.delete(frame.id) && dropNext) {
-					dropNext = false;
-					ws.close();
-					return;
+				try {
+					if (typeof message !== "string") {
+						const bytes =
+							message instanceof Uint8Array
+								? message
+								: new Uint8Array(
+										(message as ArrayBufferView).buffer,
+										(message as ArrayBufferView).byteOffset,
+										(message as ArrayBufferView).byteLength,
+									);
+						await handleDeviceWS.binaryMessage(adapter(ws), bytes);
+						return;
+					}
+					const frame = JSON.parse(message);
+					if (frame.type === "hello" && low)
+						frame.capabilities.features = frame.capabilities.features.filter(
+							(name: string) => name !== "editor.durable-write.v1",
+						);
+					if (frame.type === "hello" && withoutRawRead)
+						frame.capabilities.features = frame.capabilities.features.filter(
+							(name: string) => name !== "editor.raw-read.v1",
+						);
+					if (frame.type === "rpc_result" && applyIds.delete(frame.id) && dropNext) {
+						dropNext = false;
+						ws.close();
+						return;
+					}
+					await handleDeviceWS.message(adapter(ws), frame);
+				} catch (error) {
+					childLogs =
+						`${childLogs}\nfixture frame: ${error instanceof Error ? error.message : error}`.slice(
+							-4096,
+						);
 				}
-				await handleDeviceWS.message(adapter(ws), frame);
 			},
 			close(ws) {
 				handleDeviceWS.close(adapter(ws));
@@ -298,11 +317,11 @@ export async function nativeEditorFixture(root: string, workspace: string) {
 						const chunk = await reader.read();
 						if (chunk.done) break;
 						total += chunk.value.length;
-						if (total > 64 * 1024) {
-							owned.kill();
-							throw new Error("Native fixture log limit");
-						}
-						childLogs = (childLogs + new TextDecoder().decode(chunk.value)).slice(-4096);
+						// Keep draining past the cap. Killing the helper here drops the
+						// device with no test-visible error, and stopping the read blocks
+						// the child on a full pipe.
+						if (total <= 64 * 1024)
+							childLogs = (childLogs + new TextDecoder().decode(chunk.value)).slice(-4096);
 					}
 				} finally {
 					reader.releaseLock();

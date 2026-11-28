@@ -9,6 +9,7 @@ import { grammarsApi } from "./grammars";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
+import { narratorCommunicationApi } from "./narrator-communication";
 import { narratorsApi } from "./narrators";
 import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
@@ -17,15 +18,18 @@ import { outlineApi } from "./outline";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { providerImportApi } from "./provider-import";
+import { quotaSnapshotsApi } from "./quota-snapshots";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { storageTransferApi } from "./storage-transfer";
 import { systemLifecycleApi } from "./system-lifecycle";
+import { teamsApi } from "./teams";
 import { terminalsApi } from "./terminals";
 import { tokendanceApi } from "./tokendance";
 import { traitLayersApi } from "./trait-layers";
+import { unattendedApi } from "./unattended";
 import { workspaceContextApi } from "./workspace-context";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
@@ -57,6 +61,7 @@ export const api = {
 	...containersApi,
 	...chatApi,
 	...narratorsApi,
+	...narratorCommunicationApi,
 	...notificationsApi,
 	...terminalsApi,
 	...settingsApi,
@@ -68,6 +73,7 @@ export const api = {
 	...knowledgeApi,
 	...specApi,
 	...systemLifecycleApi,
+	...unattendedApi,
 	...devicesApi,
 	...traitLayersApi,
 	...tokendanceApi,
@@ -80,6 +86,8 @@ export const api = {
 	...commandCodeApi,
 	...storageTransferApi,
 	...providerImportApi,
+	...teamsApi,
+	...quotaSnapshotsApi,
 };
 
 export {

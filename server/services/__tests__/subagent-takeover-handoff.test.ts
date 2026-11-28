@@ -36,7 +36,7 @@ afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
-		drainPendingInjections(id);
+		await drainPendingInjections(id);
 	}
 	if (ids.length) {
 		const { backgroundTasks } = await import("../../db/schema");
@@ -111,7 +111,7 @@ describe("run result attribution", () => {
 				expect(users).toEqual([principal]);
 				// The notice reaches the destination's inbox once published.
 				const { runtimePublication } = await import("../agent-runtime/publication");
-				runtimePublication.flushRecipient(parentId);
+				await runtimePublication.flushRecipient(parentId);
 				const batch = await takePendingInjectionBatch(parentId);
 				expect(batch?.entries.length).toBeGreaterThan(0);
 				expect(batch?.userId).toBe(principal);

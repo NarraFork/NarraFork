@@ -2,12 +2,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
+import type { PendingPlanReflectionRunner } from "../lib/agent/pending-plan-reflection";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import type { ImageRef } from "../lib/uploads";
 import { createRuntimeMapView, executionAdmissions } from "./agent-runtime/ownership";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
@@ -310,6 +313,18 @@ export interface PendingPermission {
 	planSource?: Readonly<PendingPlanSource>;
 	planModeSoftDeny?: boolean;
 	planSubmittedFromFile?: boolean;
+	/**
+	 * Runs this call's plan reflection on demand while its ExitPlanMode approval waits.
+	 *
+	 * The loop publishes it for the length of the wait (`agent/pending-plan-reflection.ts`),
+	 * because only that stack frame still holds the AgentConfig and history a reflection
+	 * projects from. Absent for a request raised without a live gate behind it.
+	 */
+	planReflection?: PendingPlanReflectionRunner;
+	/** A reflection started from this wait is in flight; a second trigger is a no-op. */
+	planReflectionRunning?: boolean;
+	/** Aborted when the request is decided first, so a running review stops immediately. */
+	planReflectionAbort?: AbortController;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;
 	/**
 	 * Absolute epoch-ms timestamp at which automatic AskUserQuestion reflection
@@ -427,6 +442,9 @@ export interface NarratorRuntimeModel {
 	requestedModel: string;
 	provider: string;
 	model: string;
+	/** Actual execution value; model above remains the upstream bare identifier. */
+	concreteValue?: string;
+	settingsRevision?: number;
 	resolvedAt: number;
 }
 
@@ -442,12 +460,23 @@ export function recordNarratorRuntimeModel(
 	requestedModel: string,
 	provider: string,
 	model: string,
+	concreteValue?: string,
+	settingsRevision?: number,
 ): void {
+	const previous = recentRuntimeModels.get(narratorId);
+	const sourceChanged =
+		!previous ||
+		previous.requestedModel !== requestedModel ||
+		previous.provider !== provider ||
+		previous.model !== model ||
+		previous.concreteValue !== concreteValue;
 	recentRuntimeModels.delete(narratorId);
 	recentRuntimeModels.set(narratorId, {
 		requestedModel,
 		provider,
 		model,
+		concreteValue,
+		settingsRevision,
 		resolvedAt: Date.now(),
 	});
 	while (recentRuntimeModels.size > RECENT_RUNTIME_MODELS_MAX) {
@@ -455,6 +484,12 @@ export function recordNarratorRuntimeModel(
 		if (oldest === undefined) break;
 		recentRuntimeModels.delete(oldest);
 	}
+	if (sourceChanged)
+		eventBus.emit({
+			type: "narrator:ws_broadcast",
+			narratorId,
+			message: { type: "runtime_model_changed", narratorId },
+		});
 }
 
 export function clearNarratorRuntimeModel(narratorId: string): void {
@@ -467,14 +502,13 @@ export function getNarratorRuntimeModel(
 ): NarratorRuntimeModel | null {
 	const entry = recentRuntimeModels.get(narratorId);
 	if (!entry) return null;
-	if (
-		entry.requestedModel !== currentModel ||
-		Date.now() - entry.resolvedAt > RECENT_RUNTIME_MODEL_TTL_MS
-	) {
+	if (Date.now() - entry.resolvedAt > RECENT_RUNTIME_MODEL_TTL_MS) {
 		recentRuntimeModels.delete(narratorId);
 		return null;
 	}
-	return entry;
+	// A delayed read may still carry the previous selection. It must not erase a
+	// newer execution observation belonging to the narrator's current selection.
+	return entry.requestedModel === currentModel ? entry : null;
 }
 
 export interface KnowledgeInjectionCycleState {
@@ -797,14 +831,38 @@ export function isNarratorRuntimeBusy(narratorId: string): boolean {
 	return false;
 }
 
+/**
+ * Every narrator that currently holds runtime work, from every authority that can hold it.
+ *
+ * `isNarratorRuntimeBusy` answers the question for ONE id, but callers that must decide "is
+ * anything running at all" cannot enumerate `activeNarrators` alone: permissions, danger
+ * reflections, loop-less runtime claims and admission leases all keep a narrator busy without
+ * a session entry. This is the exhaustive counterpart, and it stays here because this module
+ * owns all of those maps.
+ */
+export function listRuntimeBusyNarratorIds(): string[] {
+	const ids = new Set<string>(activeNarrators.keys());
+	// Loop-less parent-side work: the claim map has no per-narrator view of its own.
+	for (const narratorId of narratorRuntimeClaims.keys()) ids.add(narratorId);
+	for (const pending of pendingPermissions.values()) ids.add(pending.narratorId);
+	for (const pause of pendingDangerReflections.values()) ids.add(pause.narratorId);
+	for (const [rootId, claims] of admissionWork) {
+		ids.add(rootId);
+		for (const work of claims) ids.add(work.narratorId);
+	}
+	return [...ids].filter(
+		(narratorId) => isNarratorRuntimeBusy(narratorId) || hasNarratorAdmissionWork(narratorId),
+	);
+}
+
 /** Deprecated read-only view; the mailbox is the sole queue authority. */
 export const bufferedMessages = {
-	get(narratorId: string): BufferedMessage[] | undefined {
-		const messages = getBufferedMessages(narratorId);
+	async get(narratorId: string): Promise<BufferedMessage[] | undefined> {
+		const messages = await getBufferedMessages(narratorId);
 		return messages.length ? messages : undefined;
 	},
-	has(narratorId: string): boolean {
-		return getBufferedMessages(narratorId).length > 0;
+	async has(narratorId: string): Promise<boolean> {
+		return (await getBufferedMessages(narratorId)).length > 0;
 	},
 };
 
@@ -814,6 +872,11 @@ interface NarratorWorkAdmission {
 	narratorId: string;
 	rootId: string;
 	live: boolean;
+	/**
+	 * Background-subagent work. A revert of the admission root does not abort it
+	 * and does not wait for it; a revert of the subagent itself still does.
+	 */
+	survivesRootRevert: boolean;
 	settled: Promise<void>;
 	release: () => void;
 }
@@ -897,9 +960,63 @@ export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<
 	);
 }
 
+const BACKGROUND_ID_CHUNK = 100;
+
+/**
+ * Which of `ids` are background subagents (`narrators.is_background`).
+ * Bounded by the caller's in-memory id list; each query is one chunk.
+ */
+export async function loadBackgroundSubagentIds(ids: readonly string[]): Promise<Set<string>> {
+	const unique = [...new Set(ids)];
+	const found = new Set<string>();
+	if (unique.length === 0) return found;
+	const [database, { narrators }, drizzle] = await Promise.all([
+		import("../db"),
+		import("../db/schema"),
+		import("drizzle-orm"),
+	]);
+	const { and, eq, inArray } = drizzle;
+	const { db } = database;
+	let postgresQuery: import("./context-composition-history").ContextQuery | undefined;
+	if (database.activeDatabaseBackend === "postgres") {
+		if (!database.postgresRuntime) throw new AppError("PostgreSQL runtime is not connected", 503);
+		const { postgresContextQuery } = await import("./context-composition-history");
+		postgresQuery = postgresContextQuery(database.postgresRuntime.client.sql);
+	}
+	for (let offset = 0; offset < unique.length; offset += BACKGROUND_ID_CHUNK) {
+		const chunk = unique.slice(offset, offset + BACKGROUND_ID_CHUNK);
+		if (postgresQuery) {
+			const rows = await postgresQuery.all<{ id: string }>(
+				`SELECT id FROM narrators WHERE is_background AND id IN (${chunk.map(() => "?").join(",")})`,
+				chunk,
+			);
+			for (const row of rows) found.add(row.id);
+			continue;
+		}
+		const rows = await db.query.narrators.findMany({
+			where: and(inArray(narrators.id, chunk), eq(narrators.isBackground, true)),
+			columns: { id: true },
+		});
+		for (const row of rows) found.add(row.id);
+	}
+	return found;
+}
+
+async function narratorIsBackground(narratorId: string): Promise<boolean> {
+	return (await loadBackgroundSubagentIds([narratorId])).has(narratorId);
+}
+
 export function isNarratorRevertAdmissionBlocked(narratorId: string): boolean {
 	const inherited = admissionContext.getStore()?.work.get(narratorId);
-	if (inherited?.live && revertAdmissions.has(inherited.rootId)) return true;
+	if (inherited?.live && revertAdmissions.has(inherited.rootId)) {
+		// The child's lease is also stored under its root. Only that child is exempt;
+		// checking the root from inside the child still sees the root's revert.
+		const spared =
+			inherited.survivesRootRevert &&
+			inherited.narratorId === narratorId &&
+			inherited.rootId !== narratorId;
+		if (!spared) return true;
+	}
 	return revertAdmissions.has(narratorId);
 }
 
@@ -913,7 +1030,11 @@ export function assertNarratorNotReverting(narratorId: string): void {
 	}
 }
 
-function claimAdmissionWork(narratorId: string, rootId: string): NarratorWorkAdmission {
+function claimAdmissionWork(
+	narratorId: string,
+	rootId: string,
+	survivesRootRevert = false,
+): NarratorWorkAdmission {
 	let settle!: () => void;
 	const settled = new Promise<void>((resolve) => {
 		settle = resolve;
@@ -922,6 +1043,7 @@ function claimAdmissionWork(narratorId: string, rootId: string): NarratorWorkAdm
 		narratorId,
 		rootId,
 		live: true,
+		survivesRootRevert,
 		settled,
 		release: () => {
 			if (!work.live) return;
@@ -942,7 +1064,8 @@ function claimAdmissionWork(narratorId: string, rootId: string): NarratorWorkAdm
  * A shared work lease, NOT a mutex held while a loop runs. Nested work gets its own
  * lease so detached compacts/runners cannot outlive admission. An inherited lease
  * only allows existing work to drain while an interrupting revert waits; it never
- * permits writes after the exclusive lease has been granted.
+ * permits writes after the exclusive lease has been granted. A background subagent's
+ * lease is the exception: it keeps running through a revert of its admission root.
  */
 export function withNarratorWorkAdmission<T>(
 	narratorId: string,
@@ -950,15 +1073,24 @@ export function withNarratorWorkAdmission<T>(
 	until?: (result: T) => Promise<unknown> | undefined,
 ): Promise<T> {
 	const inherited = admissionContext.getStore()?.work.get(narratorId);
-	const enter = (rootId: string): Promise<T> => {
+	const enter = (rootId: string, survivesRootRevert: boolean): Promise<T> => {
+		// Publishing into the root uses the child's lease object (stored under both
+		// ids) but must not inherit the child's exemption.
+		const survives = survivesRootRevert && narratorId !== rootId;
 		const live = [...(admissionContext.getStore()?.work.values() ?? [])].filter(
 			(work) => work.live,
 		);
+		if (isUnattendedShutdownFenced() && live.length === 0) {
+			return Promise.reject(
+				new AppError("Server is checking shutdown readiness", 503, "SERVER_SHUTTING_DOWN"),
+			);
+		}
 		// A root gate covers the whole team; a subagent gate covers only that subagent,
 		// so its parent and siblings keep running while it is reverted.
 		for (const key of new Set([rootId, narratorId])) {
 			const gate = revertAdmissions.get(key);
 			if (!gate) continue;
+			if (survives && key === rootId) continue;
 			const draining = live.some((work) =>
 				key === rootId ? work.rootId === rootId : work.narratorId === key,
 			);
@@ -972,7 +1104,7 @@ export function withNarratorWorkAdmission<T>(
 				);
 			}
 		}
-		const lease = claimAdmissionWork(narratorId, rootId);
+		const lease = claimAdmissionWork(narratorId, rootId, survives);
 		const parent = admissionContext.getStore();
 		const work = new Map(parent?.work);
 		work.set(narratorId, lease);
@@ -992,9 +1124,17 @@ export function withNarratorWorkAdmission<T>(
 		});
 	};
 	// Preserve the synchronous handoff from a start transaction into a background loop.
+	// The background flag is read only when a root revert is already reserved; the
+	// common path stays a single root lookup.
 	return inherited?.live
-		? enter(inherited.rootId)
-		: resolveNarratorAdmissionRoot(narratorId).then(enter);
+		? enter(inherited.rootId, inherited.survivesRootRevert)
+		: resolveNarratorAdmissionRoot(narratorId).then(async (rootId) => {
+				const survives =
+					narratorId !== rootId &&
+					revertAdmissions.has(rootId) &&
+					(await narratorIsBackground(narratorId));
+				return enter(rootId, survives);
+			});
 }
 
 /** Short start transaction: a pending revert also prevents NEW automatic turns. */
@@ -1087,6 +1227,27 @@ export function hasNarratorAdmissionWork(narratorId: string): boolean {
 	return admissionWorkFor(narratorId).length > 0;
 }
 
+/**
+ * Work a revert must drain before it can hold the narrator. Background-subagent
+ * leases are marked and stay out of this set so the root revert does not wait
+ * for them or cancel them.
+ */
+export function hasRevertBlockingAdmissionWork(narratorId: string): boolean {
+	return admissionWorkFor(narratorId).some((work) => !work.survivesRootRevert);
+}
+
+/** Mark live background-subagent leases so a revert of `revertedNarratorId` leaves them running. */
+export function retainBackgroundSubagentWork(
+	revertedNarratorId: string,
+	backgroundNarratorIds: ReadonlySet<string>,
+): void {
+	if (backgroundNarratorIds.size === 0) return;
+	for (const work of admissionWorkFor(revertedNarratorId)) {
+		if (work.narratorId !== revertedNarratorId && backgroundNarratorIds.has(work.narratorId))
+			work.survivesRootRevert = true;
+	}
+}
+
 /** Diagnostics only: a preview must not report its own request as unfinished work. */
 export function hasOtherNarratorAdmissionWork(narratorId: string): boolean {
 	const current = admissionContext.getStore()?.work.get(narratorId);
@@ -1131,7 +1292,11 @@ export function reserveNarratorRevertAdmission(
 	narratorId: string,
 	rootId: string = narratorId,
 ): {
-	acquire: (signal: AbortSignal, busy: () => boolean) => Promise<() => void>;
+	acquire: (
+		signal: AbortSignal,
+		busy: () => boolean,
+		options?: { retainBackgroundSubagents?: boolean },
+	) => Promise<() => void>;
 	release: () => void;
 } {
 	assertNarratorNotReverting(narratorId);
@@ -1156,10 +1321,13 @@ export function reserveNarratorRevertAdmission(
 	};
 	return {
 		release,
-		acquire: (signal, busy) =>
+		acquire: (signal, busy, options) =>
 			admissionStartLock.acquire(narratorId, async () => {
 				signal.throwIfAborted();
-				if (hasNarratorAdmissionWork(narratorId) || busy()) {
+				const pending = options?.retainBackgroundSubagents
+					? hasRevertBlockingAdmissionWork(narratorId)
+					: hasNarratorAdmissionWork(narratorId);
+				if (pending || busy()) {
 					throw new AppError("Narrator execution has not settled", 409, "NARRATOR_REVERT_BUSY");
 				}
 				gate.phase = "held";

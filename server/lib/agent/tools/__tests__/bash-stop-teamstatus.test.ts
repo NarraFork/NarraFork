@@ -5,6 +5,7 @@ import {
 	resolveRuntimePolicy,
 	UNRESTRICTED_RUNTIME_POLICY,
 } from "@server/services/agent-runtime/policy";
+import { BackgroundBashLifecycle } from "@server/services/background-bash-lifecycle";
 import * as oauthRuntime from "@server/services/oauth-narrator-runtime-policy";
 import * as traitLayers from "@server/services/trait-layer-service";
 import {
@@ -19,7 +20,7 @@ import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
 import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
-import { bashTool, resolveBashTimeoutMs } from "../bash";
+import { bashTool, resolveBashTimeoutMs, setBashKillSettleGraceMsForTests } from "../bash";
 import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 
@@ -46,6 +47,7 @@ const cancelledAgents: string[] = [];
 const taskOutput = new Map<string, string>();
 const abortControllers = new Map<string, AbortController>();
 const killHandlers = new Map<string, () => void>();
+let bashLifecycle = new BackgroundBashLifecycle();
 
 const realBackgroundTaskServiceModule = {
 	...(await import("@server/services/background-task-service")),
@@ -61,6 +63,21 @@ const realAgentRuntimeRunModule = {
 };
 
 const fakeBackgroundTaskService = {
+	runBashStartup<T>(start: () => Promise<T>): Promise<T> {
+		bashLifecycle.assertAdmission();
+		return bashLifecycle.trackTerminal(start());
+	},
+	trackBashCollector<T>(
+		id: string,
+		_controller: AbortController,
+		work: Promise<T>,
+		processStarted = true,
+	): Promise<T> {
+		return bashLifecycle.trackCollector(id, work, processStarted);
+	},
+	markBashCollectorStarted(id: string): void {
+		bashLifecycle.markCollectorStarted(id);
+	},
 	async getById(id: string) {
 		return tasks.get(id) ?? null;
 	},
@@ -159,6 +176,7 @@ const fakeBackgroundTaskService = {
 		return abortControllers.get(id)?.signal.aborted ?? false;
 	},
 	async markCancelled(id: string) {
+		if (!bashLifecycle.canStartTerminal(id)) return;
 		const task = tasks.get(id);
 		if (task) task.status = "cancelled";
 	},
@@ -169,10 +187,12 @@ const fakeBackgroundTaskService = {
 		return taskOutput.get(id) ?? "";
 	},
 	async markCompleted(id: string) {
+		if (!bashLifecycle.canStartTerminal(id)) return;
 		const task = tasks.get(id);
 		if (task) task.status = "completed";
 	},
 	async markFailed(id: string, error: string) {
+		if (!bashLifecycle.canStartTerminal(id)) return;
 		const task = tasks.get(id);
 		if (task) {
 			task.status = "failed";
@@ -180,6 +200,7 @@ const fakeBackgroundTaskService = {
 		}
 	},
 	async markTimedOut(id: string) {
+		if (!bashLifecycle.canStartTerminal(id)) return;
 		const task = tasks.get(id);
 		if (task) task.status = "failed";
 	},
@@ -281,6 +302,16 @@ const fakeNarratorService = {
 			omitted: Math.max(matching.length - shown.length, 0),
 			omittedCapped: false,
 		};
+	},
+	// Mirrors the real nested view: each listed member's own helpers, capped per member.
+	async listNestedSubagentsForTeamView(parentIds: readonly string[], perParent: number) {
+		const result = new Map<string, { subagents: FakeNarrator[]; total: number }>();
+		for (const parentId of parentIds) {
+			const children = [...narrators.values()].filter((n) => n.parentNarratorId === parentId);
+			if (children.length > 0)
+				result.set(parentId, { subagents: children.slice(0, perParent), total: children.length });
+		}
+		return result;
 	},
 	async getById(id: string) {
 		const n = narrators.get(id);
@@ -398,6 +429,7 @@ function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
 }
 
 function seed() {
+	bashLifecycle = new BackgroundBashLifecycle();
 	tasks.clear();
 	taskOutput.clear();
 	abortControllers.clear();
@@ -653,6 +685,133 @@ describe("Bash background kinds", () => {
 			await released.promise;
 			completionSpy?.mockRestore();
 			resetUpdateCoordinationForTests();
+		}
+	});
+
+	test.each([
+		false,
+		true,
+	])("collector shutdown owns delayed exit and cancellation persistence, reject=%s", async (rejectPersistence) => {
+		seed();
+		const exit = Promise.withResolvers<number>();
+		const monitored = Promise.withResolvers<void>();
+		const terminalEntered = Promise.withResolvers<void>();
+		const persisted = Promise.withResolvers<void>();
+		const released = Promise.withResolvers<void>();
+		const kill = mock(async () => {});
+		const handle: ExecHandle = {
+			exited: exit.promise,
+			onData: () => monitored.resolve(),
+			isExited: () => false,
+			kill,
+		};
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: async () => handle,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		const release = mock(() => released.resolve());
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer: () => true,
+			release,
+		};
+		const markCancelled = fakeBackgroundTaskService.markCancelled;
+		const cancellation = spyOn(fakeBackgroundTaskService, "markCancelled").mockImplementation(
+			async (id) => {
+				terminalEntered.resolve();
+				await persisted.promise;
+				await markCancelled(id);
+			},
+		);
+		let drain: Promise<void> | undefined;
+		try {
+			await bashTool.execute({ command: "fixture", run_in_background: true }, ctx);
+			await monitored.promise;
+			const task = [...tasks.values()][0];
+			abortControllers.get(task.id)?.abort();
+			killHandlers.get(task.id)?.();
+			expect(kill).toHaveBeenCalledTimes(1);
+			bashLifecycle.stop();
+			drain = bashLifecycle.drain();
+			// A rejected drain also has an immediate receiver, independently of the assertion below.
+			void drain.catch(() => {});
+			expect(bashLifecycle.getSnapshot().collectors).toBe(1);
+			expect(release).not.toHaveBeenCalled();
+			exit.resolve(0);
+			await terminalEntered.promise;
+			expect(bashLifecycle.getSnapshot().pending).toBeGreaterThan(0);
+			expect(release).not.toHaveBeenCalled();
+			if (rejectPersistence) {
+				persisted.reject(new Error("fixture cancellation persistence failed"));
+				await expect(drain).rejects.toThrow("lifecycle failed");
+				expect(bashLifecycle.getSnapshot().failed).toBeGreaterThan(0);
+				await expect(bashLifecycle.drain()).rejects.toThrow("lifecycle failed");
+			} else {
+				persisted.resolve();
+				await drain;
+				expect(task.status).toBe("cancelled");
+			}
+			await released.promise;
+			expect(cancellation).toHaveBeenCalledTimes(1);
+			expect(release).toHaveBeenCalledTimes(1);
+			expect(bashLifecycle.getSnapshot().pending).toBe(0);
+		} finally {
+			exit.resolve(0);
+			persisted.resolve();
+			await drain?.catch(() => {});
+			cancellation.mockRestore();
+		}
+	});
+
+	test("preserve drains admitted task creation and settles an undispatched task", async () => {
+		seed();
+		const created = Promise.withResolvers<void>();
+		const releaseCreation = Promise.withResolvers<void>();
+		const execCommand = mock(async () => {
+			throw new Error("Undispatched Bash must not start after preserve");
+		});
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		const createTask = fakeBackgroundTaskService.createBashTask;
+		const creation = spyOn(fakeBackgroundTaskService, "createBashTask").mockImplementation(
+			async (input) => {
+				const task = await createTask(input);
+				created.resolve();
+				await releaseCreation.promise;
+				return task;
+			},
+		);
+		const tool = bashTool.execute({ command: "fixture", run_in_background: true }, ctx);
+		let drain: Promise<void> | undefined;
+		try {
+			await created.promise;
+			bashLifecycle.stop({ preserveProcesses: true });
+			drain = bashLifecycle.drain();
+			expect(bashLifecycle.getSnapshot().pending).toBeGreaterThan(0);
+			releaseCreation.resolve();
+			await tool;
+			await drain;
+			expect(execCommand).not.toHaveBeenCalled();
+			expect([...tasks.values()][0]).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("admission is stopped"),
+			});
+			expect(bashLifecycle.getSnapshot()).toMatchObject({ pending: 0, failed: 0 });
+		} finally {
+			releaseCreation.resolve();
+			await Promise.allSettled([tool, drain].filter(Boolean));
+			creation.mockRestore();
 		}
 	});
 
@@ -1850,5 +2009,38 @@ describe("TeamStatus accepts the aliases it printed", () => {
 
 		expect(sent.isError).toBeFalsy();
 		expect(deliveredMessages[0]?.targetId).toBe("ZyxwVutsRqpoNmlkJihgF");
+	});
+});
+
+describe("Foreground Bash that survives its kill", () => {
+	test("a timed-out process that never exits still returns a result", async () => {
+		seed();
+		const kill = mock(async () => {});
+		const handle: ExecHandle = {
+			// Never settles: the kill did not take, or its exit event was lost.
+			exited: new Promise<number | null>(() => {}),
+			onData() {},
+			isExited: () => false,
+			kill,
+		};
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: async () => handle,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		setBashKillSettleGraceMsForTests(50);
+		try {
+			const result = await bashTool.execute({ command: "hang", timeout: 20 }, ctx);
+
+			expect(kill).toHaveBeenCalled();
+			expect(result.output).toContain("Command timed out after 20ms");
+			expect(result.output).toContain("Process did not exit within 50ms after being killed");
+			expect(result.output).toContain("[exit code: 1]");
+		} finally {
+			setBashKillSettleGraceMsForTests(undefined);
+		}
 	});
 });

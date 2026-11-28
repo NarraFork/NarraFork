@@ -34,15 +34,10 @@
  * just finished never played.
  */
 
-import {
-	resolveToolShimmerFlash,
-	resolveToolShimmerPhase,
-	TOOL_SHIMMER_QUEUED_EXIT_MS,
-	type ToolShimmerFlash,
-	type ToolShimmerKind,
-	TRACE_SHIMMER_CLASS,
-	TRACE_SHIMMER_FLASH_HOLD_MS,
-} from "@shared/tool-shimmer";
+import { useTraceRowShimmerKind } from "@frontend/hooks/useTraceRowShimmerKind";
+import { splitTraceRowTitle } from "@frontend/lib/trace-row-title";
+import type { ReasoningTranslationEvidence } from "@shared/pretext-layout/reasoning-translation-sources";
+import { type ToolShimmerKind, TRACE_SHIMMER_CLASS } from "@shared/tool-shimmer";
 import {
 	IconBrain,
 	IconChevronDown,
@@ -50,7 +45,7 @@ import {
 	IconDots,
 	IconTool,
 } from "@tabler/icons-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
@@ -77,6 +72,10 @@ import {
 } from "../measure/measure-tool-run";
 import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import {
+	ReasoningTranslationIndicator,
+	useVisibleReasoningSource,
+} from "../reasoning-translation-visibility";
 import {
 	applyTraceUnknownHeights,
 	isExpandedUnknownTraceBody,
@@ -240,6 +239,8 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
 	onUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
@@ -390,6 +391,8 @@ function UnknownHeightTrace(props: RenderToolRunProps) {
 }
 
 function RenderMeasuredToolRun({
+	translationSource,
+	translationEvidence,
 	measured,
 	labels = {},
 	rowIcon,
@@ -505,6 +508,8 @@ function RenderMeasuredToolRun({
 			{/* ── Rows (+ expanded bodies) ── */}
 			{rows.map((row) => (
 				<TraceRowView
+					translationSource={translationSource}
+					translationEvidence={translationEvidence}
 					key={row.key}
 					row={row}
 					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
@@ -533,6 +538,9 @@ function RenderMeasuredToolRun({
 					animScope={animScope}
 				/>
 			))}
+			{translationEvidence ? (
+				<ReasoningTranslationIndicator evidence={translationEvidence} />
+			) : null}
 		</div>
 	);
 }
@@ -545,39 +553,6 @@ const chevronSlotStyle: React.CSSProperties = {
 	flexShrink: 0,
 };
 
-/**
- * How long a one-shot outcome sweep stays on a row.
- *
- * From `@shared/tool-shimmer` so this path, the chunk path and the stylesheet cannot
- * disagree: dropping the class before the animation ends cuts the highlight off
- * wherever it happens to be, and the row shimmer has already shipped looking broken
- * in exactly that way.
- */
-const ROW_FLASH_MS = TRACE_SHIMMER_FLASH_HOLD_MS;
-
-/**
- * The shimmer STATE of one row, or null for a quiet row.
- *
- * Five states, same rule the tool cards use (`@shared/tool-shimmer`): neutral while
- * a call's input streams, purple while a reflection gate deliberates, blue while it
- * executes, and a one-shot green / red pass as it settles. Before this, a folded row
- * could only say "something here is live" via `row.shimmer` — a failure and a
- * success looked identical, which is precisely what dropping to a low LOD used to
- * cost the reader.
- *
- * Returns the KIND rather than a class name so the caller can also name the state for
- * readers who do not get the colour (see `TraceRenderLabels.shimmerState`); the class
- * is one table lookup away.
- *
- * `row.shimmer` remains the streaming signal for rows with NO lifecycle (reasoning
- * steps): the adapter sets it on the live step, and those rows carry no status at
- * all, so the resolver has nothing to say about them.
- *
- * A fresh mount never flashes (`prev === null` in `resolveToolShimmerFlash`). That
- * matters more here than on a card: virtual-list rows mount and unmount constantly
- * while scrolling, so a mount-triggered flash would light up whole screens of
- * settled history.
- */
 type LabelForm = "pending" | "tail" | "title";
 
 /**
@@ -596,71 +571,6 @@ function useLabelFormFade(form: LabelForm): boolean {
 	const switched = previous.current !== null && previous.current !== form;
 	previous.current = form;
 	return switched;
-}
-
-function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
-	const status = row.status;
-	const prevStatusRef = useRef<string | null>(null);
-	const [flash, setFlash] = useState<ToolShimmerFlash | null>(null);
-	useEffect(() => {
-		const prev = prevStatusRef.current;
-		prevStatusRef.current = status;
-		const next = resolveToolShimmerFlash(prev, status);
-		// ⚠️ A transition with no flash CLEARS the stored one; it must not just bail.
-		// The timer that would have cleared it is torn down by this effect's own
-		// cleanup, so a flash that was outranked by a live `phase` below (a retry
-		// landing inside the window: running → fail → running) survived indefinitely
-		// and replayed on the NEXT quiet status. `running → fail → running →
-		// cancelled` flashed red on the cancellation — precisely the transition that
-		// must never flash — and `running → success → running → pending` flashed
-		// green on a row waiting for the reader's approval.
-		if (!next) {
-			setFlash(null);
-			return;
-		}
-		setFlash(next);
-		const timer = setTimeout(() => setFlash(null), ROW_FLASH_MS);
-		return () => clearTimeout(timer);
-	}, [status]);
-
-	const phase = resolveToolShimmerPhase({
-		status,
-		// The row's only disambiguation for a `pending` tool: without it a deliberating
-		// gate would fall silent instead of turning purple.
-		reflectionStatus: row.reflectionStatus ?? null,
-		// Parked slate mark when an earlier same-turn call still owns the slot. The
-		// adapter resolved this from the real sibling prefix; a folded row cannot see
-		// its peers, so it passes the verdict rather than a synthesized peer list.
-		queuedBehindUpstream: row.queuedBehindUpstream,
-	});
-	// Leaving queued dissolves the slate tint instead of cutting the pulse mid-cycle
-	// (see CARD path and `TOOL_SHIMMER_QUEUED_EXIT_MS`).
-	const isQueued = phase === "queued";
-	const prevQueuedRef = useRef(false);
-	const [queuedExit, setQueuedExit] = useState(false);
-	useEffect(() => {
-		const wasQueued = prevQueuedRef.current;
-		prevQueuedRef.current = isQueued;
-		if (isQueued) {
-			setQueuedExit(false);
-			return;
-		}
-		if (wasQueued) {
-			setQueuedExit(true);
-			const timer = setTimeout(() => setQueuedExit(false), TOOL_SHIMMER_QUEUED_EXIT_MS);
-			return () => clearTimeout(timer);
-		}
-		// Non-queued phase changes must not cancel the exit timer (e.g. running → success).
-	}, [isQueued]);
-	// The leave-fade outranks a live phase for one short window: the parked mark
-	// must finish dissolving before the next sweep paints over it. A re-entry into
-	// queued cancels the fade (handled above).
-	if (queuedExit && phase !== "queued") return "queued_out";
-	// A live phase outranks a pending flash (a retry that resumed inside the window).
-	if (phase) return phase;
-	if (flash) return flash;
-	// No lifecycle of its own: fall back to the adapter's live-row marker.
-	return row.shimmer ? "streaming" : null;
 }
 
 /**
@@ -732,31 +642,7 @@ function TraceRowTitle({
 	);
 }
 
-/**
- * Split a row title into its BOLD tool name and the rest.
- *
- * The adapter joins them as `"Name · summary"` (`toolTraceItem`), and the measured row
- * carries `toolName` alongside, so the split is a prefix check rather than a parse of the
- * separator — a summary containing its own `·` cannot confuse it.
- *
- * Returns null when the title is not that shape (a reasoning step, a caller-supplied
- * `resolveToolTitle`, a truncated title whose name was cut), in which case the title is
- * drawn verbatim. Height-neutral either way: same text, same single line.
- */
-export function splitTraceRowTitle(
-	title: string | undefined,
-	toolName: string | undefined,
-): { name: string; detail: string } | null {
-	if (!title || !toolName) return null;
-	// `Task` is displayed as `Agent`, so match what the adapter actually wrote.
-	const displayName = toolName === "Task" ? "Agent" : toolName;
-	if (!title.startsWith(displayName)) return null;
-	const rest = title.slice(displayName.length);
-	if (rest.length === 0) return { name: displayName, detail: "" };
-	// The adapter's separator, and nothing else, may follow the name.
-	if (!rest.startsWith(" · ")) return null;
-	return { name: displayName, detail: rest.slice(3) };
-}
+export { splitTraceRowTitle } from "@frontend/lib/trace-row-title";
 
 /**
  * A live reasoning row's label: a fixed "1234 字符…" size prefix followed by the
@@ -868,6 +754,8 @@ function LiveTailText({
 }
 
 function TraceRowView({
+	translationSource,
+	translationEvidence,
 	row,
 	rowIcon,
 	onToggleRow,
@@ -888,6 +776,8 @@ function TraceRowView({
 	onToggleTextExpanded,
 	onBodyUnknownHeight,
 }: {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	onBodyUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
@@ -912,6 +802,13 @@ function TraceRowView({
 	animKeyBase?: string;
 	animScope?: string;
 }) {
+	const visibleRef = useVisibleReasoningSource<HTMLDivElement>(
+		translationSource,
+		translationEvidence,
+		translationEvidence ? row.body : undefined,
+		undefined,
+		row.itemIndex,
+	);
 	/**
 	 * The card node from the last render that HAD one, kept so a closing drill-down can
 	 * be animated shut around it (see `closingRowKeys`).
@@ -1175,6 +1072,7 @@ function TraceRowView({
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
 				<div
+					ref={visibleRef}
 					style={{
 						paddingBlock: rowSpacing(TRACE_BODY_PADDING_Y),
 						position: "absolute",
@@ -1186,6 +1084,7 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
+					{translationSource ? <ReasoningTranslationIndicator target={translationSource} /> : null}
 					<RenderTextPreview
 						textPreviewLabels={textPreviewLabels}
 						onToggleTextExpanded={onToggleTextExpanded}

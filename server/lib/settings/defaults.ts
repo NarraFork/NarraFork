@@ -17,7 +17,7 @@ export const DEFAULTS: NarraForkSettings = {
 	speech: { enabled: false, providers: [] },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
-	proxy: { mode: "direct" },
+	proxy: { mode: "direct", noProxyRules: [] },
 	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
 	// DATABASE_URL from the environment — the connection URL is never read from this file
 	// (see the `database` field comment in types.ts).
@@ -133,7 +133,7 @@ export const DEFAULTS: NarraForkSettings = {
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
 	workspace: {
-		treeSnapshotsEnabled: true,
+		treeSnapshotsEnabled: false,
 	},
 	narratorBlocks: {
 		write: true,
@@ -333,7 +333,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"server.tls.autoReissue": {
-		desc: "启动时，本机 IP 变化则自动重新签发内置证书，保留原 CA。默认开启。",
+		desc: "启动时，本机 IP 变化、证书有效期超过 825 天，或剩余不足 30 天，则自动重新签发内置证书，保留原 CA。默认开启。",
 		type: "boolean",
 	},
 	"server.tls.certFile": {
@@ -377,6 +377,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"proxy.url": {
 		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https 协议，仅填 host:port 时默认按 http 处理。',
 		type: "string",
+	},
+	"proxy.noProxyRules": {
+		desc: "直连规则（no_proxy）。每条含 match（wildcard / regex）、pattern、enabled。内置 HTTP 通道按目标豁免；插件提供商不按目标豁免。交互浏览器只收到部分通配主机规则，裸主机在 Chromium 里不是「主机及其子域」。规则只能直连，不能强制走代理。",
+		type: "array",
 	},
 
 	// ── paths ───────────────────────────────────────────────────────────
@@ -835,9 +839,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── workspace ───────────────────────────────────────────────────────
 	"workspace.treeSnapshotsEnabled": {
-		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+		desc: "历史兼容字段，默认 false。本地文件历史与整树快照已停用，此字段不改变本地捕获策略。",
 		type: "boolean",
-		valid: "true / false，默认 true",
+		valid: "true / false，默认 false",
 	},
 
 	// ── narratorBlocks ──────────────────────────────────────────────────

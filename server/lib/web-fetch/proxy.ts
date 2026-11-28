@@ -9,20 +9,19 @@ function webFetchProxyOverride() {
 	return settings.agent.webFetchPolicy?.proxy;
 }
 
-/**
- * Resolve the proxy URL for WebFetch, honouring the WebFetch proxy
- * override. Used for isolated WebFetch browser-rendering contexts.
- */
-export function getWebFetchProxy(): string | undefined {
-	return resolveOverride(webFetchProxyOverride());
-}
-
-/** Browser sessions resolve independently from WebFetch. */
+/** Browser sessions resolve independently from WebFetch (no per-navigation target). */
 export function getBrowserProxy(): string | undefined {
 	return resolveOverride(settings.agent.browserProxy);
 }
 
-/** Resolve the proxy for a specific target URL (applies loopback/NO_PROXY exemptions). */
+/**
+ * Resolve the WebFetch proxy for one target URL.
+ *
+ * WebFetch opens a fresh isolated browser context per navigation, so the target is
+ * always known here — which is what lets `settings.proxy.noProxyRules` (wildcard
+ * and regex alike) decide that context's proxy, not just Chromium's host-based
+ * bypass list. The override is honoured first (absent/"default" → global policy).
+ */
 export function getWebFetchProxyForUrl(target: string | URL): string | undefined {
 	return resolveProxyForUrl(target, webFetchProxyOverride());
 }

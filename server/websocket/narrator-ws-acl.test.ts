@@ -17,15 +17,30 @@
  *    Those were the second hole: a reader who could see a permission request could
  *    approve it, because the id was all the handler asked for.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { cleanDb, getTestDb } from "../../tests/setup";
-import { aclGrants, narratorMessages, narrators, narratorToolCalls, users } from "../db/schema";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { cleanDb } from "../../tests/setup";
+import {
+	aclGrants,
+	chatRooms,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../db/schema";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "../services/__tests__/agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
-const { getNarratorConnections, handleNarratorWS } = await import("./narrator-ws");
+const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await import(
+	"./narrator-ws"
+);
 
 type SentMessage = Record<string, unknown>;
 type FakeNarratorWS = Parameters<typeof handleNarratorWS.open>[0];
@@ -45,6 +60,7 @@ function openWs(options: { userId?: string; userRole?: string } = {}) {
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedNarrators: new Set<string>(),
+			subscribedChatRooms: new Set<string>(),
 			catchingUpNarrators: new Map(),
 			catchUpBuffers: new Map(),
 			userId: options.userId,
@@ -56,7 +72,9 @@ function openWs(options: { userId?: string; userRole?: string } = {}) {
 	} as unknown as FakeNarratorWS;
 	handleNarratorWS.open(ws);
 	openedConnections.push(ws);
-	return { ws, sent };
+	// ACL command responses are asserted independently from the initial revision hint.
+	const initialFrames = sent.splice(0);
+	return { ws, sent, initialFrames };
 }
 
 /**
@@ -144,15 +162,232 @@ beforeEach(() => {
 	seedUsers();
 });
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openedConnections.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
+	await drainRuntimeTestWork();
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
+});
+
+it("new-room discovery reaches only authorized subscribers of that narrator without joining chat", async () => {
+	seedNarrator("created-target", "private");
+	seedNarrator("created-other", "private");
+	const target = openWs({ userId: OWNER });
+	const other = openWs({ userId: OWNER });
+	const denied = openWs({ userId: STRANGER });
+	await handleNarratorWS.message(target.ws, {
+		type: "subscribe",
+		kind: "list",
+		narratorIds: ["created-target"],
+	});
+	await handleNarratorWS.message(other.ws, {
+		type: "subscribe",
+		kind: "list",
+		narratorIds: ["created-other"],
+	});
+	await handleNarratorWS.message(denied.ws, {
+		type: "subscribe",
+		kind: "list",
+		narratorIds: ["created-target"],
+	});
+	const frame = {
+		type: "chat:room_created" as const,
+		narratorId: "created-target",
+		roomId: "new-room",
+	};
+	broadcastToNarrator("created-target", frame);
+	expect(target.sent).toContainEqual(frame);
+	expect(other.sent).not.toContainEqual(frame);
+	expect(denied.sent).not.toContainEqual(frame);
+	expect(target.ws.data.subscribedChatRooms.size).toBe(0);
+});
+
+describe("chat subscribe acknowledgment", () => {
+	function seedRoom() {
+		seedNarrator("chat-private", "private");
+		db.insert(chatRooms)
+			.values({
+				id: "chat-room",
+				narratorId: "chat-private",
+				kind: "narrator",
+				nextSeq: 4,
+				createdAt: NOW,
+			})
+			.run();
+	}
+
+	it("ACKs each authorized join, after joining, including repeated subscriptions", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: OWNER });
+		const chat = await import("../services/chat-service");
+		const original = chat.readChatTailSeq;
+		const tail = spyOn(chat, "readChatTailSeq").mockImplementation(async (roomId) => {
+			expect(ws.data.subscribedChatRooms.has(roomId)).toBe(true);
+			return original(roomId);
+		});
+		try {
+			for (const requestId of ["first", "resumed"]) {
+				await handleNarratorWS.message(ws, {
+					type: "chat_subscribe",
+					roomIds: ["chat-room"],
+					requestId,
+				});
+				expect(sent).toContainEqual({
+					type: "chat:subscribed",
+					roomId: "chat-room",
+					requestId,
+					tailSeq: 3,
+				});
+			}
+			expect(tail).toHaveBeenCalledTimes(2);
+		} finally {
+			tail.mockRestore();
+		}
+	});
+
+	it("ACKs simultaneous owners of the same room independently", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: OWNER });
+		await Promise.all(
+			["panel-one", "panel-two"].map((requestId) =>
+				handleNarratorWS.message(ws, { type: "chat_subscribe", roomIds: ["chat-room"], requestId }),
+			),
+		);
+		for (const requestId of ["panel-one", "panel-two"]) {
+			expect(sent).toContainEqual({
+				type: "chat:subscribed",
+				roomId: "chat-room",
+				requestId,
+				tailSeq: 3,
+			});
+		}
+	});
+
+	it("denies private and nonexistent rooms identically without joining", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: STRANGER });
+		await handleNarratorWS.message(ws, {
+			type: "chat_subscribe",
+			roomIds: ["chat-room", "absent"],
+			requestId: "denied",
+		});
+		for (const roomId of ["chat-room", "absent"]) {
+			expect(sent).toContainEqual({
+				type: "chat:subscription_denied",
+				roomId,
+				requestId: "denied",
+				status: 403,
+			});
+		}
+		expect(ws.data.subscribedChatRooms.size).toBe(0);
+	});
+
+	it("reports permission loss to every simultaneous waiting owner", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: STRANGER });
+		await Promise.all(
+			["denied-one", "denied-two"].map((requestId) =>
+				handleNarratorWS.message(ws, { type: "chat_subscribe", roomIds: ["chat-room"], requestId }),
+			),
+		);
+		for (const requestId of ["denied-one", "denied-two"]) {
+			expect(sent).toContainEqual({
+				type: "chat:subscription_denied",
+				roomId: "chat-room",
+				requestId,
+				status: 403,
+			});
+		}
+	});
+
+	it("reauthorizes a joined room after its read grant is revoked", async () => {
+		seedRoom();
+		grantRead("chat-private", VIEWER);
+		const { ws, sent } = openWs({ userId: VIEWER });
+		await handleNarratorWS.message(ws, {
+			type: "chat_subscribe",
+			roomIds: ["chat-room"],
+			requestId: "before-revoke",
+		});
+		expect(ws.data.subscribedChatRooms.has("chat-room")).toBe(true);
+		db.delete(aclGrants).run();
+		await handleNarratorWS.message(ws, {
+			type: "chat_subscribe",
+			roomIds: ["chat-room"],
+			requestId: "after-revoke",
+		});
+		expect(ws.data.subscribedChatRooms.has("chat-room")).toBe(false);
+		expect(sent).toContainEqual({
+			type: "chat:subscription_denied",
+			roomId: "chat-room",
+			requestId: "after-revoke",
+			status: 403,
+		});
+	});
+
+	it("keeps legacy batch subscriptions without ACK frames", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: OWNER });
+		await handleNarratorWS.message(ws, { type: "chat_subscribe", roomIds: ["chat-room"] });
+		expect(ws.data.subscribedChatRooms.has("chat-room")).toBe(true);
+		expect(sent.some((frame) => frame.type === "chat:subscribed")).toBe(false);
+	});
+
+	it("unsubscribe cancels an in-flight authorization and its ACK", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: OWNER });
+		const chat = await import("../services/chat-service");
+		const access = await chat.assertCanRead("chat-room", OWNER);
+		let release!: (value: typeof access) => void;
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = spyOn(chat, "assertCanRead").mockImplementation(() => {
+			entered();
+			return new Promise((resolve) => {
+				release = resolve;
+			});
+		});
+		try {
+			const joining = handleNarratorWS.message(ws, {
+				type: "chat_subscribe",
+				roomIds: ["chat-room"],
+				requestId: "stale",
+			});
+			await started;
+			await handleNarratorWS.message(ws, { type: "chat_unsubscribe", roomIds: ["chat-room"] });
+			release(access);
+			await joining;
+			expect(ws.data.subscribedChatRooms.has("chat-room")).toBe(false);
+			expect(sent.some((frame) => frame.type === "chat:subscribed")).toBe(false);
+		} finally {
+			gate.mockRestore();
+		}
+	});
+
+	it("does not report operational read failure as permission loss", async () => {
+		seedRoom();
+		const { ws, sent } = openWs({ userId: OWNER });
+		const chat = await import("../services/chat-service");
+		const gate = spyOn(chat, "assertCanRead").mockRejectedValue(new Error("worker unavailable"));
+		try {
+			await handleNarratorWS.message(ws, {
+				type: "chat_subscribe",
+				roomIds: ["chat-room"],
+				requestId: "retry",
+			});
+			expect(sent.some((frame) => frame.type === "chat:subscription_denied")).toBe(false);
+			expect(sent.some((frame) => frame.type === "error")).toBe(true);
+		} finally {
+			gate.mockRestore();
+		}
+	});
 });
 
 describe("subscribe authorization", () => {

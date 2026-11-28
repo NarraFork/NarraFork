@@ -14,6 +14,7 @@
 		"start": "Start",
 		"chooseDirectory": "Choose working directory",
 		"directoryRequired": "No default project directory is set. Choose a working directory for this session, or set a default in Settings.",
+		"deviceUnavailable": "The execution device \"{{device}}\" is offline or no longer available. Choose another device before starting.",
 		"advanced": "More session options",
 		"sendFailed": "Session created, but the message could not be sent"
 	}

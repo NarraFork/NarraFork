@@ -9,6 +9,8 @@
  *   such as `"pipeline:<base64url-json>"`.
  */
 
+import { TEAM_TRAIT } from "@shared/team-trait";
+
 // ---------------------------------------------------------------------------
 // Variant helpers
 // ---------------------------------------------------------------------------
@@ -70,7 +72,8 @@ export type NarratorTrait =
 	| "knowledge-steward"
 	| "scheduled"
 	| "imported"
-	| "bot";
+	| "bot"
+	| "team";
 
 /** Trait marking a narrator whose history was imported from Claude Code or Codex. */
 export const IMPORTED_TRAIT = "imported";
@@ -86,6 +89,22 @@ export const BOT_TRAIT = "bot";
 /** Whether the given traits mark this narrator as a bot. */
 export function isBotNarrator(raw: unknown): boolean {
 	return parseTraits(raw).includes(BOT_TRAIT);
+}
+
+/**
+ * Trait marking a team coordinator: the narrator that IS a project team
+ * (docs/PROJECT_TEAMS-PLAN.md). Always written together with its `project_teams` row, in one
+ * transaction: at creation, when a person turns an existing session into a team, and removed
+ * with the row when a person disbands the team and keeps the session
+ * (`services/teams/team-conversion.ts`, both under `narratorTraitsLock`). Forks and imports do
+ * not carry it (they have no team row). Defined in the leaf `shared/team-trait.ts` so the
+ * session UI can read it too without pulling the team model into the DB read worker.
+ */
+export { TEAM_TRAIT };
+
+/** Whether the given traits mark this narrator as a team coordinator. */
+export function isTeamNarrator(raw: unknown): boolean {
+	return parseTraits(raw).includes(TEAM_TRAIT);
 }
 
 /** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */

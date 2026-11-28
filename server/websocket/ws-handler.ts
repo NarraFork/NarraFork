@@ -7,7 +7,9 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { runReadFanoutWebSocketScope } from "../lib/read-fanout-diagnostics";
 import { settings } from "../lib/settings";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import { currentSqlTraceSpan, runInSqlTraceSpan, startSqlTraceSpan } from "../lib/sql-trace";
 import type { VNetClientMessage } from "../lib/vnet/types";
 import {
@@ -35,7 +37,13 @@ import {
 	sendExternalNarratorFrame,
 } from "./oauth-connection-registry";
 import { drainOutlineLive, handleOutlineLiveBinary } from "./outline-live-ws";
-import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
+import { SessionRevalidation } from "./session-revalidation";
+import {
+	dropUnauthorizedTerminalSubscriptions,
+	getTerminalConnections,
+	handleTerminalWS,
+	type TerminalWSData,
+} from "./terminal-ws";
 import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 // === Unified WS data type ===
@@ -91,6 +99,10 @@ export function narratorWebSocketBackendRefusal(
 
 let acceptingWebSocketMessages = true;
 const activeWebSocketHandlers = new Set<Promise<void>>();
+
+export function hasActiveWebSocketHandlers(): boolean {
+	return activeWebSocketHandlers.size > 0;
+}
 
 function trackWebSocketHandler(work: Promise<void>, onError: (error: unknown) => void): void {
 	const tracked = work.catch(onError);
@@ -178,6 +190,8 @@ export function resolveWSData(
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
+			userId: userInfo?.userId,
+			userRole: userInfo?.role,
 			sessionExp: sessionAuth?.sessionExp,
 			sessionId: sessionAuth?.sessionId,
 			sessionUserId: sessionAuth?.sessionUserId,
@@ -233,6 +247,7 @@ function isSessionWSExpired(data: SessionWSAuth, nowSeconds: number): boolean {
 type SessionSocket = ServerWebSocket<WSData & { channel: "narrator" | "terminal" }>;
 
 function closeFinishedSessionSocket(ws: SessionSocket): void {
+	sessionRevalidation.forget(ws);
 	logger.debug("Closing WS whose session ended", {
 		channel: ws.data.channel,
 		userId: ws.data.sessionUserId,
@@ -256,35 +271,67 @@ function closeFinishedSessionSocket(ws: SessionSocket): void {
  * refresh the expiry and live role of the rest. A storage failure keeps the socket —
  * it must not read as "your session is gone".
  */
-export async function revalidateSessionSockets(sockets: readonly SessionSocket[]): Promise<void> {
-	for (const ws of sockets) {
-		if (ws.readyState !== 1) continue;
-		const sessionId = ws.data.sessionId;
-		if (!sessionId) {
-			// No session to re-check: only the snapshotted expiry can end it.
-			if (isSessionWSExpired(ws.data, Math.floor(Date.now() / 1000))) {
-				closeFinishedSessionSocket(ws);
-			}
-			continue;
-		}
-		let session: Awaited<ReturnType<typeof resolveLiveSession>>;
-		try {
-			session = await resolveLiveSession(sessionId);
-		} catch (error) {
-			logger.warn("Failed to re-check WS session", {
-				userId: ws.data.sessionUserId,
-				error: error instanceof Error ? error.name : "UnknownError",
-			});
-			continue;
-		}
-		if (ws.readyState !== 1) continue;
+function reportSessionRevalidationFailure(error: unknown): void {
+	try {
+		logger.warn("WS session revalidation round failed", {
+			errorType: error instanceof Error ? "Error" : typeof error,
+		});
+	} catch {
+		// Background diagnostics must not create an unhandled rejection.
+	}
+}
+
+/** Subscription checks share the session round's identity, epoch and stop guard. */
+function revalidateTerminalSubscriptions(
+	ws: SessionSocket,
+	isCurrent: () => boolean,
+): Promise<void> | undefined {
+	if (ws.data.channel !== "terminal") return;
+	const terminal = ws as ServerWebSocket<WSData & { channel: "terminal" }>;
+	return dropUnauthorizedTerminalSubscriptions([terminal], isCurrent).then(() => {});
+}
+
+const sessionRevalidationOptions = {
+	onRoundError: reportSessionRevalidationFailure,
+	read: resolveLiveSession,
+	afterReadFailure: revalidateTerminalSubscriptions,
+	apply(
+		ws: SessionSocket,
+		session: Awaited<ReturnType<typeof resolveLiveSession>>,
+		isCurrent: () => boolean,
+	) {
 		if (!session || session.sub !== ws.data.sessionUserId) {
 			closeFinishedSessionSocket(ws);
-			continue;
+			return;
 		}
 		ws.data.sessionExp = session.exp;
-		if (ws.data.channel === "narrator") ws.data.userRole = session.role;
-	}
+		// Both channels authorize with the live role (a demoted admin loses its shortcut).
+		ws.data.userRole = session.role;
+		return revalidateTerminalSubscriptions(ws, isCurrent);
+	},
+	withoutSession(ws: SessionSocket, isCurrent: () => boolean) {
+		if (isSessionWSExpired(ws.data, Math.floor(Date.now() / 1000))) {
+			closeFinishedSessionSocket(ws);
+			return;
+		}
+		return revalidateTerminalSubscriptions(ws, isCurrent);
+	},
+	onError(ws: SessionSocket, error: unknown) {
+		logger.warn("Failed to re-check WS session", {
+			userId: ws.data.sessionUserId,
+			error: error instanceof Error ? error.name : "UnknownError",
+		});
+	},
+};
+const sessionRevalidation = hotSafe(
+	"narrafork.wsSessionRevalidation",
+	() => new SessionRevalidation(sessionRevalidationOptions),
+);
+Object.setPrototypeOf(sessionRevalidation, SessionRevalidation.prototype);
+sessionRevalidation.configure(sessionRevalidationOptions);
+
+export function revalidateSessionSockets(sockets: readonly SessionSocket[]): Promise<void> {
+	return sessionRevalidation.revalidate(sockets);
 }
 
 /** Re-check a user's session sockets whenever their authorization changes. */
@@ -302,12 +349,15 @@ function watchAuthChanges(): void {
 		for (const ws of getTerminalConnections()) {
 			if (!event.userId || ws.data.sessionUserId === event.userId) affected.push(ws);
 		}
-		if (affected.length > 0) void revalidateSessionSockets(affected);
+		void sessionRevalidation
+			.invalidate(affected, (ws) => !event.userId || ws.data.sessionUserId === event.userId)
+			.catch(reportSessionRevalidationFailure);
 	};
 	eventBus.on("auth:changed", authChangeWatch.handler);
 }
 
 export function startHeartbeat() {
+	sessionRevalidation.start();
 	watchAuthChanges();
 	hotTimer(HEARTBEAT_KEY, () =>
 		setInterval(() => {
@@ -397,7 +447,9 @@ export function startHeartbeat() {
 			}
 
 			// The known expiry passed, but the session may have slid forward since: re-check.
-			if (expiredSession.length > 0) void revalidateSessionSockets(expiredSession);
+			if (expiredSession.length > 0) {
+				void revalidateSessionSockets(expiredSession).catch(reportSessionRevalidationFailure);
+			}
 
 			for (const ws of staleNarrator) {
 				// Delegate to the channel handler so presence / stats are cleaned up
@@ -463,6 +515,9 @@ export function startHeartbeat() {
 
 export function stopHeartbeat() {
 	hotTimerClear(HEARTBEAT_KEY);
+	sessionRevalidation.stop();
+	if (authChangeWatch.handler) eventBus.off("auth:changed", authChangeWatch.handler);
+	authChangeWatch.handler = null;
 }
 
 /**
@@ -474,6 +529,7 @@ export function stopHeartbeat() {
  */
 export function closeAllConnections() {
 	acceptingWebSocketMessages = false;
+	stopHeartbeat();
 	closeAllExternalNarratorConnections();
 	for (const ws of getNarratorConnections()) {
 		try {
@@ -515,9 +571,11 @@ function dispatchParsedMessage(
 ): void {
 	if (channel === "narrator") {
 		trackWebSocketHandler(
-			handleNarratorWS.message(
-				ws as ServerWebSocket<WSData & { channel: "narrator" }>,
-				parsed as NarratorClientMessage,
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleNarratorWS.message(
+					ws as ServerWebSocket<WSData & { channel: "narrator" }>,
+					parsed as NarratorClientMessage,
+				),
 			),
 			(err) => {
 				logger.warn("Narrator WS message handler error", { error: String(err) });
@@ -530,7 +588,9 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "external-narrator") {
 		trackWebSocketHandler(
-			handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleExternalNarratorWS.message(ws as ExternalNarratorWS, parsed),
+			),
 			(err) => {
 				logger.warn("External narrator WS message handler error", { error: String(err) });
 				try {
@@ -548,16 +608,20 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "terminal") {
 		trackWebSocketHandler(
-			Promise.resolve(
-				handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				Promise.resolve(
+					handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed),
+				),
 			),
 			(err) => logger.warn("Terminal WS message handler error", { error: String(err) }),
 		);
 	} else if (channel === "vnet") {
 		trackWebSocketHandler(
-			handleVNetWS.message(
-				ws as ServerWebSocket<WSData & { channel: "vnet" }>,
-				parsed as VNetClientMessage,
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleVNetWS.message(
+					ws as ServerWebSocket<WSData & { channel: "vnet" }>,
+					parsed as VNetClientMessage,
+				),
 			),
 			(err) => {
 				logger.warn("VNet WS message handler error", { error: String(err) });
@@ -570,7 +634,9 @@ function dispatchParsedMessage(
 		);
 	} else if (channel === "device") {
 		trackWebSocketHandler(
-			handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+			runReadFanoutWebSocketScope(channel, (parsed as { type: unknown }).type, () =>
+				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+			),
 			(err) => logger.warn("Device WS message handler error", { error: String(err) }),
 		);
 	}
@@ -578,7 +644,7 @@ function dispatchParsedMessage(
 
 export const wsHandlers = {
 	open(ws: ServerWebSocket<WSData>) {
-		if (!acceptingWebSocketMessages) {
+		if (!acceptingWebSocketMessages || isUnattendedShutdownFenced()) {
 			try {
 				ws.close(1012, "server shutting down");
 			} catch {
@@ -602,6 +668,14 @@ export const wsHandlers = {
 	},
 
 	message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
+		if (isUnattendedShutdownFenced() && acceptingWebSocketMessages) {
+			try {
+				ws.close(1013, "server checking shutdown readiness");
+			} catch {
+				// already dead — ignore
+			}
+			return;
+		}
 		if (!acceptingWebSocketMessages) {
 			try {
 				ws.close(1012, "server shutting down");
@@ -627,7 +701,9 @@ export const wsHandlers = {
 				const narratorWs = ws as ServerWebSocket<WSData & { channel: "narrator" }>;
 				narratorWs.data.lastPongAt = Date.now();
 				try {
-					handleOutlineLiveBinary(narratorWs, bytes);
+					runReadFanoutWebSocketScope(channel, "outline_binary", () =>
+						handleOutlineLiveBinary(narratorWs, bytes),
+					);
 				} catch (error) {
 					logger.warn("Outline live frame handler error", { error: String(error) });
 				}
@@ -656,9 +732,11 @@ export const wsHandlers = {
 					return;
 				}
 				trackWebSocketHandler(
-					handleDeviceWS.binaryMessage(
-						ws as ServerWebSocket<WSData & { channel: "device" }>,
-						bytes,
+					runReadFanoutWebSocketScope(channel, "binary", () =>
+						handleDeviceWS.binaryMessage(
+							ws as ServerWebSocket<WSData & { channel: "device" }>,
+							bytes,
+						),
 					),
 					(err) => logger.warn("Device WS binary handler error", { error: String(err) }),
 				);
@@ -768,6 +846,9 @@ export const wsHandlers = {
 
 	close(ws: ServerWebSocket<WSData>, _code: number, _reason: string) {
 		const { channel } = ws.data;
+		if (channel === "narrator" || channel === "terminal") {
+			sessionRevalidation.forget(ws as SessionSocket);
+		}
 
 		if (channel === "narrator") {
 			handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);

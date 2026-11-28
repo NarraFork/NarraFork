@@ -18,12 +18,14 @@ import {
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
 	isNarratorMutationPendingFor,
+	matchesNarratorSearch,
 	type NarratorListSearchParams,
+	NO_EXPANDED_IDS,
 	normalizeNarratorListSearchPatch,
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
-import { useAllModels } from "../../hooks/useModels";
+import { useModelRuntimeSettings } from "../../hooks/useModels";
 import {
 	useDeleteNarrator,
 	useNarratorsPaginated,
@@ -72,13 +74,31 @@ function ArchivedNarratorsPage() {
 	const deleteNarrator = useDeleteNarrator();
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
-	const { defaultModelValue } = useAllModels();
+	const { defaultModelValue } = useModelRuntimeSettings();
 	const narratorDeleteCapability = useNarratorDeleteCapability();
 	const deleteSupported = narratorDeleteCapability.supported;
 	const deleteUnsupportedReason = narratorDeleteCapability.reason ?? t("deleteNarratorUnsupported");
 
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+	// 哪个主会话的顺便提问子会话是展开的。放在页面上而不是卡片里，重新取数后不丢。
+	const [expandedAskInPassing, setExpandedAskInPassing] = useState<Set<string>>(() => new Set());
+
+	const toggleAskInPassing = useCallback((narratorId: string) => {
+		setExpandedAskInPassing((prev) => {
+			const next = new Set(prev);
+			if (next.has(narratorId)) next.delete(narratorId);
+			else next.add(narratorId);
+			return next;
+		});
+	}, []);
+
+	const openNarrator = useCallback(
+		(narratorId: string) => {
+			navigate({ to: "/narrators/$narratorId", params: { narratorId } });
+		},
+		[navigate],
+	);
 
 	const handleDelete = useCallback(
 		(narrator: NarratorListItem) => {
@@ -108,6 +128,16 @@ function ArchivedNarratorsPage() {
 		() => filterNarratorsByLocalQuery(narrators, localQuery),
 		[narrators, localQuery],
 	);
+
+	// 搜索命中在子会话里时把主会话展开：否则列表里会出现一条自己看不出为什么在这的行。
+	const expandedBySearch = useMemo(() => {
+		if (!localQuery.trim()) return NO_EXPANDED_IDS;
+		return new Set(
+			filteredNarrators
+				.filter((narrator) => !matchesNarratorSearch(narrator, localQuery))
+				.map((narrator) => narrator.id),
+		);
+	}, [filteredNarrators, localQuery]);
 
 	return (
 		<Stack>
@@ -170,6 +200,11 @@ function ArchivedNarratorsPage() {
 							deleteUnsupportedReason={deleteUnsupportedReason}
 							onUnarchive={(narratorId) => unarchiveNarrator.mutate(narratorId)}
 							onDelete={handleDelete}
+							askInPassingExpanded={
+								expandedAskInPassing.has(narrator.id) || expandedBySearch.has(narrator.id)
+							}
+							onToggleAskInPassing={toggleAskInPassing}
+							onOpenAskInPassing={openNarrator}
 						/>
 					))}
 					{!localQuery.trim() && <div ref={sentinelRef} style={{ height: 1 }} />}

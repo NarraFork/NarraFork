@@ -27,6 +27,7 @@ import {
 	IconNotebook,
 	IconRobot,
 	IconSearch,
+	IconSitemap,
 	IconTerminal2,
 	IconTextSize,
 	IconTimeline,
@@ -35,7 +36,16 @@ import {
 } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
@@ -43,6 +53,7 @@ import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { lazyWithRetry } from "../../../lib/lazy-with-retry";
+import { useRecentTabsScope } from "../../../lib/recent-tabs-owner";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import {
@@ -102,6 +113,11 @@ const FileTreePanel = lazy(() =>
 );
 const NarratorTimelinePanel = lazy(() =>
 	import("../timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
+);
+const CommunicationTopologyPanel = lazy(() =>
+	import("../communication/CommunicationTopologyPanel").then((m) => ({
+		default: m.CommunicationTopologyPanel,
+	})),
 );
 // Both dock and drawer defer the same editor / binary-preview entry.
 const FilePanelContent = lazy(() =>
@@ -356,6 +372,7 @@ export function SubagentSessionPanelContent({
 }: SubagentSessionPanelContentProps) {
 	const navigate = useNavigate();
 	const { data: narrator } = useNarrator(subagentNarratorId);
+	const recentTabsScope = useRecentTabsScope();
 	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
 	const narratorData = narrator as any;
@@ -373,14 +390,17 @@ export function SubagentSessionPanelContent({
 				addSubagentToRecentTabs: userPrefs?.addSubagentToRecentTabs,
 			})
 		) {
-			addSubagentRecentTab({
-				id: subagentNarratorId,
-				parentNarratorId: narratorData?.parentNarratorId,
-				title,
-				cwd: narratorData?.cwd,
-				status: narratorData?.status,
-				isScheduled: traits.includes("scheduled"),
-			});
+			addSubagentRecentTab(
+				{
+					id: subagentNarratorId,
+					parentNarratorId: narratorData?.parentNarratorId,
+					title,
+					cwd: narratorData?.cwd,
+					status: narratorData?.status,
+					isScheduled: traits.includes("scheduled"),
+				},
+				recentTabsScope,
+			);
 		}
 		if (onOpenStandalonePage) {
 			onOpenStandalonePage(subagentNarratorId);
@@ -396,6 +416,7 @@ export function SubagentSessionPanelContent({
 		narratorData,
 		onClose,
 		onOpenStandalonePage,
+		recentTabsScope,
 		subagentNarratorId,
 		title,
 		traits,
@@ -471,6 +492,7 @@ export function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams
 
 // ── Terminal ──
 export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const visible = useDockviewPanelVisible(props.api);
 	const { t } = useTranslation("terminal");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -484,26 +506,6 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			props.api.setTitle(title);
 		}
 	}, [t, props.api]);
-
-	// Bridge: register terminal stdin writer so chat can push text to us.
-	const registerWrite = dock?.registerWriteTerminalStdin;
-	const handleWriteRef = useCallback(
-		(fn: ((text: string) => void) | null) => {
-			if (!registerWrite || !fn) return;
-			const unregister = registerWrite(fn);
-			return unregister;
-		},
-		[registerWrite],
-	);
-	const unregisterRef = useRef<(() => void) | null>(null);
-	const onWriteRef = useCallback(
-		(fn: ((text: string) => void) | null) => {
-			unregisterRef.current?.();
-			unregisterRef.current = fn ? (handleWriteRef(fn) ?? null) : null;
-		},
-		[handleWriteRef],
-	);
-	useEffect(() => () => unregisterRef.current?.(), []);
 
 	const sendToChat = useCallback((text: string) => dock?.appendChatInput(text), [dock]);
 
@@ -524,8 +526,8 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			>
 				<NarratorTerminal
 					narratorId={narratorId}
+					visible={visible}
 					onSendToChat={sendToChat}
-					onWriteRef={onWriteRef}
 					onExit={close}
 				/>
 			</Suspense>
@@ -807,8 +809,46 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			subjectId="__userchat__"
 			detachKind="userchat"
 		>
+			<DockviewNarratorPanelVisibilityProvider api={props.api}>
+				<LazyPanelBoundary>
+					<NarratorUserChatPanel narratorId={narratorId} />
+				</LazyPanelBoundary>
+			</DockviewNarratorPanelVisibilityProvider>
+		</ToolPanelShell>
+	);
+}
+
+// ── Communication (the current domain and its explicit neighbours) ──
+export function CommunicationDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+	const navigate = useNavigate();
+	const openNarrator = useCallback(
+		(id: string) => void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+		[navigate],
+	);
+
+	useLayoutEffect(() => {
+		const title = t("communicationTitle");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("communicationTitle")}
+			icon={<IconSitemap size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__communication__"
+		>
 			<LazyPanelBoundary>
-				<NarratorUserChatPanel narratorId={narratorId} />
+				<DockviewNarratorPanelVisibilityProvider api={props.api}>
+					<CommunicationTopologyPanel
+						key={narratorId}
+						scope={{ kind: "narrator", narratorId }}
+						onOpenNarrator={openNarrator}
+					/>
+				</DockviewNarratorPanelVisibilityProvider>
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
@@ -1177,6 +1217,15 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 		[openFilePanel, props.api.id, narratorId],
 	);
 
+	// The tree's row menu offers "reference in the composer" only when a composer for THIS
+	// narrator is reachable. In the dock it is: the chat panel registers `addFileReference`
+	// here, the same bridge the file editor's quote action uses. A tree torn into its own
+	// window has no dock, so the scope stays empty and the entry is hidden rather than dead.
+	const referenceScope = useMemo(
+		() => ({ narratorId, addReference: dock?.addFileReference ?? undefined }),
+		[dock?.addFileReference, narratorId],
+	);
+
 	return (
 		<ToolPanelShell
 			title={t("fileTree.title")}
@@ -1186,7 +1235,9 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			detachKind="filetree"
 		>
 			<LazyPanelBoundary>
-				<FileTreePanel narratorId={narratorId} onOpenFile={handleOpenFile} />
+				<FileReferenceScopeProvider value={referenceScope}>
+					<FileTreePanel narratorId={narratorId} onOpenFile={handleOpenFile} />
+				</FileReferenceScopeProvider>
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
@@ -1255,6 +1306,7 @@ export const narratorDockComponents: Record<
 	userchat: UserChatDockPanel,
 	appearance: AppearanceDockPanel,
 	timeline: TimelineDockPanel,
+	communication: CommunicationDockPanel,
 	subagent: SubagentDockPanel,
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,

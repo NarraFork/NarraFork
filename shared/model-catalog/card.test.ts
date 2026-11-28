@@ -6,6 +6,7 @@ import {
 	patchRawMetadata,
 	type RawMetadata,
 	rawCatalogFromModelFiles,
+	timeOfUsePriceGroups,
 	validateRawMetadata,
 } from "./card";
 
@@ -123,6 +124,46 @@ describe("complete model cards v2", () => {
 			"5",
 		);
 		expect(view.prices[3]!.rows.find((row) => row.derived)?.displayRate).toBe("8");
+	});
+	test("parses time-of-use rates independently of standard and long-context pricing", () => {
+		const raw = {
+			input_cost_per_token: 2e-6,
+			input_cost_per_token_peak: "3.5e-6",
+			output_cost_per_token_peak: 8e-6,
+			output_cost_per_token_off_peak: "unavailable",
+			input_cost_per_token_off_peak: 1e-6,
+			cache_read_input_token_cost_off_peak: 0,
+			cache_creation_input_token_cost_off_peak: null,
+			long_context_input_token_threshold: 200000,
+			long_context_input_cost_multiplier: 2,
+		};
+		const view = modelCardView(raw);
+		expect(view.prices.map(({ tier }) => tier)).toEqual(["standard"]);
+		expect(view.prices[0]?.rows.map(({ displayRate }) => displayRate)).toEqual(["2", "4"]);
+		const [peak, offPeak] = timeOfUsePriceGroups(raw);
+		expect(peak?.tier).toBe("peak");
+		expect(offPeak?.tier).toBe("off_peak");
+		expect(peak?.rows).toMatchObject([
+			{ component: "input", rate: "0.0000035", displayRate: "3.5", displayQuantity: 1_000_000 },
+			{ component: "output", displayRate: "8" },
+		]);
+		expect(offPeak?.rows).toMatchObject([
+			{ component: "cacheWrite", displayRate: null },
+			{ component: "cacheRead", displayRate: "0" },
+			{ component: "input", displayRate: "1" },
+		]);
+		expect(view.attributes).toMatchObject({
+			input_cost_per_token_off_peak: 1e-6,
+			output_cost_per_token_off_peak: "unavailable",
+		});
+		expect(() => patchRawMetadata(raw, { set: { input_cost_per_token_peak: 1e-6 } })).toThrow(
+			"Read-only or unknown metadata field",
+		);
+		// This display parser does not validate unrelated fields or project the card.
+		expect(timeOfUsePriceGroups({ ...raw, input_cost_per_token: "unrelated" })).toEqual([
+			peak,
+			offPeak,
+		]);
 	});
 	test("keeps cache durations, multimodal rates, counts, seconds and characters distinct", () => {
 		const claude = modelCardView(samples["claude-opus-4-6"]!).prices[0]!.rows;

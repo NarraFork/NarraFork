@@ -179,7 +179,10 @@ export function parseSub2ApiBalance(body: unknown): ProviderBalanceData | null {
 			const total = body.subscription[`${window}_limit_usd`];
 			const used = body.subscription[`${window}_usage_usd`];
 			if (total === undefined || total === null) continue;
-			if (!finite(total) || total < 0 || !finite(used) || used < 0) return null;
+			if (!finite(total) || total < 0) return null;
+			// Zero is an unconfigured cap, not an exhausted zero-dollar allowance.
+			if (total === 0) continue;
+			if (!finite(used) || used < 0) return null;
 			const remaining = total - used;
 			if (!finite(remaining)) return null;
 			amounts.push({

@@ -209,7 +209,7 @@ for (const [name, provider, model] of projectionProviders()) {
 for (const apiMode of ["responses", "codex"] as const) {
 	test(`${apiMode}: outgoing baseline stays frozen; updates remain in input`, async () => {
 		const provider = new OpenAIProvider({ ...CONFIG, apiMode });
-		const requests: Array<{ instructions?: string; input: unknown[] }> = [];
+		const requests: Array<{ input: unknown[] }> = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (_input, init) => {
 			requests.push(JSON.parse(String(init?.body)));
@@ -252,28 +252,24 @@ for (const apiMode of ["responses", "codex"] as const) {
 			globalThis.fetch = originalFetch;
 		}
 		expect(requests).toHaveLength(3);
-		if (apiMode === "responses") {
-			expect(requests[1].instructions).toBe(requests[0].instructions);
-			expect(requests[1].instructions).toContain("frozen-baseline");
-			expect(requests[1].instructions).not.toContain("<context_update>");
-		} else {
-			// Codex carries instructions as one stable developer input item, not a
-			// second top-level prompt lane. Context updates must never change that item.
-			for (const request of requests) expect(request).not.toHaveProperty("instructions");
-			expect(requests[1].input[0]).toEqual(requests[0].input[0]);
-			const baseline = requests[1].input[0] as {
-				type: string;
-				role: string;
-				id: string;
-				content: Array<{ type: string; text: string }>;
-			};
+		// Responses and Codex both carry the frozen prompt as one developer input item.
+		// Context updates must never change that item or create a second prompt lane.
+		for (const request of requests) expect(request).not.toHaveProperty("instructions");
+		expect(requests[1].input[0]).toEqual(requests[0].input[0]);
+		const baseline = requests[1].input[0] as {
+			type?: string;
+			role: string;
+			id?: string;
+			content: Array<{ type: string; text: string }>;
+		};
+		expect(baseline.role).toBe("developer");
+		expect(baseline.content).toHaveLength(1);
+		expect(baseline.content[0].type).toBe("input_text");
+		expect(baseline.content[0].text.split("frozen-baseline")).toHaveLength(2);
+		expect(JSON.stringify(baseline)).not.toContain("<context_update>");
+		if (apiMode === "codex") {
 			expect(baseline.type).toBe("message");
-			expect(baseline.role).toBe("developer");
 			expect(baseline.id).toMatch(/^msg_nf_instructions_/);
-			expect(baseline.content).toHaveLength(1);
-			expect(baseline.content[0].type).toBe("input_text");
-			expect(baseline.content[0].text.split("frozen-baseline")).toHaveLength(2);
-			expect(baseline.content[0].text).not.toContain("<context_update>");
 		}
 		expect(requests[1].input.slice(0, requests[0].input.length)).toEqual(requests[0].input);
 		expect(requests[1].input).toEqual(requests[2].input);

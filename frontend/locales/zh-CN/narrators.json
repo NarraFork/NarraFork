@@ -57,6 +57,7 @@
 	"dragToSidebar": "拖到侧栏排序，或拖到某个工作区加入其中",
 	"archive": "归档",
 	"unarchive": "取消归档",
+	"askInPassingSessions": "顺便提问（{{count}}）",
 	"archivedNarrators": "已归档叙述者",
 	"viewArchived": "查看已归档",
 	"backToNarrators": "返回叙述者列表",
@@ -199,5 +200,29 @@
 	"promptLibraryPickPlaceholder": "选择一段提示词",
 	"promptLibraryEmpty": "提示词库为空，去「套路 → 提示词库」新建",
 	"promptLibraryInsert": "插入",
-	"promptLibraryReplace": "替换全文"
+	"promptLibraryReplace": "替换全文",
+	"createMode": {
+		"session": "会话",
+		"team": "以团队开始",
+		"teamHint": "团队由一个协调者会话统筹，它派出的 Agent 在本项目的分支上干活。创建后进入团队页。",
+		"teamAvailable": "也可以在这里开始一个团队：协调者和它的 Agent，归属这个目录的项目。",
+		"teamUnavailable": "无法以团队开始：{{reason}}"
+	},
+	"teamStart": {
+		"inProject": "团队将建在项目「{{name}}」中。",
+		"newProject": "{{root}} 还没有项目，将为这个仓库创建一个。",
+		"reason": {
+			"remoteDevice": "团队只能在本服务器上运行，请把执行设备选为本机。",
+			"chooseDirectory": "请先选择一个位于 git 仓库内的目录。",
+			"checking": "正在检查目录…",
+			"postgres": "PostgreSQL 部署暂不支持团队。",
+			"lookupFailed": "无法检查这个目录。",
+			"notDirectory": "这不是本服务器上已存在的目录。",
+			"notGit": "这个目录不在 git 仓库中。",
+			"projectNotGit": "这个目录所属项目的文件夹不是 git 工作区。",
+			"archived": "这个目录所属的项目已归档。",
+			"readOnly": "你对这个目录所属的项目只有读权限。"
+		}
+	},
+	"followDefaultUnset": "默认模型（未配置）"
 }

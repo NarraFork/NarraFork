@@ -1,5 +1,4 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { copyFile, unlink } from "node:fs/promises";
 import type { Worker } from "node:worker_threads";
 import { connectCompiledWorker } from "../../../lib/compiled-worker";
 import { logger } from "../../../lib/logger";
@@ -29,6 +28,9 @@ const job: core.EditTextJob = { kind: "notes", text: "word ".repeat(1_000), cont
 const small: core.EditTextJob = { kind: "normalize", contents: ["plain"] };
 const channels: EditTextChannel[] = [];
 let sequence = 0;
+// Reevaluate the module without writing temporary sources that other tests can scan.
+const reloadRunner = (): Promise<typeof import("../edit-text-runner")> =>
+	import(`../edit-text-runner.ts?lifecycle=${++sequence}`);
 const ownerKey = (name: string) => Symbol.for(`narrafork.outline.editTextWorker${name}`);
 function channel(connect?: EditTextWorkerConnect) {
 	const name = `.native-lifecycle-${++sequence}`;
@@ -282,29 +284,20 @@ test("failed startup cleanup keeps its physical slot until observed exit, not an
 
 test("permanent shutdown is shared by actual module reevaluation and even tiny inline calls", async () => {
 	await processEditText(small, { worker: true });
-	const target = new URL(
-		`../edit-text-runner.hmr-${process.pid}-${sequence++}.ts`,
-		import.meta.url,
-	);
-	await copyFile(new URL("../edit-text-runner.ts", import.meta.url), target);
-	try {
-		const other = await import(target.href);
-		expect(other.processEditText).not.toBe(processEditText);
-		const original = Reflect.get(globalThis, ownerKey(""));
-		await other.closeEditTextWorkers();
-		expect(Reflect.get(globalThis, ownerKey(""))).toBe(original);
-		expect(await failure(processEditText(small))).toMatchObject({ code: "OUTLINE_TEXT_FAILED" });
-		expect(await failure(other.processEditText(small))).toMatchObject({
-			code: "OUTLINE_TEXT_FAILED",
-		});
-		expect(await failure(processBackgroundText(small))).toMatchObject({
-			code: "OUTLINE_TEXT_FAILED",
-		});
-		await resetEditTextWorkersForTests();
-		expect(await processEditText(small)).toHaveLength(1);
-	} finally {
-		await unlink(target);
-	}
+	const other = await reloadRunner();
+	expect(other.processEditText).not.toBe(processEditText);
+	const original = Reflect.get(globalThis, ownerKey(""));
+	await other.closeEditTextWorkers();
+	expect(Reflect.get(globalThis, ownerKey(""))).toBe(original);
+	expect(await failure(processEditText(small))).toMatchObject({ code: "OUTLINE_TEXT_FAILED" });
+	expect(await failure(other.processEditText(small))).toMatchObject({
+		code: "OUTLINE_TEXT_FAILED",
+	});
+	expect(await failure(processBackgroundText(small))).toMatchObject({
+		code: "OUTLINE_TEXT_FAILED",
+	});
+	await resetEditTextWorkersForTests();
+	expect(await processEditText(small)).toHaveLength(1);
 });
 
 test("a legacy owner without handles fails closed even with no counted active work", async () => {
@@ -313,13 +306,8 @@ test("a legacy owner without handles fails closed even with no counted active wo
 	const current = Reflect.get(globalThis, key);
 	const legacy = { worker: null, starting: null, queue: [], active: null, idle: null, nextId: 0 };
 	Reflect.set(globalThis, key, legacy);
-	const target = new URL(
-		`../edit-text-runner.legacy-${process.pid}-${sequence++}.ts`,
-		import.meta.url,
-	);
-	await copyFile(new URL("../edit-text-runner.ts", import.meta.url), target);
 	try {
-		const other = await import(target.href);
+		const other = await reloadRunner();
 		expect(other.processEditText).not.toBe(processEditText);
 		const error = await failure(other.processEditText(small));
 		expect(error).toMatchObject({ code: "OUTLINE_TEXT_FAILED", statusCode: 503 });
@@ -328,7 +316,6 @@ test("a legacy owner without handles fails closed even with no counted active wo
 		expect(Reflect.get(globalThis, key)).toBe(legacy);
 	} finally {
 		Reflect.set(globalThis, key, current);
-		await unlink(target);
 	}
 });
 

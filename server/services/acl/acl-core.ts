@@ -22,6 +22,7 @@
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { aclGrants } from "../../db/schema";
+import { type ReadQueryOptions, readQuery } from "../../db/worker-read";
 import { logger } from "../../lib/logger";
 import { type AclScope, GLOBAL_SCOPE, resolveAncestorChain, scopeKey } from "./acl-scope";
 
@@ -92,7 +93,7 @@ function adminCaps(principal: AclPrincipal): ScopeCaps {
 	};
 }
 
-type GrantRow = {
+export type GrantRow = {
 	scopeType: string;
 	scopeId: string | null;
 	capability: string;
@@ -107,7 +108,12 @@ type GrantRow = {
  * rules — the same semantics both predecessors had. Deny rules are deliberately
  * not introduced: they make "why can't I see this?" unanswerable without a solver.
  */
-async function loadGrants(principal: AclPrincipal, scopes: AclScope[]): Promise<GrantRow[]> {
+async function loadGrants(
+	principal: AclPrincipal,
+	scopes: AclScope[],
+	readOptions?: ReadQueryOptions,
+): Promise<GrantRow[]> {
+	readOptions?.signal?.throwIfAborted();
 	const scopedIds = scopes.filter((s) => s.id !== null);
 	const includesGlobal = scopes.some((s) => s.type === "global");
 	if (scopedIds.length === 0 && !includesGlobal) return [];
@@ -119,7 +125,7 @@ async function loadGrants(principal: AclPrincipal, scopes: AclScope[]): Promise<
 		),
 	);
 
-	return await db
+	const query = db
 		.select({
 			scopeType: aclGrants.scopeType,
 			scopeId: aclGrants.scopeId,
@@ -137,10 +143,17 @@ async function loadGrants(principal: AclPrincipal, scopes: AclScope[]): Promise<
 				scopeMatch,
 			),
 		);
+	return await (readOptions
+		? readQuery(query, { ...readOptions, executionPolicy: "worker-required" })
+		: query);
 }
 
-/** Fold one grant row into an accumulator, honouring the two row shapes. */
-function applyGrant(
+/**
+ * Fold one grant row into an accumulator, honouring the two row shapes. Exported for batch
+ * judges that load many principals' grants in one query (`judgeNarratorAccessBatch`) and must
+ * read each row exactly as {@link resolveCaps} does.
+ */
+export function applyGrant(
 	target: { read: boolean; write: boolean; manage: boolean },
 	domain: AclDomainCredentials,
 	grant: GrantRow,
@@ -177,13 +190,15 @@ function applyGrant(
 export async function resolveCaps(
 	principal: AclPrincipal | null | undefined,
 	scope: AclScope,
+	readOptions?: ReadQueryOptions,
 ): Promise<ScopeCaps> {
+	readOptions?.signal?.throwIfAborted();
 	if (!principal?.userId) return anonymousCaps();
 	if (principal.role === "admin") return adminCaps(principal);
 
-	const ancestors = await resolveAncestorChain(scope);
+	const ancestors = await resolveAncestorChain(scope, readOptions);
 	const chain = scope.type === "global" ? [GLOBAL_SCOPE] : [scope, ...ancestors];
-	const grants = await loadGrants(principal, chain);
+	const grants = await loadGrants(principal, chain, readOptions);
 
 	const own = { read: false, write: false, manage: false };
 	const domain = emptyDomain();

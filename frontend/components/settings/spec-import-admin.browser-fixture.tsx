@@ -14,6 +14,7 @@ import type {
 	OutlineSpecImportStatus,
 } from "@shared/outline-spec-import";
 import { OUTLINE_SPEC_IMPORT_ADMIN_STATES } from "@shared/outline-spec-import";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -26,7 +27,9 @@ import {
 import { createInstance } from "i18next";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../hooks/useRuntimeSettings";
 import { api } from "../../lib/api";
+import { setToken } from "../../lib/api/client";
 import commonEn from "../../locales/en/common.json";
 import errorsEn from "../../locales/en/errors.json";
 import narratorEn from "../../locales/en/narrator.json";
@@ -220,7 +223,14 @@ api.getSpecLossPage = async () => ({
 	canAct: false,
 });
 api.getUserPreferences = async () => ({}) as never;
-api.getSettings = async () => ({ agent: {}, outline: { enabled: true } }) as never;
+const runtimeSettings: RuntimeSettings = {
+	revision: 1,
+	agent: { defaultModel: "auto:test", summaryModel: "auto:test" },
+	outline: { enabled: true },
+	requestEvidence: { autoPin: "off" },
+	summaryModelAvailable: null,
+};
+api.getRuntimeSettings = async () => runtimeSettings;
 api.getNarrator = async () => ({ id: NARRATOR }) as never;
 
 export function ready(): boolean {
@@ -265,7 +275,8 @@ export async function mount(options: {
 	});
 	document.documentElement.lang = options.lang;
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	client.setQueryData(["settings"], { agent: {}, outline: { enabled: true } });
+	setToken("spec-import-admin-fixture");
+	client.setQueryData(runtimeSettingsQueryOptions().queryKey, runtimeSettings);
 	const rootRoute = createRootRoute({ component: () => <Outlet /> });
 	const home = createRoute({
 		getParentRoute: () => rootRoute,

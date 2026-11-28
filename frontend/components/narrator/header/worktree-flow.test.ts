@@ -210,6 +210,39 @@ describe("quick worktree flow", () => {
 		expect(s.flow.state.error).toBe("empty");
 		expect(s.calls).toEqual([]);
 	});
+	test("a refusal keeps its server code for localization, cleared by the next error", async () => {
+		const refusal = Object.assign(new Error("partial clone on an old git"), {
+			data: { code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" },
+		});
+		const s = setup({
+			prepare: mock(async () => {
+				throw refusal;
+			}),
+		});
+		await s.flow.submit({ ...draft, name: "fix" }, context);
+		expect(s.flow.state.error).toBe("partial clone on an old git");
+		expect(s.flow.state.errorCode).toBe("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+		expect(s.flow.state.confirmedFailure).toBe(false);
+		await s.flow.submit({ ...draft, name: " " }, context);
+		expect(s.flow.state.error).toBe("empty");
+		expect(s.flow.state.errorCode).toBeUndefined();
+		const failed = setup({
+			create: mock(
+				async (): Promise<WorktreeCreateResult> => ({
+					outcome: "failed",
+					worktree: null,
+					residuals: { destinationExists: null, branchExists: null },
+					error: { code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE", message: "refused" },
+				}),
+			),
+		});
+		await failed.flow.submit({ ...draft, name: "fix" }, context);
+		expect(failed.flow.state).toMatchObject({
+			confirmedFailure: true,
+			error: "refused",
+			errorCode: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+		});
+	});
 	test("capability denial does not invoke any endpoint", async () => {
 		const s = setup();
 		await s.flow.submit(

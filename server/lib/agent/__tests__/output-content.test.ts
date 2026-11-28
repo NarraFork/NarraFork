@@ -7,6 +7,33 @@ function blocks(events: Iterable<AgentEvent>) {
 }
 
 describe("output content lifecycle", () => {
+	test("seals an already-persisted reasoning prefix without closing its lane", () => {
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "summary", outputIndex: 0 };
+		content.append("reasoning", "first", lane);
+		expect(blocks(content.flush())[0]).toMatchObject({ revision: 1, completed: false });
+		expect([
+			...content.boundary({
+				...lane,
+				kind: "reasoning",
+				phase: "checkpoint",
+				reasoningSummaryEnd: 5,
+			}),
+		]).toEqual([
+			expect.objectContaining({
+				sealedReasoningLength: 5,
+				block: expect.objectContaining({ revision: 2, completed: false }),
+			}),
+		]);
+		content.append("reasoning", "\n\nlater", lane);
+		expect([...content.flush()]).toEqual([
+			expect.objectContaining({
+				sealedReasoningLength: 5,
+				block: expect.objectContaining({ text: "first\n\nlater", revision: 3, completed: false }),
+			}),
+		]);
+	});
+
 	test("native complete persists a new revision even after an unchanged checkpoint", () => {
 		const content = new OutputContentAccumulator();
 		const lane = { blockId: "native", outputIndex: 0 };

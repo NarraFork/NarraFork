@@ -226,7 +226,7 @@ describe("A3 prompt projections do not classify control grants as roles", () => 
 					"en",
 					policy,
 				);
-				expect(result).toContain("Await(agent)");
+				expect(result).toContain("Watch(agent)");
 				expect(result).toContain("recipient");
 				if (systemPrompt === null) expect(result).toStartWith("GLOBAL DEFAULT\n\n");
 				else {
@@ -242,17 +242,18 @@ describe("A3 prompt projections do not classify control grants as roles", () => 
 			settings.agent.defaultSystemPrompt = previous;
 		}
 	});
-	test("an ordinary control grant adds no reporting role or Await prohibition", () => {
+	test("an ordinary control grant adds no reporting role or Watch prohibition", () => {
 		const prompt = runtimeBasePrompt(base, "en", resolveRuntimePolicy([]));
 		expect(prompt).toBe("BASE");
 		expect(prompt).not.toContain("Await");
+		expect(prompt).not.toContain("Watch");
 		expect(prompt).not.toContain("parent");
 	});
 	test("delegation interaction restrictions come from the ceiling even without any relationship", async () => {
 		const policy = resolveRuntimePolicy([await compileDelegationCeiling("general")]);
 		for (const locale of ["en", "zh-CN"] as const) {
 			const prompt = runtimeBasePrompt({ systemPrompt: "BASE" }, locale, policy);
-			expect(prompt).toContain("Await(agent)");
+			expect(prompt).toContain("Watch(agent)");
 			expect(prompt).not.toContain("await=true");
 			expect(prompt).toContain("AskUserQuestion");
 			expect(prompt).not.toContain("parent");
@@ -280,7 +281,7 @@ describe("A3 prompt projections do not classify control grants as roles", () => 
 			expect(prompt).not.toContain("controller");
 			expect(prompt).not.toContain("different-caller");
 			expect(prompt?.includes("caller is waiting")).toBe(waiting);
-			expect(prompt).not.toContain("Await(agent)");
+			expect(prompt).not.toContain("Watch(agent)");
 			expect(prompt).not.toContain("must be asynchronous");
 		}
 	});

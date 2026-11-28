@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { apiRequests, credentialUsageTotals, narrators, userUsageTotals } from "@server/db/schema";
 import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { eq } from "drizzle-orm";
@@ -16,7 +16,10 @@ import {
 	startApiRequest,
 } from "../api-request-tracker";
 import { resolveCredentialDisplayName } from "../credential-display-name";
-import { settings } from "../settings";
+import { getProviderKeyStore } from "../provider-keys";
+import { defaultRequestSourceId } from "../request-source";
+import { saveSettings, settings } from "../settings";
+import { registerTokenDanceRuntime } from "../tokendance-runtime";
 
 afterEach(() => {
 	cleanDb(sqlite);
@@ -374,5 +377,196 @@ describe("request user attribution", () => {
 			startApiRequest({ provider: "test", model: "test", narratorId: "shared" }).userId,
 		).toBeNull();
 		expect(startApiRequest({ provider: "test", model: "test", userId: null }).userId).toBeNull();
+	});
+});
+
+const { resolveProviderAndModel } = await import("../agent/provider");
+const { agentGenerateWithMeta, summaryGenerateWithHistory } = await import("../agent");
+const { OpenAIProvider } = await import("../agent/openai-provider");
+const { AnthropicProvider } = await import("../agent/anthropic-provider");
+const { NugProvider } = await import("../agent/nug-provider");
+const { TokenDanceProvider } = await import("../agent/tokendance-provider");
+
+describe("every source reports the credential it used to fall back to", () => {
+	type Adapter = import("../agent/provider").ProviderAdapter;
+	type Params = import("../agent/provider").ChatParams;
+	const usage = { inputTokens: 10, outputTokens: 5 };
+
+	/**
+	 * Network-free inner adapters that, as the worst case, report an id of their own on
+	 * every path. The outer layer must override it with the real credential.
+	 */
+	function stubInner(proto: object) {
+		const target = proto as Adapter;
+		return [
+			spyOn(target, "chat").mockImplementation(async function* (params: Params) {
+				params.onRequestStart?.({ credentialId: "inner-id" });
+				yield { text: "hi", credentialId: "inner-id" };
+				yield { usage: { promptTokens: 10, completionTokens: 5 } };
+			} as never),
+			spyOn(target, "generateWithMeta").mockImplementation((async () => ({
+				text: "hi",
+				usage,
+				credentialId: "inner-id",
+			})) as never),
+			spyOn(target, "generateWithHistoryWithMeta" as never).mockImplementation((async () => ({
+				text: "hi",
+				usage,
+				credentialId: "inner-id",
+			})) as never),
+		];
+	}
+
+	/** Drive one streamed request the way the agent loop records it. */
+	async function streamed(model: string) {
+		const resolved = resolveProviderAndModel(model);
+		let credentialId: string | undefined;
+		let handle: ReturnType<typeof startApiRequest> | undefined;
+		const params = {
+			signal: new AbortController().signal,
+			conversationId: "c1",
+			stickySessionKey: "c1",
+			model: resolved.model,
+			onRequestStart: (info?: { credentialId?: string }) => {
+				if (info?.credentialId) credentialId = info.credentialId;
+				handle ??= startApiRequest({
+					provider: resolved.provider,
+					model: resolved.model,
+					credentialId,
+					userId: "u",
+				});
+			},
+		} as unknown as Params;
+		for await (const event of resolved.adapter.chat(params)) {
+			if (event.credentialId) credentialId = event.credentialId;
+		}
+		if (!handle) throw new Error("request never started");
+		await finishApiRequest(handle, { credentialId, usage });
+		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+		return { start: handle.credentialId, end: credentialId, row: row?.credentialId };
+	}
+
+	/** Both non-streaming entry points, recorded through trackApiRequest. */
+	async function nonStreamed(model: string) {
+		const before = db.select().from(apiRequests).all().length;
+		await agentGenerateWithMeta("q", model, undefined, undefined, { userId: "u" });
+		const savedSummary = settings.agent.summaryModel;
+		settings.agent.summaryModel = model;
+		try {
+			await summaryGenerateWithHistory("s", "q", undefined, { userId: "u" });
+		} finally {
+			settings.agent.summaryModel = savedSummary;
+		}
+		return db
+			.select()
+			.from(apiRequests)
+			.all()
+			.slice(before)
+			.map((row) => row.credentialId);
+	}
+
+	async function expectSource(model: string, expected: string, legacy: string | null) {
+		// The id the prefix fallback used to pick is exactly what is now reported.
+		expect(legacy).toBe(expected);
+		expect(await streamed(model)).toEqual({ start: expected, end: expected, row: expected });
+		expect(await nonStreamed(model)).toEqual([expected, expected]);
+	}
+
+	test("direct connection with one plain key, NUG, TokenDance and Command Code", async () => {
+		const spies = [
+			...stubInner(OpenAIProvider.prototype),
+			...stubInner(AnthropicProvider.prototype),
+			...stubInner(NugProvider.prototype),
+			...stubInner(TokenDanceProvider.prototype),
+			spyOn(NugProvider.prototype, "prepareForModel").mockImplementation(() => {}),
+			spyOn(TokenDanceProvider.prototype, "prepareForModel").mockImplementation(() => {}),
+		];
+		const saved = structuredClone({
+			customApiProviders: settings.customApiProviders,
+			nugProviders: settings.nugProviders,
+			commandCode: settings.commandCode,
+		});
+		const disposeTokenDance = registerTokenDanceRuntime({
+			getTokenDanceRuntimeConfig: () => ({ apiKey: "td", generation: 1, disabled: false }),
+			getTokenDanceCatalogModels: () => [],
+			assertTokenDanceConnection: () => {},
+			registerTokenDanceRequest: () => () => {},
+		});
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [
+					{
+						id: "directConn",
+						name: "Direct",
+						prefix: "direct",
+						apiKey: "sk-only",
+						baseUrl: "https://api.example.com/v1",
+						defaultModel: "m",
+						protocol: "completions-compatible",
+					},
+				],
+			});
+			settings.nugProviders = [
+				{
+					id: "nugConn",
+					name: "Gateway",
+					prefix: "gw",
+					apiKey: "nug-key",
+					baseUrl: "https://nug.example.com",
+					defaultModel: "",
+				},
+			];
+			settings.commandCode = { apiKey: "cc-key" };
+
+			await expectSource("direct:m", "directConn", defaultRequestSourceId("direct"));
+			await expectSource("gw:openai:m", "nugConn", defaultRequestSourceId("gw"));
+			await expectSource("tokendance:m", "tokendance", defaultRequestSourceId("tokendance"));
+			await expectSource("CommandCode:gpt-5", "CommandCode", defaultRequestSourceId("CommandCode"));
+			await expectSource(
+				"CommandCode:claude-sonnet-4",
+				"CommandCode",
+				defaultRequestSourceId("CommandCode"),
+			);
+		} finally {
+			disposeTokenDance();
+			saveSettings({ ...settings, customApiProviders: saved.customApiProviders });
+			settings.nugProviders = saved.nugProviders;
+			settings.commandCode = saved.commandCode;
+			for (const spy of spies) spy.mockRestore();
+		}
+	});
+
+	test("a pooled connection names the key, not the connection its adapters carry", async () => {
+		const spies = stubInner(OpenAIProvider.prototype);
+		const saved = structuredClone(settings.customApiProviders);
+		try {
+			saveSettings({
+				...settings,
+				customApiProviders: [
+					{
+						id: "poolConn",
+						name: "Pool",
+						prefix: "pool",
+						apiKey: "sk-one",
+						baseUrl: "https://api.example.com/v1",
+						defaultModel: "m",
+						protocol: "completions-compatible",
+					},
+				],
+			});
+			const second = getProviderKeyStore().add("poolConn", { apiKey: "sk-two" });
+			getProviderKeyStore().reorder("poolConn", [second.id]);
+			expect(await streamed("pool:m")).toEqual({
+				start: second.id,
+				end: second.id,
+				row: second.id,
+			});
+			expect(await nonStreamed("pool:m")).toEqual([second.id, second.id]);
+		} finally {
+			saveSettings({ ...settings, customApiProviders: saved });
+			getProviderKeyStore().removeProvider("poolConn");
+			for (const spy of spies) spy.mockRestore();
+		}
 	});
 });

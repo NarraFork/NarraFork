@@ -133,6 +133,8 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 				? matchingTc
 				: undefined;
 		const executionTc = toolExecutionFallback(block, matchingTc);
+		const executionAttempt =
+			block.executionAttempt ?? (executionTc ? matchingTc?.executionAttempt : undefined);
 		const status = block.status ?? tc?.status ?? "running";
 		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
 		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
@@ -151,6 +153,12 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 		}
 		results.push({
 			id: block.tcId ?? tc?.id,
+			executionAttempt:
+				typeof executionAttempt === "number" &&
+				Number.isSafeInteger(executionAttempt) &&
+				executionAttempt >= 0
+					? executionAttempt
+					: undefined,
 			toolName: normalizeToolName(block.name ?? ""),
 			toolUseId: block.id,
 			inputJson: block.inputJson ?? (executionTc ? tc?.inputJson : undefined) ?? block.input,

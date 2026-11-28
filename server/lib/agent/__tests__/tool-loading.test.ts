@@ -817,7 +817,7 @@ describe("openai_additional_tools wire", () => {
 		expect(later.body.input as unknown[]).toEqual(expect.arrayContaining([item]));
 		// Rebuilt later, the item and notice keep their place: a growing prefix.
 		expect((later.body.input as unknown[]).slice(0, input.length)).toEqual(input);
-		expect(String(later.body.instructions ?? "")).not.toContain("additional_tools");
+		expect(later.body).not.toHaveProperty("instructions");
 	});
 });
 

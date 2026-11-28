@@ -32,6 +32,7 @@ import { BrandingSection } from "./BrandingSection";
 import { DependencyStatus } from "./DependencyStatus";
 import { SystemShutdownCard } from "./SystemShutdownCard";
 import { TlsSection } from "./TlsSection";
+import { UnattendedModeCard } from "./UnattendedModeCard";
 
 const HOST_PRESETS = ["localhost", AUTO_LAN_HOST, "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
 
@@ -160,6 +161,7 @@ export function ServerSystemSection({
 			{/* Server */}
 			<Title order={5}>{t("serverSubSection")}</Title>
 			<SystemShutdownCard />
+			<UnattendedModeCard />
 			{settingsFeatureCapability.storagePath && (
 				<Alert color="blue" variant="light" py={6} title={t("settingsStoragePathTitle")}>
 					{t("settingsStoragePathDesc", { path: settingsFeatureCapability.storagePath })}

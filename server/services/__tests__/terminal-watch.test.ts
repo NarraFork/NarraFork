@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import { backgroundTasks, narratorBufferedMessages, narrators } from "../../db/schema";
+import { eventBus } from "../../lib/event-bus";
 import { BufferManager } from "../../terminal/buffer-manager";
 import { wakeInboxIfEligible } from "../agent-runtime/inbox";
 import { flushRuntimePublications, runtimePublication } from "../agent-runtime/publication";
@@ -19,11 +20,14 @@ import {
 	MAX_WATCH_PATTERN_CHARS,
 	notifyTerminalOutput,
 	PUBLISH_RETRY_DELAYS_MS,
+	registerRestoredWatchAnchors,
+	resetRestoredWatchAnchorsForTests,
 	resumeTerminalWatchesForTests,
 	startTerminalWatch,
 	suspendTerminalWatchesForShutdown,
 	type WatchStart,
 } from "../terminal-watch-service";
+import { MAX_PUBLISH_RETRY_DELAY_MS } from "../watch-observation";
 
 const PARENT = "terminal-watch-parent";
 const TERMINAL = "terminal-watch-term";
@@ -54,6 +58,8 @@ afterEach(async () => {
 		for (const id of activeWatchIds(TERMINAL)) await backgroundTaskService.cancel(id);
 		await buffer.dispose(true);
 	}
+	// Frozen results have released their buffer but may still own publication retries.
+	suspendTerminalWatchesForShutdown();
 	mock.restore();
 	cleanDb(sqlite);
 });
@@ -106,6 +112,20 @@ async function startWithCursor(buffer: BufferManager, pattern: string, startAt?:
 		marker: cursor.marker,
 		disposeMarkers: cursor.dispose,
 		start: startAt ?? { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+		principal: { userId: null },
+	});
+	if (result.status !== "started") throw new Error(result.message);
+	return result.taskId;
+}
+
+async function startLifecycle(buffer?: BufferManager, timeoutMs = 60_000) {
+	const result = await startTerminalWatch({
+		narratorId: PARENT,
+		terminalId: TERMINAL,
+		terminalName: "T",
+		timeoutMs,
+		buffer,
+		principal: { userId: null },
 	});
 	if (result.status !== "started") throw new Error(result.message);
 	return result.taskId;
@@ -125,12 +145,12 @@ async function waitForStatus(taskId: string, timeoutMs = 3_000) {
 	}
 }
 
-async function notices() {
-	await flushRuntimePublications(PARENT);
+async function notices(narratorId = PARENT) {
+	await flushRuntimePublications(narratorId);
 	return db
 		.select()
 		.from(narratorBufferedMessages)
-		.where(eq(narratorBufferedMessages.narratorId, PARENT))
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
 		.all()
 		.map((r) => projectPendingInjection(r));
 }
@@ -284,7 +304,165 @@ describe("rendered pattern freshness", () => {
 	});
 });
 
+describe("repeated terminal watches", () => {
+	test("one watcher's repeated lifecycle watches share one observation and one notice", async () => {
+		const first = await startLifecycle(undefined, 60_000);
+		const repeat = await startTerminalWatch({
+			narratorId: PARENT,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			timeoutMs: 120_000,
+		});
+		expect(repeat).toMatchObject({ status: "started", taskId: first, reused: true });
+		expect(activeWatchIds(TERMINAL)).toEqual([first]);
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await waitForStatus(first))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a repeated lifecycle watch extends the shared deadline and times out once", async () => {
+		const first = await startLifecycle(undefined, 1_000);
+		expect(await startLifecycle(undefined, 1_500)).toBe(first);
+		await Bun.sleep(1_200);
+		expect((await row(first))?.status).toBe("running");
+		const done = await waitForStatus(first);
+		expect(done?.output).toContain("observation reached its deadline");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("text watches with different patterns stay separate but share one ending notice", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const ready = await start(buffer, "READY", { kind: "offset", offset: 0 });
+		const done = await start(buffer, "DONE", { kind: "offset", offset: 0 });
+		const lifecycle = await startLifecycle(buffer);
+		expect(new Set([ready, done, lifecycle]).size).toBe(3);
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal was detached from the server");
+		// Duplicates settle silently but keep their own outcome: an unmatched pattern is not a match.
+		for (const id of [ready, done, lifecycle])
+			expect((await waitForStatus(id))?.status).toBe("failed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("different watchers of one terminal keep independent watches and notices", async () => {
+		const other = "terminal-watch-other";
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({ id: other, variant: "primary", status: "idle", createdAt: now, updatedAt: now })
+			.run();
+		const mine = await startLifecycle();
+		const theirs = await startTerminalWatch({
+			narratorId: other,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			timeoutMs: 60_000,
+		});
+		if (theirs.status !== "started") throw new Error(theirs.message);
+		expect(theirs.reused).toBeFalsy();
+		expect(theirs.taskId).not.toBe(mine);
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await waitForStatus(mine))?.status).toBe("completed");
+		expect((await waitForStatus(theirs.taskId))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(await notices(other)).toHaveLength(1);
+	});
+});
+
 describe("terminal watch", () => {
+	test("a lifecycle deadline needs no buffer, markers, or output snapshot", async () => {
+		const id = await startLifecycle(undefined, 40);
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("observation reached its deadline");
+		expect(done?.output).not.toContain("output:");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("lifecycle watches complete once on exit signals even with no normal buffer", async () => {
+		const id = await startLifecycle();
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("the terminal exited or was closed");
+		expect(done?.output).toContain("not an individual command's success");
+		expect(await notices()).toHaveLength(1);
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+	});
+
+	test("detaching ends a lifecycle watch as failed, not command completion", async () => {
+		const buffer = newBuffer();
+		const read = spyOn(buffer, "readFromMarker");
+		const id = await startLifecycle(buffer);
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal was detached from the server");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("failed");
+		expect(done?.output).toContain("may still be running");
+		expect(read).not.toHaveBeenCalled();
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect(await notices()).toHaveLength(1);
+		expect((await row(id))?.output).toBe(done?.output);
+	});
+
+	test("a stalled pattern read cannot hide exit from a lifecycle watch on the same buffer", async () => {
+		const buffer = newBuffer();
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		spyOn(buffer, "readFromMarker").mockImplementation(async () => {
+			entered.resolve();
+			await gate.promise;
+			return { text: "", markerLost: false };
+		});
+		try {
+			const textId = await start(buffer, "NEVER", { kind: "offset", offset: 0 });
+			await entered.promise;
+			const lifecycleId = await startLifecycle(buffer, 100);
+			const ended = endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+			const done = await waitForStatus(lifecycleId);
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toContain("the terminal exited");
+			expect(done?.output).not.toContain("deadline");
+			expect(await backgroundTaskService.cancel(textId)).toBe(true);
+			gate.resolve();
+			await ended;
+			eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+			const delivered = await notices();
+			expect(
+				delivered.filter((notice) => notice?.kind === "bg_bash" && notice.task.id === lifecycleId),
+			).toHaveLength(1);
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	test("Stop cancels lifecycle observation without affecting its terminal or accepting later exit", async () => {
+		const buffer = newBuffer();
+		const id = await startLifecycle(buffer);
+		expect(await backgroundTaskService.cancel(id)).toBe(true);
+		output(buffer, "the terminal is still usable\r\n");
+		expect(await buffer.getContents()).toContain("still usable");
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await row(id))?.status).toBe("cancelled");
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		await notices();
+		expect(wakes).toEqual([]);
+	});
+
+	test("shutdown suspends lifecycle observation for restart interruption instead of reporting exit", async () => {
+		const buffer = newBuffer();
+		const id = await startLifecycle(buffer);
+		suspendTerminalWatchesForShutdown();
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+		eventBus.emit({ type: "terminal:exited", terminalId: TERMINAL, narratorId: PARENT });
+		expect((await row(id))?.status).toBe("running");
+		expect(await notices()).toEqual([]);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		// Terminal watches are settled after narrator recovery, off the startup path.
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("failed");
+		expect(done?.output).toMatch(/restart|interrupted/i);
+	});
+
 	test("multiline partial output survives a resize on the next empty cursor row", async () => {
 		const buffer = newBuffer();
 		const id = await startWithCursor(buffer, "RE\nADY");
@@ -409,18 +587,67 @@ describe("terminal watch", () => {
 		const id = await start(buffer, "NEVER", { kind: "offset", offset: 0 }, 300);
 		output(buffer, "working...\r\n");
 		const done = await waitForStatus(id);
-		expect(done?.status).toBe("timeout");
-		expect(done?.output).toContain("timed out");
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toMatch(/timed out|deadline/i);
+		expect(done?.output).toMatch(/still (?:be )?running/);
 		expect(done?.output).toContain("working...");
 		expect((await notices()).length).toBe(1);
+	});
+
+	test("a stalled terminal read cannot delay its deadline or publish a late match", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const cursor = await buffer.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const releasedRead = Promise.withResolvers<void>();
+		const read = buffer.readCursor.bind(buffer);
+		spyOn(buffer, "readCursor").mockImplementationOnce(async (point) => {
+			const captured = await read(point);
+			entered.resolve();
+			await gate.promise;
+			releasedRead.resolve();
+			return captured;
+		});
+		try {
+			const result = await startTerminalWatch({
+				narratorId: PARENT,
+				terminalId: TERMINAL,
+				terminalName: "T",
+				pattern: "READY",
+				timeoutMs: 150,
+				buffer,
+				cursor,
+				marker: cursor.marker,
+				disposeMarkers: cursor.dispose,
+				start: { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+			});
+			if (result.status !== "started") throw new Error(result.message);
+			output(buffer, "READY while the read response is blocked\r\n");
+			await entered.promise;
+			const done = await waitForStatus(result.taskId);
+			expect(done?.status).toBe("completed");
+			expect(done?.output).toMatch(/timed out|deadline/i);
+			expect(done?.output).toMatch(/still (?:be )?running/);
+			expect(activeWatchIds(TERMINAL)).toEqual([]);
+			expect(await notices()).toHaveLength(1);
+			gate.resolve();
+			await releasedRead.promise;
+			await Bun.sleep(20);
+			expect((await row(result.taskId))?.output).toBe(done?.output);
+			expect(await notices()).toHaveLength(1);
+		} finally {
+			gate.resolve();
+		}
 	});
 
 	test.each([
 		"completed",
 		"timeout",
 	] as const)("retries a rolled-back %s publication without losing or duplicating the notice", async (status) => {
-		const method = status === "completed" ? "markCompleted" : "markTimedOut";
-		const publish = backgroundTaskService[method].bind(backgroundTaskService);
+		const method = "markCompleted";
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
 		let attempts = 0;
 		const published = spyOn(backgroundTaskService, method).mockImplementation(async (...args) => {
 			attempts++;
@@ -439,7 +666,11 @@ describe("terminal watch", () => {
 		const id = await start(buffer, "READY", { kind: "offset", offset: 2 }, 300);
 		output(buffer, status === "completed" ? "READY\r\n" : "still working\r\n");
 		const done = await waitForStatus(id);
-		expect(done?.status).toBe(status);
+		expect(done?.status).toBe("completed");
+		if (status === "timeout") {
+			expect(done?.output).toMatch(/timed out|deadline/i);
+			expect(done?.output).toMatch(/still (?:be )?running/);
+		} else expect(done?.output).toContain('"READY" appeared');
 		expect(published).toHaveBeenCalledTimes(2);
 		const delivered = await notices();
 		expect(delivered).toHaveLength(1);
@@ -459,7 +690,7 @@ describe("terminal watch", () => {
 		const deadline = Date.now() + 1_000;
 		while (published.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10);
 		expect(published).toHaveBeenCalledTimes(1);
-		expect(activeWatchIds(TERMINAL)).toContain(id);
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
 		expect(await backgroundTaskService.cancel(id)).toBe(true);
 		await Bun.sleep(CHECK_INTERVAL_MS * 2);
 		expect(published).toHaveBeenCalledTimes(1);
@@ -482,7 +713,7 @@ describe("terminal watch", () => {
 		const deadline = Date.now() + 1_000;
 		while (published.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10);
 		expect(published).toHaveBeenCalledTimes(1);
-		expect(activeWatchIds(TERMINAL)).toContain(id);
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
 		suspendTerminalWatchesForShutdown();
 		await Bun.sleep(CHECK_INTERVAL_MS * 2);
 		expect(published).toHaveBeenCalledTimes(1);
@@ -516,9 +747,9 @@ describe("terminal watch", () => {
 		expect(await notices()).toHaveLength(1);
 	});
 
-	test("permanent publication failures have a bounded retry budget and release resources", async () => {
+	test("publication failures release terminal resources immediately but remain stoppable beyond the old retry budget", async () => {
 		const published = spyOn(backgroundTaskService, "markCompleted").mockRejectedValue(
-			new Error("permanent publication failure"),
+			new Error("persistent publication failure"),
 		);
 		const schedule = globalThis.setTimeout;
 		const delays: number[] = [];
@@ -526,21 +757,94 @@ describe("terminal watch", () => {
 			...args: Parameters<typeof setTimeout>
 		) => {
 			const [handler, delay, ...rest] = args;
-			const retry = PUBLISH_RETRY_DELAYS_MS.some((value) => value === delay);
+			const retry =
+				PUBLISH_RETRY_DELAYS_MS.some((value) => value === delay) ||
+				delay === MAX_PUBLISH_RETRY_DELAY_MS;
 			if (retry && delay !== undefined) delays.push(delay);
 			return schedule(handler, retry ? 5 : delay, ...rest);
 		}) as typeof setTimeout);
 		const buffer = newBuffer();
 		output(buffer, "$ ");
-		const id = await start(buffer, "READY", { kind: "offset", offset: 2 });
+		const cursor = await buffer.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		const dispose = spyOn(cursor, "dispose");
+		const result = await startTerminalWatch({
+			narratorId: PARENT,
+			terminalId: TERMINAL,
+			terminalName: "T",
+			pattern: "READY",
+			timeoutMs: 60_000,
+			buffer,
+			cursor,
+			marker: cursor.marker,
+			disposeMarkers: cursor.dispose,
+			start: { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+		});
+		if (result.status !== "started") throw new Error(result.message);
 		output(buffer, "READY\r\n");
 		const deadline = Date.now() + 1_000;
-		while (activeWatchIds(TERMINAL).includes(id) && Date.now() < deadline) await Bun.sleep(10);
-		expect(delays).toEqual([...PUBLISH_RETRY_DELAYS_MS]);
-		expect(published).toHaveBeenCalledTimes(1 + PUBLISH_RETRY_DELAYS_MS.length);
+		while (published.mock.calls.length < 6 && Date.now() < deadline) await Bun.sleep(5);
+		expect(published.mock.calls.length).toBeGreaterThanOrEqual(6);
+		expect(delays.slice(0, 3)).toEqual([...PUBLISH_RETRY_DELAYS_MS]);
+		expect(delays.slice(3).every((delay) => delay === MAX_PUBLISH_RETRY_DELAY_MS)).toBe(true);
+		expect(dispose).toHaveBeenCalledTimes(1);
+		expect(cursor.marker.isDisposed).toBe(true);
+		expect(cursor.observedEndMarker?.isDisposed ?? true).toBe(true);
+		expect(buffer.cloneReadCursor(cursor)).toBeUndefined();
 		expect(activeWatchIds(TERMINAL)).toEqual([]);
-		expect((await row(id))?.status).toBe("running");
+		expect((await row(result.taskId))?.status).toBe("running");
 		expect(await notices()).toEqual([]);
+		expect(await backgroundTaskService.cancel(result.taskId)).toBe(true);
+		const stoppedAt = published.mock.calls.length;
+		await Bun.sleep(40);
+		expect(published).toHaveBeenCalledTimes(stoppedAt);
+		expect((await row(result.taskId))?.status).toBe("cancelled");
+		expect(dispose).toHaveBeenCalledTimes(1);
+	});
+
+	test("publication recovers beyond the old retry budget and delivers its frozen result exactly once", async () => {
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		const firstAttempt = Promise.withResolvers<void>();
+		let attempts = 0;
+		const published = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (...args) => {
+				if (++attempts <= 5) {
+					firstAttempt.resolve();
+					throw new Error("temporary publication failure");
+				}
+				return publish(...args);
+			},
+		);
+		const schedule = globalThis.setTimeout;
+		spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [handler, delay, ...rest] = args;
+			const retry =
+				PUBLISH_RETRY_DELAYS_MS.some((value) => value === delay) ||
+				delay === MAX_PUBLISH_RETRY_DELAY_MS;
+			return schedule(handler, retry ? 5 : delay, ...rest);
+		}) as typeof setTimeout);
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await startWithCursor(buffer, "READY");
+		output(buffer, "READY original result\r\n");
+		await firstAttempt.promise;
+		expect(activeWatchIds(TERMINAL)).toEqual([]);
+		const read = spyOn(buffer, "readCursor");
+		output(buffer, "unrelated later output\r\n");
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		expect(read).not.toHaveBeenCalled();
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("READY original result");
+		expect(done?.output).not.toContain("unrelated later output");
+		expect(published).toHaveBeenCalledTimes(6);
+		expect(await notices()).toHaveLength(1);
+		expect(wakes).toEqual([PARENT]);
+		await Bun.sleep(40);
+		expect(await notices()).toHaveLength(1);
+		expect(published).toHaveBeenCalledTimes(6);
 	});
 
 	test("ending the buffer fails the watch after a last match attempt", async () => {
@@ -551,10 +855,39 @@ describe("terminal watch", () => {
 		// Output that lands right before exit, with no check run yet.
 		buffer.append("BYE\r\n");
 		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
-		expect((await row(lastMinute))?.status).toBe("completed");
-		const failed = await row(missed);
+		expect((await waitForStatus(lastMinute))?.status).toBe("completed");
+		const failed = await waitForStatus(missed);
 		expect(failed?.status).toBe("failed");
 		expect(failed?.output).toContain("the terminal exited");
+	});
+
+	test("ending a buffer preserves an in-flight frozen match until publication commits", async () => {
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await start(buffer, "BYE", { kind: "offset", offset: 0 });
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const publish = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		const completed = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (...args) => {
+				entered.resolve();
+				await gate.promise;
+				return publish(...args);
+			},
+		);
+		try {
+			output(buffer, "BYE\r\n");
+			await entered.promise;
+			await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+			expect((await row(id))?.status).toBe("running");
+			expect(completed).toHaveBeenCalledTimes(1);
+		} finally {
+			gate.resolve();
+		}
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain('"BYE" appeared');
+		expect(completed).toHaveBeenCalledTimes(1);
 	});
 
 	test("a different buffer for the same terminal does not end the watch", async () => {
@@ -619,8 +952,395 @@ describe("terminal watch", () => {
 		await backgroundTaskService.killAll();
 		expect((await row(id))?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		const recovered = await row(id);
+		const recovered = await waitForStatus(id);
 		expect(recovered?.status).toBe("failed");
-		expect(recovered?.output).toContain("Terminal watch ended because the server restarted");
+		expect(recovered?.output).toMatch(/interrupted.*server restart/i);
+		// Without a start saved with a resumable snapshot, a text watch cannot prove it
+		// saw output produced while no server ran.
+		expect(recovered?.output).toContain("The watch did not stop the target");
+	});
+});
+
+describe("terminal lifecycle watches are re-attached after a restart", () => {
+	async function seedTerminal(status: "running" | "exited" = "running") {
+		const { terminals } = await import("../../db/schema");
+		db.insert(terminals)
+			.values({
+				id: TERMINAL,
+				narratorId: PARENT,
+				name: "T",
+				status,
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+	}
+
+	/** Shut down, then recover as a fresh process: the dtach session is attached again. */
+	async function restartWith(buffer: BufferManager | undefined, attached: boolean) {
+		suspendTerminalWatchesForShutdown();
+		await backgroundTaskService.killAll();
+		resumeTerminalWatchesForTests();
+		const { terminalService } = await import("../terminal-service");
+		spyOn(terminalService, "isAttached").mockReturnValue(attached);
+		spyOn(terminalService, "getActiveBuffer").mockReturnValue(buffer);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		// Terminal re-attachment runs after narrator recovery, off the startup path.
+		const deadline = Date.now() + 3_000;
+		while (Date.now() < deadline) {
+			const pending = db
+				.select()
+				.from(backgroundTasks)
+				.all()
+				.filter((task) => task.status === "running" && !activeWatchIds(TERMINAL).includes(task.id));
+			if (pending.length === 0) return;
+			await Bun.sleep(10);
+		}
+	}
+
+	test("a live terminal keeps its watch and reports the later exit", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		const id = await startLifecycle(buffer);
+		await restartWith(buffer, true);
+		expect((await row(id))?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toEqual([id]);
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited or was closed");
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("completed");
+		expect(ended?.output).toContain("the terminal exited or was closed");
+	});
+
+	test("a terminal that exited while the server was down reports that exit, not an interruption", async () => {
+		await seedTerminal();
+		const id = await startLifecycle(newBuffer());
+		const { terminals } = await import("../../db/schema");
+		db.update(terminals).set({ status: "exited" }).where(eq(terminals.id, TERMINAL)).run();
+		await restartWith(undefined, false);
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("completed");
+		expect(ended?.output).toContain("the terminal exited or was closed");
+		expect(ended?.output).not.toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a terminal that no longer belongs to the watcher ends as interrupted", async () => {
+		await seedTerminal();
+		const id = await startLifecycle(newBuffer());
+		const { terminals } = await import("../../db/schema");
+		db.update(terminals).set({ narratorId: null }).where(eq(terminals.id, TERMINAL)).run();
+		await restartWith(undefined, false);
+		const ended = await row(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+});
+
+describe("output gaps from a durable executor session", () => {
+	test("a text watch keeps a match it already had output for, and otherwise reports the gap", async () => {
+		const { interruptTextWatchesForGap } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const matched = await start(buffer, "BUILD OK", { kind: "offset", offset: 0 });
+		const missed = await start(buffer, "DEPLOYED", { kind: "offset", offset: 0 });
+		const lifecycle = await startLifecycle(buffer);
+		// Seen before the hole, but not yet checked when the gap arrives.
+		buffer.append("BUILD OK\r\n");
+		await interruptTextWatchesForGap(TERMINAL, buffer, 4096);
+
+		const ok = await waitForStatus(matched);
+		expect(ok?.status).toBe("completed");
+		expect(ok?.output).toContain("BUILD OK");
+		const lost = await waitForStatus(missed);
+		expect(lost?.status).toBe("failed");
+		expect(lost?.output).toContain("4096 bytes of output");
+		expect(lost?.output).toContain("may have appeared without being observed");
+		// Lifecycle watches are about the terminal, not its text.
+		expect((await row(lifecycle))?.status).toBe("running");
+	});
+
+	test("an executor restart settles text watches before its notice can match them", async () => {
+		const { interruptTextWatchesForRestart } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const replayed = await start(buffer, "step 2 done", { kind: "offset", offset: 0 });
+		// Appears only in the notice that follows the restart, never in the shell's output.
+		const noticeOnly = await start(buffer, "part of it is missing", { kind: "offset", offset: 0 });
+		buffer.append("step 2 done\r\n");
+		await interruptTextWatchesForRestart(TERMINAL, buffer, "incomplete");
+		buffer.append(
+			"\r\n[NarraFork: the device could not record all of this output; part of it is missing]\r\n",
+		);
+
+		const ok = await waitForStatus(replayed);
+		expect(ok?.status).toBe("completed");
+		const ended = await waitForStatus(noticeOnly);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toContain("could not record all output");
+		expect(ended?.output).toContain("may have appeared without being observed");
+	});
+
+	test("unmatched text watches ended by an executor restart share one ending notice", async () => {
+		const { interruptTextWatchesForRestart } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const ready = await start(buffer, "READY", { kind: "offset", offset: 0 });
+		const done = await start(buffer, "DONE", { kind: "offset", offset: 0 });
+		const exit = await startLifecycle(buffer);
+		await interruptTextWatchesForRestart(TERMINAL, buffer, "lost");
+		for (const id of [ready, done]) {
+			const ended = await waitForStatus(id);
+			expect(ended?.status).toBe("failed");
+			expect(ended?.output).toContain("executor restarted");
+		}
+		expect(await notices()).toHaveLength(1);
+		// The exit watch is not swallowed by the restart notice: the terminal's end
+		// is still reported when its buffer goes away.
+		expect((await row(exit))?.status).toBe("running");
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		expect((await waitForStatus(exit))?.output).toContain("the terminal exited");
+		expect(await notices()).toHaveLength(2);
+	});
+});
+
+describe("text watches on executor-session terminals continue after a restart", () => {
+	let seq = 0;
+	beforeEach(() => {
+		seq = 0;
+		resetRestoredWatchAnchorsForTests();
+	});
+	afterEach(() => resetRestoredWatchAnchorsForTests());
+
+	async function seedTerminal() {
+		const { terminals } = await import("../../db/schema");
+		db.insert(terminals)
+			.values({
+				id: TERMINAL,
+				narratorId: PARENT,
+				name: "T",
+				status: "running",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+	}
+
+	/** Output numbered like an executor session's stream. */
+	function numbered(buffer: BufferManager, data: string) {
+		seq += data.length;
+		buffer.append(data, seq);
+		notifyTerminalOutput(TERMINAL);
+	}
+
+	/**
+	 * Stop as a shutdown does (watches released, snapshot saved after `beforeSave`
+	 * reached the buffer unobserved), then start as a new process: the terminal is
+	 * resumed from the snapshot and restart recovery re-registers the watches.
+	 */
+	async function restart(buffer: BufferManager, beforeSave?: string) {
+		suspendTerminalWatchesForShutdown();
+		if (beforeSave) {
+			seq += beforeSave.length;
+			buffer.append(beforeSave, seq);
+		}
+		await buffer.saveToDisk();
+		await backgroundTaskService.killAll();
+		resumeTerminalWatchesForTests();
+		resetRestoredWatchAnchorsForTests();
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		const held = registerRestoredWatchAnchors(
+			TERMINAL,
+			restored,
+			await restored.takeRestoredAnchors(),
+		);
+		const { terminalService } = await import("../terminal-service");
+		spyOn(terminalService, "isAttached").mockReturnValue(true);
+		spyOn(terminalService, "getActiveBuffer").mockReturnValue(restored);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		// Terminal watches are re-attached off the startup path; the held output is
+		// released once every one has been.
+		await held;
+		const deadline = Date.now() + 3_000;
+		while (
+			Date.now() < deadline &&
+			db
+				.select()
+				.from(backgroundTasks)
+				.all()
+				.some((task) => task.status === "running" && !activeWatchIds(TERMINAL).includes(task.id))
+		)
+			await Bun.sleep(10);
+		return { restored, held };
+	}
+
+	test("output printed before the restart but never checked is matched", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK");
+		numbered(buffer, "make\r\ncompiling\r\n");
+		const { held } = await restart(buffer, "BUILD OK\r\n");
+		expect(held).toBeDefined();
+		await held;
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain('"BUILD OK" appeared in terminal "T"');
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("the watch keeps matching only output after its start", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "earlier READY\r\n$ ");
+		const id = await startWithCursor(buffer, "READY");
+		const { restored } = await restart(buffer, "waiting\r\n");
+		expect((await row(id))?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toEqual([id]);
+		// The same handle the session was given before the restart.
+		numbered(restored, "server READY\r\n");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("server READY");
+	});
+
+	test("a resumed watch survives a second restart", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "SECOND");
+		const first = await restart(buffer);
+		expect((await row(id))?.status).toBe("running");
+		const second = await restart(first.restored, "SECOND\r\n");
+		await second.held;
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
+
+	test("a watch that skipped its command's echo resumes without saving the input", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK", {
+			kind: "echo",
+			input: "secret-token\nmake && echo BUILD OK\n",
+		});
+		numbered(buffer, "make && echo BUILD OK\r\ncompiling\r\n");
+		// A check finds the echo; from then on the watch can be saved.
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
+		suspendTerminalWatchesForShutdown();
+		await buffer.saveToDisk();
+		const { join } = await import("node:path");
+		const { getNarraforkPath } = await import("../../lib/narrafork-home");
+		const saved = JSON.parse(
+			await Bun.file(join(getNarraforkPath("buffers"), `${TERMINAL}.buf`)).text(),
+		);
+		expect(saved.anchors).toHaveLength(1);
+		expect(Object.keys(saved.anchors[0].data).sort()).toEqual([
+			"checkpoint",
+			"kind",
+			"pattern",
+			"version",
+		]);
+		expect(JSON.stringify(saved)).not.toContain("secret-token");
+		resumeTerminalWatchesForTests();
+		// The command's own echo does not satisfy the watch; its output does.
+		const { restored } = await restart(buffer);
+		expect((await row(id))?.status).toBe("running");
+		numbered(restored, "BUILD OK\r\n$ ");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+	});
+
+	test("a watch whose echo was never checked is not saved and ends as interrupted", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK", { kind: "echo", input: "hunter2\n" });
+		const { held } = await restart(buffer, "\r\n");
+		expect(held).toBeUndefined();
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("an occurrence that disappeared before the restart counts when it returns", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		// A status row that already says READY when the watch starts.
+		numbered(buffer, "status: READY");
+		const id = await startWithCursor(buffer, "READY");
+		numbered(buffer, "\rstatus: BUSY ");
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
+		expect((await row(id))?.status).toBe("running");
+		// Back to READY after the last check, then the restart.
+		const { held } = await restart(buffer, "\rstatus: READY");
+		await held;
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+	});
+
+	test("a gap in the replayed output still ends the resumed watch as possibly missed", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "DEPLOYED");
+		const { restored } = await restart(buffer);
+		const { interruptTextWatchesForGap } = await import("../terminal-watch-service");
+		await interruptTextWatchesForGap(TERMINAL, restored, 2048);
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toContain("2048 bytes of output");
+	});
+
+	test("a text watch on a terminal that does not number its output still ends as interrupted", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await startWithCursor(buffer, "READY");
+		const { held } = await restart(buffer);
+		expect(held).toBeUndefined();
+		const ended = await row(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a settled watch's start is not saved again", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "OK");
+		numbered(buffer, "OK\r\n");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+		await buffer.saveToDisk();
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		expect(await restored.takeRestoredAnchors()).toEqual([]);
+	});
+
+	test("starts nobody resumes are dropped once recovery finishes, releasing held output", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "NEVER");
+		// The row ended (say, cancelled) after the snapshot that still carries its start.
+		await buffer.saveToDisk();
+		await backgroundTaskService.cancel(id);
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		const held = registerRestoredWatchAnchors(
+			TERMINAL,
+			restored,
+			await restored.takeRestoredAnchors(),
+		);
+		expect(held).toBeDefined();
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await held;
+		// Terminals resumed later keep nothing for watches.
+		const late = await restored.markReadCursor();
+		if (!late) throw new Error("no cursor");
+		expect(registerRestoredWatchAnchors(TERMINAL, restored, [{ id, cursor: late, data: {} }])).toBe(
+			undefined,
+		);
+		expect(late.marker.isDisposed).toBe(true);
 	});
 });

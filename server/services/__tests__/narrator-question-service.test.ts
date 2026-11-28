@@ -1,3 +1,4 @@
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 /**
  * Contract for asynchronous AskUserQuestion records.
  *
@@ -15,7 +16,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -23,6 +24,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // The shared migrated test database, not a hand-rolled subset.
 //
@@ -30,7 +32,9 @@ import {
 // mock is process-wide, so those four tables became `db` for all 190 sibling files and
 // broke 139 unrelated assertions. `getTestDb()` runs the real migrations, so a leak
 // costs nothing structural — and the `afterAll` below re-points the module anyway.
-const { db: testDb, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db: testDb, sqlite } = fixture;
+await fixture.ready;
 
 // Snapshot the real module first so `afterAll` can restore it: `mock.restore()` does
 // NOT undo `mock.module`, and an FTS-less test db leaking into later real-db suites is
@@ -220,16 +224,20 @@ describe("question lifecycle closure", () => {
 	test("new async requires context, user-deferred remains compatible, and UTF-8 budgets apply", async () => {
 		const call = await seedToolCall();
 		await expect(
-			createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
-		).rejects.toThrow("context");
+			await captureWorkerRejectionThrower(
+				createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
+			),
+		).toThrow("context");
 		await expect(
-			createQuestionRecord({
-				narratorId: NARRATOR_ID,
-				...call,
-				questions: QUESTIONS,
-				context: "中".repeat(700),
-			}),
-		).rejects.toThrow("2048");
+			await captureWorkerRejectionThrower(
+				createQuestionRecord({
+					narratorId: NARRATOR_ID,
+					...call,
+					questions: QUESTIONS,
+					context: "中".repeat(700),
+				}),
+			),
+		).toThrow("2048");
 		const result = await createQuestionRecord({
 			narratorId: NARRATOR_ID,
 			...call,
@@ -422,26 +430,30 @@ describe("question lifecycle closure", () => {
 	test("oversized snapshots and answers reject before changing state; legacy detail stays bounded", async () => {
 		const call = await seedToolCall();
 		await expect(
-			createAsyncQuestion({
-				narratorId: NARRATOR_ID,
-				...call,
-				questions: [
-					{
-						id: "q",
-						header: "Question",
-						options: [{ header: "Artifact", preview: "x".repeat(64 * 1024) }],
-					},
-				],
-			}),
-		).rejects.toThrow("snapshot");
+			await captureWorkerRejectionThrower(
+				createAsyncQuestion({
+					narratorId: NARRATOR_ID,
+					...call,
+					questions: [
+						{
+							id: "q",
+							header: "Question",
+							options: [{ header: "Artifact", preview: "x".repeat(64 * 1024) }],
+						},
+					],
+				}),
+			),
+		).toThrow("snapshot");
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,
 			...call,
 			questions: QUESTIONS,
 		});
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
-		).rejects.toThrow("answers");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
+			),
+		).toThrow("answers");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		sqlite
 			.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?")
@@ -460,8 +472,10 @@ describe("question lifecycle closure", () => {
 			record.id,
 		);
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
-		).rejects.toThrow("ambiguous");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
+			),
+		).toThrow("ambiguous");
 		sqlite.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?").run(
 			JSON.stringify([
 				{
@@ -575,7 +589,7 @@ beforeEach(async () => {
 	await seedParents();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	setQuestionServiceSeam(null);
 	setInjectionScheduler(previousScheduler);
 	// Re-point the module at the real database. `mock.restore()` does not undo
@@ -584,10 +598,13 @@ afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
-describe("own question wait capability", () => {
-	test("Await(question) still reads an existing own answer but rejects another session's question", async () => {
+describe("own question query capability", () => {
+	test("Question reads existing own answers when asking is disabled without exposing another session's question", async () => {
+		const { questionTool } = await import("../../lib/agent/tools/question");
+		const { askUserQuestionTool } = await import("../../lib/agent/tools/ask-user-question");
 		const { awaitTool } = await import("../../lib/agent/tools/await");
 		const { resolveToolFilter } = await import("../subagent-tools");
 		const { toolCallId, toolUseId } = await seedToolCall();
@@ -602,31 +619,62 @@ describe("own question wait capability", () => {
 			userId: "user-1",
 			locale: "en",
 		});
-		expect(answer.ok).toBe(true);
+		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
 		const filter = resolveToolFilter("general");
-		// Asking is gone for subagents, but waiting on a question that already exists
-		// (e.g. filed by the primary before delegation) stays available.
-		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(false);
-		expect(filter?.(awaitTool)).toBe(true);
+		// Losing the ability to ask does not remove read access to existing own items.
+		// Neither a parent relationship nor a legacy Await grants access to foreign items.
+		expect(filter?.(askUserQuestionTool)).toBe(false);
+		expect(filter?.(awaitTool)).toBe(false);
+		expect(filter?.(questionTool)).toBe(true);
 		const context = {
 			narratorId: NARRATOR_ID,
 			parentNarratorId: "legacy-parent",
-			currentToolUseId: "legacy-question-wait",
+			currentToolUseId: "question-query",
 			signal: new AbortController().signal,
 		} as import("../../lib/agent/types").ToolContext;
-		const own = await awaitTool.execute({ type: "question", id: record.id }, context);
+		const deliveriesBeforeQuery = scheduledDeliveries;
+		const injectionsBeforeQuery = injections.length;
+		const own = await questionTool.execute({ action: "get", id: record.id }, context);
 		expect(own.isError).not.toBe(true);
-		expect(own.output).toContain("Redis");
-		expect(own.metadata?.status).toBe("answered");
-		const foreign = await awaitTool.execute(
-			{ type: "question", id: record.id },
-			{
-				...context,
-				narratorId: OTHER_NARRATOR_ID,
+		expect(JSON.parse(own.output)).toMatchObject({
+			record: {
+				id: record.id,
+				narratorId: NARRATOR_ID,
+				status: "answered",
+				answers: { "cache-layer": "Redis" },
+				answerMessageId: answer.record.answerMessageId,
+				resolution: null,
 			},
+			events: [{ messageId: answer.record.answerMessageId, actor: "user-1" }],
+		});
+		expect(await questionTool.execute({ action: "get", id: record.id }, context)).toEqual(own);
+		const ownList = await questionTool.execute({ action: "list", filter: "pending" }, context);
+		expect(ownList.isError).not.toBe(true);
+		expect(JSON.parse(ownList.output).items.map((item: { id: string }) => item.id)).toEqual([
+			record.id,
+		]);
+		const foreignContext = {
+			...context,
+			narratorId: OTHER_NARRATOR_ID,
+			parentNarratorId: NARRATOR_ID,
+		};
+		const foreign = await questionTool.execute({ action: "get", id: record.id }, foreignContext);
+		expect(foreign.isError).not.toBe(true);
+		expect(JSON.parse(foreign.output)).toEqual({
+			record: null,
+			tooLarge: false,
+			events: [],
+			nextCursor: null,
+		});
+		const foreignList = await questionTool.execute(
+			{ action: "list", filter: "all" },
+			foreignContext,
 		);
-		expect(foreign.isError).toBe(true);
-		expect(foreign.output).toContain("not an async question belonging to this session");
+		expect(foreignList.isError).not.toBe(true);
+		expect(JSON.parse(foreignList.output)).toEqual({ items: [], nextCursor: null });
+		expect(scheduledDeliveries).toBe(deliveriesBeforeQuery);
+		expect(injections).toHaveLength(injectionsBeforeQuery);
+		expect(isAsyncQuestionAwaited(record.id)).toBe(false);
 	});
 });
 
@@ -806,8 +854,10 @@ describe("answerAsyncQuestion", () => {
 		broadcasts = [];
 		deliveryError = new Error("injected persistence failure");
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-		).rejects.toThrow("injected persistence failure");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+			),
+		).toThrow("injected persistence failure");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		expect((await getAsyncQuestion(record.id))?.answers).toBeNull();
 		expect(broadcasts).toEqual([]);
@@ -839,8 +889,10 @@ describe("answerAsyncQuestion", () => {
 			WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'injected message insert failure'); END`);
 		try {
 			await expect(
-				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected message insert failure");
+				await captureWorkerRejectionThrower(
+					answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+				),
+			).toThrow("injected message insert failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect((await getAsyncQuestion(record.id))?.answerMessageId).toBeNull();
 		} finally {
@@ -863,8 +915,10 @@ describe("answerAsyncQuestion", () => {
 			BEGIN SELECT RAISE(ABORT, 'injected question update failure'); END`);
 		try {
 			await expect(
-				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected question update failure");
+				await captureWorkerRejectionThrower(
+					answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+				),
+			).toThrow("injected question update failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect(
 				sqlite.query("SELECT count(*) AS n FROM narrator_messages WHERE role = 'user'").get(),
@@ -941,7 +995,9 @@ describe("dismissAsyncQuestion", () => {
 			questions: QUESTIONS,
 		});
 		deliveryError = new Error("injected dismissal failure");
-		await expect(dismissAsyncQuestion(record.id)).rejects.toThrow("injected dismissal failure");
+		await expect(await captureWorkerRejectionThrower(dismissAsyncQuestion(record.id))).toThrow(
+			"injected dismissal failure",
+		);
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		deliveryError = null;
 		const result = await dismissAsyncQuestion(record.id);

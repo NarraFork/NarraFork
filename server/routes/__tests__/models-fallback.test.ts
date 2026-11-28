@@ -1,7 +1,4 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 /**
  * Regression tests for the model-list fallback logic on the provider "test"
@@ -41,19 +38,15 @@ type FetchOpenaiModels = (config: {
 let buildModelsUrls: BuildModelsUrls;
 let fetchAnthropicModels: FetchAnthropicModels;
 let fetchOpenaiModels: FetchOpenaiModels;
-let testHome = "";
-let originalNarraforkHome: string | undefined;
 const originalFetch = globalThis.fetch;
 
 beforeAll(async () => {
-	// Both route modules transitively initialise the DB layer at import time,
-	// which resolves its data dir from NARRAFORK_HOME (NOT process.env.HOME —
-	// node's os.homedir() reads the system passwd entry, so overriding HOME would
-	// not isolate it). Point it at a fresh temp dir so the test uses its own empty
-	// SQLite file instead of contending for the real ~/.narrafork instance lock.
-	originalNarraforkHome = process.env.NARRAFORK_HOME;
-	testHome = mkdtempSync(join(tmpdir(), "narrafork-models-fallback-"));
-	process.env.NARRAFORK_HOME = testHome;
+	// Reuse the isolated home owned by tests/preload.ts. Creating a second DB
+	// here duplicates migrations and leaves its Windows watcher handles outside
+	// the standard test teardown.
+	if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME) {
+		throw new Error("Model catalog tests require the isolated tests/preload.ts environment");
+	}
 
 	const openaiMod = await import("../openai");
 	buildModelsUrls = openaiMod.buildModelsUrls as unknown as BuildModelsUrls;
@@ -64,9 +57,6 @@ beforeAll(async () => {
 
 afterAll(() => {
 	globalThis.fetch = originalFetch;
-	if (originalNarraforkHome === undefined) delete process.env.NARRAFORK_HOME;
-	else process.env.NARRAFORK_HOME = originalNarraforkHome;
-	if (testHome) rmSync(testHome, { recursive: true, force: true });
 });
 
 describe("buildModelsUrls (OpenAI) suggest-safety", () => {

@@ -1,0 +1,257 @@
+/**
+ * NarraFork design tokens — the single source of truth for palette, semantic color,
+ * spacing, radius and motion.
+ *
+ * ## Direction of derivation (do not invert)
+ *
+ *     palette (hex)  →  --mantine-*  →  semantic tokens  →  components
+ *
+ * The `--nf-*` semantic names below read Mantine's variables rather than the palette
+ * directly, because three separate mechanisms overwrite those variables on <html>:
+ * OLED mode (styles/oled.css) and plugin-contributed themes (compiled server-side into
+ * scoped `--mantine-*` declarations). Reading through them is what makes a theme change
+ * reach every surface. A semantic token that pointed straight at `--nf-ink-900` would
+ * silently stop following both — and the failure looks like a colour being one shade
+ * off, which nobody reports.
+ *
+ * ## Hex belongs here only
+ *
+ * Every literal colour in `frontend/` should come from this file, with two deliberate
+ * exceptions kept in the check script's allowlist: `components/terminal/terminal-theme.ts`
+ * (terminal palettes are content, not chrome) and `components/settings/BrandingSection.tsx`
+ * (user-chosen brand colours).
+ *
+ * ## Dark surfaces group; they do not divide
+ *
+ * Adjacent dark surfaces cannot be pushed far apart — past roughly 1.5:1 the UI starts
+ * to look muddy and grey rather than deep. So the surface ramp only *groups* (each step
+ * is ≥1.12:1 from its neighbour) and real boundaries use `--nf-line` (≈2:1, decorative)
+ * or `--nf-line-strong` (3.4:1, meets WCAG 1.4.11 for interactive control boundaries).
+ * Please do not "make the layers clearer" by brightening the surfaces.
+ *
+ * ## Relationship to the plugin token set
+ *
+ * `components/plugins/host-tokens.ts` publishes fourteen semantic names to sandboxed
+ * plugin iframes and reads their values from the live document. It is a public contract
+ * for third-party plugins, so this file must keep deriving from `--mantine-*`; the plugin
+ * set keeps working without a single change there.
+ *
+ * Import order matters: after `@mantine/core/styles.css` and before `styles/oled.css`
+ * (see main.tsx). `light-dark()` requires a `color-scheme`, which Mantine sets on
+ * `:root[data-mantine-color-scheme]`.
+ */
+
+:root {
+	/* ---- palette: dark ink (blue-cast neutral, not grey) ---- */
+	--nf-ink-950: #111113;
+	--nf-ink-900: #212225;
+	--nf-ink-850: #272a2d;
+	--nf-ink-800: #2e3135;
+	--nf-ink-700: #363a3f;
+	--nf-ink-600: #6e7681;
+	--nf-ink-300: #b0b4ba;
+	--nf-ink-200: #c3c6cc;
+	--nf-ink-100: #edeef0;
+
+	/* ---- palette: light paper ---- */
+	--nf-paper-50: #f0f0f3;
+	--nf-paper-0: #fcfcfd;
+	--nf-paper-100: #e8e8ec;
+	--nf-paper-200: #e0e1e6;
+	--nf-paper-300: #d9d9e0;
+	--nf-paper-500: #6f7480;
+	--nf-paper-600: #60646c;
+	--nf-paper-700: #3c4048;
+	--nf-paper-900: #1c2024;
+
+	/*
+	 * Action: what the user can do (primary buttons, focus, current selection).
+	 * Filled values are dark enough to carry white text (≥4.5:1); the `-text` variants
+	 * are the on-surface variant used for links and text inside a tinted chip.
+	 */
+	--nf-action-fill-dark: #5060db;
+	--nf-action-fill-light: #4459d8;
+	--nf-action-fill-hover-dark: #5a6ae0;
+	--nf-action-fill-hover-light: #4a5fdd;
+	--nf-action-text-dark: #a0aef7;
+	--nf-action-text-light: #3a50b8;
+	--nf-action-subtle-dark: #1e2236;
+	--nf-action-subtle-light: #edf0fe;
+
+	/*
+	 * Status: what the system is doing. Deliberately separate from `action` — one hue
+	 * carrying both "you can press this" and "this is running" is how a screen ends up
+	 * with nothing standing out.
+	 *
+	 * `-graphic` values are for dots, bars and icons (≥3:1 non-text). `-text` values are
+	 * the legible-on-surface variants (≥4.5:1); in dark they happen to coincide for three
+	 * of the four, in light they do not — `live` at 3.97:1 fails AA as text, which is why
+	 * it gets its own darker step.
+	 */
+	--nf-live-graphic-dark: #46c6bc;
+	--nf-live-graphic-light: #0f8f86;
+	--nf-live-text-dark: #7fd8d2;
+	--nf-live-text-light: #0b7268;
+	--nf-wait-graphic-dark: #7d95b8;
+	--nf-wait-graphic-light: #5a739a;
+	--nf-attention-graphic-dark: #f0a93e;
+	--nf-attention-graphic-light: #96600b;
+	--nf-danger-graphic-dark: #f0555a;
+	--nf-danger-graphic-light: #c2262b;
+
+	/*
+	 * Diff hunk headers. Shared by the transcript diff and the git split view, which had
+	 * drifted into two copies of the same six colours.
+	 */
+	--nf-diff-hunk-text-light: #59636e;
+	--nf-diff-hunk-text-dark: #9198a1;
+	--nf-diff-hunk-bg-light: #ddf4ff;
+	--nf-diff-hunk-bg-dark: #121d2f;
+	--nf-diff-hunk-line-light: #c6e6ff;
+	--nf-diff-hunk-line-dark: #1f2a37;
+
+	/* Text painted on a caller-supplied solid colour (peer avatars, outline chips). */
+	--nf-on-solid: #ffffff;
+
+	/* ---- radius: by role, not by size ---- */
+	--nf-radius-plane: 0;
+	--nf-radius-control: var(--mantine-radius-sm); /* 4px */
+	--nf-radius-overlay: var(--mantine-radius-md); /* 8px */
+
+	/* ---- spacing ---- */
+	--nf-space-1: 2px;
+	--nf-space-2: 4px;
+	--nf-space-3: 8px;
+	--nf-space-4: 12px;
+	--nf-space-5: 16px;
+	--nf-space-6: 24px;
+	--nf-space-7: 32px;
+	--nf-space-8: 48px;
+
+	/* ---- type ---- */
+	--nf-font-ui:
+		ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+		"Noto Sans CJK SC", sans-serif;
+	--nf-font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", monospace;
+	/* Counts, durations and token totals must not change width while a stream appends. */
+	--nf-numeric: tabular-nums;
+
+	/* ---- motion ---- */
+	--nf-dur-fast: 120ms;
+	--nf-dur-base: 180ms;
+	--nf-dur-slow: 240ms;
+	--nf-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/*
+ * `color-scheme` is declared literally, NOT left to Mantine's
+ * `color-scheme: var(--mantine-color-scheme)`.
+ *
+ * Chromium does not honour that indirection when resolving `light-dark()`: the computed
+ * `color-scheme` still reads `dark`, but every `light-dark()` below resolves to its light
+ * branch, so the whole semantic layer would silently paint light-mode colours on a dark
+ * page. Verified in a headless Chrome probe (`getComputedStyle(...).colorScheme === "dark"`
+ * while `light-dark(#121212, #fefefe)` painted `#fefefe`). Declaring the literal value in
+ * a later rule fixes it and keeps this file independent of Mantine's internals.
+ */
+:root[data-mantine-color-scheme="dark"] {
+	color-scheme: dark;
+}
+
+:root[data-mantine-color-scheme="light"] {
+	/*
+	 * Color-scheme only. Do not retint `--mantine-color-body` / `dimmed` here: with no
+	 * saved palette the light scheme must stay on Mantine's own values (`body` #fff,
+	 * `dimmed` gray-6). A chosen preset writes those variables from `palette-apply.ts`,
+	 * on a selector that loses to OLED.
+	 */
+	color-scheme: light;
+}
+
+/*
+ * ---- semantic layer ----
+ *
+ * Written twice — once per scheme — instead of with `light-dark()`.
+ *
+ * `light-dark()` inside a CUSTOM PROPERTY does not follow the colour scheme in Chromium:
+ * it resolves to its first (light) branch in both schemes, while the same function in a
+ * normal property (e.g. `border: 1px solid light-dark(a, b)`) resolves correctly. Probed
+ * in headless Chrome: with `color-scheme: dark` computed on <html>,
+ * `--x: light-dark(#111, #eee)` reported `#111`. Duplicating the block is the portable
+ * fix; it also keeps each scheme readable on its own.
+ *
+ * `--nf-surface-canvas` / `--nf-surface` / `--nf-line-strong` / `--nf-text` /
+ * `--nf-text-muted` read Mantine's variables, not the palette, so OLED and plugin themes
+ * still reach every consumer through them.
+ */
+:root {
+	color-scheme: light;
+
+	--nf-surface-canvas: var(--mantine-color-body);
+	--nf-surface: var(--mantine-color-default);
+	--nf-surface-raised: var(--nf-paper-100);
+	--nf-surface-overlay: var(--nf-paper-200);
+	/*
+	 * Derived from the Mantine border variable rather than the palette so it follows OLED
+	 * and plugin themes; mixed with the surface to land at the decorative weight (~2:1).
+	 */
+	--nf-line: color-mix(in srgb, var(--mantine-color-default-border) 62%, var(--nf-surface));
+	--nf-line-strong: var(--mantine-color-default-border);
+
+	--nf-text: var(--mantine-color-text);
+	--nf-text-secondary: var(--nf-paper-700);
+	--nf-text-muted: var(--mantine-color-dimmed);
+
+	--nf-action: var(--nf-action-fill-light);
+	--nf-action-hover: var(--nf-action-fill-hover-light);
+	--nf-action-label: var(--nf-action-text-light);
+	--nf-action-subtle: var(--nf-action-subtle-light);
+
+	--nf-live-graphic: var(--nf-live-graphic-light);
+	--nf-live-text: var(--nf-live-text-light);
+	--nf-wait-graphic: var(--nf-wait-graphic-light);
+	--nf-attention-graphic: var(--nf-attention-graphic-light);
+	--nf-danger-graphic: var(--nf-danger-graphic-light);
+
+	--nf-diff-hunk-text: var(--nf-diff-hunk-text-light);
+	--nf-diff-hunk-bg: var(--nf-diff-hunk-bg-light);
+	--nf-diff-hunk-line: var(--nf-diff-hunk-line-light);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+	color-scheme: dark;
+
+	--nf-surface-canvas: var(--mantine-color-body);
+	--nf-surface: var(--mantine-color-default);
+	--nf-surface-raised: var(--nf-ink-850);
+	--nf-surface-overlay: var(--nf-ink-800);
+	--nf-line: color-mix(in srgb, var(--mantine-color-default-border) 62%, var(--nf-surface));
+	--nf-line-strong: var(--mantine-color-default-border);
+
+	--nf-text: var(--mantine-color-text);
+	--nf-text-secondary: var(--nf-ink-200);
+	--nf-text-muted: var(--mantine-color-dimmed);
+
+	--nf-action: var(--nf-action-fill-dark);
+	--nf-action-hover: var(--nf-action-fill-hover-dark);
+	--nf-action-label: var(--nf-action-text-dark);
+	--nf-action-subtle: var(--nf-action-subtle-dark);
+
+	--nf-live-graphic: var(--nf-live-graphic-dark);
+	--nf-live-text: var(--nf-live-text-dark);
+	--nf-wait-graphic: var(--nf-wait-graphic-dark);
+	--nf-attention-graphic: var(--nf-attention-graphic-dark);
+	--nf-danger-graphic: var(--nf-danger-graphic-dark);
+
+	--nf-diff-hunk-text: var(--nf-diff-hunk-text-dark);
+	--nf-diff-hunk-bg: var(--nf-diff-hunk-bg-dark);
+	--nf-diff-hunk-line: var(--nf-diff-hunk-line-dark);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--nf-dur-fast: 0ms;
+		--nf-dur-base: 0ms;
+		--nf-dur-slow: 0ms;
+	}
+}

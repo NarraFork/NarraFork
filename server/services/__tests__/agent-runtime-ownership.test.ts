@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { z } from "zod/v4";
 import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -18,11 +19,18 @@ import {
 	getSearchExecutionScope,
 	withSearchExecutionScope,
 } from "../../lib/search/execution-scope";
+import {
+	publicationDedupeKey,
+	publicationEventFromDedupeKey,
+} from "../agent-runtime/publication-outbox";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-// Share the preload-isolated file-backed DB with the real prefix/history workers.
-const { db, sqlite } = await import("../../db");
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Context now imports publication services; load it only after binding the isolated DB.
 const { createRuntimeEventContext } = await import("../agent-runtime/context");
@@ -59,6 +67,28 @@ const CHILD = "runtime-owner-child";
 const SIBLING = "runtime-owner-sibling";
 const ids = [ROOT, CHILD, SIBLING];
 
+function terminalPublications(logicalRunId: string) {
+	const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((eventKind) =>
+		publicationDedupeKey(
+			{ producerKind: "agent", taskId: CHILD, logicalRunId, recipientId: ROOT },
+			eventKind,
+		),
+	);
+	return db.transaction((tx) => [
+		...tx
+			.select({ eventKind: runtimePublicationOutbox.eventKind })
+			.from(runtimePublicationOutbox)
+			.where(inArray(runtimePublicationOutbox.dedupeKey, keys))
+			.all(),
+		...tx
+			.select({ dedupeKey: narratorBufferedMessages.dedupeKey })
+			.from(narratorBufferedMessages)
+			.where(inArray(narratorBufferedMessages.dedupeKey, keys))
+			.all()
+			.map((row) => ({ eventKind: publicationEventFromDedupeKey(row.dedupeKey) })),
+	]);
+}
+
 beforeEach(async () => {
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
@@ -92,7 +122,8 @@ beforeEach(async () => {
 			.run();
 	}
 });
-afterEach(() => {
+afterEach(async () => {
+	await sessionModule.drainNarratorSessionTails({ deadlineAt: Date.now() + 10_000 });
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		state.activeNarrators.delete(id);
@@ -100,8 +131,10 @@ afterEach(() => {
 	mock.restore();
 });
 afterAll(async () => {
-	await closePrefixSnapshotStore();
+	(await import("../agent-runtime/publication")).stopRuntimePublications();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	unregisterProvider();
+	mock.module("../../db", () => realDb);
 });
 
 function active(narratorId: string): ActiveNarrator {
@@ -295,6 +328,32 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 				try {
 					if (entry === "Send") {
 						const now = new Date().toISOString();
+						const { users } = await import("../../db/schema");
+						const { ensureCommunicationNodeTx, grantFixtureNarratorWrite } = await import(
+							"./runtime-communication-fixtures"
+						);
+						const userId = "runtime-send-principal";
+						db.transaction((tx) => {
+							tx.insert(users)
+								.values({ id: userId, username: userId, passwordHash: "test", createdAt: now })
+								.run();
+							grantFixtureNarratorWrite(tx, ROOT, userId);
+							tx.update(narrators)
+								.set({ aclRootNarratorId: ROOT })
+								.where(eq(narrators.id, CHILD))
+								.run();
+							tx.update(narrators)
+								.set({
+									runtimeRegistrationJson: {
+										version: 1,
+										run: { logicalRunId: `seed-${ROOT}`, principal: { userId } },
+									},
+								})
+								.where(eq(narrators.id, ROOT))
+								.run();
+							ensureCommunicationNodeTx(tx, ROOT, null);
+							ensureCommunicationNodeTx(tx, CHILD, ROOT);
+						});
 						await db.insert(narratorMessages).values({
 							id: "sender-message",
 							narratorId: ROOT,
@@ -611,9 +670,8 @@ describe("signal shutdown keeps recoverable runs nonterminal", () => {
 					expect(
 						await db.query.backgroundTasks.findFirst({ where: eq(backgroundTasks.id, CHILD) }),
 					).toMatchObject({ status: ending === "timeout" ? "timeout" : "cancelled" });
-					const published = await db.query.runtimePublicationOutbox.findMany({
-						where: eq(runtimePublicationOutbox.taskId, CHILD),
-					});
+					await (await import("../agent-runtime/publication")).flushRuntimePublications(ROOT);
+					const published = terminalPublications(agent.logicalRunId as string);
 					expect(
 						published.filter(
 							(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),
@@ -693,9 +751,8 @@ test.each([
 		expect(await db.query.narrators.findFirst({ where: eq(narrators.id, CHILD) })).toMatchObject({
 			status: "idle",
 		});
-		const published = await db.query.runtimePublicationOutbox.findMany({
-			where: eq(runtimePublicationOutbox.taskId, CHILD),
-		});
+		await (await import("../agent-runtime/publication")).flushRuntimePublications(ROOT);
+		const published = terminalPublications(agent.logicalRunId as string);
 		expect(
 			published.filter(
 				(row) => row.eventKind === (ending === "timeout" ? "timed_out" : "cancelled"),
@@ -1175,7 +1232,9 @@ describe("the run service owns the entire finalization", () => {
 			expect((await handle.terminal).hasError).toBe(true);
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			// Not consumed by the failing run and not auto-woken past the failure.
-			expect(bufferModule.getBufferedMessages(CHILD).map((m) => m.text)).toEqual(["keep me"]);
+			expect((await bufferModule.getBufferedMessages(CHILD)).map((m) => m.text)).toEqual([
+				"keep me",
+			]);
 			expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(0);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 		} finally {
@@ -1191,10 +1250,10 @@ describe("the run service owns the entire finalization", () => {
 		if (!current) throw new Error("expected successor");
 		const accepted = await bufferModule.enqueueBufferedMessage(CHILD, "keep me");
 		expect(accepted.ok).toBe(true);
-		const queued = bufferModule.getBufferedMessages(CHILD);
+		const queued = await bufferModule.getBufferedMessages(CHILD);
 		try {
 			expect(old.release()).toBe(false);
-			expect(bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
+			expect(await bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
 			expect(getExecutionOwner(CHILD)).toBe(current);
 		} finally {
 			await bufferModule.clearBufferedMessages(CHILD);

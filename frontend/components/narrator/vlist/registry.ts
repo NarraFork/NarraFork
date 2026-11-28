@@ -42,6 +42,7 @@ import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
 import { measureSystemSimpleCard } from "./measure/measure-system-simple";
 import { measureSystemTextCard } from "./measure/measure-system-text";
+import { measureTeamChip, measureTeamEvent } from "./measure/measure-team-row";
 import { measureToolCall, measureToolCallGroup } from "./measure/measure-tool-call";
 import {
 	measureActivityTrace,
@@ -274,6 +275,18 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Turn token/cost usage line",
 		lodSensitive: false,
 		measure: (d, w, l) => measureTurnUsage(d as AnyData, w, l),
+	},
+	"team-chip": {
+		kind: "team-chip",
+		label: "Team chip (team page coordinator conversation)",
+		lodSensitive: false,
+		measure: (d, w, _l, o) => measureTeamChip(d as AnyData, w, o as AnyData),
+	},
+	"team-event": {
+		kind: "team-event",
+		label: "Team event divider (team page coordinator conversation)",
+		lodSensitive: false,
+		measure: (d, w) => measureTeamEvent(d as AnyData, w),
 	},
 };
 

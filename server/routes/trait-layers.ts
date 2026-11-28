@@ -5,9 +5,10 @@
  * are the two layers above it. The payload shapes are deliberately identical to
  * the narrator ones so the same UI editor can drive all three.
  *
- * Authorization: project traits are admin-only for now because there is no
- * project membership model yet (any authenticated user can currently see every
- * project), so "members may edit their project's policy" is not yet expressible.
+ * Authorization: project trait edits are admin-only. Project membership
+ * (owner, visibility, and grants in `project-acl.ts`) already decides who can
+ * see or change a project, but this route does not consult that ACL — a
+ * project owner or manager still cannot edit the project trait layer here.
  * User traits are self-service — they are that user's own defaults — with admins
  * additionally able to edit anyone's.
  */
@@ -79,7 +80,7 @@ async function resolveTarget(c: Context): Promise<{ layer: EditableTraitLayer; o
 	if (!ownerId) throw new ValidationError("Owner id is required");
 
 	if (layer === "project") {
-		// No project membership model exists yet, so project policy stays admin-only.
+		// Membership exists; this route still does not use it.
 		await assertAdmin(c);
 	} else {
 		const user = c.get("user");

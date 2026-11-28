@@ -65,6 +65,7 @@
  * space at — Chinese prose meeting inline code — correctly gains nothing.
  */
 
+import { parseAgentReference } from "@shared/agent-reference";
 import type { ReactNode } from "react";
 
 /** Shared by React fragments and the escaped static-span painter. Geometry identical. */
@@ -76,9 +77,19 @@ export const LINE_FRAGMENTS_STYLE = {
 	// Center/right alignment must use the same max-content advance.
 	width: "max-content",
 } as const;
-export function LineFragments({ children }: { children: ReactNode }) {
+
+/**
+ * `data-vlist-line-chip` on a line that holds an agent reference chip, so its CSS
+ * (AgentReferenceLink.module.css) needs no `:has()`, which Chrome re-evaluates against
+ * the whole app shell on every node the list inserts or removes.
+ */
+export function lineChipAttribute(fragments: readonly { href: string | null }[]) {
+	return fragments.some((frag) => parseAgentReference(frag.href) !== null) ? "" : undefined;
+}
+
+export function LineFragments({ children, chip }: { children: ReactNode; chip?: string }) {
 	return (
-		<span data-vlist-line-frags style={LINE_FRAGMENTS_STYLE}>
+		<span data-vlist-line-frags data-vlist-line-chip={chip} style={LINE_FRAGMENTS_STYLE}>
 			{children}
 		</span>
 	);

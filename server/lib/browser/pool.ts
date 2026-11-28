@@ -4,9 +4,14 @@
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { NoProxyRule } from "@shared/proxy-settings";
 import type { Browser, BrowserContext, Page } from "puppeteer-core";
+import { ValidationError } from "../errors";
 import { logger } from "../logger";
-import { getBrowserProxy, getWebFetchProxy } from "../web-fetch/proxy";
+import { getNoProxyRules } from "../net/proxy";
+import { ambientNoProxy } from "../net/proxy-env";
+import { getBrowserProxy, getWebFetchProxyForUrl } from "../web-fetch/proxy";
+import { managedManualProxyBypassList } from "./manual-proxy";
 import { closeTab } from "./tab-scope";
 import { attachUserBrowser } from "./user-browser";
 
@@ -98,6 +103,34 @@ const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font", "stylesheet"])
 const PROXY_BYPASS_LIST = ["localhost", "*.localhost", "127.0.0.0/8", "[::1]", "0.0.0.0"];
 
 /**
+ * Chromium bypass entries for the configured no_proxy rules.
+ *
+ * The browser fetches through a proxy at the Chromium process/context level, so
+ * it cannot consult the URL-level resolver. Only what Chromium's bypass list can
+ * express is forwarded: wildcard host globs (`*.example.com`, `svc.corp`).
+ * Regex rules and scheme/path patterns are skipped — Chromium has no
+ * regular-expression syntax there — and the URL-resolved channels still honour
+ * them.
+ */
+export function browserProxyBypassEntries(
+	rules: readonly NoProxyRule[] = getNoProxyRules(),
+): string[] {
+	const entries: string[] = [];
+	for (const rule of rules) {
+		if (rule.enabled === false || rule.match !== "wildcard") continue;
+		const pattern = rule.pattern.trim();
+		if (!pattern || pattern.includes("://") || pattern.includes("/")) continue;
+		entries.push(pattern);
+	}
+	return entries;
+}
+
+/** The full Chromium bypass list: built-in loopback entries plus configured rules. */
+function proxyBypassList(): string[] {
+	return [...PROXY_BYPASS_LIST, ...browserProxyBypassEntries()];
+}
+
+/**
  * Windows 上的 Edge 可能经兼容层重启自身，丢掉 Puppeteer 依赖的 stderr（DevTools 地址）与调试管道；
  * 其他 Chromium 会忽略这个开关。
  */
@@ -121,7 +154,7 @@ function buildLaunchArgs(headless: boolean): string[] {
 		...LAUNCH_ARGS,
 		...sandbox,
 		...(proxy
-			? [`--proxy-server=${proxy}`, `--proxy-bypass-list=${PROXY_BYPASS_LIST.join(";")}`]
+			? [`--proxy-server=${proxy}`, `--proxy-bypass-list=${proxyBypassList().join(";")}`]
 			: ["--no-proxy-server"]),
 		...(headless ? ["--disable-gpu"] : HEADED_PROFILE_ARGS),
 	];
@@ -131,7 +164,7 @@ export function browserContextProxyOptions(proxy: string | undefined) {
 	return {
 		// Explicit direct mode also overrides a proxy on a preserved old Chrome.
 		proxyServer: proxy ?? "direct://",
-		proxyBypassList: PROXY_BYPASS_LIST,
+		proxyBypassList: proxyBypassList(),
 	};
 }
 
@@ -436,7 +469,9 @@ export interface FetchPageOptions {
  */
 export async function fetchPage(url: string, options?: FetchPageOptions): Promise<Page> {
 	const b = await getBrowser();
-	const ctx = await b.createBrowserContext(browserContextProxyOptions(getWebFetchProxy()));
+	// Resolve against the navigation target: a fresh context is created per fetch,
+	// so no_proxy rules (wildcard and regex alike) can decide this context's proxy.
+	const ctx = await b.createBrowserContext(browserContextProxyOptions(getWebFetchProxyForUrl(url)));
 	let page: Page;
 	try {
 		page = await ctx.newPage();
@@ -492,11 +527,27 @@ export interface BrowserTab {
  * 无头会话各用一个隔离 context，cookie 互不相通。有头会话放进默认 context：一个窗口只属于一个
  * profile，隔离 context 的页面必然另开窗口，只有默认 context 能让所有标签并进同一个窗口。
  */
-export async function openTab(headless = true): Promise<BrowserTab> {
+export async function openTab(headless = true, managedManual = false): Promise<BrowserTab> {
+	let manualProxyOptions: { proxyServer: string; proxyBypassList?: string[] } | undefined;
+	if (managedManual) {
+		if (!headless)
+			throw new ValidationError("Manual browser sessions require managed headless mode.");
+		// Validate the entire context policy before acquiring a process or creating a tab.
+		const proxy = getBrowserProxy();
+		manualProxyOptions = proxy
+			? {
+					proxyServer: proxy,
+					proxyBypassList: managedManualProxyBypassList(ambientNoProxy(), getNoProxyRules()),
+				}
+			: { proxyServer: "direct://" };
+	}
 	const entry = await getEntry(headless);
 	if (headless) {
+		if (managedManual && !entry.owned) {
+			throw new ValidationError("Manual browser sessions require managed headless mode.");
+		}
 		const context = await entry.browser.createBrowserContext(
-			browserContextProxyOptions(getBrowserProxy()),
+			manualProxyOptions ?? browserContextProxyOptions(getBrowserProxy()),
 		);
 		const page = await context.newPage().catch(async (error: unknown) => {
 			await context.close().catch(() => {});

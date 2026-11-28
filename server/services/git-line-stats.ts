@@ -13,7 +13,9 @@ import type { UntrackedLineBatch } from "./git-untracked-line-worker";
 
 export const GIT_LINE_STATS_OUTPUT_BYTES = 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
-const MAX_UNTRACKED_FILES = 200;
+const MAX_UNTRACKED_FILES = 10_000;
+const UNTRACKED_BATCH_FILES = 200;
+const UNTRACKED_CONTENT_BYTES = 20_000_000;
 const WORKER_IDLE_MS = 60_000;
 
 interface NumstatEntry {
@@ -150,6 +152,8 @@ interface UntrackedRead {
 	action: "read";
 	cwd: string;
 	paths: string[];
+	remainingBytes: number;
+	deadlineAt: number;
 }
 
 function createLinePool() {
@@ -182,13 +186,14 @@ function createLinePool() {
 }
 
 const lineOwner = hotSafe("narrafork.gitLineStats.workers.v1", () => ({
-	version: 1,
+	version: 2,
 	pool: createLinePool(),
 	reads: new Map<AbortController, Promise<void>>(),
 	closed: false,
 	closing: undefined as Promise<void> | undefined,
 }));
-if (lineOwner.version !== 1)
+// Keep the owner key stable: hot reload must not strand the old pool or reuse its old wire budget.
+if (lineOwner.version !== 2)
 	throw new Error(
 		"Git line statistics ownership predates this runtime; manually restart NarraFork",
 	);
@@ -219,18 +224,34 @@ async function readUntracked(
 	cwd: string,
 	paths: string[],
 	signal: AbortSignal,
+	remainingBytes: number,
+	deadlineAt: number,
 ): Promise<UntrackedLineBatch> {
 	const startedAt = performance.now();
 	let failed = false;
 	try {
-		return await lineOwner.pool.run(
-			{ action: "read", cwd, paths },
+		const result = await lineOwner.pool.run(
+			{ action: "read", cwd, paths, remainingBytes, deadlineAt },
 			{
 				signal,
 				bytes: (cwd.length + paths.reduce((size, path) => size + path.length, 0)) * 2,
-				deadlineAt: Infinity,
+				deadlineAt,
 			},
 		);
+		if (
+			!Array.isArray(result.files) ||
+			result.files.length !== paths.length ||
+			!Number.isSafeInteger(result.readBytes) ||
+			result.readBytes < 0 ||
+			result.readBytes > remainingBytes
+		) {
+			throw new GitError("Invalid Git line statistics worker reply");
+		}
+		for (let index = 0; index < result.files.length; index++) {
+			if (result.files[index].path !== paths[index])
+				throw new GitError("Invalid Git line statistics worker path");
+		}
+		return result;
 	} catch (error) {
 		failed = true;
 		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
@@ -317,18 +338,53 @@ async function measureGitLineStats(cwd: string, signal: AbortSignal): Promise<Gi
 	staged.complete &&= stagedOutput.complete;
 	unstaged.complete &&= unstagedOutput.complete;
 	const untrackedPaths: string[] = [];
+	// Charge serialized paths before retaining them; raw Git bytes alone do not bound JSON escapes.
+	let requestBytes = Buffer.byteLength(
+		JSON.stringify({
+			action: "read",
+			cwd,
+			paths: [],
+			remainingBytes: UNTRACKED_CONTENT_BYTES,
+			deadlineAt: Number.MAX_SAFE_INTEGER,
+		}),
+	);
 	let offset = 0;
 	while (untrackedPaths.length < MAX_UNTRACKED_FILES) {
 		const end = untrackedOutput.output.indexOf("\0", offset);
 		if (end < 0) break;
 		const path = untrackedOutput.output.slice(offset, end);
+		if (path) {
+			if (path.length > GIT_LINE_STATS_OUTPUT_BYTES - requestBytes) break;
+			const bytes = Buffer.byteLength(JSON.stringify(path)) + (untrackedPaths.length ? 1 : 0);
+			if (requestBytes + bytes > GIT_LINE_STATS_OUTPUT_BYTES) break;
+			requestBytes += bytes;
+			untrackedPaths.push(path);
+		}
 		offset = end + 1;
-		if (path) untrackedPaths.push(path);
 	}
 	const listedAll = untrackedOutput.complete && offset === untrackedOutput.output.length;
-	const untracked = untrackedPaths.length
-		? await readUntracked(cwd, untrackedPaths, combined)
-		: { files: [], complete: true };
+	const untracked: UntrackedLineBatch = {
+		files: [],
+		complete: true,
+		readFiles: 0,
+		readBytes: 0,
+	};
+	// One absolute deadline and content allowance for the entire round, including queue waits.
+	const deadlineAt = Date.now() + COMMAND_TIMEOUT_MS;
+	for (let start = 0; start < untrackedPaths.length; start += UNTRACKED_BATCH_FILES) {
+		combined.throwIfAborted();
+		const batch = await readUntracked(
+			cwd,
+			untrackedPaths.slice(start, start + UNTRACKED_BATCH_FILES),
+			combined,
+			UNTRACKED_CONTENT_BYTES - untracked.readBytes,
+			deadlineAt,
+		);
+		untracked.files.push(...batch.files);
+		untracked.complete &&= batch.complete;
+		untracked.readFiles += batch.readFiles;
+		untracked.readBytes += batch.readBytes;
+	}
 	combined.throwIfAborted();
 	const files = new Map<string, GitLineStatsFile>();
 	const stagedPaths = new Set<string>();
@@ -358,7 +414,10 @@ async function measureGitLineStats(cwd: string, signal: AbortSignal): Promise<Gi
 		unstagedPaths.add(entry.path);
 	}
 	const measured: GitLineStatsFile[] = [];
+	let linesAdded = 0;
+	let linesRemoved = 0;
 	let filesComplete = true;
+	let measurementsComplete = true;
 	// Reserve the small totals/envelope before adding individually bounded DTOs.
 	let remainingOutputBytes = GIT_LINE_STATS_OUTPUT_BYTES - 128;
 	for (const file of files.values()) {
@@ -371,30 +430,30 @@ async function measureGitLineStats(cwd: string, signal: AbortSignal): Promise<Gi
 			file.unstagedLinesRemoved = 0;
 		}
 		file.complete &&= file.stagedLinesAdded !== undefined && file.unstagedLinesAdded !== undefined;
-		const bytes = Buffer.byteLength(JSON.stringify(file), "utf8") + 1;
-		if (measured.length >= 10_000 || bytes > remainingOutputBytes) {
-			filesComplete = false;
-			break;
+		linesAdded += (file.stagedLinesAdded ?? 0) + (file.unstagedLinesAdded ?? 0);
+		linesRemoved += (file.stagedLinesRemoved ?? 0) + (file.unstagedLinesRemoved ?? 0);
+		measurementsComplete &&= file.complete;
+		// Public rows remain a bounded prefix; totals describe every measured row this round.
+		if (filesComplete) {
+			const bytes = Buffer.byteLength(JSON.stringify(file), "utf8") + 1;
+			if (measured.length >= 10_000 || bytes > remainingOutputBytes) {
+				filesComplete = false;
+			} else {
+				remainingOutputBytes -= bytes;
+				measured.push(file);
+			}
 		}
-		remainingOutputBytes -= bytes;
-		measured.push(file);
 	}
 	return {
 		files: measured,
-		linesAdded: measured.reduce(
-			(sum, file) => sum + (file.stagedLinesAdded ?? 0) + (file.unstagedLinesAdded ?? 0),
-			0,
-		),
-		linesRemoved: measured.reduce(
-			(sum, file) => sum + (file.stagedLinesRemoved ?? 0) + (file.unstagedLinesRemoved ?? 0),
-			0,
-		),
+		linesAdded,
+		linesRemoved,
 		complete:
 			staged.complete &&
 			unstaged.complete &&
 			listedAll &&
 			filesComplete &&
 			untracked.complete &&
-			measured.every((file) => file.complete),
+			measurementsComplete,
 	};
 }

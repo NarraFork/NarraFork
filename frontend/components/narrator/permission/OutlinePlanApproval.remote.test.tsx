@@ -33,6 +33,30 @@ let root: Root;
 let container: HTMLElement;
 let client: QueryClient;
 let nativeRequests = 0;
+// Bun forwards a bare `setTimeout` to `window.setTimeout` once a fake window is
+// installed, so these wrappers call the originals captured before that happens.
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+// The lock button's loading indicator is a 150ms transition. Its animation frames
+// call setState, and React reads `window.event` to do that. Teardown drops any
+// frame still queued after the 0ms ones have flushed.
+const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+function trackTimeout(callback: () => void, delay = 0): ReturnType<typeof setTimeout> {
+	const id = nativeSetTimeout(() => {
+		pendingTimers.delete(id);
+		callback();
+	}, delay);
+	pendingTimers.add(id);
+	return id;
+}
+function clearTrackedTimeout(id: ReturnType<typeof setTimeout>) {
+	pendingTimers.delete(id);
+	nativeClearTimeout(id);
+}
+function clearPendingTimers() {
+	for (const id of pendingTimers) nativeClearTimeout(id);
+	pendingTimers.clear();
+}
 const permission: PendingPermission = {
 	id: "approval",
 	toolName: "ExitPlanMode",
@@ -57,7 +81,18 @@ const permission: PendingPermission = {
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	const matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-	Object.assign(window, { matchMedia });
+	const requestAnimationFrame = (callback: FrameRequestCallback) =>
+		trackTimeout(() => callback(performance.now()));
+	const cancelAnimationFrame = (handle: ReturnType<typeof setTimeout>) => {
+		clearTrackedTimeout(handle);
+	};
+	Object.assign(window, {
+		matchMedia,
+		setTimeout: trackTimeout,
+		clearTimeout: clearTrackedTimeout,
+		requestAnimationFrame,
+		cancelAnimationFrame,
+	});
 	Object.defineProperty(window.document, "fonts", {
 		value: { addEventListener() {}, removeEventListener() {} },
 		configurable: true,
@@ -77,9 +112,8 @@ beforeEach(() => {
 			unobserve() {}
 			disconnect() {}
 		},
-		requestAnimationFrame: (callback: FrameRequestCallback) =>
-			setTimeout(() => callback(performance.now()), 0),
-		cancelAnimationFrame: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
+		requestAnimationFrame,
+		cancelAnimationFrame,
 		localStorage: { getItem: () => "test-token" },
 		IS_REACT_ACT_ENVIRONMENT: true,
 	})) {
@@ -101,7 +135,19 @@ beforeEach(() => {
 	root = createRoot(container);
 });
 afterEach(async () => {
-	await act(async () => root.unmount());
+	try {
+		await act(async () => root.unmount());
+		// Flush the loading transition's 0ms frames while the fake window still
+		// exists, then cancel its 150ms follow-up. A frame that runs after the
+		// window is removed is an unhandled "window is not defined" between tests.
+		await act(async () => {
+			for (let i = 0; i < 4; i++) {
+				await new Promise((resolve) => nativeSetTimeout(resolve, 0));
+			}
+		});
+	} finally {
+		clearPendingTimers();
+	}
 	client.clear();
 	container.remove();
 	expect(nativeRequests).toBe(0);

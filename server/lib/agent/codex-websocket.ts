@@ -11,6 +11,7 @@ import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { generateId } from "../id";
 import { logger } from "../logger";
+import { applyProxyExemptions } from "../net/proxy";
 import {
 	getHttpCodexUserAgent,
 	mergeExtraHeaders,
@@ -205,6 +206,10 @@ export interface StreamCodexResponsesWebSocketOptions {
 	signal: AbortSignal;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
 	resetSessionBeforeRequest?: boolean;
+	/** Use a private socket without admitting or evicting entries in the shared cache. */
+	ephemeralSession?: boolean;
+	/** A diagnostics credential can be revoked while the request is being built. */
+	validateBeforeDispatch?: () => void;
 	turnMetadata?: string;
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
@@ -670,7 +675,7 @@ export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 ): Record<string, string> {
 	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
-	// contract (no top-level instructions/tools, additional_tools spliced into
+	// contract (no top-level tools, additional_tools spliced into
 	// input, parallel_tool_calls off) that this transport does not implement, and
 	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {
@@ -982,6 +987,7 @@ class ReusableWebSocketConnection {
 			url: string;
 			headers: Record<string, string>;
 			proxy?: string;
+			validateBeforeDispatch?: () => void;
 			onUpgrade: (response: IncomingMessage) => void;
 		},
 	): Promise<void> {
@@ -994,9 +1000,12 @@ class ReusableWebSocketConnection {
 			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
 				headers: handshake.headers,
 			};
+			// Exemptions were resolved with the handshake digest. Use that same
+			// effective proxy so cache identity and the actual route cannot diverge.
 			if (handshake.proxy) {
 				wsOptions.agent = new HttpsProxyAgent(handshake.proxy);
 			}
+			handshake.validateBeforeDispatch?.();
 			const ws = new WebSocketImpl(handshake.url, wsOptions);
 			this.ws = ws;
 
@@ -1220,7 +1229,15 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
-	const handshakeDigest = codexWebSocketHandshakeDigest(options, handshakeHeaders);
+	options.validateBeforeDispatch?.();
+	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
+	// Resolve custom/system/global proxy exemptions before comparing the wire
+	// identity. Rule changes must replace a socket when its effective route changes.
+	const proxy = applyProxyExemptions(options.proxy, url);
+	const handshakeDigest = codexWebSocketHandshakeDigest(
+		{ baseUrl: options.baseUrl, proxy },
+		handshakeHeaders,
+	);
 	if (
 		session.handshakeDigest === handshakeDigest &&
 		session.connection?.isOpen() &&
@@ -1247,14 +1264,14 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
-	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
 	const connection = new ReusableWebSocketConnection();
 	connection.onFrame = (incoming) =>
 		recordWebSocketMessage(options.requestDump, connection.id, incoming);
 	await connection.connect(options.signal, {
 		url,
 		headers: handshakeHeaders,
-		proxy: options.proxy,
+		proxy,
+		validateBeforeDispatch: options.validateBeforeDispatch,
 		onUpgrade: (response) => {
 			connection.handshakeMeta = {
 				status: response.statusCode,
@@ -1289,8 +1306,8 @@ export async function* streamCodexResponsesWebSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const cacheKey = buildSessionCacheKey(options);
-	const cachedSession = getOrCreateSession(cacheKey);
-	if (cachedSession.disabled) {
+	const cachedSession = options.ephemeralSession ? undefined : getOrCreateSession(cacheKey);
+	if (cachedSession?.disabled) {
 		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
 	}
 	// A nested request under the same sticky key (a danger/plan/task reflection runs while
@@ -1299,9 +1316,10 @@ export async function* streamCodexResponsesWebSocket(
 	// socket carries one in-flight response, and touching the parent's response chain would
 	// corrupt its `previous_response_id` continuation. Run it on a private, uncached session
 	// instead: a fresh socket, full request, closed when this call ends.
-	const ephemeral = cachedSession.busy;
-	const session = ephemeral ? createSessionState() : cachedSession;
-	if (ephemeral) {
+	const reusableSession = cachedSession && !cachedSession.busy ? cachedSession : undefined;
+	const ephemeral = !reusableSession;
+	const session = reusableSession ?? createSessionState();
+	if (cachedSession?.busy) {
 		logger.info("Codex Responses WebSocket session busy; using an ephemeral connection", {
 			sessionKey: options.sessionKey,
 			credentialId: options.credentialId,
@@ -1412,6 +1430,7 @@ export async function* streamCodexResponsesWebSocket(
 					)
 				: frame.text;
 			options.signal.throwIfAborted();
+			options.validateBeforeDispatch?.();
 			options.requestDump?.setRequest(
 				{
 					transport: "websocket",
@@ -1437,6 +1456,8 @@ export async function* streamCodexResponsesWebSocket(
 					body: frame.body,
 				});
 			}
+			options.signal.throwIfAborted();
+			options.validateBeforeDispatch?.();
 			await connection?.send(frame.text);
 			requestDispatched = true;
 		};
@@ -1474,18 +1495,11 @@ export async function* streamCodexResponsesWebSocket(
 		/**
 		 * Recover from `websocket_connection_limit_reached`.
 		 *
-		 * Upstream retires a Responses WebSocket after 60 minutes and says so explicitly:
-		 * "Create a new websocket connection to continue." That instruction is always
-		 * actionable, so a reconnect is attempted regardless of whether output already
-		 * streamed — the previous code only reconnected when nothing had been yielded,
-		 * which meant the failure mode that actually happens in practice (the cap firing
-		 * mid-response on a long-lived narrator) was never recovered.
-		 *
-		 * When output DID already reach the client, the resend must not be silent: the
-		 * caller has persisted that partial turn, so recovery is surfaced as a resumable
-		 * error and the agent loop continues from the partial output rather than
-		 * duplicating it. Only a genuinely exhausted budget falls through to an error,
-		 * and that error is retryable so the loop still has a path forward.
+		 * Upstream retires a Responses WebSocket after 60 minutes. Before delivering
+		 * output, a bounded reconnect can resend the full request. Once output reaches
+		 * the caller, clear the connection-scoped chain and surface a resumable error;
+		 * the host must rebuild from its persisted partial turn to avoid replaying
+		 * text or tools. Exhausted pre-output recovery is also retryable.
 		 */
 		const handleConnectionLimitReached = async (detail: {
 			status?: number;

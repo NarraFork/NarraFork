@@ -24,9 +24,11 @@ const modules = [
 	"../../hooks/usePlatform",
 	"../../hooks/useProjectDirStatus",
 	"../../hooks/useRecentTabs",
-	"../common/DirectoryPicker",
+	"../../hooks/useWorkspaceContext",
+	"../common/DeviceDirectoryPicker",
 	"../narrator/CreateNarratorLazyModal",
 	"../narrator/composer/NarratorComposer",
+	"../narrator/interaction/DropOverlay",
 	"../narrator/interaction/PermissionModePickerMenu",
 	"../narrator/interaction/UploadProgressBar",
 	"../narrator/model/ModelPickerMenu",
@@ -38,6 +40,7 @@ for (const id of modules) originals.set(id, await import(id));
 const replace = (id: (typeof modules)[number], exports: object) =>
 	mock.module(id, () => ({ ...originals.get(id), ...exports }));
 const shell = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+const box = ({ children, ...props }: ComponentProps<"div">) => <div {...props}>{children}</div>;
 const button = ({
 	children,
 	onClick,
@@ -68,7 +71,7 @@ function documentFromProps(): ComposerDocument | undefined {
 }
 replace("@mantine/core", {
 	ActionIcon: button,
-	Box: shell,
+	Box: box,
 	Button: button,
 	Group: shell,
 	Text: shell,
@@ -92,8 +95,15 @@ replace("../../hooks/useProjectDirStatus", {
 	useProjectDirStatus: () => ({ usablePath: "/workspace", needsChoice: false }),
 });
 replace("../../hooks/useRecentTabs", { addRecentTab: async () => {} });
-replace("../common/DirectoryPicker", { DirectoryBrowserModal: () => null });
+replace("../../hooks/useWorkspaceContext", {
+	useWorkspaceDevices: () => ({ data: { devices: [] }, isSuccess: true }),
+});
+replace("../common/DeviceDirectoryPicker", { DeviceDirectoryModal: () => null });
 replace("../narrator/CreateNarratorLazyModal", { CreateNarratorLazyModal: () => null });
+replace("../narrator/interaction/DropOverlay", {
+	DropOverlay: ({ visible }: { visible: boolean }) =>
+		visible ? <div data-drop-overlay="true">dropFilesHere</div> : null,
+});
 replace("../narrator/interaction/PermissionModePickerMenu", {
 	PermissionModePickerMenu: () => null,
 });
@@ -255,6 +265,25 @@ async function submit() {
 		await props.onSendWithMode?.("turn");
 	});
 }
+async function dragFiles(type: "dragenter" | "dragleave") {
+	const zone = host.firstElementChild;
+	if (!zone) throw new Error("Dashboard drop zone not rendered");
+	const event = new window.Event(type, { bubbles: true, cancelable: true });
+	Object.defineProperty(event, "dataTransfer", { value: { types: ["Files"], files: [] } });
+	await act(async () => {
+		zone.dispatchEvent(event);
+	});
+}
+
+test("Dashboard highlights its drop zone while files are dragged over it", async () => {
+	const zone = host.firstElementChild as HTMLElement | null;
+	expect(zone?.style.position).toBe("relative");
+	expect(host.querySelector("[data-drop-overlay]")).toBeNull();
+	await dragFiles("dragenter");
+	expect(host.querySelector("[data-drop-overlay]")).not.toBeNull();
+	await dragFiles("dragleave");
+	expect(host.querySelector("[data-drop-overlay]")).toBeNull();
+});
 
 test("Dashboard stages and persists media-only drafts through the real ingestion hook", async () => {
 	const speech = audio();

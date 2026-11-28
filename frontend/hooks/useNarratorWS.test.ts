@@ -177,9 +177,14 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
 		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
 		const sourceUpdates: unknown[] = [];
+		const countUpdates: unknown[] = [];
+		const countSnapshots: unknown[] = [];
 		const warnings: unknown[] = [];
 		const subagentWarnings: unknown[] = [];
 		const errors: unknown[] = [];
+		const statusUpdates: unknown[] = [];
+		const paymentUpdates: unknown[] = [];
+		const substatusUpdates: unknown[] = [];
 		narratorWSManager.addListener = ((_opts, listener) => {
 			sourceListeners.push(listener);
 			return { _id: nextHandleId++ };
@@ -202,12 +207,19 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 				props.narratorId,
 				{
 					onNarratorWarning: (info) => warnings.push(info),
+					onPaymentRequired: (info) => paymentUpdates.push(info),
 					onSubagentWarning: (id, info) => subagentWarnings.push({ id, ...info }),
 					onNarratorError: (...args) => errors.push(args),
+					onStatusChange: (...args) => statusUpdates.push(args),
+					onSubstatusChange: (substatus) => substatusUpdates.push(substatus),
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
-					onStreamingSnapshot: (snapshot) =>
-						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument),
+					onToolOutput: (_id, _output, _parent, meta) =>
+						countUpdates.push(meta?.subagentOutputCount),
+					onStreamingSnapshot: (snapshot) => {
+						sourceUpdates.push(snapshot.toolChunks[0]?.inputDocument);
+						countSnapshots.push(snapshot.subagentOutputCounts);
+					},
 				},
 				props.cursor || props.messageVersion != null
 					? { cursor: props.cursor, messageVersion: props.messageVersion }
@@ -229,6 +241,67 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		try {
 			root.render(createElement(Harness));
 			await settle();
+			const paymentContext = `npc1.${(Date.now() + 900000).toString(36)}.${"n".repeat(22)}.${"m".repeat(43)}`;
+			for (const listener of sourceListeners) {
+				listener({
+					type: "payment_required",
+					narratorId: "n1",
+					providerId: "source-B",
+					paymentContext,
+					credentialId: "private-CID",
+					providerIdentity: "private-identity",
+					resumeAction: "retry",
+				});
+				listener({
+					type: "payment_required",
+					narratorId: "n1",
+					providerId: "source-B",
+					paymentContext: '["private-CID","private-identity"]',
+					resumeAction: "retry",
+				});
+				listener({
+					type: "payment_required",
+					narratorId: "n1",
+					isSubagent: true,
+					paymentContext,
+					resumeAction: "retry",
+				});
+			}
+			expect(paymentUpdates).toHaveLength(2);
+			expect(paymentUpdates[0]).toMatchObject({ providerId: "source-B", paymentContext });
+			expect(paymentUpdates[1]).not.toHaveProperty("paymentContext");
+			expect(JSON.stringify(paymentUpdates)).not.toContain("private-CID");
+			expect(JSON.stringify(paymentUpdates)).not.toContain("private-identity");
+			const statusPatch = {
+				status: "idle",
+				statusEpoch: "server-process",
+				statusRevision: 1,
+				messageCount: 17,
+				substatus: [],
+				turnStartedAt: null,
+				updatedAt: "2026-11-24T01:00:00.000Z",
+				errorMessage: null,
+				errorRetryable: null,
+				archivedWithNarratorId: null,
+			};
+			const substatusPatch = {
+				...statusPatch,
+				status: "waiting",
+				substatus: ["reflecting"],
+				statusRevision: 2,
+			};
+			for (const listener of sourceListeners) {
+				listener({ type: "status_change", narratorId: "n1", ...statusPatch });
+				listener({ type: "status_change", narratorId: "n1", status: "working" });
+				listener({ type: "substatus_change", narratorId: "n1", ...substatusPatch });
+				listener({ type: "substatus_change", narratorId: "n1", substatus: ["reasoning"] });
+			}
+			expect(statusUpdates).toEqual([
+				["idle", undefined, [], statusPatch],
+				["working", undefined, undefined, { status: "working" }],
+				["waiting", undefined, ["reflecting"], substatusPatch],
+			]);
+			expect(substatusUpdates).toEqual([["reasoning"]]);
 			const inputDocument = {
 				ref: {
 					id: "source",
@@ -267,6 +340,48 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			])
 				for (const listener of sourceListeners) listener(frame);
 			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
+			const count = {
+				childNarratorId: "child",
+				logicalRunId: "run",
+				toolUseId: "agent",
+				toolCallId: "pk",
+				attempt: 0,
+				count: 12,
+				active: true,
+			};
+			for (const frame of [
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "agent",
+					output: "12",
+					subagentOutputCount: count,
+				},
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "agent",
+					output: "12",
+					subagentOutputCount: { ...count, count: -1 },
+				},
+				{
+					type: "tool_output",
+					narratorId: "n1",
+					toolUseId: "wrong-agent",
+					output: "12",
+					subagentOutputCount: count,
+				},
+				{ type: "tool_output", narratorId: "n1", toolUseId: "shell", output: "12" },
+				{
+					type: "streaming_snapshot",
+					narratorId: "n1",
+					subagentOutputCounts: [count, { ...count, attempt: -1 }],
+				},
+				{ type: "streaming_snapshot", narratorId: "n1", subagentOutputCounts: [] },
+			])
+				for (const listener of sourceListeners) listener(frame);
+			expect(countUpdates).toEqual([count, undefined]);
+			expect(countSnapshots).toEqual([undefined, [count], []]);
 			for (const frame of [
 				{
 					type: "warning",

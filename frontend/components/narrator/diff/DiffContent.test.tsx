@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import type { DiffLine } from "@shared/pretext-layout/diff-core";
 import {
 	createDiffDocument,
 	type DiffDocument,
@@ -7,7 +8,7 @@ import {
 	getDiffRowAnchor,
 	projectDiffDocument,
 } from "@shared/pretext-layout/diff-core";
-import { layoutDiffRows } from "@shared/pretext-layout/diff-layout";
+import { diffTypography, layoutDiffRows } from "@shared/pretext-layout/diff-layout";
 import { createSourceText, trimSourceText } from "@shared/pretext-layout/source-text";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -16,7 +17,7 @@ import { useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { topLevelStreamingChunkToToolFields } from "../narrator-message-helpers";
 import { AutoFollowScroll, useContentViewport } from "../scroll/AutoFollowScroll";
-import { DiffContent } from "./DiffContent";
+import { DiffContent, type DiffLineOperations } from "./DiffContent";
 
 const {
 	applyStreamingToolChunk,
@@ -945,6 +946,212 @@ describe("DiffContent permanent viewport", () => {
 		expect(scroller().scrollTop).toBeLessThan(before);
 		expect(controllers.get("inline")?.following).toBe(false);
 		expect(canvas().querySelector("[data-diff-range-warning='range']")).toBeNull();
+	});
+
+	test("optional row controls and selected marks stay inside the virtual window", async () => {
+		const lines: DiffLine[] = Array.from({ length: 4000 }, (_, index) => ({
+			type: "added",
+			content: `row ${index}`,
+			newLineNo: index + 1,
+		}));
+		const calls = new Set<number>();
+		const operations: DiffLineOperations = {
+			width: 84,
+			selected: new Set([1, 2]),
+			render: (index) => {
+				calls.add(index);
+				return (
+					<button type="button" data-row-control={index}>
+						Move
+					</button>
+				);
+			},
+		};
+		root.render(
+			<MantineProvider>
+				<AutoFollowScroll
+					bodyId="inline"
+					live={false}
+					revision={1}
+					followTarget="row"
+					layout={{ width: 320, height: 200 }}
+				>
+					<DiffContent lines={lines} lineOperations={operations} />
+					<Probe id="inline" />
+				</AutoFollowScroll>
+			</MantineProvider>,
+		);
+		await settle();
+		expect(calls.size).toBeLessThan(40);
+		expect(canvas().querySelectorAll("[data-diff-line-operations]").length).toBeLessThan(40);
+		expect(
+			[...canvas().querySelectorAll("[data-diff-selected]")].map((node) =>
+				node.getAttribute("data-diff-line-index"),
+			),
+		).toEqual(["1", "2"]);
+		const code = canvas().querySelector<HTMLElement>("[data-diff-row] [data-diff-visual-line]");
+		expect(Number.parseFloat(code?.style.left ?? "0")).toBeGreaterThan(84);
+	});
+
+	test("only operation anchors expand while text, blank rows and wraps use natural typography", async () => {
+		const lines: DiffLine[] = ["context", "same", "", "same", "word ".repeat(40)].map(
+			(content, index) => ({
+				type: index === 0 ? "context" : "added",
+				content,
+				newLineNo: index + 1,
+			}),
+		);
+		const anchors = new Set([1, 2, 4]);
+		root.render(
+			<MantineProvider>
+				<AutoFollowScroll
+					bodyId="inline"
+					live={false}
+					revision={1}
+					followTarget="row"
+					layout={{ width: 320, height: 800 }}
+				>
+					<DiffContent
+						lines={lines}
+						wordWrap
+						lineOperations={{
+							width: 84,
+							anchors,
+							minHeight: 28,
+							keys: new Map(lines.map((_, index) => [index, `unit:${index}`])),
+							render: (index) =>
+								anchors.has(index) ? (
+									<button type="button" data-row-control={index}>
+										Move
+									</button>
+								) : null,
+						}}
+					/>
+					<Probe id="inline" />
+				</AutoFollowScroll>
+			</MantineProvider>,
+		);
+		await settle();
+		const rows = [...canvas().querySelectorAll<HTMLElement>("[data-diff-row]")];
+		const natural = diffTypography().lineHeight;
+		expect(canvas().style.lineHeight).toBe(`${natural}px`);
+		expect(rows.map((row) => Number.parseFloat(row.style.height)).slice(0, 4)).toEqual([
+			natural,
+			28,
+			28,
+			natural,
+		]);
+		expect(rows[2]?.querySelector("[data-diff-visual-line]")?.textContent).toBe("");
+		expect(rows[2]?.querySelector("[data-diff-gutter]")?.textContent).toContain("3+");
+		const wrapped = rows[4];
+		expect(wrapped?.querySelectorAll("[data-diff-visual-line]").length).toBeGreaterThan(2);
+		expect(Number.parseFloat(wrapped?.style.height ?? "0")).toBe(
+			(wrapped?.querySelectorAll("[data-diff-visual-line]").length ?? 0) * natural,
+		);
+		expect(canvas().querySelectorAll("[data-row-control]").length).toBe(3);
+	});
+
+	test("full-index anchors survive distant scroll projections without changing their extent", async () => {
+		const lines: DiffLine[] = Array.from({ length: 2_000 }, (_, index) => ({
+			type: "added",
+			content: `row ${index}`,
+			newLineNo: index + 1,
+		}));
+		const anchors = new Set([0, 50, 700, 701, 1_600]);
+		root.render(
+			<MantineProvider>
+				<AutoFollowScroll
+					bodyId="inline"
+					live={false}
+					revision={1}
+					followTarget="row"
+					layout={{ width: 320, height: 200 }}
+				>
+					<DiffContent
+						lines={lines}
+						lineOperations={{
+							width: 84,
+							anchors,
+							minHeight: 28,
+							render: (index) =>
+								anchors.has(index) ? (
+									<button type="button" data-row-control={index}>
+										Move
+									</button>
+								) : null,
+						}}
+					/>
+					<Probe id="inline" />
+				</AutoFollowScroll>
+			</MantineProvider>,
+		);
+		await settle();
+		const natural = diffTypography().lineHeight;
+		const totalHeight = 2_000 * natural + anchors.size * (28 - natural);
+		expect(controllers.get("inline")?.getSnapshot().scrollHeight).toBe(totalHeight);
+		await pauseAt(0);
+		for (const index of [1_700, 700, 50]) {
+			const expectedTop =
+				index * natural + [...anchors].filter((row) => row < index).length * (28 - natural);
+			scroller().scrollTop = expectedTop;
+			scroller().dispatchEvent(new Event("scroll"));
+			await settle();
+			expect(scroller().scrollTop).toBe(expectedTop);
+			expect(canvas().querySelector(`[data-diff-line-index="${index}"]`)).not.toBeNull();
+			expect(controllers.get("inline")?.getSnapshot().scrollHeight).toBe(totalHeight);
+			if (anchors.has(index)) {
+				expect(
+					canvas().querySelector<HTMLElement>(`[data-diff-line-index="${index}"]`)?.style.height,
+				).toBe("28px");
+				expect(canvas().querySelector(`[data-row-control="${index}"]`)).not.toBeNull();
+			}
+		}
+	});
+
+	test("a retained Git unit key restores the same reading row after an earlier unit moves", async () => {
+		const lines: DiffLine[] = Array.from({ length: 500 }, (_, index) => ({
+			type: "added",
+			content: `line ${index}`,
+			newLineNo: index + 1,
+		}));
+		function paint(rows: DiffLine[], anchorIndex: number) {
+			root.render(
+				<MantineProvider>
+					<AutoFollowScroll
+						bodyId="inline"
+						live={false}
+						revision={rows.length}
+						followTarget="row"
+						layout={{ width: 320, height: 200 }}
+					>
+						<DiffContent
+							lines={rows}
+							lineOperations={{
+								width: 84,
+								keys: new Map([[anchorIndex, "stable-unit:0"]]),
+								anchors: new Set([anchorIndex]),
+								minHeight: 28,
+								render: () => null,
+							}}
+						/>
+						<Probe id="inline" />
+					</AutoFollowScroll>
+				</MantineProvider>,
+			);
+		}
+		paint(lines, 120);
+		await settle();
+		await pauseAt(0);
+		const node = scroller();
+		const natural = diffTypography().lineHeight;
+		node.scrollTop = 120 * natural + 25;
+		node.dispatchEvent(new Event("scroll"));
+		await settle();
+		expect(node.scrollTop).toBe(120 * natural + 25);
+		paint(lines.slice(50), 70);
+		await settle();
+		expect(scroller()).toBe(node);
+		expect(node.scrollTop).toBe(70 * natural + 25);
 	});
 
 	test("static history stays at its head and unmount releases follow frames", async () => {

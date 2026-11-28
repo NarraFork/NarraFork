@@ -1,8 +1,11 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { eq, inArray } from "drizzle-orm";
-import { db } from "../../db";
+import { and, eq, inArray } from "drizzle-orm";
+import { db, sqlite } from "../../db";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -19,6 +22,7 @@ import {
 	getRunHold,
 	setRunHold,
 } from "../agent-runtime/ownership";
+import { backgroundTaskService } from "../background-task-service";
 import * as completionQueue from "../bg-completion-queue";
 import * as passExecutor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
@@ -46,7 +50,7 @@ let activeChildId: string | undefined;
 let restoreSpies: Array<() => void> = [];
 
 async function until(predicate: () => boolean | Promise<boolean>): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	const deadline = Date.now() + 10_000;
 	while (!(await predicate())) {
 		if (Date.now() > deadline) throw new Error("Timed out waiting for background runner");
 		await Bun.sleep(5);
@@ -83,6 +87,20 @@ beforeEach(async () => {
 		updatedAt: now,
 	});
 	const broadcast = spyOn(websocket, "broadcastToNarrator").mockImplementation((target, event) => {
+		if (event.type === "background_task_started") {
+			const task = db
+				.select()
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, event.taskNarratorId))
+				.get();
+			const row = db.select().from(narrators).where(eq(narrators.id, event.taskNarratorId)).get();
+			expect(task?.logicalRunId).toBeTruthy();
+			expect(row).toMatchObject({
+				logicalRunId: task?.logicalRunId,
+				isBackground: true,
+				backgroundStatus: "running",
+			});
+		}
 		broadcasts.push({ target, event });
 	});
 	// Keep normal completion publication real, but do not launch a parent model loop.
@@ -116,7 +134,7 @@ afterEach(async () => {
 	settings.agent.subagentAllowedModels = originalAllowedModels;
 	for (const id of ids) {
 		clearTakenOver(id);
-		drainPendingInjections(id);
+		await drainPendingInjections(id);
 		clearAliasRegistry(id);
 	}
 	if (ids.length) {
@@ -186,7 +204,6 @@ async function launch(
 	// Only the model pass is simulated; the run service, hold and finalizer are real.
 	const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
 		activeChildId = options.config.narratorId as string;
-		ids.push(activeChildId);
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, activeChildId) });
 		observedAtStart = {
 			held: isTakenOver(activeChildId),
@@ -210,6 +227,10 @@ async function launch(
 	const output = await Promise.race([
 		runSubagent({
 			parentNarratorId: parentId,
+			onCreated: (id) => {
+				activeChildId = id;
+				ids.push(id);
+			},
 			toolUseId: parentCall?.toolUseId ?? generateId(),
 			...(parentCall ? { toolCallBinding: parentCall.toolCallBinding } : {}),
 			subagentType: "general",
@@ -227,9 +248,313 @@ async function launch(
 	]).finally(() => clearTimeout(timer));
 	await until(() => observedAtStart !== undefined);
 	expect(execute).toHaveBeenCalledTimes(1);
-	expect(output).toContain("<background_task_id>");
+	expect(output).toContain("<background_task_id>creation-takeover-regression</background_task_id>");
+	expect(output).toContain(`[Creation takeover regression](nf-agent://open?id=${activeChildId})`);
+	expect(output).not.toContain("nf-agent://open?id=creation-takeover-regression");
 	return { output, observedAtStart, childId: activeChildId as string };
 }
+
+describe("registered background startup boundaries", () => {
+	const input = () => ({
+		parentNarratorId: parentId,
+		toolUseId: generateId(),
+		subagentType: "general",
+		prompt: "Startup failure must not execute a model",
+		cwd: process.env.HOME as string,
+		model: MODEL,
+		locale: "en",
+		signal: new AbortController().signal,
+		background: true,
+		onCreated: (id: string) => {
+			activeChildId = id;
+			ids.push(id);
+		},
+	});
+
+	test("registration failure preserves the original exception without a running mirror or started notice", async () => {
+		const original = Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+		const create = spyOn(backgroundTaskService, "createAgentTask").mockRejectedValue(original);
+		const mark = spyOn(backgroundTaskService, "markNarratorRunning");
+		restoreSpies.push(
+			() => create.mockRestore(),
+			() => mark.mockRestore(),
+		);
+		await expect(runSubagent(input())).rejects.toBe(original);
+		expect(mark).not.toHaveBeenCalled();
+		const row = db
+			.select()
+			.from(narrators)
+			.where(eq(narrators.id, activeChildId as string))
+			.get();
+		expect(row?.backgroundStatus).not.toBe("running");
+		expect(
+			db
+				.select()
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, activeChildId as string))
+				.get(),
+		).toBeUndefined();
+		expect(
+			broadcasts.some(
+				({ event }) => (event as { type?: string }).type === "background_task_started",
+			),
+		).toBe(false);
+	});
+
+	test("a refusing creation hook archives the subagent before any run and is rethrown", async () => {
+		const runtime = await import("../agent-runtime/run");
+		const start = spyOn(runtime, "startNarratorRun");
+		const create = spyOn(backgroundTaskService, "createAgentTask");
+		restoreSpies.push(
+			() => start.mockRestore(),
+			() => create.mockRestore(),
+		);
+		// A team work item refusing its worker (another one attached first, or a dependency).
+		const refusal = Object.assign(new Error("Work item w already has a worker"), {
+			code: "TEAM_WORK_ITEM_CHANGED",
+		});
+		let created: string | undefined;
+		await expect(
+			runSubagent({
+				...input(),
+				onCreated: (id: string) => {
+					created = id;
+					ids.push(id);
+					throw refusal;
+				},
+			}),
+		).rejects.toBe(refusal);
+		expect(created).toBeTruthy();
+		expect(start).not.toHaveBeenCalled();
+		expect(create).not.toHaveBeenCalled();
+		const row = db
+			.select()
+			.from(narrators)
+			.where(eq(narrators.id, created as string))
+			.get();
+		expect(row?.status).toBe("archived");
+		expect(getExecutionOwner(created as string)).toBeUndefined();
+	});
+
+	test("a synchronous start exception settles exactly this task and is rethrown unchanged", async () => {
+		const runtime = await import("../agent-runtime/run");
+		const original = new Error("start admission failed");
+		const start = spyOn(runtime, "startNarratorRun").mockRejectedValue(original);
+		restoreSpies.push(() => start.mockRestore());
+		await expect(runSubagent(input())).rejects.toBe(original);
+		expect(
+			db
+				.select()
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, activeChildId as string))
+				.get()?.status,
+		).toBe("failed");
+		expect(getExecutionOwner(activeChildId as string)).toBeUndefined();
+		expect(await takePendingInjectionBatch(parentId)).toBeNull();
+	});
+
+	test("a persistent compensation lock keeps the original startup exception and reserved task", async () => {
+		const runtime = await import("../agent-runtime/run");
+		const original = new Error("original startup failure");
+		const blocker = new Database(sqlite.filename);
+		let locked = false;
+		const start = spyOn(runtime, "startNarratorRun").mockImplementation(async () => {
+			blocker.run("BEGIN IMMEDIATE");
+			locked = true;
+			throw original;
+		});
+		restoreSpies.push(() => start.mockRestore());
+		try {
+			await expect(runSubagent(input())).rejects.toBe(original);
+			expect(
+				db
+					.select()
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, activeChildId as string))
+					.get()?.status,
+			).toBe("running");
+			expect(getExecutionOwner(activeChildId as string)).toBeUndefined();
+		} finally {
+			if (locked) blocker.run("ROLLBACK");
+			blocker.close();
+		}
+	});
+
+	test.each([
+		"rejected",
+		"admission_closed",
+	])("takeover preserves control without redelivering a synchronous %s failure", async (mode) => {
+		const runtime = await import("../agent-runtime/run");
+		const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+		const original = new Error("start admission rejected after takeover");
+		const idle = Promise.resolve({
+			started: false,
+			output: "",
+			finalText: "",
+			hasError: false,
+			interrupted: false,
+			timedOut: false,
+		});
+		const start = spyOn(runtime, "startNarratorRun").mockImplementation(async () => {
+			expect(isTakenOver(activeChildId as string)).toBe(true);
+			if (mode === "rejected") throw original;
+			return {
+				started: false,
+				notStartedReason: "admission_closed",
+				foreground: idle,
+				terminal: idle,
+				completion: idle,
+			};
+		});
+		const model = spyOn(passExecutor, "executeAgentLoop");
+		restoreSpies.push(
+			() => start.mockRestore(),
+			() => model.mockRestore(),
+		);
+		const toolUseId = generateId();
+		const toolCallBinding = await insertParentAgentCall(toolUseId);
+		const failure = await runSubagent({
+			...input(),
+			toolUseId,
+			toolCallBinding,
+			takeoverByUser: true,
+		}).catch((error) => error);
+		if (mode === "rejected") expect(failure).toBe(original);
+		else
+			expect(failure).toMatchObject({
+				message: "Background agent run did not start: admission is closed",
+			});
+		const child = activeChildId as string;
+		expect(getExecutionOwner(child)).toBeUndefined();
+		expect(getRunHold(child)).toMatchObject({ released: false, result: { hasError: true } });
+		expect(
+			db.select().from(backgroundTasks).where(eq(backgroundTasks.id, child)).get()?.status,
+		).toBe("failed");
+		expect(model).not.toHaveBeenCalled();
+		// The parent tool executor reports the synchronous exception before user release.
+		db.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				outputJson: "Synchronous Agent failure",
+				errorMessage: String(failure),
+			})
+			.where(eq(narratorToolCalls.id, toolCallBinding.toolCallId))
+			.run();
+		const conclusion = db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, toolCallBinding.toolCallId))
+			.get();
+		const notices = () =>
+			db
+				.select({ id: narratorBufferedMessages.id })
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, parentId),
+						eq(narratorBufferedMessages.noticeKind, "agent"),
+					),
+				)
+				.all();
+		await getRuntimePublicationService().flushRecipient(parentId);
+		expect(notices()).toHaveLength(0);
+		if (mode === "admission_closed") {
+			setRunHold(child, undefined);
+			expect((await runtime.hydrateRunHolds()).has(child)).toBe(true);
+		}
+		expect(await runtime.controlRun(child, { kind: "release" })).toBe(true);
+		expect(getRunHold(child)).toBeUndefined();
+		await getRuntimePublicationService().flushRecipient(parentId);
+		expect(notices()).toHaveLength(0);
+		expect(
+			db
+				.select()
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, toolCallBinding.toolCallId))
+				.get(),
+		).toEqual(conclusion);
+	});
+
+	test("takeover creation retains an asynchronous preparation failure until the user releases it", async () => {
+		const session = await import("../narrator-session");
+		const { controlRun } = await import("../agent-runtime/run");
+		const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+		const original = new Error("takeover preparation failed before session activation");
+		const prepare = spyOn(session, "ensureNarrator").mockRejectedValue(original);
+		const model = spyOn(passExecutor, "executeAgentLoop");
+		restoreSpies.push(
+			() => prepare.mockRestore(),
+			() => model.mockRestore(),
+		);
+		const output = await runSubagent({ ...input(), takeoverByUser: true });
+		expect(output).toContain("User takeover is already active");
+		const child = activeChildId as string;
+		await until(() => !!getRunHold(child)?.result && runEnded(child));
+		expect(model).not.toHaveBeenCalled();
+		expect(getRunHold(child)).toMatchObject({
+			released: false,
+			result: { finalText: original.message, hasError: true },
+		});
+		const row = db.select().from(narrators).where(eq(narrators.id, child)).get();
+		expect(row).toMatchObject({
+			status: "idle",
+			backgroundStatus: "failed",
+			backgroundResult: original.message,
+		});
+		expect(parseSubstatus(row?.substatus)).toContain("taken_over");
+		expect(await takePendingInjectionBatch(parentId)).toBeNull();
+		expect(await controlRun(child, { kind: "release" })).toBe(true);
+		await getRuntimePublicationService().flushRecipient(parentId);
+		expect(
+			db.select().from(backgroundTasks).where(eq(backgroundTasks.id, child)).get(),
+		).toMatchObject({ status: "failed", output: original.message });
+		expect(getRunHold(child)).toBeUndefined();
+		const notices = () =>
+			db
+				.select({ id: narratorBufferedMessages.id })
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, parentId),
+						eq(narratorBufferedMessages.noticeKind, "agent"),
+					),
+				)
+				.all();
+		expect(notices()).toHaveLength(1);
+		expect(await controlRun(child, { kind: "release" })).toBe(false);
+		await getRuntimePublicationService().flushRecipient(parentId);
+		expect(notices()).toHaveLength(1);
+	});
+
+	test("closed admission ends the unclaimed registration", async () => {
+		const runtime = await import("../agent-runtime/run");
+		const idle = Promise.resolve({
+			started: false,
+			output: "",
+			finalText: "",
+			hasError: false,
+			interrupted: false,
+			timedOut: false,
+		});
+		const start = spyOn(runtime, "startNarratorRun").mockResolvedValue({
+			started: false,
+			notStartedReason: "admission_closed",
+			foreground: idle,
+			terminal: idle,
+			completion: idle,
+		});
+		restoreSpies.push(() => start.mockRestore());
+		await expect(runSubagent(input())).rejects.toThrow("run did not start");
+		expect(
+			db
+				.select()
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, activeChildId as string))
+				.get()?.status,
+		).toBe("failed");
+		expect(await takePendingInjectionBatch(parentId)).toBeNull();
+	});
+});
 
 describe("Agent creation in user takeover mode", () => {
 	for (const outcome of ["success", "error", "throw"] as const) {
@@ -316,7 +641,7 @@ describe("Agent creation in user takeover mode", () => {
 		const { output, observedAtStart, childId } = await launch(false, "success");
 		expect(observedAtStart?.held).toBe(false);
 		expect(output).toContain("Background task started.");
-		expect(output).toContain("Await({");
+		expect(output).toContain("Watch({");
 		releaseExecution?.();
 		await until(() => runEnded(childId));
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, childId) });

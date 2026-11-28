@@ -12,7 +12,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import type { TokenDancePublicConnection } from "@shared/tokendance";
+import type { TokenDanceLoginChoice, TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	createFileRoute,
@@ -29,6 +29,7 @@ import { useConfirmDialog } from "../../components/common/confirm-dialog-context
 import { AutoParticipationSwitch } from "../../components/providers/AutoParticipationSwitch";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
+import { CredentialMigrationAlert } from "../../components/providers/CredentialMigrationAlert";
 import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
 	CustomApiProviderSection,
@@ -48,13 +49,16 @@ import {
 import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
 import { createProviderAndRefresh } from "../../components/providers/provider-create-flow";
 import { rebaseProviderState } from "../../components/providers/provider-settings-rebase";
+import { saveProviderSettings } from "../../components/providers/provider-settings-save";
 import {
 	createSnapshot,
 	initialProvidersState,
 	isPlatformProviderPrefix,
+	type ProviderKeyTarget,
 	type ProvidersState,
 	providersReducer,
 	providersStateFromSettings,
+	rebasePersistedProviderKeySnapshot,
 	useIsDirty,
 	useProvidersDispatch,
 } from "../../components/providers/providers-reducer";
@@ -76,6 +80,7 @@ import {
 	useProviderModelRefreshCapability,
 	useSettingsFeatureCapability,
 } from "../../hooks/usePlatform";
+import { invalidateQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { replaceCurrentHistoryState } from "../../lib/history-entry";
@@ -187,6 +192,16 @@ function SettingsProvidersPage() {
 	}, [isAddingProvider]);
 
 	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
+	const syncPersistedProviderKey = useCallback((target: ProviderKeyTarget, apiKey: string) => {
+		const rebased = rebasePersistedProviderKeySnapshot(savedSnapshot.current, target, apiKey);
+		savedSnapshot.current = rebased.snapshot;
+		dispatch({
+			type: "SYNC_PERSISTED_PROVIDER_KEY",
+			target,
+			apiKey,
+			previousApiKey: rebased.previousApiKey,
+		});
+	}, []);
 
 	useEffect(() => {
 		if (settings && !state.initialized) {
@@ -253,6 +268,10 @@ function SettingsProvidersPage() {
 						...fresh,
 						customApiProviders: recovered.customApiProviders,
 						nugProviders: recovered.nugProviders,
+						tokendance: {
+							...(fresh.tokendance as Record<string, unknown>),
+							toolResultImages: recovered.tokenDanceToolResultImages,
+						},
 						agent: { ...(fresh.agent as Record<string, unknown>), ...createSnapshot(recovered) },
 					});
 					savedSnapshot.current = createSnapshot(freshState);
@@ -281,9 +300,10 @@ function SettingsProvidersPage() {
 		};
 	}, [state.initialized, isTokenDanceCallback, user?.role, user?.id, navigate, qc, returnEpoch, t]);
 	const tokenDanceLogin = useCallback(
-		(addPage?: Record<string, unknown>) =>
+		(addPage?: Record<string, unknown>, loginChoice?: TokenDanceLoginChoice) =>
 			startTokenDanceLogin(
 				tokenDanceDraftSnapshot(stateRef.current, savedSnapshot.current, addPage),
+				loginChoice,
 			),
 		[],
 	);
@@ -411,26 +431,38 @@ function SettingsProvidersPage() {
 				});
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
 			}
-			// 平台集成里 TokenDance 的开关存在它自己的连接记录里，所以先提交它、再存 settings：
-			// 这样 settings 响应里的 tokendance.disabled 已是新值，SYNC 之后草稿不会回退。
-			if (stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled) {
-				try {
-					await api.tokenDanceUpdateConnection(stateToSave.tokenDanceDisabled);
-				} catch {
-					notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
-					throw new Error(t("tokendance.operationFailed"));
-				}
-			}
+			const connectionChanged =
+				stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled ||
+				stateToSave.tokenDanceToolResultImages !== savedSnapshot.current.tokenDanceToolResultImages;
 			const { payload } = prepareProviderSettingsSave(stateToSave);
-			const response = await updateMutation.mutateAsync(payload);
+			const response = await saveProviderSettings(
+				() => updateMutation.mutateAsync(payload),
+				connectionChanged
+					? async () => {
+							try {
+								return await api.tokenDanceUpdateConnection(
+									stateToSave.tokenDanceDisabled,
+									undefined,
+									stateToSave.tokenDanceToolResultImages ?? "off",
+								);
+							} catch {
+								notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
+								throw new Error(t("tokendance.operationFailed"));
+							}
+						}
+					: undefined,
+			);
+			qc.setQueryData(["admin", "settings"], response);
+			qc.setQueryData(["settings"], response);
 			// 快照先行、SYNC 随后：快照一变，概览排序（只看快照）在 SYNC 触发的这次
 			// 渲染里就重排 —— 不需要额外的信号 state，也不存在时序窗口。
 			savedSnapshot.current = createSnapshot(
 				providersStateFromSettings(response as Record<string, unknown>),
 			);
 			dispatch({ type: "SYNC_FROM_SETTINGS", settings: response as Record<string, unknown> });
-			// 凭据可能刚被替换，额度要按新的 key 重新拉取。
-			void qc.invalidateQueries({ queryKey: ["commandcode", "usage"] });
+			// A replaced credential must never retain the previous account's quota while refetching.
+			await invalidateQuotaSnapshots(qc);
+			void qc.invalidateQueries({ queryKey: ["commandcode", "usage-summary"] });
 			// Prefix renames and removed providers move or drop provider-model overrides.
 			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 			// Joining or leaving auto changes which sources each auto: model has.
@@ -1251,6 +1283,10 @@ function SettingsProvidersPage() {
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
 							connection={tokenDance}
+							toolResultImages={state.tokenDanceToolResultImages}
+							onToolResultImagesChange={(value) =>
+								dispatch({ type: "SET_TOKENDANCE_TOOL_IMAGES", value })
+							}
 							enabled={!tokenDanceDisabled}
 							onToggleEnabled={() =>
 								dispatchers.setPlatformDisabled("tokendance", !tokenDanceDisabled)
@@ -1261,7 +1297,7 @@ function SettingsProvidersPage() {
 							modelProtocols={state.modelProtocols}
 							onModelProtocolChange={dispatchers.setModelProtocol}
 							onTestModel={setTestingModel}
-							onLogin={() => tokenDanceLogin()}
+							onLogin={(choice) => tokenDanceLogin(undefined, choice)}
 							onChanged={refreshTokenDanceSettings}
 							onDeleted={() => setSelectedProvider(null)}
 						/>
@@ -1271,6 +1307,7 @@ function SettingsProvidersPage() {
 							pluginProvider={selectedPluginProvider}
 							state={state}
 							dispatchers={dispatchers}
+							onPersistedKeyChanged={syncPersistedProviderKey}
 							providerModelsMap={providerModelsMap}
 							commandcodeModels={commandcodeModels}
 							pluginModelsByPrefix={pluginModelsByPrefix}
@@ -1349,6 +1386,7 @@ function SettingsProvidersPage() {
 					<Group gap="xs">
 						<Title order={2}>{t("providersTitle")}</Title>
 					</Group>
+					<CredentialMigrationAlert settings={settings} />
 					{!settingsFeatureCapability.patchSupported && (
 						<Alert color="yellow" variant="light" title={t("settingsPatchUnsupportedWarning")}>
 							{t("settingsPatchUnsupportedWarningDesc")}
@@ -1425,6 +1463,7 @@ interface ProviderSectionContentProps {
 	pluginProvider?: { pluginId: string; contributionId: string };
 	state: ProvidersState;
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
+	onPersistedKeyChanged: (target: ProviderKeyTarget, apiKey: string) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
 	/** Command Code 的模型（已带 `CommandCode:` 前缀），由后端从 Provider API 拉取并缓存。 */
 	commandcodeModels: ModelOption[];
@@ -1450,6 +1489,7 @@ function ProviderSectionContent({
 	pluginProvider,
 	state,
 	dispatchers,
+	onPersistedKeyChanged,
 	providerModelsMap,
 	commandcodeModels,
 	pluginModelsByPrefix,
@@ -1472,6 +1512,7 @@ function ProviderSectionContent({
 			<CommandCodeSection
 				value={state.commandCode}
 				onChange={dispatchers.setCommandCode}
+				onPersistedKeyChanged={(apiKey) => onPersistedKeyChanged({ kind: "command-code" }, apiKey)}
 				onToggleDisabled={() =>
 					dispatchers.setPlatformDisabled("CommandCode", !state.commandCode.disabled)
 				}
@@ -1540,6 +1581,9 @@ function ProviderSectionContent({
 			<CustomApiProviderSection
 				provider={customApiMatch}
 				onProvidersChange={dispatchers.setCustomApiProviders}
+				onPersistedKeyChanged={(apiKey) =>
+					onPersistedKeyChanged({ kind: "custom", id: customApiMatch.id }, apiKey)
+				}
 				openAIProviderModelsMap={providerModelsMap}
 				anthropicProviderModelsMap={anthropicModelsMap}
 				geminiProviderModelsMap={geminiModelsMap}
@@ -1565,6 +1609,7 @@ function ProviderSectionContent({
 			<NUGProvidersSection
 				providers={[nugMatch]}
 				onProvidersChange={dispatchers.setNugProviders}
+				onPersistedKeyChanged={(id, apiKey) => onPersistedKeyChanged({ kind: "nug", id }, apiKey)}
 				providerModelsMap={nugModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}

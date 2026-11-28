@@ -55,6 +55,7 @@ import { composerPreviewText } from "../composer/composer-quotes";
 import { QueuedImageThumb } from "../composer/EditAttachmentChips";
 import { fileReferenceToken } from "../composer/file-reference-input";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
+import { ComposerNarratorReferences } from "../message/ComposerNarratorReferences";
 import { EditableComposerDocument } from "../message/EditableComposerDocument";
 import { MediaAttachment } from "../message/MediaAttachment";
 import { queuedMessageMode } from "./queue-message-mode";
@@ -66,6 +67,12 @@ export interface QueuedMessageRowProps {
 	narratorId?: string;
 	index: number;
 	isEditing: boolean;
+	isStartingEdit?: boolean;
+	isEditLocked?: boolean;
+	queueMutationsDisabled?: boolean;
+	editStale?: boolean;
+	editProtected?: boolean;
+	editError?: string;
 	onStartEdit: (msg: BufferMessageSummary) => void;
 	onCancelEdit: () => void;
 	/** Resolves false when the server rejected the edit, so the editor stays open. */
@@ -159,6 +166,12 @@ export function QueuedMessageRow({
 	narratorId,
 	index,
 	isEditing,
+	isStartingEdit = false,
+	isEditLocked = false,
+	queueMutationsDisabled = false,
+	editStale = false,
+	editProtected = true,
+	editError,
 	onStartEdit,
 	onCancelEdit,
 	onSaveEdit,
@@ -175,6 +188,7 @@ export function QueuedMessageRow({
 	urgentError,
 }: QueuedMessageRowProps) {
 	const { t } = useTranslation("narrator");
+	const mutationsLocked = isEditLocked || queueMutationsDisabled;
 	const mode = urgentStatus ? "interrupt" : queuedMessageMode(msg);
 	const [textExpanded, setTextExpanded] = useState(false);
 	const borderColor =
@@ -185,7 +199,12 @@ export function QueuedMessageRow({
 				: "var(--mantine-color-default-border)";
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
-		disabled: mode !== "turn" || isEditing || urgentStatus !== undefined,
+		disabled:
+			mode !== "turn" ||
+			isEditing ||
+			isStartingEdit ||
+			mutationsLocked ||
+			urgentStatus !== undefined,
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),
@@ -219,6 +238,8 @@ export function QueuedMessageRow({
 			urgentStatus === "sending" ||
 			(urgentOnly && next !== "interrupt") ||
 			isEditing ||
+			isStartingEdit ||
+			mutationsLocked ||
 			(next === "interrupt" && failed && !urgentOnly)
 		)
 			return;
@@ -244,10 +265,20 @@ export function QueuedMessageRow({
 		}
 	};
 	const canEdit =
-		!isEditing && !retrying && changingMode === null && !urgentCommitted && !urgentOnly;
+		(!queueMutationsDisabled || isEditLocked) &&
+		!editStale &&
+		!isEditing &&
+		!isStartingEdit &&
+		!retrying &&
+		changingMode === null &&
+		!urgentCommitted &&
+		!urgentOnly;
 	const startEditing = () => {
 		if (
+			(queueMutationsDisabled && !isEditLocked) ||
+			editStale ||
 			isEditing ||
+			isStartingEdit ||
 			retryingRef.current ||
 			changingModeRef.current ||
 			urgentRequestedRef.current ||
@@ -275,7 +306,14 @@ export function QueuedMessageRow({
 	);
 	const [retryError, setRetryError] = useState<string | null>(null);
 	const retry = async () => {
-		if (retryingRef.current || changingModeRef.current || !failed) return;
+		if (
+			retryingRef.current ||
+			changingModeRef.current ||
+			isStartingEdit ||
+			mutationsLocked ||
+			!failed
+		)
+			return;
 		retryingRef.current = true;
 		setRetrying(true);
 		setRetryError(null);
@@ -312,6 +350,8 @@ export function QueuedMessageRow({
 	const msgRef = useRef(msg);
 	msgRef.current = msg;
 	const canSubmit =
+		editProtected &&
+		!isStartingEdit &&
 		!!snapshot &&
 		(!!snapshot.text.trim() ||
 			snapshot.fileReferences.length > 0 ||
@@ -422,6 +462,15 @@ export function QueuedMessageRow({
 							files: (msg.textFiles ?? []).map((file) => file.filename),
 						})}
 					</Text>
+					{msg.hasComposerDocument && narratorId && (
+						<ComposerNarratorReferences
+							narratorId={narratorId}
+							messageId={msg.id}
+							hasComposerDocument
+							revision={msg.contentRevision}
+							queued
+						/>
+					)}
 					<QueuedAttachmentPreview
 						narratorId={narratorId}
 						images={msg.images ?? []}
@@ -440,6 +489,31 @@ export function QueuedMessageRow({
 							{urgentError && `: ${urgentError}`}
 						</Text>
 					)}
+					{isStartingEdit && (
+						<Text size="xs" c="dimmed" role="status">
+							{t("queuedEditStarting")}
+						</Text>
+					)}
+					{editError && (
+						<Stack gap={2}>
+							<Text size="xs" c="red" role="alert">
+								{editError}
+							</Text>
+							<Group gap="xs">
+								<Button
+									size="compact-xs"
+									variant="light"
+									disabled={editStale}
+									onClick={startEditing}
+								>
+									{t("queuedEditReacquire")}
+								</Button>
+								<Button size="compact-xs" variant="subtle" onClick={onCancelEdit}>
+									{t("queuedEditDismiss")}
+								</Button>
+							</Group>
+						</Stack>
+					)}
 					{failureNotice}
 				</Stack>
 				{failed && !urgentOnly && (
@@ -448,7 +522,7 @@ export function QueuedMessageRow({
 						color="red"
 						variant="light"
 						loading={retrying}
-						disabled={retrying || changingMode !== null}
+						disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 						onClick={() => void retry()}
 					>
 						{t("queuedRetry")}
@@ -461,7 +535,7 @@ export function QueuedMessageRow({
 							variant="subtle"
 							color={mode === "turn" ? "indigo" : "gray"}
 							aria-label={toggleLabel}
-							disabled={retrying || changingMode !== null}
+							disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 							loading={changingMode !== null && changingMode !== "interrupt"}
 							onClick={() => void changeMode(nextMode)}
 						>
@@ -481,7 +555,12 @@ export function QueuedMessageRow({
 						color="orange"
 						aria-label={urgentLabel}
 						disabled={
-							(failed && !urgentOnly) || retrying || changingMode !== null || urgentCommitted
+							isStartingEdit ||
+							mutationsLocked ||
+							(failed && !urgentOnly) ||
+							retrying ||
+							changingMode !== null ||
+							urgentCommitted
 						}
 						loading={changingMode === "interrupt"}
 						onClick={() => void changeMode("interrupt")}
@@ -495,7 +574,7 @@ export function QueuedMessageRow({
 							size="sm"
 							variant="subtle"
 							color="gray"
-							disabled={retrying || changingMode !== null}
+							disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 							aria-label={t("queuedActions")}
 						>
 							<IconDotsVertical size={14} />
@@ -513,20 +592,30 @@ export function QueuedMessageRow({
 						{mode === "turn" && (
 							<>
 								<Menu.Divider />
-								<Menu.Item disabled={!canMoveUp} onClick={() => onMove(msg.id, -1)}>
+								<Menu.Item
+									disabled={mutationsLocked || !canMoveUp}
+									onClick={() => onMove(msg.id, -1)}
+								>
 									{t("queuedMoveUp")}
 								</Menu.Item>
-								<Menu.Item disabled={!canMoveDown} onClick={() => onMove(msg.id, 1)}>
+								<Menu.Item
+									disabled={mutationsLocked || !canMoveDown}
+									onClick={() => onMove(msg.id, 1)}
+								>
 									{t("queuedMoveDown")}
 								</Menu.Item>
 							</>
 						)}
 						<Menu.Divider />
-						<Menu.Item color="red" onClick={() => onRemove(msg.id)}>
+						<Menu.Item
+							color="red"
+							disabled={isStartingEdit || mutationsLocked}
+							onClick={() => onRemove(msg.id)}
+						>
 							{cancelBufferLabel}
 						</Menu.Item>
 						{onClearAll && (
-							<Menu.Item color="red" onClick={onClearAll}>
+							<Menu.Item color="red" disabled={mutationsLocked} onClick={onClearAll}>
 								{t("clearAllQueued")}
 							</Menu.Item>
 						)}
@@ -538,7 +627,7 @@ export function QueuedMessageRow({
 						variant="subtle"
 						aria-label={cancelBufferLabel}
 						title={cancelBufferLabel}
-						disabled={retrying || changingMode !== null}
+						disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 						onClick={(event) => {
 							event.stopPropagation();
 							if (!retryingRef.current && !changingModeRef.current) onRemove(msg.id);
@@ -568,6 +657,26 @@ export function QueuedMessageRow({
 				)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
 				{senderHeader}
+				{editProtected ? (
+					<Text size="xs" c="dimmed" role="status">
+						{t("queuedEditPaused")}
+					</Text>
+				) : (
+					<Stack gap={2}>
+						<Text size="xs" c="red" role="alert">
+							{editError ?? t("queuedEditProtectionLost")}
+						</Text>
+						<Button
+							size="compact-xs"
+							variant="light"
+							loading={isStartingEdit}
+							disabled={submitting || editStale}
+							onClick={() => onStartEdit(msgRef.current)}
+						>
+							{t("queuedEditReacquire")}
+						</Button>
+					</Stack>
+				)}
 				{failureNotice}
 				<EditableComposerDocument
 					key={msg.id}
@@ -631,6 +740,7 @@ export function QueuedMessageRow({
 				size="xs"
 				variant="subtle"
 				color="gray"
+				aria-label={t("queuedEditDismiss")}
 				disabled={submitting}
 				onClick={onCancelEdit}
 			>

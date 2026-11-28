@@ -7,6 +7,7 @@ import {
 import type { MeasureElement, VListItem } from "@shared/pretext-layout/layout-pipeline";
 import { reflowTurnUsageData } from "@shared/pretext-layout/turn-usage";
 import type { RenderLod } from "./prepared-block";
+import { measureRevisionOf } from "./team-conversation-transform";
 import { type ResizePermissionResolver, reflowPermissionForms } from "./vlist-resize-permission";
 
 /** Keep both the work and the shrink-to-reveal loop bounded to one batch per frame. */
@@ -122,7 +123,8 @@ export function previewResize(input: ResizePreviewInput) {
 			input.lod,
 			spec.opts,
 			spec.key,
-			index.manifest.documentRevision,
+			// The measure cache's revision: team mode's manifest suffix is not part of it.
+			measureRevisionOf(index.manifest.documentRevision),
 		);
 		nextItems ??= items.slice();
 		nextItems[itemIndex] = { spec, measured, contentWidth: width };

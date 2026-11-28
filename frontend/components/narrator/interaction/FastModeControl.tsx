@@ -10,18 +10,20 @@ import {
 } from "@mantine/core";
 import { IconBolt } from "@tabler/icons-react";
 import type React from "react";
-
-type FastModeOverride = "inherit" | "on" | "off";
+import type { FastModeOverride } from "./fast-mode-state";
+import type { Mutate } from "./mutate";
 
 export interface FastModeControlProps {
 	/** Popover placement — desktop uses top-end, the mobile toolbar bottom-end. */
 	position: "top-end" | "bottom-end";
-	/** Session-level override; "inherit" follows the user default. */
+	/** Explicit session choice; inherit follows its upstream source. */
 	fastModeOverride: FastModeOverride;
-	/** The user-level default fast-mode state (what "inherit" resolves to). */
+	/** The viewing user's editable default, only displayed for primary sessions. */
 	fastModeDefault: boolean;
-	/** Effective state after resolving inherit — drives the icon colour. */
+	/** Server-resolved state — drives the icon colour and shortcut. */
 	fastModeEnabled: boolean;
+	sourceUnavailable: boolean;
+	isSubagent: boolean;
 	/**
 	 * Coarse-pointer / mobile viewports open the settings by long-press instead of
 	 * hover, so hover handlers are suppressed when true.
@@ -37,18 +39,16 @@ export interface FastModeControlProps {
 	/** True immediately after a long-press fired, so the ensuing click is ignored. */
 	longPressFiredRef: React.MutableRefObject<boolean>;
 	narratorId: string;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateFastMode.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateUserPreferences.
-	updateUserPrefs: any;
+	fastModeMutation: Mutate<{ id: string; fastModeOverride: FastModeOverride }>;
+	updateUserPrefs: Mutate<{ fastModeDefault: boolean }>;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
 /**
  * Fast-mode toggle button + its settings popover (session override segmented
- * control + user-default switch). Extracted verbatim from NarratorPanel; all
- * state/handlers are injected so behaviour is identical across the desktop and
+ * control + primary-session user-default switch). State/handlers are injected
+ * so behaviour is identical across the desktop and
  * mobile status-bar mounts.
  */
 export function FastModeControl(props: FastModeControlProps) {
@@ -57,6 +57,8 @@ export function FastModeControl(props: FastModeControlProps) {
 		fastModeOverride,
 		fastModeDefault,
 		fastModeEnabled,
+		sourceUnavailable,
+		isSubagent,
 		fastModeUsesTapSettings,
 		settingsOpened,
 		setSettingsOpened,
@@ -93,9 +95,11 @@ export function FastModeControl(props: FastModeControlProps) {
 					<Tooltip
 						label={
 							fastModeOverride === "inherit"
-								? t("fast_mode_inherit_tooltip", {
-										state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
-									})
+								? sourceUnavailable
+									? t("fast_mode_source_unavailable")
+									: t(isSubagent ? "fast_mode_primary_tooltip" : "fast_mode_inherit_tooltip", {
+											state: fastModeEnabled ? t("fast_mode_on") : t("fast_mode_off"),
+										})
 								: t("fast_mode_tooltip")
 						}
 						position={position.startsWith("top") ? "top" : "bottom"}
@@ -118,8 +122,7 @@ export function FastModeControl(props: FastModeControlProps) {
 									longPressFiredRef.current = false;
 									return;
 								}
-								// Clicking pins this session against its current effective
-								// state; the popover restores "follow default".
+								// Clicking pins only this session; the popover restores inheritance.
 								fastModeMutation.mutate({
 									id: narratorId,
 									fastModeOverride: fastModeEnabled ? "off" : "on",
@@ -152,28 +155,32 @@ export function FastModeControl(props: FastModeControlProps) {
 						data={[
 							{
 								value: "inherit",
-								label: t("fast_mode_session_inherit", {
-									state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
-								}),
+								label: t(isSubagent ? "fast_mode_session_primary" : "fast_mode_session_inherit"),
 							},
 							{ value: "on", label: t("fast_mode_on") },
 							{ value: "off", label: t("fast_mode_off") },
 						]}
 					/>
-					<Text size="xs" c="dimmed">
-						{t("fast_mode_session_desc")}
+					<Text size="xs" c={sourceUnavailable ? "orange" : "dimmed"}>
+						{sourceUnavailable
+							? t("fast_mode_source_unavailable")
+							: t(isSubagent ? "fast_mode_primary_desc" : "fast_mode_session_desc")}
 					</Text>
-					<Switch
-						size="sm"
-						checked={fastModeDefault}
-						onChange={(event) =>
-							updateUserPrefs.mutate({ fastModeDefault: event.currentTarget.checked })
-						}
-						label={t("fast_mode_default_switch")}
-					/>
-					<Text size="xs" c="dimmed">
-						{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
-					</Text>
+					{!isSubagent && (
+						<>
+							<Switch
+								size="sm"
+								checked={fastModeDefault}
+								onChange={(event) =>
+									updateUserPrefs.mutate({ fastModeDefault: event.currentTarget.checked })
+								}
+								label={t("fast_mode_default_switch")}
+							/>
+							<Text size="xs" c="dimmed">
+								{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
+							</Text>
+						</>
+					)}
 					<Text size="xs" c="dimmed">
 						{fastModeUsesTapSettings ? t("fast_mode_mobile_hint") : t("fast_mode_desktop_hint")}
 					</Text>

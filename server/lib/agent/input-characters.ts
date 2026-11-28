@@ -54,6 +54,9 @@ export function markRuntimeSystemMessage<T extends object>(message: T): T {
 	return message;
 }
 
+export function isRuntimeSystemMessage(message: unknown): boolean {
+	return !!message && typeof message === "object" && runtimeSystemMessages.has(message);
+}
 type ObjectValue = Record<string, unknown>;
 function object(value: unknown): ObjectValue {
 	return value && typeof value === "object" ? (value as ObjectValue) : {};
@@ -391,7 +394,13 @@ async function measureInputCharacters(
 				await content(message, fixed ? "system" : "other");
 			}
 		}
-		for (const field of ["input", "contents"]) await content(request[field], "other");
+		if (Array.isArray(request.input)) {
+			for (const item of request.input)
+				await content(item, isRuntimeSystemMessage(item) ? "system" : "other");
+		} else {
+			await content(request.input, "other");
+		}
+		await content(request.contents, "other");
 		if (request.tools) {
 			// Tool declarations are model inputs; only transport/cache annotations are omitted.
 			if (!Array.isArray(request.tools)) fail("unsupported_input");
@@ -479,7 +488,7 @@ export async function reportInputCharacters(
 	const options: InputCharacterOptions = { ...budget, includeComposition: true };
 	const request = object(body);
 	const first = params.history?.[0];
-	const synthetic = !!first && typeof first === "object" && runtimeSystemMessages.has(first);
+	const synthetic = isRuntimeSystemMessage(first);
 	if (
 		params.history &&
 		Array.isArray(request.messages) &&

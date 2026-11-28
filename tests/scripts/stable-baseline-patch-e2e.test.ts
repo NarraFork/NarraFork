@@ -96,6 +96,7 @@ function producerOptions() {
 	const config = { serverUrl: "https://only-in-process.invalid", token };
 	return {
 		kind: "main" as const,
+		patchOnly: false,
 		repository,
 		tag: `v${TARGET}`,
 		config,

@@ -8,10 +8,12 @@
  */
 
 import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
-import { getTestDb } from "../../../../tests/setup";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 import type { EntitySearchQuery } from "../types";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({
 	...realDbModule,
@@ -96,10 +98,10 @@ beforeAll(async () => {
 	sqlite.run("DROP TABLE narrator_messages_fts");
 });
 
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 function query(text: string, extra: Partial<EntitySearchQuery> = {}): EntitySearchQuery {

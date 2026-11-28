@@ -99,6 +99,8 @@ export interface PermissionCallbacks {
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
+	/** Run one plan reflection for a plan that is already waiting for approval. */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
 	/**
@@ -128,6 +130,11 @@ export interface NarratorPanelSnapshot {
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
 	fastModeOverride?: "inherit" | "on" | "off";
+	effectiveFastMode?: boolean;
+	fastModeSource?: import("../../lib/api/narrators").FastModeSource;
+	fastModeSourceNarratorId?: string | null;
+	variant?: string | null;
+	type?: string | null;
 	turnStartedAt?: string | null;
 }
 
@@ -157,7 +164,6 @@ export interface NarratorPanelProps {
 	highlightRequestId?: string;
 	/** Text that picks which row of a multi-row message the jump lands on. */
 	highlightNeedle?: string;
-	onSendToTerminal?: (text: string) => void;
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
 	terminalOpen?: boolean;
 	onToggleTerminal?: () => void;
@@ -199,6 +205,28 @@ export interface NarratorPanelProps {
 	specPanelOpen?: boolean;
 	/** Toggle the spec panel (desktop sidebar mode) */
 	onToggleSpecPanel?: () => void;
+	/**
+	 * What a read-only viewer sees in place of the composer; omitted keeps the session's own
+	 * notice. The team page says 「你是只读成员」 here.
+	 */
+	readOnlyNotice?: string;
+	/**
+	 * The host draws its own header above the panel, so the panel leaves out its title row and
+	 * toolbar (the team page's coordinator column). The session's own page always has them.
+	 */
+	hideHeader?: boolean;
+	/**
+	 * Called with the panel's connection state whenever it changes, so a host that hides the
+	 * header (and with it the 「断开连接」 badge) can show it and offer the same reconnect.
+	 */
+	onConnectionChange?: (connection: NarratorPanelConnection) => void;
+}
+
+/** The narrator socket's state as the panel reports it to a host (`onConnectionChange`). */
+export interface NarratorPanelConnection {
+	disconnected: boolean;
+	/** The panel's own reconnect (the badge's click). */
+	reconnect: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB

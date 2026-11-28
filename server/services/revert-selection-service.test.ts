@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { FILE_CHANGE_LIMITS, type FileChangeRevertSelector } from "@shared/file-change-protocol";
+import * as readPool from "../lib/db-worker/pool";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import {
@@ -13,6 +14,7 @@ import {
 	REVERT_SELECTION_LIMITS,
 	REVERT_SELECTION_PAGE_ITEMS,
 	RevertSelectionService,
+	readCommittedRevertSelectionBody,
 	resetRevertBodyWorkersForTests,
 } from "./revert-selection-service";
 
@@ -1609,7 +1611,10 @@ describe("bounded metadata collection and drift", () => {
 				INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES('selected','root','[{"type":"text","text":"old"}]');
 				INSERT INTO narrator_message_refs VALUES('selected-ref','root','selected',1,NULL);
 			`);
-			service = new RevertSelectionService({ $client: source }, { authorize, onSlow: () => {} });
+			service = new RevertSelectionService(
+				{ $client: source },
+				{ authorize, onSlow: () => {}, readInspectionBody: readCommittedRevertSelectionBody },
+			);
 			const initial = source
 				.query<{ data_version: number }, []>("PRAGMA data_version")
 				.get()?.data_version;
@@ -1622,6 +1627,69 @@ describe("bounded metadata collection and drift", () => {
 			expect((await pending).selectionComplete).toBe(true);
 		} finally {
 			writer.close();
+			source.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("committed inspection binds the reference and exact body length; Worker failures never read locally", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "revert-selection-worker-"));
+		const source = new Database(join(directory, "fixture.db"));
+		const body = '[{"type":"text","text":"历史"}]';
+		const identity = {
+			id: "selected",
+			narratorId: "root",
+			refId: "selected-ref",
+			contentBytes: Buffer.byteLength(body),
+			bodyRevision: null,
+			stateRevision: null,
+		};
+		const controller = new AbortController();
+		const read = (ref = identity) =>
+			readCommittedRevertSelectionBody(source, ref, controller.signal, Date.now() + 5000);
+		try {
+			source.exec(DDL);
+			source.exec("INSERT INTO narrators(id,owner_user_id) VALUES('root','alice')");
+			source
+				.query(
+					"INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES('selected','root',?)",
+				)
+				.run(body);
+			source.exec(
+				"INSERT INTO narrator_message_refs VALUES('selected-ref','root','selected',1,NULL)",
+			);
+			const localQuery = spyOn(source, "query");
+			const worker = spyOn(readPool, "runReadTask");
+			try {
+				expect(await read()).toBe(body);
+				expect(await read({ ...identity, refId: "other" })).toBeNull();
+				expect(await read({ ...identity, contentBytes: identity.contentBytes - 1 })).toBeNull();
+				for (const error of [
+					new readPool.WorkersUnavailableError("creation_failed"),
+					new readPool.DbReadTaskExecutionError("execution failed"),
+					new readPool.DbReadTaskTimeoutError("timed out"),
+				]) {
+					worker.mockRejectedValueOnce(error);
+					await expect(read()).rejects.toBe(error);
+					expect(worker.mock.lastCall?.[2]?.signal).toBe(controller.signal);
+				}
+				const previous = process.env.NARRAFORK_DB_WORKER;
+				process.env.NARRAFORK_DB_WORKER = "off";
+				try {
+					await expect(read()).rejects.toMatchObject({ reason: "disabled_by_env" });
+				} finally {
+					if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+					else process.env.NARRAFORK_DB_WORKER = previous;
+				}
+				const cancel = new Error("request cancelled");
+				controller.abort(cancel);
+				await expect(read()).rejects.toBe(cancel);
+				expect(localQuery).not.toHaveBeenCalled();
+			} finally {
+				worker.mockRestore();
+				localQuery.mockRestore();
+			}
+		} finally {
 			source.close();
 			rmSync(directory, { recursive: true, force: true });
 		}

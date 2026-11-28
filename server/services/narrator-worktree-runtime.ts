@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { activeDatabaseBackend } from "../db";
+import { readQuery } from "../db/worker-read";
 import { isAdminUser } from "../lib/agent/tools/admin-common";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
@@ -14,38 +15,61 @@ import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
 import { unknownWorktreeScope } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
+import { createWorktreeRetirementPorts } from "./narrator-worktree-retirement";
 import { NarratorWorktreeService } from "./narrator-worktree-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
+
+/**
+ * Authorized worktree target for one narrator.
+ *
+ * This is the ordinary grant: a live checkout, never the read-only recovery that
+ * `authorizeList` uses. Removal shares it on purpose — see `assertRemovalReady`.
+ */
+async function resolveWorktreeAuthorization(
+	principal: NarratorPrincipal,
+	narratorId: string,
+	need: "read" | "write",
+	signal: AbortSignal,
+) {
+	if (activeDatabaseBackend !== "sqlite")
+		throw new AppError(
+			"Worktree resource adapter unavailable",
+			503,
+			"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
+		);
+	const target = await authorizeGitTargetForPrincipal(
+		principal,
+		{ narratorId },
+		need,
+		signal,
+		false,
+		false,
+	);
+	const source = await loadNarratorForAccess(narratorId, principal, "read");
+	const rootId = await resolveAclRootId(source);
+	if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
+	const root = await loadNarratorForAccess(rootId, principal, "read");
+	signal.throwIfAborted();
+	// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
+	return {
+		...target,
+		resourceScope: root.ownerUserId
+			? {
+					scopeKind: target.contextProjectId ? ("project" as const) : ("standalone" as const),
+					scopeProjectId: target.contextProjectId ?? null,
+					scopeOwnerUserId: root.ownerUserId,
+				}
+			: unknownWorktreeScope,
+	};
+}
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
 	authorizeList: (principal, narratorId, _need, signal) =>
 		authorizeGitTargetForPrincipal(principal, { narratorId }, "read", signal, false, true),
-	authorize: async (principal, narratorId, need, signal) => {
-		if (activeDatabaseBackend !== "sqlite")
-			throw new AppError(
-				"Worktree resource adapter unavailable",
-				503,
-				"WORKTREE_RESOURCE_BACKEND_UNAVAILABLE",
-			);
-		const target = await authorizeGitTargetForPrincipal(principal, { narratorId }, need, signal);
-		const source = await loadNarratorForAccess(narratorId, principal, "read");
-		const rootId = await resolveAclRootId(source);
-		if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
-		const root = await loadNarratorForAccess(rootId, principal, "read");
-		signal.throwIfAborted();
-		// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
-		return {
-			...target,
-			resourceScope: root.ownerUserId
-				? {
-						scopeKind: target.contextProjectId ? ("project" as const) : ("standalone" as const),
-						scopeProjectId: target.contextProjectId ?? null,
-						scopeOwnerUserId: root.ownerUserId,
-					}
-				: unknownWorktreeScope,
-		};
-	},
+	authorize: (principal, narratorId, need, signal) =>
+		resolveWorktreeAuthorization(principal, narratorId, need, signal),
+	retirement: createWorktreeRetirementPorts(),
 	authorizeDestination: async (principal, narratorId, source, destination, need, signal) => {
 		const target = await authorizeGitDestinationForPrincipal(
 			principal,
@@ -89,10 +113,13 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 			import("../db"),
 			import("../db/schema"),
 		]);
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { title: true },
-		});
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { title: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		const result = await summaryGenerate(
 			(requirement ?? row?.title ?? "new worktree task").slice(0, 2000),
 			"Return only one short lowercase ASCII kebab-case Git branch slug (1-48 characters, letters/digits/hyphens), describing this task. No prefix, quotes, markdown or explanation.",

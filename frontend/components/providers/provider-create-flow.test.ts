@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { AddProviderType } from "@shared/sourcing/presets";
 import { type AddProviderDraft, customProviderFromDraft } from "./provider-add-draft";
 import { createProviderAndRefresh, type ProviderCreateDependencies } from "./provider-create-flow";
-import type { AddProviderType } from "./provider-presets";
 import { providersStateFromSettings } from "./providers-reducer";
 
 const draft: AddProviderDraft = {

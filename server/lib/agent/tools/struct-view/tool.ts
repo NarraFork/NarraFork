@@ -276,17 +276,19 @@ export const structViewTool: ToolDefinition = {
 			...(ctx.signal ? { signal: ctx.signal } : {}),
 		};
 
-		const resolved = await resolveProvider(doc);
-		// `stash` is the one structural mode that must survive a missing provider: with an
-		// `address` it needs no grammar at all, and refusing the call would deny the relay
-		// exactly where it is most needed — a file whose language cannot be parsed is one
-		// whose ranges can only be named by line.
+		// Address/list stashes never parse. Do not admit worker work for them, even
+		// when the file has an installed grammar; worker failures must only block
+		// symbol stashes. Let runStash reject ambiguous address+symbol inputs first.
 		if (mode === "stash") {
+			const hasSymbol = typeof args.symbol === "string" && args.symbol.trim().length > 0;
+			const hasAddress = typeof args.address === "string" && args.address.trim().length > 0;
+			const resolved = hasSymbol && !hasAddress ? await resolveProvider(doc) : null;
 			return runStash(ioPath, text, doc, resolved, args, ctx.narratorId, encoding, [], {
 				deviceId: backend.deviceId,
 				pathFlavor: backend.pathFlavor,
 			});
 		}
+		const resolved = await resolveProvider(doc);
 		if (!resolved) {
 			return {
 				// Naming the remedy matters: without it this reads as "this file is unsupported"

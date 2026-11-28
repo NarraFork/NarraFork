@@ -37,6 +37,10 @@ import { getNarraforkHome } from "../lib/narrafork-home";
 import { settings } from "../lib/settings";
 import { createRevertPlanSchema, revertPlanFilesQuerySchema } from "../lib/validators/narrators";
 import * as narratorWs from "../websocket/narrator-ws";
+import {
+	allowRetainedFileHistoryForTests,
+	retainFileHistoryForTests,
+} from "./__tests__/retained-file-history";
 import { fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
 import {
@@ -176,6 +180,7 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 	otherToken = await createToken(otherId);
 	settings.workspace.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
+	owner.restorers.push(allowRetainedFileHistoryForTests(), retainFileHistoryForTests(runtime));
 	owner.runtime = runtime;
 	// Workspace switching starts index/Git probes after the HTTP response. They still own this cwd.
 	const syncProjects = projectIndex.syncNarratorProjectLinksSafely;
@@ -2900,7 +2905,7 @@ describe("per-file queues, archived metadata and unchanged state", () => {
 			.set({ status: "running", inputJson: { description: "fixture activity" } })
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
-		const named = collectRevertBlockers(narratorId).find(
+		const named = (await collectRevertBlockers(narratorId)).find(
 			(item) => item.toolCallId === call.toolCallId,
 		);
 		expect(named).toMatchObject({ kind: "running_tool", toolName: "Bash" });

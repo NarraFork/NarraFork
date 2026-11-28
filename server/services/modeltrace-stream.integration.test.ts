@@ -1,34 +1,60 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
+import { NotFoundError } from "@server/lib/errors";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { eq } from "drizzle-orm";
 import type { StreamingBlock } from "../../frontend/components/narrator/message/message-segments";
 import { applyStreamingDelta } from "../../frontend/components/narrator/streaming/streaming-delta-fold";
-import { getTestDb, readTestMessageContent } from "../../tests/setup";
+import { readTestMessageContent } from "../../tests/setup";
 import { apiRequests, narratorMessageRefs, narratorMessages, narrators, users } from "../db/schema";
 import {
 	forgetModelTraceRequest,
 	rememberModelTraceRequest,
 } from "../lib/agent/modeltrace-request";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "../lib/agent/provider";
+import {
+	captureWorkerRejection,
+	getNarratorWorkerTestDb,
+} from "./__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const dbStub = {
 	db,
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
 	releaseDatabaseInstanceLockOnly: () => {},
 };
 mock.module("@server/db", () => dbStub);
 mock.module("../db", () => dbStub);
+// This suite exercises the real stream, database, and request tracker; the SDK
+// and worker lifecycle are covered by the engine suite.
+mock.module("@server/lib/modeltrace", () => ({
+	buildModelTraceChallenges: (count = 1) =>
+		Array.from({ length: count }, (_, i) => ({
+			prompt: `sampling challenge ${i + 1}`,
+			expectedCount: 300 + i,
+		})),
+	analyzeModelTrace: async () => ({ type: "modeltrace_result", decision: "partial", results: [] }),
+	MODELTRACE_MAX_TEXT_LENGTH: 10_000,
+}));
 const realWs = { ...(await import("../websocket/narrator-ws")) };
 interface FrameMessage {
 	type: string;
 	event?: { delta?: { type?: string; text?: string } };
-	message?: { id: string; role: string };
+	message?: {
+		id: string;
+		role: string;
+		refId?: string;
+		contentJson?: (ModelTraceResultBlock & Record<string, unknown>)[];
+	};
 	messageId?: string;
+	oldMessageId?: string;
 }
 const frames: Array<{ target: string; message: FrameMessage }> = [];
 let onFrame: ((message: FrameMessage) => void) | undefined;
@@ -50,9 +76,17 @@ mock.module("./agent-runtime/inbox", () => ({
 }));
 const { getStreamingSnapshot, clearStreamingSnapshot } = await import("./narrator-event-handler");
 const { narratorPersistence } = await import("./narrator-persistence");
-const { retryModelTrace, cancelModelTrace } = await import("./modeltrace-service");
-const { tryClaimExecution } = await import("./agent-runtime/ownership");
 const id = "modeltrace-stream-child";
+mock.module("./modeltrace-store", () => ({
+	ensureTraceNarrator: async () => id,
+	createDiagnosticNarrator: async () => id,
+	clearTraceHistory: async () => {},
+}));
+const { startModelTrace, retryModelTrace, calibrateModelTrace, cancelModelTrace } = await import(
+	"./modeltrace-service"
+);
+const { tryClaimExecution } = await import("./agent-runtime/ownership");
+const parentId = "modeltrace-stream-parent";
 const userId = "modeltrace-stream-user";
 let chat: ReturnType<typeof mock<ProviderAdapter["chat"]>>;
 const source: ChatParams = {
@@ -75,15 +109,29 @@ beforeEach(async () => {
 		.insert(users)
 		.values({ id: userId, username: userId, passwordHash: "test", createdAt: now })
 		.onConflictDoNothing();
-	await db.insert(narrators).values({ id, traits: ["modeltrace"], createdAt: now, updatedAt: now });
+	await db.insert(narrators).values({
+		id,
+		ownerUserId: userId,
+		model: source.model,
+		visibility: "private",
+		writeAudience: "owner",
+		traits: ["modeltrace"],
+		createdAt: now,
+		updatedAt: now,
+	});
 	chat = mock(async function* () {
 		yield { text: "answer" };
 	});
-	rememberModelTraceRequest(id, { chat } as unknown as ProviderAdapter, source, "test-provider");
+	rememberModelTraceRequest(
+		parentId,
+		{ chat, supportsDiagnosticFork: () => true } as unknown as ProviderAdapter,
+		source,
+		"test-provider",
+	);
 });
 afterEach(async () => {
 	cancelModelTrace(id);
-	forgetModelTraceRequest(id);
+	forgetModelTraceRequest(parentId);
 	clearStreamingSnapshot(id);
 	onFrame = undefined;
 	mock.restore();
@@ -97,10 +145,10 @@ afterEach(async () => {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 });
-afterAll(() => sqlite.close());
+afterAll(() => fixture.close());
 
-async function launch() {
-	await retryModelTrace(id, userId);
+async function launch(options?: Parameters<typeof startModelTrace>[3]) {
+	await startModelTrace(parentId, userId, "en", options);
 }
 async function replies() {
 	return (await db.query.narratorMessages.findMany({ where: eq(narratorMessages.narratorId, id) }))
@@ -126,8 +174,8 @@ test("native prefix and reconnect snapshot are visible before completion; final 
 	let providerEnded = false;
 	const answer = JSON.stringify(Array(300).fill(17));
 	chat.mockImplementation(async function* (params) {
-		expect(params.conversationId).toBe(source.conversationId);
-		expect(params.content.startsWith(source.content)).toBe(true);
+		expect(params.conversationId).not.toBe(source.conversationId);
+		expect(params.content).toBe("sampling challenge 1");
 		yield { reasoning: "private reasoning" };
 		yield { text: answer.slice(0, 12) };
 		await next.promise;
@@ -191,6 +239,149 @@ test("native prefix and reconnect snapshot are visible before completion; final 
 	expect(requests[0]?.messageId).toBe(rows[0]?.id);
 	expect(chat).toHaveBeenCalledTimes(1);
 	assertReleased();
+});
+
+test.each([
+	"write revoked",
+	"read revoked",
+	"source deleted",
+])("fork retry and calibration do not call the provider after %s", async (scenario) => {
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id: parentId,
+		ownerUserId: userId,
+		visibility: "public",
+		writeAudience: "public",
+		createdAt: now,
+		updatedAt: now,
+	});
+	try {
+		await launch({ fork: true });
+		await finished.promise;
+		expect(chat).toHaveBeenCalledTimes(1);
+		const token = frames
+			.map(({ message }) => message.message?.contentJson?.[0]?.calibrationId)
+			.find(Boolean);
+		if (!token) throw new Error("Expected a valid calibration token in the result frame");
+		if (scenario === "source deleted") {
+			await db.delete(narrators).where(eq(narrators.id, parentId));
+		} else {
+			await db
+				.update(narrators)
+				.set({
+					ownerUserId: null,
+					visibility: scenario === "read revoked" ? "private" : "public",
+					writeAudience: scenario === "write revoked" ? "owner" : "public",
+				})
+				.where(eq(narrators.id, parentId));
+		}
+		expect(await captureWorkerRejection(retryModelTrace(id, userId))).toBeInstanceOf(NotFoundError);
+		expect(
+			await captureWorkerRejection(calibrateModelTrace(id, token, { userId, isAdmin: false })),
+		).toBeInstanceOf(NotFoundError);
+		expect(chat).toHaveBeenCalledTimes(1);
+		assertReleased();
+	} finally {
+		await db.delete(narrators).where(eq(narrators.id, parentId));
+	}
+});
+
+test("parallel calibration updates one bounded card without ordinary chat streams or duplicate answers", async () => {
+	const resume = Promise.withResolvers<void>();
+	const live = Promise.withResolvers<NonNullable<FrameMessage["message"]>>();
+	const answer = "x".repeat(500);
+	let sample = 0;
+	chat.mockImplementation(async function* () {
+		const current = ++sample;
+		yield {
+			text: `${current}:${answer}`,
+			messageId: `upstream-${current}`,
+			usage: { inputTokens: current, completionTokens: 10 + current },
+		};
+		await resume.promise;
+	});
+	onFrame = ({ message }) => {
+		if (
+			message?.contentJson?.[0]?.sampleProgress?.every(
+				(slot) => slot.state === "running" && slot.text,
+			)
+		)
+			live.resolve(message);
+	};
+	await launch({ calibrate: true });
+	const visible = await live.promise;
+	expect(chat).toHaveBeenCalledTimes(3);
+	expect(getStreamingSnapshot(id)).toBeUndefined();
+	expect(deltas()).toHaveLength(0);
+	const persisted = readTestMessageContent(sqlite, visible.id);
+	expect(persisted).toEqual(visible.contentJson ?? []);
+	expect(visible.contentJson?.[0]?.sampleProgress?.map((slot) => slot.text?.length)).toEqual([
+		120, 120, 120,
+	]);
+	resume.resolve();
+	await finished.promise;
+	const requests = await db.query.apiRequests.findMany({ where: eq(apiRequests.narratorId, id) });
+	expect(await replies()).toHaveLength(0);
+	expect(requests).toHaveLength(3);
+	expect(requests.map(({ outputTokens }) => outputTokens).sort()).toEqual([11, 12, 13]);
+	const cards = (
+		await db.query.narratorMessages.findMany({ where: eq(narratorMessages.narratorId, id) })
+	).filter(({ role }) => role === "disp");
+	expect(cards.map(({ id }) => id)).toEqual([visible.id]);
+	expect(readTestMessageContent(sqlite, visible.id)).toMatchObject([
+		{
+			decision: "partial",
+			sampleProgress: Array.from({ length: 3 }, () => ({ state: "complete", attempt: 1 })),
+		},
+	]);
+	expect(getStreamingSnapshot(id)).toBeUndefined();
+	assertReleased();
+});
+
+test("calibration finalization uses copy-on-write when another narrator acquired a ref", async () => {
+	const pendingFrame = Promise.withResolvers<NonNullable<FrameMessage["message"]>>();
+	const resume = Promise.withResolvers<void>();
+	const sibling = `${id}-sibling`;
+	const siblingRef = `${sibling}-ref`;
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({ id: sibling, createdAt: now, updatedAt: now });
+	try {
+		chat.mockImplementation(async function* () {
+			await resume.promise;
+			yield { text: "[17]" };
+		});
+		onFrame = ({ message }) => {
+			if (message?.contentJson?.[0]?.progressOnly) pendingFrame.resolve(message);
+		};
+		await launch({ calibrate: true });
+		const pending = await pendingFrame.promise;
+		const ownRef = await db.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.messageId, pending.id),
+		});
+		await db
+			.insert(narratorMessageRefs)
+			.values({ id: siblingRef, narratorId: sibling, messageId: pending.id, seq: 0 });
+		resume.resolve();
+		await finished.promise;
+		const updated = frames
+			.map(({ message }) => message)
+			.find((frame) => frame.oldMessageId === pending.id);
+		expect(updated?.message?.refId).toBe(ownRef?.id);
+		expect(updated?.message?.id).not.toBe(pending.id);
+		expect(updated?.message?.contentJson?.[0]?.progressOnly).toBeUndefined();
+		expect(readTestMessageContent(sqlite, pending.id)).toEqual(pending.contentJson ?? []);
+		expect(
+			(
+				await db.query.narratorMessageRefs.findFirst({
+					where: eq(narratorMessageRefs.id, siblingRef),
+				})
+			)?.messageId,
+		).toBe(pending.id);
+	} finally {
+		resume.resolve();
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, siblingRef));
+		await db.delete(narrators).where(eq(narrators.id, sibling));
+	}
 });
 
 test("coalesces a burst into incremental chunks and flushes pending text during a provider pause", async () => {
@@ -268,7 +459,7 @@ test("cancellation seals incomplete text, retains usage, clears snapshot, and re
 	chat.mockImplementation(async function* () {
 		yield { text: "retry answer" };
 	});
-	await launch();
+	await retryModelTrace(id, userId);
 	await finished.promise;
 	rows = await replies();
 	expect(rows).toHaveLength(2);

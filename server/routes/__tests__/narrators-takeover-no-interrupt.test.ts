@@ -37,8 +37,11 @@ const { db } = await import("../../db");
 const { narrators, users } = await import("../../db/schema");
 const { eq } = await import("drizzle-orm");
 const { generateId } = await import("../../lib/id");
+const { eventBus } = await import("../../lib/event-bus");
 const { parseSubstatus } = await import("../../lib/narrator-utils");
-const { activeNarrators } = await import("../../services/narrator-session-state");
+const { activeNarrators, claimNarratorRuntime } = await import(
+	"../../services/narrator-session-state"
+);
 const {
 	getExecutionOwner,
 	getRunHold,
@@ -304,14 +307,63 @@ describe("releasing a hold", () => {
 });
 
 describe("when nothing is actually running", () => {
-	test("refuses with 409 rather than recording a hold nobody will honour", async () => {
-		// working in the DB, but no run owns it: between passes, or a zombie row.
-		const res = await takeover(subagentId);
+	test("waits out the gap between passes and holds the run that resumes", async () => {
+		// working in the DB, no run for a moment: the next pass claims it shortly.
+		const pending = takeover(subagentId);
+		await Bun.sleep(100);
+		const { run, turn } = registerRun(subagentId);
 
-		expect(res.status).toBe(409);
-		expect(isTakenOver(subagentId)).toBe(false);
+		const res = await pending;
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ takenOver: true });
+		expect(turn.signal.aborted).toBe(false);
+		expect(run.cancel.signal.aborted).toBe(false);
+		expect(isTakenOver(subagentId)).toBe(true);
+		expect((await readSubagent())?.status).toBe("working");
+	});
+
+	test("repairs a zombie row and holds it instead of refusing forever", async () => {
+		// working in the DB, but no run will ever own it again: its writer is gone.
+		await setSubagentRow({ substatus: JSON.stringify(["interrupted"]) });
+		// A parent waiting on this subagent settles when it turns idle without a hold.
+		const heldWhenIdle: boolean[] = [];
+		const onStatus = (event: { narratorId: string; status: string }) => {
+			if (event.narratorId === subagentId && event.status === "idle")
+				heldWhenIdle.push(isTakenOver(subagentId));
+		};
+		eventBus.on("narrator:status_changed", onStatus);
+
+		const res = await Promise.resolve(takeover(subagentId)).finally(() =>
+			eventBus.off("narrator:status_changed", onStatus),
+		);
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ takenOver: true });
+		expect(isTakenOver(subagentId)).toBe(true);
 		const row = await readSubagent();
-		expect(parseSubstatus(row?.substatus)).not.toContain("taken_over");
+		// Idle and held, like a hold restored after a restart: the next message runs it.
+		expect(row?.status).toBe("idle");
+		expect(parseSubstatus(row?.substatus)).toEqual(
+			expect.arrayContaining(["interrupted", "taken_over"]),
+		);
+		expect(heldWhenIdle.length).toBeGreaterThan(0);
+		expect(heldWhenIdle.every(Boolean)).toBe(true);
+	});
+
+	test("asks for a retry while work is owned without a run", async () => {
+		const release = claimNarratorRuntime(subagentId, "recovery-stage");
+		try {
+			const res = await takeover(subagentId);
+
+			expect(res.status).toBe(409);
+			expect(isTakenOver(subagentId)).toBe(false);
+			const row = await readSubagent();
+			expect(row?.status).toBe("working");
+			expect(parseSubstatus(row?.substatus)).not.toContain("taken_over");
+		} finally {
+			release();
+		}
 	});
 
 	test("refuses an idle subagent", async () => {
@@ -326,5 +378,44 @@ describe("when nothing is actually running", () => {
 	test("refuses a session whose run delivers nowhere", async () => {
 		const res = await takeover(parentId);
 		expect(res.status).toBe(400);
+	});
+});
+
+describe("a running subagent whose run delivers nowhere", () => {
+	const noDestination = {
+		version: 1,
+		run: { logicalRunId: "orphan-run" },
+	};
+
+	function getDetail(id: string) {
+		return app().request(`http://localhost/narrators/${id}`);
+	}
+
+	test("detail reports whether takeover has a result to hold", async () => {
+		const delegated = await getDetail(subagentId);
+		expect(delegated.status).toBe(200);
+		expect((await delegated.json()).deliversResult).toBe(true);
+
+		await setSubagentRow({ runtimeRegistrationJson: noDestination });
+		const orphan = await getDetail(subagentId);
+		expect(orphan.status).toBe(200);
+		expect((await orphan.json()).deliversResult).toBe(false);
+	});
+
+	test("takeover is refused but Stop still ends it", async () => {
+		await setSubagentRow({ runtimeRegistrationJson: noDestination });
+
+		const refused = await takeover(subagentId);
+		expect(refused.status).toBe(400);
+		expect(await refused.json()).toMatchObject({ error: "This session does not deliver a result" });
+
+		const stop = await app().request(`http://localhost/narrators/${subagentId}/interrupt`, {
+			method: "POST",
+		});
+		expect(stop.status).toBe(200);
+		expect(await stop.json()).toEqual({ interrupted: true });
+		const row = await readSubagent();
+		expect(row.status).toBe("idle");
+		expect(parseSubstatus(row.substatus)).toContain("interrupted");
 	});
 });

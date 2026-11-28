@@ -11,8 +11,15 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconPlus, IconRefresh, IconTrash } from "@tabler/icons-react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import {
+	IconDownload,
+	IconEye,
+	IconPencil,
+	IconPlus,
+	IconRefresh,
+	IconTrash,
+} from "@tabler/icons-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useCreateProjectSkill,
@@ -23,6 +30,7 @@ import {
 	useUpdateProjectSkill,
 } from "../../hooks/useSkills";
 import { api } from "../../lib/api";
+import { SkillLinkModal } from "./SkillLinkModal";
 
 const MAX_SKILL_FILE_PREVIEW_ITEMS = 50;
 const MAX_SKILL_FILE_PREVIEW_CHARS = 2_000;
@@ -34,6 +42,7 @@ interface SkillSummary {
 	location: string;
 	files: string[];
 	disabled?: boolean;
+	canUpdateFromUrl?: boolean;
 }
 
 interface SkillDraft {
@@ -98,8 +107,17 @@ export function ProjectSkillsManager({
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [viewOpened, { open: openView, close: closeView }] = useDisclosure(false);
+	const [linkTarget, setLinkTarget] = useState<{
+		projectId: string;
+		skill?: SkillSummary;
+	} | null>(null);
+	const closeLink = useCallback(() => setLinkTarget(null), []);
+	useEffect(() => {
+		if (!canManage || linkTarget?.projectId !== projectId) closeLink();
+	}, [canManage, linkTarget?.projectId, projectId, closeLink]);
 
 	const editLoadSeqRef = useRef(0);
+	const editProjectIdRef = useRef(projectId);
 	const draftTouchedRef = useRef(false);
 	const [editingSkill, setEditingSkill] = useState<string | null>(null);
 	const [draft, setDraft] = useState<SkillDraft>({ name: "", description: "", content: "" });
@@ -119,6 +137,15 @@ export function ProjectSkillsManager({
 		closeEdit();
 	}, [closeEdit]);
 
+	useEffect(() => {
+		const projectChanged = editProjectIdRef.current !== projectId;
+		editProjectIdRef.current = projectId;
+		if (!canManage || projectChanged) handleCloseEdit();
+		return () => {
+			editLoadSeqRef.current++;
+		};
+	}, [canManage, projectId, handleCloseEdit]);
+
 	const updateDraft = useCallback((updater: (current: SkillDraft) => SkillDraft) => {
 		draftTouchedRef.current = true;
 		setDraft(updater);
@@ -131,8 +158,8 @@ export function ProjectSkillsManager({
 		setEditContentLoading(false);
 		setEditingSkill(null);
 		setDraft({ name: "", description: "", content: "" });
-		openEdit();
-	}, [canManage, openEdit]);
+		setLinkTarget({ projectId });
+	}, [canManage, projectId]);
 
 	const handleEdit = useCallback(
 		(skill: SkillSummary) => {
@@ -173,9 +200,11 @@ export function ProjectSkillsManager({
 		if (editingSkill) {
 			updateMutation.mutate({ currentName: editingSkill, ...data }, { onSuccess: handleCloseEdit });
 		} else {
-			createMutation.mutate(data, { onSuccess: handleCloseEdit });
+			createMutation.mutate(data, {
+				onSuccess: () => setLinkTarget((current) => (current === linkTarget ? null : current)),
+			});
 		}
-	}, [canManage, createMutation, draft, editingSkill, handleCloseEdit, updateMutation]);
+	}, [canManage, createMutation, draft, editingSkill, handleCloseEdit, linkTarget, updateMutation]);
 
 	const handleDelete = useCallback(
 		(name: string) => {
@@ -206,6 +235,64 @@ export function ProjectSkillsManager({
 	}, [canManage, refreshMutation]);
 
 	const disabledTitle = canManage ? undefined : disabledReason;
+	const editorForm = (
+		<Stack>
+			<Text size="xs" c="dimmed">
+				{t("projectSkillWritePath")}
+			</Text>
+			<TextInput
+				label={t("skillName")}
+				placeholder={t("skillNamePlaceholder")}
+				value={draft.name}
+				onChange={(e) => {
+					// Read the value before the updater runs: React nulls out
+					// currentTarget once the event handler returns.
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, name: val }));
+				}}
+			/>
+			<TextInput
+				label={t("skillDescription")}
+				placeholder={t("skillDescriptionPlaceholder")}
+				value={draft.description}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, description: val }));
+				}}
+			/>
+			<Textarea
+				label={t("skillContent")}
+				placeholder={t("skillContentPlaceholder")}
+				value={draft.content}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, content: val }));
+				}}
+				autosize
+				minRows={8}
+				maxRows={20}
+			/>
+			<Group justify="flex-end" gap="xs">
+				<Button
+					variant="subtle"
+					onClick={editingSkill ? handleCloseEdit : closeLink}
+					disabled={createMutation.isPending || updateMutation.isPending}
+				>
+					{t("cancel")}
+				</Button>
+				<Button
+					onClick={handleSave}
+					disabled={
+						!canManage || editContentLoading || !draft.name.trim() || !draft.description.trim()
+					}
+					loading={createMutation.isPending || updateMutation.isPending}
+					title={disabledTitle}
+				>
+					{t("save")}
+				</Button>
+			</Group>
+		</Stack>
+	);
 
 	return (
 		<Stack>
@@ -213,13 +300,14 @@ export function ProjectSkillsManager({
 				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
 					{t("projectSkillWritePath")}
 				</Text>
-				<Group gap="xs">
+				<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 					<ActionIcon
 						variant="subtle"
 						size="sm"
 						onClick={handleRefresh}
 						loading={refreshMutation.isPending}
 						disabled={!canManage}
+						aria-label={t("refreshSkills")}
 						title={disabledTitle ?? t("refreshSkills")}
 					>
 						<IconRefresh size={14} />
@@ -232,7 +320,7 @@ export function ProjectSkillsManager({
 						disabled={!canManage}
 						title={disabledTitle}
 					>
-						{t("createSkill")}
+						{t("addSkill")}
 					</Button>
 				</Group>
 			</Group>
@@ -292,18 +380,53 @@ export function ProjectSkillsManager({
 									</Text>
 								)}
 							</div>
-							<Group gap={4}>
-								<Button variant="subtle" size="compact-xs" onClick={() => handleView(skill)}>
-									{t("viewSkill")}
-								</Button>
-								<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(skill)}>
-									{t("editSkill")}
-								</Button>
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+								<ActionIcon
+									variant="subtle"
+									size="sm"
+									onClick={() => handleView(skill)}
+									disabled={!canManage}
+									aria-label={t("viewSkill")}
+									title={disabledTitle ?? t("viewSkill")}
+								>
+									<IconEye size={14} />
+								</ActionIcon>
+								<ActionIcon
+									variant="subtle"
+									size="sm"
+									onClick={() => handleEdit(skill)}
+									disabled={!canManage}
+									aria-label={t("editSkill")}
+									title={disabledTitle ?? t("editSkill")}
+								>
+									<IconPencil size={14} />
+								</ActionIcon>
+								<ActionIcon
+									variant="subtle"
+									size="sm"
+									onClick={() => {
+										if (canManage && skill.canUpdateFromUrl) setLinkTarget({ projectId, skill });
+									}}
+									disabled={!canManage || !skill.canUpdateFromUrl}
+									aria-label={t("updateSkillFromLink")}
+									title={
+										!canManage
+											? (disabledReason ?? t("skillLinkManagementUnavailable"))
+											: !skill.canUpdateFromUrl
+												? t("skillLinkUpdateUnsupported")
+												: t("updateSkillFromLink")
+									}
+								>
+									<IconDownload size={14} />
+								</ActionIcon>
 								<ActionIcon
 									variant="subtle"
 									color="red"
 									size="sm"
 									onClick={() => handleDelete(skill.name)}
+									disabled={!canManage}
+									aria-label={t("deleteSkill")}
+									title={disabledTitle ?? t("deleteSkill")}
 								>
 									<IconTrash size={14} />
 								</ActionIcon>
@@ -313,64 +436,18 @@ export function ProjectSkillsManager({
 				);
 			})}
 
-			<Modal
-				opened={editOpened}
-				onClose={handleCloseEdit}
-				title={editingSkill ? t("editSkill") : t("createSkill")}
-				size="lg"
-			>
-				<Stack>
-					<Text size="xs" c="dimmed">
-						{t("projectSkillWritePath")}
-					</Text>
-					<TextInput
-						label={t("skillName")}
-						placeholder={t("skillNamePlaceholder")}
-						value={draft.name}
-						onChange={(e) => {
-							// Read the value before the updater runs: React nulls out
-							// currentTarget once the event handler returns.
-							const val = e.currentTarget.value;
-							updateDraft((d) => ({ ...d, name: val }));
-						}}
-					/>
-					<TextInput
-						label={t("skillDescription")}
-						placeholder={t("skillDescriptionPlaceholder")}
-						value={draft.description}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							updateDraft((d) => ({ ...d, description: val }));
-						}}
-					/>
-					<Textarea
-						label={t("skillContent")}
-						placeholder={t("skillContentPlaceholder")}
-						value={draft.content}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							updateDraft((d) => ({ ...d, content: val }));
-						}}
-						autosize
-						minRows={8}
-						maxRows={20}
-					/>
-					<Group justify="flex-end" gap="xs">
-						<Button variant="subtle" onClick={handleCloseEdit}>
-							{t("cancel")}
-						</Button>
-						<Button
-							onClick={handleSave}
-							disabled={
-								!canManage || editContentLoading || !draft.name.trim() || !draft.description.trim()
-							}
-							loading={createMutation.isPending || updateMutation.isPending}
-							title={disabledTitle}
-						>
-							{t("save")}
-						</Button>
-					</Group>
-				</Stack>
+			<SkillLinkModal
+				opened={linkTarget?.projectId === projectId}
+				onClose={closeLink}
+				projectId={projectId}
+				skill={linkTarget?.skill}
+				enabled={canManage}
+				manualForm={!linkTarget?.skill ? editorForm : undefined}
+				manualPending={createMutation.isPending}
+			/>
+
+			<Modal opened={editOpened} onClose={handleCloseEdit} title={t("editSkill")} size="lg">
+				{editorForm}
 			</Modal>
 
 			<Modal

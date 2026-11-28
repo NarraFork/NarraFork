@@ -1,7 +1,9 @@
 // Codex Usage API — fetch ChatGPT account usage limits
 // Based on https://chatgpt.com/backend-api/wham/usage
 
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { logger } from "./logger";
+import { applyProxyExemptions } from "./net/proxy";
 
 export type CodexUsageWindowType = "5h" | "weekly" | "monthly" | "unknown";
 
@@ -289,6 +291,23 @@ export function getCodexUsageWindows(usage?: CodexUsageResult): CodexUsageWindow
 	);
 }
 
+/** Project the canonical credential-state usage without storing a second snapshot. */
+export function projectCodexUsageSnapshot(usage: CodexUsageResult): QuotaSnapshot {
+	const fetchedAt = Date.parse(usage.queriedAt);
+	return {
+		fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : 0,
+		scope: "subscription",
+		windows: getCodexUsageWindows(usage).map((window) => ({
+			kind: window.window_type === "unknown" ? "other" : window.window_type,
+			usedRatio: window.used_percent / 100,
+			resetsAt: window.reset_at * 1000,
+		})),
+		balances: [],
+		plan: usage.plan_type,
+		detail: usage,
+	};
+}
+
 async function readResponseTextWithLimit(response: Response): Promise<string> {
 	const contentLength = Number(response.headers.get("content-length"));
 	if (Number.isFinite(contentLength) && contentLength > MAX_USAGE_RESPONSE_BYTES) {
@@ -356,9 +375,13 @@ export async function fetchCodexUsage(
 		headers,
 		signal: abortController.signal,
 	};
-	if (proxy) {
+	// Exemptions are applied here so a usage endpoint covered by
+	// `settings.proxy.noProxyRules` is reached directly, whichever proxy mode
+	// (custom / system / inherited global) produced this URL.
+	const effectiveProxy = proxy ? applyProxyExemptions(proxy, USAGE_API_URL) : undefined;
+	if (effectiveProxy) {
 		// @ts-expect-error - Bun supports proxy option
-		fetchOptions.proxy = proxy;
+		fetchOptions.proxy = effectiveProxy;
 	}
 
 	try {
@@ -446,9 +469,13 @@ export async function consumeCodexResetCredit(
 		body: JSON.stringify({ redeem_request_id: crypto.randomUUID() }),
 		signal: abortController.signal,
 	};
-	if (proxy) {
+	// Same exemption step as `fetchCodexUsage`: rules win over every proxy mode.
+	const effectiveProxy = proxy
+		? applyProxyExemptions(proxy, RESET_CREDITS_CONSUME_API_URL)
+		: undefined;
+	if (effectiveProxy) {
 		// @ts-expect-error - Bun supports proxy option
-		fetchOptions.proxy = proxy;
+		fetchOptions.proxy = effectiveProxy;
 	}
 
 	try {

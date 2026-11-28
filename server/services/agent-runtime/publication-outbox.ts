@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
@@ -8,6 +9,7 @@ import {
 	narratorToolContinuations,
 	runtimePublicationOutbox as outbox,
 } from "../../db/schema";
+import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
@@ -20,7 +22,9 @@ import {
 } from "./mailbox";
 import { AWAITED_TERMINAL_CONSUMED_REASON } from "./mailbox-shared";
 import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
+import { publicationDedupeKey } from "./publication-key";
 import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
+import type { RuntimeReadOptions } from "./read-options";
 import { runAtomicWrite } from "./runtime-write";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -45,6 +49,79 @@ export interface PublicationRun {
 	logicalRunId: string;
 	recipientId: string;
 }
+const publicationFailureMessages = {
+	identity_mismatch: "Publication identity mismatch",
+	terminal_conflict: "Publication terminal conflict",
+	recipient_mismatch: "Publication reservation recipient mismatch",
+	run_mismatch: "Publication reservation run mismatch",
+	missing_reservation: "Publication requires a startup reservation",
+} as const;
+
+/** Bounded identity/status evidence only; never attach an intent or producer result. */
+export class PublicationStateError extends ValidationError {
+	constructor(
+		readonly reason: keyof typeof publicationFailureMessages,
+		phase: "start" | "finish" | "commit",
+		run: PublicationRun & { eventKind?: PublicationEvent },
+		evidence: {
+			producerKind?: string;
+			taskId?: string;
+			logicalRunId?: string | null;
+			recipientId?: string;
+			eventKind?: string;
+			state?: string;
+		} = {},
+	) {
+		const identity = {
+			phase,
+			eventKind: run.eventKind,
+			producerKind: run.producerKind,
+			taskId: run.taskId.slice(0, 256),
+			logicalRunId: run.logicalRunId.slice(0, 256),
+			recipientId: run.recipientId.slice(0, 256),
+			evidence: Object.fromEntries(
+				Object.entries(evidence).map(([key, value]) => [
+					key,
+					typeof value === "string" ? value.slice(0, 256) : value,
+				]),
+			),
+		};
+		super(
+			`${publicationFailureMessages[reason]}: ${JSON.stringify(identity)}`,
+			`PUBLICATION_${reason.toUpperCase()}`,
+		);
+	}
+}
+
+export function assertPublicationTaskIdentity(
+	run: PublicationRun,
+	task:
+		| {
+				id: string;
+				type: string;
+				logicalRunId: string | null;
+				parentNarratorId: string;
+				status: string;
+		  }
+		| undefined
+		| null,
+): void {
+	if (
+		!task ||
+		task.id !== run.taskId ||
+		task.type !== run.producerKind ||
+		task.logicalRunId !== run.logicalRunId ||
+		task.parentNarratorId !== run.recipientId
+	)
+		throw new PublicationStateError("identity_mismatch", "finish", run, {
+			producerKind: task?.type,
+			taskId: task?.id,
+			logicalRunId: task?.logicalRunId,
+			recipientId: task?.parentNarratorId,
+			state: task?.status ?? "missing",
+		});
+}
+
 export type LegacyPublicationSource = Omit<PublicationRun, "logicalRunId">;
 export interface LegacyRuntimeAdmission extends LegacyPublicationSource {
 	/** Obtained from the real runtime registry, not supplied by a tool/request argument. */
@@ -175,19 +252,7 @@ export interface PublicationIntent extends PublicationRun {
 	resultRef: string;
 	summary: string;
 }
-export function publicationDedupeKey(
-	run: PublicationRun,
-	eventKind: PublicationEvent | "terminal",
-) {
-	return JSON.stringify([
-		"publication",
-		run.producerKind,
-		run.taskId,
-		run.logicalRunId,
-		eventKind,
-		run.recipientId,
-	]);
-}
+export { publicationDedupeKey } from "./publication-key";
 /** Inverse of the event slot in publicationDedupeKey, for delivered mailbox receipts. */
 export function publicationEventFromDedupeKey(
 	dedupeKey: string | null,
@@ -1176,25 +1241,27 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		registerLegacyRunningRunSlots,
 		registerLegacyUnknownBashFailure,
 		registerLegacyCompletedRunSlots,
-		listPending(options: { afterId?: string; limit?: number } = {}, tx: RuntimeStoreDb = db) {
-			return tx
-				.select({
-					id: outbox.id,
-					recipientId: outbox.recipientId,
-					producerKind: outbox.producerKind,
-					logicalRunId: outbox.logicalRunId,
-					arrivalSeq: outbox.arrivalSeq,
-				})
-				.from(outbox)
-				.where(
-					and(
-						eq(outbox.state, "pending"),
-						options.afterId ? gt(outbox.id, options.afterId) : undefined,
-					),
-				)
-				.orderBy(asc(outbox.id))
-				.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1)
-				.all();
+		async listPending(options: { afterId?: string; limit?: number } & RuntimeReadOptions = {}) {
+			return readQuery(
+				db
+					.select({
+						id: outbox.id,
+						recipientId: outbox.recipientId,
+						producerKind: outbox.producerKind,
+						logicalRunId: outbox.logicalRunId,
+						arrivalSeq: outbox.arrivalSeq,
+					})
+					.from(outbox)
+					.where(
+						and(
+							eq(outbox.state, "pending"),
+							options.afterId ? gt(outbox.id, options.afterId) : undefined,
+						),
+					)
+					.orderBy(asc(outbox.id))
+					.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1),
+				{ ...options, executionPolicy: "worker-required", maxRows: L.pageSize + 1 },
+			);
 		},
 		/** Fail actual events, but preserve running tasks' reserved capacity until their result commits. */
 		failRecipient(recipientId: string, reason: string) {

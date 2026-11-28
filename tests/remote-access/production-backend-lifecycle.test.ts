@@ -9,7 +9,9 @@ import { createToken, verifyToken } from "../../server/lib/auth";
 import { eventBus } from "../../server/lib/event-bus";
 import { generateId } from "../../server/lib/id";
 import { markTrustedRemoteRequest } from "../../server/lib/remote-request-context";
+import { fenceUnattendedShutdown } from "../../server/lib/shutdown-activity";
 import { createStartupReadinessGate } from "../../server/lib/startup-readiness";
+import { projectRoutes } from "../../server/routes/projects";
 import { createProductionRemoteBackendHarness } from "../../server/services/__tests__/remote-access-harness";
 import { authSessionStore } from "../../server/services/auth/store";
 import {
@@ -17,6 +19,7 @@ import {
 	finishLiveCompactProgress,
 	startLiveCompactProgress,
 } from "../../server/services/compact-live-state";
+import { gitService } from "../../server/services/git-service";
 import { type WSData, wsHandlers } from "../../server/websocket/ws-handler";
 import { REMOTE_SESSION_INTROSPECT_PATH } from "../../shared/remote-access/ipc";
 
@@ -272,6 +275,58 @@ test("ordinary Response identity and Bun.file Range/HEAD semantics remain unchan
 	} finally {
 		void server.stop(true);
 	}
+});
+test("a local project clone blocks unattended shutdown even after its SSE client disconnects", async () => {
+	const cloning = Promise.withResolvers<void>();
+	const clone = spyOn(gitService, "cloneRepoStreaming").mockReturnValue(cloning.promise);
+	const app = new Hono<AppEnv>();
+	app.use("*", async (c, next) => {
+		c.set("user", { sub: userId, role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		await next();
+	});
+	app.route("/projects", projectRoutes);
+	const lifecycle = createServerRequestLifecycle();
+	const readiness = createStartupReadinessGate();
+	readiness.settle({ ok: true });
+	const dispatch = createServerRequestDispatcher({
+		app,
+		lifecycle,
+		startupReadiness: readiness,
+		activeDatabaseBackend: "sqlite",
+	});
+	try {
+		const response = await dispatch(
+			new Request("http://localhost/projects", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					name: "clone test",
+					gitPath: "/unused/project-clone-test",
+					repoMode: "clone",
+					cloneUrl: "https://example.invalid/repo.git",
+				}),
+			}),
+			{ requestIP: () => null, upgrade: () => false },
+		);
+		expect(response?.headers.get("content-type")).toContain("text/event-stream");
+		expect(clone).toHaveBeenCalledTimes(1);
+		expect(lifecycle.activeCount).toBe(1);
+		await response?.body?.cancel();
+		expect(lifecycle.activeCount).toBe(1);
+		expect(
+			await fenceUnattendedShutdown(
+				() => lifecycle.activeCount > 0,
+				async () => {
+					throw new Error("Shutdown should have found the active clone before probing");
+				},
+			),
+		).toBe(false);
+	} finally {
+		cloning.reject(new Error("test clone stopped"));
+		await lifecycle.drain();
+		clone.mockRestore();
+	}
+	expect(lifecycle.activeCount).toBe(0);
 });
 test("PostgreSQL refusal reaches both ordinary and private narrator socket entry", async () => {
 	const value = await authorized({ backend: "postgres" });

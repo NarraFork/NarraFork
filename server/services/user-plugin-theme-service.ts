@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { userPluginThemes } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { generateId } from "../lib/id";
 
 /**
@@ -19,10 +20,13 @@ export interface UserEnabledTheme {
 
 /** Return the set of themes a user has explicitly enabled. */
 export async function listEnabledThemes(userId: string): Promise<UserEnabledTheme[]> {
-	const rows = await db
-		.select({ pluginId: userPluginThemes.pluginId, themeId: userPluginThemes.themeId })
-		.from(userPluginThemes)
-		.where(and(eq(userPluginThemes.userId, userId), eq(userPluginThemes.enabled, true)));
+	const rows = await readQuery(
+		db
+			.select({ pluginId: userPluginThemes.pluginId, themeId: userPluginThemes.themeId })
+			.from(userPluginThemes)
+			.where(and(eq(userPluginThemes.userId, userId), eq(userPluginThemes.enabled, true))),
+		{ executionPolicy: "worker-required" },
+	);
 	return rows;
 }
 
@@ -32,17 +36,20 @@ export async function isThemeEnabled(
 	pluginId: string,
 	themeId: string,
 ): Promise<boolean> {
-	const row = await db
-		.select({ enabled: userPluginThemes.enabled })
-		.from(userPluginThemes)
-		.where(
-			and(
-				eq(userPluginThemes.userId, userId),
-				eq(userPluginThemes.pluginId, pluginId),
-				eq(userPluginThemes.themeId, themeId),
-			),
-		)
-		.limit(1);
+	const row = await readQuery(
+		db
+			.select({ enabled: userPluginThemes.enabled })
+			.from(userPluginThemes)
+			.where(
+				and(
+					eq(userPluginThemes.userId, userId),
+					eq(userPluginThemes.pluginId, pluginId),
+					eq(userPluginThemes.themeId, themeId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	return row.length > 0 && row[0].enabled === true;
 }
 
@@ -57,6 +64,8 @@ export async function setThemeEnabled(
 	enabled: boolean,
 ): Promise<boolean> {
 	const now = new Date().toISOString();
+	// Existence decides insert vs update in the same turn (no Worker hop), so two toggles
+	// of one theme cannot both insert.
 	const existing = await db
 		.select({ id: userPluginThemes.id })
 		.from(userPluginThemes)

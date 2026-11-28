@@ -44,6 +44,7 @@ import {
 	parseQueuedGoalCommand,
 	resumeNextBufferedMessage,
 } from "../narrator-session";
+import { activeNarrators } from "../narrator-session-state";
 import { rejectOutlinePending } from "../outline/pending";
 import { OUTLINE_TASKS_PAGE_ALIAS } from "../outline/person-tasks";
 import { outlineStore } from "../outline/store";
@@ -500,6 +501,17 @@ describe("the WebSocket ways in", () => {
 	test("buffer_message and update_buffer queue /goal for an outline session", async () => {
 		const owner = await user();
 		const id = await session({ owner, status: "working" });
+		// A working row with no runtime owner is a zombie: admission wakes the inbox,
+		// reconcile drops it to idle, and the queued /goal runs. A live loop is the
+		// session this case is about, so both commands stay queued.
+		activeNarrators.set(id, {
+			narratorId: id,
+			alive: true,
+			_loopRunning: true,
+		} as unknown as NonNullable<ReturnType<typeof activeNarrators.get>>);
+		restores.push(() => {
+			activeNarrators.delete(id);
+		});
 		const { ws } = openWs(owner);
 		await handleNarratorWS.message(ws, {
 			type: "buffer_message",

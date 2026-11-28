@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.14",
+	"version": "0.9.16",
 	"private": true,
 	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.3",
@@ -61,6 +61,7 @@
 		"lang-map": "^0.4.0",
 		"ldapts": "^9.2.0",
 		"linkedom": "^0.18.12",
+		"lmfpd-sdk": "0.2.0",
 		"marked": "^18.0.7",
 		"mermaid": "^11.16.0",
 		"monaco-editor": "0.56.0",
@@ -122,6 +123,7 @@
 	},
 	"scripts": {
 		"approve": "bun server/scripts/approve-all.ts",
+		"check:tokens": "bun scripts/check-style-tokens.ts",
 		"sql:report": "bun scripts/sql-trace-report.ts",
 		"build": "rm -f server/generated/embedded-frontend.ts && bunx vite build --config frontend/vite.config.ts && bun scripts/generate-builtin-plugins.ts",
 		"build:remote": "bun scripts/build-remote-frontend.ts",
@@ -145,7 +147,7 @@
 		"db:baseline:pg": "bun scripts/postgres-migrations.ts baseline",
 		"db:resume:pg": "bun scripts/postgres-migrations.ts resume",
 		"db:migrate": "bun server/db/migrate.ts",
-		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
+		"dev": "bun run db:migrate; PORT=7778 bun run --hot server/index.ts",
 		"dev:all": "bun server/dev-all.ts",
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:ts": "bun server/dev-all.ts",

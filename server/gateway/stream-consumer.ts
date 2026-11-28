@@ -146,13 +146,23 @@ export class GatewayStreamConsumer {
 
 	/**
 	 * Abort the consumer (e.g. on error). Best-effort final edit.
+	 * A failed edit is logged; it does not reject the caller.
 	 */
 	abort(): void {
 		this.done = true;
 		this.stopFlushTimer();
-		// Best-effort: try to deliver what we have
 		if (this.accumulated && this.messageId) {
-			this.sendOrEdit(this.accumulated).catch(() => {});
+			this.sendOrEdit(this.accumulated).then(
+				(delivered) => {
+					if (delivered) return;
+					logger.warn("[stream-consumer] Abort final edit was not delivered");
+				},
+				(err: unknown) => {
+					logger.error("[stream-consumer] Abort final edit failed", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				},
+			);
 		}
 		this.resolveCompletion?.();
 	}

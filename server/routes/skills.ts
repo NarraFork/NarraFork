@@ -1,11 +1,12 @@
-import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
-import { db } from "../db";
-import { projects } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { requireProjectAccess } from "../lib/project-access";
-import { createProjectSkillSchema, updateProjectSkillSchema } from "../lib/validators";
-import { requireAuth } from "../middleware/auth";
+import {
+	createProjectSkillSchema,
+	importSkillSchema,
+	updateProjectSkillSchema,
+} from "../lib/validators";
+import { requireAdmin, requireAuth } from "../middleware/auth";
 import { skillService } from "../services/skill-service";
 
 export const skillRoutes = new Hono();
@@ -36,6 +37,90 @@ async function getProjectGitPath(
 	return project.gitPath;
 }
 
+async function readSkillRemoteBody(c: Context): Promise<unknown> {
+	// Count actual bytes, including chunked bodies and misleading Content-Length.
+	const reader = c.req.raw.body?.getReader();
+	if (!reader) throw new ValidationError("A JSON request body is required");
+	const buffer = new Uint8Array(8_192);
+	let bytes = 0;
+	let timedOut = false;
+	const cancel = () => {
+		void reader.cancel().catch(() => {});
+	};
+	const timer = setTimeout(() => {
+		timedOut = true;
+		cancel();
+	}, 5_000);
+	c.req.raw.signal.addEventListener("abort", cancel, { once: true });
+	try {
+		for (;;) {
+			c.req.raw.signal.throwIfAborted();
+			const { done, value } = await reader.read();
+			if (timedOut) throw new AppError("Skill import request timed out", 408);
+			c.req.raw.signal.throwIfAborted();
+			if (done) break;
+			if (bytes + value.byteLength > buffer.byteLength) {
+				throw new AppError("Skill import request body is too large", 413);
+			}
+			buffer.set(value, bytes);
+			bytes += value.byteLength;
+		}
+	} finally {
+		clearTimeout(timer);
+		c.req.raw.signal.removeEventListener("abort", cancel);
+		cancel();
+		reader.releaseLock();
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytes)));
+	} catch {
+		throw new ValidationError("Invalid JSON request body");
+	}
+	return body;
+}
+
+async function readImportUrl(c: Context): Promise<string> {
+	const parsed = importSkillSchema.safeParse(await readSkillRemoteBody(c));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return parsed.data.url;
+}
+
+// Keep literal import endpoints before the name routes. Authorization always precedes downloads.
+// Global link import writes a remote file tree into the instance-wide skills directory.
+skillRoutes.post("/global/import", requireAdmin, async (c) => {
+	const url = await readImportUrl(c);
+	const skill = await skillService.importGlobalSkill(url, c.req.raw.signal);
+	return c.json(skill, 201);
+});
+
+skillRoutes.post("/import", async (c) => {
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");
+	const url = await readImportUrl(c);
+	const skill = await skillService.importProjectSkill(projectGitPath, url, c.req.raw.signal);
+	return c.json(skill, 201);
+});
+
+skillRoutes.post("/global/:name/update-from-url", requireAdmin, async (c) => {
+	const url = await readImportUrl(c);
+	return c.json(
+		await skillService.updateGlobalSkillFromUrl(c.req.param("name") ?? "", url, c.req.raw.signal),
+	);
+});
+
+skillRoutes.post("/:name/update-from-url", async (c) => {
+	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");
+	const url = await readImportUrl(c);
+	return c.json(
+		await skillService.updateProjectSkillFromUrl(
+			projectGitPath,
+			c.req.param("name"),
+			url,
+			c.req.raw.signal,
+		),
+	);
+});
+
 // === Global skill CRUD (must be before /:name to avoid route conflict) ===
 
 /**
@@ -43,7 +128,10 @@ async function getProjectGitPath(
  * List all global skills (scanned from ~/).
  */
 skillRoutes.get("/global", async (c) => {
-	const skills = await skillService.loadGlobalSkills();
+	const loaded = await skillService.loadGlobalSkills();
+	const skills = await Promise.all(
+		loaded.map((skill) => skillService.describeSkillManagement(null, skill)),
+	);
 	return c.json(
 		skills.map((s) => ({
 			name: s.name,
@@ -51,6 +139,7 @@ skillRoutes.get("/global", async (c) => {
 			location: s.location,
 			files: s.files,
 			disabled: s.disabled ?? false,
+			canUpdateFromUrl: s.canUpdateFromUrl ?? false,
 		})),
 	);
 });
@@ -64,7 +153,7 @@ skillRoutes.get("/global/:name", async (c) => {
 	const globals = await skillService.loadGlobalSkills();
 	const skill = globals.find((s) => s.name === name);
 	if (!skill) throw new NotFoundError("Global skill", name);
-	return c.json(skill);
+	return c.json(await skillService.describeSkillManagement(null, skill));
 });
 
 /**
@@ -136,7 +225,10 @@ skillRoutes.post("/global/:name/toggle", async (c) => {
  */
 skillRoutes.get("/", async (c) => {
 	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "read");
-	const skills = await skillService.loadProjectSkills(projectGitPath);
+	const loaded = await skillService.loadProjectSkills(projectGitPath);
+	const skills = await Promise.all(
+		loaded.map((skill) => skillService.describeSkillManagement(projectGitPath, skill)),
+	);
 	return c.json(
 		skills.map((s) => ({
 			name: s.name,
@@ -144,6 +236,7 @@ skillRoutes.get("/", async (c) => {
 			location: s.location,
 			files: s.files,
 			disabled: s.disabled ?? false,
+			canUpdateFromUrl: s.canUpdateFromUrl ?? false,
 		})),
 	);
 });
@@ -177,7 +270,7 @@ skillRoutes.get("/:name", async (c) => {
 	const skill = await skillService.loadSkillByName(projectGitPath, name);
 	if (!skill) throw new NotFoundError("Skill", name);
 
-	return c.json(skill);
+	return c.json(await skillService.describeSkillManagement(projectGitPath, skill));
 });
 
 /**

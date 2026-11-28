@@ -8,6 +8,7 @@ import {
 } from "../attached-files";
 import { ensureLegacyFileWorktreeCopy } from "../legacy-file-attachments";
 import { logger } from "../logger";
+import type { ModelHistoryPreparation } from "../model-history-preparation";
 import {
 	ensureImageWorktreeCopy,
 	type ImageRef,
@@ -53,13 +54,21 @@ function textFilesFromBlocks(blocks: Array<Record<string, unknown>>): PersistedF
 /** Immutable model-only preparation; upload identities and saved message rows stay intact. */
 export async function projectAttachmentLocations<T extends DbMessage>(
 	messages: readonly T[],
-	options: { cwd: string; narratorId: string; currentInput?: string; signal?: AbortSignal },
+	options: {
+		cwd: string;
+		narratorId: string;
+		currentInput?: string;
+		signal?: AbortSignal;
+		deadline?: number;
+		preparation?: ModelHistoryPreparation;
+	},
 ): Promise<{ messages: T[]; currentInput?: string }> {
 	options.signal?.throwIfAborted();
+	const startedAt = Date.now();
 	const budget: ImageWorktreeCopyBudget = {
 		remainingCopies: MAX_HISTORY_ATTACHMENT_COPIES,
 		remainingBytes: MAX_HISTORY_ATTACHMENT_BYTES,
-		deadlineAt: Date.now() + COPY_PREPARATION_BUDGET_MS,
+		deadlineAt: options.deadline ?? startedAt + COPY_PREPARATION_BUDGET_MS,
 	};
 	const copies = new Map<string, Promise<TextFileRef | null>>();
 	const current = findCurrentSenderMessage(messages);
@@ -101,12 +110,13 @@ export async function projectAttachmentLocations<T extends DbMessage>(
 			let copy = copies.get(key);
 			if (!copy) {
 				copy = ensureImageWorktreeCopy(options.cwd, image, owner, options.signal, budget).catch(
-					(error) => {
+					() => {
 						options.signal?.throwIfAborted();
 						logger.warn("Image worktree copy unavailable", {
+							preparationId: options.preparation?.preparationId,
 							messageId: message.id,
 							imageId: image.imageId,
-							error: String(error),
+							outcome: "unavailable",
 						});
 						return null;
 					},
@@ -126,11 +136,12 @@ export async function projectAttachmentLocations<T extends DbMessage>(
 			let copy = copies.get(key);
 			if (!copy) {
 				copy = ensureLegacyFileWorktreeCopy(options.cwd, source, options.signal, budget).catch(
-					(error) => {
+					() => {
 						options.signal?.throwIfAborted();
 						logger.warn("Legacy file worktree copy unavailable", {
+							preparationId: options.preparation?.preparationId,
 							messageId: message.id,
-							error: String(error),
+							outcome: "unavailable",
 						});
 						return null;
 					},
@@ -191,8 +202,11 @@ export async function projectAttachmentLocations<T extends DbMessage>(
 		}
 	}
 	options.signal?.throwIfAborted();
-	const durationMs = Date.now() - (budget.deadlineAt - COPY_PREPARATION_BUDGET_MS);
-	if (durationMs > 1000) {
+	options.preparation?.count("distinctAttachments", copies.size);
+	options.preparation?.count("newCopies", MAX_HISTORY_ATTACHMENT_COPIES - budget.remainingCopies);
+	options.preparation?.count("copiedBytes", MAX_HISTORY_ATTACHMENT_BYTES - budget.remainingBytes);
+	const durationMs = Date.now() - startedAt;
+	if (!options.preparation && durationMs > 1000) {
 		logger.warn("Slow model attachment preparation", {
 			narratorId: options.narratorId,
 			durationMs,

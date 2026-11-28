@@ -66,7 +66,7 @@ describe("bounded mirror timeout configuration", () => {
 		expect(mirrorJobTimeoutMs("remote-peer")).toBe(120 * 60_000);
 		expect(mirrorJobTimeoutMs("main", "300")).toBe(300 * 60_000);
 		expect(mirrorTransferTimeoutMs()).toBe(15 * 60_000);
-		expect(mirrorTransferTimeoutMs("60")).toBe(60 * 60_000);
+		expect(mirrorTransferTimeoutMs("100")).toBe(100 * 60_000);
 		for (const value of [
 			"NaN",
 			"-1",
@@ -81,7 +81,7 @@ describe("bounded mirror timeout configuration", () => {
 			1.5,
 		])
 			expect(() => mirrorJobTimeoutMs("main", value)).toThrow();
-		for (const value of ["61", "0", "NaN", "1e1", -1, 61, Number.POSITIVE_INFINITY])
+		for (const value of ["101", "0", "NaN", "1e1", -1, 101, Number.POSITIVE_INFINITY])
 			expect(() => mirrorTransferTimeoutMs(value)).toThrow();
 		for (const value of [0, Number.NaN, 300 * 60_000 + 1])
 			expect(() => validateMirrorJobTimeoutMs(value)).toThrow();

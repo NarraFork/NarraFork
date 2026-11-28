@@ -40,6 +40,7 @@ import {
 import { setUploadsDirForTests } from "../../lib/uploads";
 import {
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	sendMessageSchema,
 	updateBufferedMessageSchema,
 } from "../../lib/validators/narrators";
@@ -63,6 +64,7 @@ function execute(text: string, bindings: Record<string, unknown>) {
 	return new Function(...Object.keys(bindings), js)(...Object.values(bindings));
 }
 const common = {
+	resolveNarratorMessageOnlyRevert: async () => true,
 	ValidationError,
 	NotFoundError,
 	catalogError,
@@ -90,6 +92,7 @@ const common = {
 	releaseStagedFiles: () => {},
 	parseFileReferenceInput,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	sendMessageSchema,
 	updateBufferedMessageSchema,
 	validateUploadedImage: () => {
@@ -330,7 +333,7 @@ describe("new-session media forwarding", () => {
 				const branch = section(
 					source,
 					"\t\tif (queuedNewCommand && !narratorBusy) {",
-					"\n\t\tconst locale = await getUserLanguage(userId);",
+					"\n\t\tconst { locale, replyInUserLanguage } = await readMessageLanguagePreferences(",
 				);
 				const cleanup = section(source, "\t} finally {\n\t\tif (!uploadsAccepted)", "\n});");
 				const run = execute(

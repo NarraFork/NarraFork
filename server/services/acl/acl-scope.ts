@@ -20,6 +20,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { knowledgeCollections, knowledgeEntries, narrators } from "../../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../../db/worker-read";
 import { resolveNarratorProjectId } from "../narrator-project";
 
 /**
@@ -82,7 +83,11 @@ function collectionInheritsProjectGate(collection: Record<string, unknown>): boo
 	return collection.inheritProjectGate === true || collection.inheritProjectGate === 1;
 }
 
-export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]> {
+export async function resolveAncestorChain(
+	scope: AclScope,
+	readOptions?: ReadQueryOptions,
+): Promise<AclScope[]> {
+	readOptions?.signal?.throwIfAborted();
 	switch (scope.type) {
 		case "global":
 			return [];
@@ -92,14 +97,22 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 
 		case "narrator": {
 			if (!scope.id) return [GLOBAL_SCOPE];
-			const narrator = await db.query.narrators.findFirst({
+			const query = db.query.narrators.findMany({
+				limit: 1,
 				where: eq(narrators.id, scope.id),
 				columns: { id: true, contextProjectId: true },
 			});
+			const narrator = readOptions
+				? await readQueryFirst(query, {
+						...readOptions,
+						executionPolicy: "worker-required",
+						maxRows: 1,
+					})
+				: (await query)[0];
 			if (!narrator) return [GLOBAL_SCOPE];
 			const chain: AclScope[] = [];
 			// Single source of truth for "which project" — see narrator-project.ts.
-			const projectId = await resolveNarratorProjectId(narrator);
+			const projectId = await resolveNarratorProjectId(narrator, readOptions);
 			if (projectId) chain.push({ type: "project", id: projectId });
 			chain.push(GLOBAL_SCOPE);
 			return chain;
@@ -107,10 +120,14 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 
 		case "knowledge_collection": {
 			if (!scope.id) return [GLOBAL_SCOPE];
-			const collection = await db.query.knowledgeCollections.findFirst({
+			const query = db.query.knowledgeCollections.findMany({
+				limit: 1,
 				where: eq(knowledgeCollections.id, scope.id),
 				columns: { projectId: true },
 			});
+			const collection = readOptions
+				? await readQueryFirst(query, { ...readOptions, executionPolicy: "worker-required" })
+				: (await query)[0];
 			if (!collection?.projectId) return [GLOBAL_SCOPE];
 			// The project gate is opt-in per collection. Collections created before
 			// project ACLs existed were readable by anyone who could reach the project
@@ -126,16 +143,20 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 
 		case "knowledge_entry": {
 			if (!scope.id) return [GLOBAL_SCOPE];
-			const entry = await db.query.knowledgeEntries.findFirst({
+			const query = db.query.knowledgeEntries.findMany({
+				limit: 1,
 				where: eq(knowledgeEntries.id, scope.id),
 				columns: { collectionId: true },
 			});
+			const entry = readOptions
+				? await readQueryFirst(query, { ...readOptions, executionPolicy: "worker-required" })
+				: (await query)[0];
 			if (!entry?.collectionId) return [GLOBAL_SCOPE];
 			const collectionScope: AclScope = {
 				type: "knowledge_collection",
 				id: entry.collectionId,
 			};
-			return [collectionScope, ...(await resolveAncestorChain(collectionScope))];
+			return [collectionScope, ...(await resolveAncestorChain(collectionScope, readOptions))];
 		}
 	}
 }

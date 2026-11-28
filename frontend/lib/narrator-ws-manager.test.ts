@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION } from "@shared/recent-tabs";
-import { coerceMessageReplacementAliases } from "../hooks/useNarratorWS";
+import { coerceMessageReplacementAliases, coerceNarratorStatusPatch } from "../hooks/useNarratorWS";
+import { getAuthSnapshot, setToken } from "./api/client";
 import {
 	chunkNarratorIds,
 	limitNarratorSubscriptionIds,
@@ -8,6 +9,7 @@ import {
 	NarratorWSManager,
 	shouldDeliverToListener,
 } from "./narrator-ws-manager";
+import { withSocketTimers } from "./ws-test-utils";
 
 describe("complete input document lane ordering", () => {
 	test("snapshot and seal descriptors are not overtaken by immediate live input deltas", async () => {
@@ -45,6 +47,85 @@ describe("complete input document lane ordering", () => {
 		expect(seen).toEqual([snapshot, live, seal]);
 		await Promise.resolve();
 		expect(seen).toHaveLength(3);
+	});
+});
+
+describe("status patch projection", () => {
+	test("preserves explicit clears and false while omitting absent legacy fields", () => {
+		expect(coerceNarratorStatusPatch({ status: "working" })).toEqual({ status: "working" });
+		expect(
+			coerceNarratorStatusPatch({
+				status: "idle",
+				substatus: [],
+				turnStartedAt: null,
+				updatedAt: "2026-11-24T01:00:00.000Z",
+				errorMessage: null,
+				errorRetryable: false,
+				archivedWithNarratorId: null,
+				backgroundWorkActive: false,
+				model: "must-not-overwrite",
+			}),
+		).toEqual({
+			status: "idle",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "2026-11-24T01:00:00.000Z",
+			errorMessage: null,
+			errorRetryable: false,
+			archivedWithNarratorId: null,
+			backgroundWorkActive: false,
+		});
+	});
+
+	test("rejects malformed status and excludes invalid optional values", () => {
+		expect(coerceNarratorStatusPatch({ status: null })).toBeNull();
+		expect(
+			coerceNarratorStatusPatch(
+				Object.assign(Object.create({ updatedAt: "inherited", errorRetryable: false }), {
+					status: "idle",
+				}),
+			),
+		).toEqual({ status: "idle" });
+		expect(
+			coerceNarratorStatusPatch({
+				status: "waiting",
+				substatus: ["reasoning", 1],
+				turnStartedAt: false,
+				errorMessage: undefined,
+				errorRetryable: "false",
+			}),
+		).toEqual({ status: "waiting" });
+	});
+});
+
+describe("late completion intent", () => {
+	test("stale same-epoch done emits only a notification intent; foreign epochs and snapshots do not", async () => {
+		const manager = new NarratorWSManager();
+		const seen: Array<Record<string, unknown>> = [];
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => seen.push(frame));
+		const route = manager as unknown as { _dispatch: (frame: Record<string, unknown>) => void };
+		const state = {
+			type: "substatus_change",
+			narratorId: "n1",
+			statusEpoch: "epoch",
+			statusRevision: 2,
+			status: "idle",
+			substatus: ["unread", "new-label"],
+			turnStartedAt: "turn",
+		};
+		const done = {
+			...state,
+			type: "status_change",
+			statusRevision: 1,
+			substatus: ["unread"],
+			backgroundWorkActive: true,
+		};
+		route._dispatch(state);
+		route._dispatch(done);
+		route._dispatch({ ...done, statusEpoch: "old-process" });
+		route._dispatch({ ...done, subscriptionRequestId: "removed-subscription" });
+		await Promise.resolve();
+		expect(seen).toEqual([state, { ...done, type: "status_notification" }]);
 	});
 });
 
@@ -1261,6 +1342,135 @@ function withSilencedWarn(fn: () => void): void {
 }
 
 describe("reconnect resilience", () => {
+	test("A → B → A retires the original socket and its queued frames even when token bytes match again", async () => {
+		const received: unknown[] = [];
+		withMockBrowserGlobals(() => {
+			const values = new Map<string, string>();
+			const storage = patchGlobal("localStorage", {
+				getItem: (key: string) => values.get(key) ?? null,
+				setItem: (key: string, value: string) => values.set(key, value),
+				removeItem: (key: string) => values.delete(key),
+			});
+			const manager = new NarratorWSManager();
+			try {
+				setToken("fixture-a");
+				manager.addListener({ types: ["user:recent_tabs_delta"] }, (frame) =>
+					received.push(frame.revision),
+				);
+				manager.connect();
+				const first = MockWebSocket.instances[0];
+				first.readyState = MockWebSocket.OPEN;
+				first.onopen?.();
+				const originalGeneration = manager.getConnectionAuthGeneration();
+				first.onmessage?.({
+					data: JSON.stringify({ type: "user:recent_tabs_delta", revision: 1 }),
+				});
+				setToken("fixture-b");
+				setToken("fixture-a");
+				const current = MockWebSocket.instances.at(-1);
+				if (!current) throw Error("Missing replacement socket");
+				expect(first.readyState).toBe(MockWebSocket.CLOSED);
+				expect(MockWebSocket.instances).toHaveLength(3);
+				current.readyState = MockWebSocket.OPEN;
+				current.onopen?.();
+				expect(manager.getConnectionAuthGeneration()).toBe(getAuthSnapshot().generation);
+				expect(manager.getConnectionAuthGeneration()).not.toBe(originalGeneration);
+				first.onmessage?.({
+					data: JSON.stringify({ type: "user:recent_tabs_delta", revision: 2 }),
+				});
+				manager.addListener({ types: ["communication_updated"] }, (frame) =>
+					received.push(frame.revision),
+				);
+				current.onmessage?.({
+					data: JSON.stringify({ type: "communication_updated", revision: 3 }),
+				});
+			} finally {
+				manager.disconnect();
+				restoreGlobal(storage);
+			}
+		});
+		await Promise.resolve();
+		expect(received).toEqual([3]);
+	});
+	test("times out a silent handshake and reconnects through backoff", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					fire(10_000);
+					expect(manager.disconnected).toBe(true);
+					expect(reconnectInternals(manager).reconnectAttempts).toBe(1);
+					fire(1000);
+					expect(socket?.readyState).toBe(MockWebSocket.CLOSED);
+					expect(MockWebSocket.instances).toHaveLength(2);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
+	test("opening cancels the handshake deadline", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					if (!socket) throw new Error("Missing socket");
+					socket.readyState = MockWebSocket.OPEN;
+					socket.onopen?.();
+					fire(10_000);
+					expect(manager.connected).toBe(true);
+					expect(MockWebSocket.instances).toHaveLength(1);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
+	test("credential generations identify the token used by the live socket, not a later cache update", () => {
+		withMockBrowserGlobals(() => {
+			let token = "account-A-token";
+			const storage = patchGlobal("localStorage", {
+				getItem: (key: string) => (key === "narrafork_token" ? token : null),
+			});
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const oldSocket = MockWebSocket.instances.at(-1);
+				if (!oldSocket) throw new Error("Missing first socket");
+				oldSocket.readyState = MockWebSocket.OPEN;
+				oldSocket.onopen?.();
+				const first = manager.getCredentialIdentity();
+				expect(typeof first).toBe("number");
+				expect(manager.getConnectionCredentialIdentity()).toBe(first);
+				token = "account-B-token";
+				const next = manager.getCredentialIdentity();
+				expect(next).not.toBe(first);
+				expect(manager.getConnectionCredentialIdentity()).toBe(first);
+				token = "account-A-token";
+				expect(manager.getCredentialIdentity()).toBe(first);
+				token = "account-B-token";
+				expect(manager.getCredentialIdentity()).toBe(next);
+				manager.reconnect();
+				expect(manager.getConnectionCredentialIdentity()).toBeUndefined();
+				oldSocket.onopen?.();
+				expect(manager.connected).toBe(false);
+				const newSocket = MockWebSocket.instances.at(-1);
+				if (!newSocket || newSocket === oldSocket) throw new Error("Missing replacement socket");
+				expect(newSocket.url).toContain("account-B-token");
+				newSocket.readyState = MockWebSocket.OPEN;
+				newSocket.onopen?.();
+				expect(manager.getConnectionCredentialIdentity()).toBe(next);
+				expect(manager.getCredentialIdentity()).toBe(next);
+			} finally {
+				manager.disconnect();
+				restoreGlobal(storage);
+			}
+		});
+	});
 	test("reconnects after a graceful server shutdown (1001) instead of never retrying", () => {
 		withMockBrowserGlobals(() => {
 			const manager = new NarratorWSManager();
