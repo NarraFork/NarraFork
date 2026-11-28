@@ -16,6 +16,7 @@ import { MantineProvider } from "@mantine/core";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { headingMetrics, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
 import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -34,6 +35,7 @@ import { TextSelection } from "prosemirror-state";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../hooks/useRuntimeSettings";
 import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import { outlineRouterLink, useOutlineRouterNavigate } from "../../lib/outline-router";
 import { parseOutlineBlockSearch } from "../../lib/outline-view";
@@ -262,7 +264,13 @@ export function open(options: OpenOptions): void {
 	transport = new SocketTransport(options.wsUrl);
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+		revision: 1,
+		agent: { defaultModel: "", summaryModel: "" },
+		outline: { enabled: true },
+		requestEvidence: { autoPin: "off" },
+		summaryModelAvailable: null,
+	} satisfies RuntimeSettings);
 	if (options.host === "page") {
 		const search = new URLSearchParams();
 		if (lens === "all") search.set("view", "all");
@@ -551,6 +559,80 @@ export function caret(blockId: string, offset = -1, head?: number): boolean {
 	});
 	v.pm.focus();
 	return true;
+}
+
+/**
+ * A programmatic caret ready for native keyboard selection. ProseMirror schedules a DOM-selection
+ * repair while handling focus; native Shift+Down can otherwise run before that repair, and lose
+ * its new DOM selection before selectionchange reaches the editor. Wait for the callbacks actually
+ * scheduled by this focus, not a guessed delay or a private ProseMirror field.
+ */
+export async function caretReady(blockId: string, offset = -1, timeoutMs = 5000): Promise<boolean> {
+	const dom = view().pm.dom;
+	const original = { setTimeout: window.setTimeout, clearTimeout: window.clearTimeout };
+	const schedule: Window["setTimeout"] = original.setTimeout;
+	const cancel: Window["clearTimeout"] = original.clearTimeout;
+	const pending = new Map<number, () => void>();
+	const tasks: Promise<void>[] = [];
+	let deadline: number | undefined;
+	const capture = () => {
+		window.setTimeout = ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+			if (typeof callback !== "function") return schedule.call(window, callback, delay, ...args);
+			let finish = () => {};
+			tasks.push(
+				new Promise<void>((resolve) => {
+					finish = resolve;
+				}),
+			);
+			const id = schedule.call(
+				window,
+				() => {
+					try {
+						callback(...args);
+					} finally {
+						pending.delete(id);
+						finish();
+					}
+				},
+				delay,
+			);
+			pending.set(id, finish);
+			return id;
+		}) as typeof window.setTimeout;
+		window.clearTimeout = ((id?: number) => {
+			cancel.call(window, id);
+			if (id !== undefined) {
+				pending.get(id)?.();
+				pending.delete(id);
+			}
+		}) as typeof window.clearTimeout;
+	};
+	dom.addEventListener("focus", capture, { capture: true, once: true });
+	try {
+		let placed: boolean;
+		try {
+			placed = caret(blockId, offset);
+		} finally {
+			dom.removeEventListener("focus", capture, true);
+			// Only synchronous focus setup is captured; later work uses the exact original scheduler.
+			window.setTimeout = original.setTimeout;
+		}
+		await Promise.race([
+			Promise.all(tasks),
+			new Promise<never>((_, reject) => {
+				deadline = schedule.call(
+					window,
+					() => reject(new Error("outline focus setup did not finish")),
+					timeoutMs,
+				);
+			}),
+		]);
+		return placed && view().pm.hasFocus();
+	} finally {
+		window.setTimeout = original.setTimeout;
+		window.clearTimeout = original.clearTimeout;
+		if (deadline !== undefined) cancel.call(window, deadline);
+	}
 }
 
 export function selection() {

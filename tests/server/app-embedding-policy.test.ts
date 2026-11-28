@@ -75,7 +75,7 @@ describe("app shell embedding policy", () => {
 describe("api cross-origin policy", () => {
 	test("the allowed origin is decided by the tested resolver, not inline", () => {
 		// The previous inline value was a hard-coded `http://localhost:5173` while this
-		// repo's dev server runs on 7778 — wrong for years, and invisible because dev is
+		// repo's dev server runs on 41221 — wrong for years, and invisible because dev is
 		// same-origin through Vite's proxy. Routing the decision through a named function
 		// is what makes it testable at all.
 		expect(APP_TS).toContain("resolveAllowedCorsOrigin");

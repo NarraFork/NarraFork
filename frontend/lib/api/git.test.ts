@@ -106,6 +106,113 @@ describe("git APIs", () => {
 		clearToken();
 	});
 
+	test("independent index APIs pin cursors and paths and send explicit actions", async () => {
+		installLocalStorage();
+		const calls: Array<{ url: URL; init?: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({ url: new URL(String(input), "http://localhost"), init });
+				return Response.json({});
+			},
+		});
+		const target: GitTarget = { narratorId: "n /", workspaceKey: "设备:/a b?", canWrite: true };
+		const controller = new AbortController();
+		await api.getGitStagingLists(target, controller.signal);
+		await api.getGitStagingFiles(
+			target,
+			"stage /A",
+			{ cursor: "tree cursor+", limit: 100, filter: ["M"] },
+			controller.signal,
+		);
+		await api.getGitStagingDiff(
+			target,
+			"stage /A",
+			{ path: "new file.ts", oldPath: "old file.ts" },
+			controller.signal,
+		);
+		await api.gitStagingAction(target, {
+			action: "move",
+			fromListId: "A",
+			toListId: "B",
+			expectedGeneration: 7,
+			observationId: "o7",
+			paths: ["new file.ts"],
+		});
+		await api.gitStagingAction(target, {
+			action: "commit",
+			listId: "A",
+			message: "group commit",
+			expectedGeneration: 7,
+			observationId: "o7",
+		});
+		expect(calls[0]?.url.pathname).toBe("/api/narrators/n%20%2F/git/staging-lists");
+		expect(calls[1]?.url.pathname).toBe(
+			"/api/narrators/n%20%2F/git/staging-lists/stage%20%2FA/files",
+		);
+		expect(calls[1]?.url.searchParams.has("revision")).toBe(false);
+		expect(calls[1]?.url.searchParams.get("cursor")).toBe("tree cursor+");
+		expect(calls[1]?.url.searchParams.get("filter")).toBe("M");
+		expect(calls[2]?.url.searchParams.get("path")).toBe("new file.ts");
+		expect(calls[2]?.url.searchParams.get("oldPath")).toBe("old file.ts");
+		expect(
+			calls
+				.slice(0, 3)
+				.every(({ url }) => url.searchParams.get("workspaceKey") === target.workspaceKey),
+		).toBe(true);
+		expect(JSON.parse(String(calls[3]?.init?.body))).toEqual({
+			workspaceKey: target.workspaceKey,
+			action: "move",
+			fromListId: "A",
+			toListId: "B",
+			expectedGeneration: 7,
+			observationId: "o7",
+			paths: ["new file.ts"],
+		});
+		expect(JSON.parse(String(calls[4]?.init?.body))).toEqual({
+			workspaceKey: target.workspaceKey,
+			action: "commit",
+			listId: "A",
+			message: "group commit",
+			expectedGeneration: 7,
+			observationId: "o7",
+		});
+		controller.abort();
+		expect(calls.slice(0, 3).every(({ init }) => init?.signal?.aborted)).toBe(true);
+		expect(() =>
+			api.gitStagingAction(
+				{ ...target, canWrite: false },
+				{ action: "recover", operationId: "op1", expectedGeneration: 7, observationId: "o7" },
+			),
+		).toThrow("read-only");
+	});
+
+	test("a staging write error is returned once", async () => {
+		installLocalStorage();
+		let calls = 0;
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => {
+				calls++;
+				return Response.json({ error: "Index is locked" }, { status: 409 });
+			},
+		});
+		await expect(
+			api.gitStagingAction(
+				{ narratorId: "n", workspaceKey: "w", canWrite: true },
+				{
+					action: "move",
+					fromListId: "A",
+					toListId: "B",
+					paths: ["a"],
+					expectedGeneration: 7,
+					observationId: "o7",
+				},
+			),
+		).rejects.toThrow("Index is locked");
+		expect(calls).toBe(1);
+	});
+
 	test("line stats reads pin the workspace and forward cancellation", async () => {
 		installLocalStorage();
 		const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -194,6 +301,38 @@ describe("git APIs", () => {
 		]);
 		expect(() => api.gitPushBranch({ ...target, canWrite: false })).toThrow("read-only");
 		clearToken();
+	});
+
+	test("status page statistics preserve row identities, filters, workspace and cancellation", async () => {
+		installLocalStorage();
+		const calls: Array<{ url: string; init?: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({ url: String(input), init });
+				return Response.json({ snapshotId: "s?&", rows: [] });
+			},
+		});
+		const target: GitTarget = { narratorId: "n /", workspaceKey: "设备:/a b?", canWrite: false };
+		const rows = [
+			{ type: "directory" as const, section: "staged" as const, path: "中文/a b?&\\n" },
+			{ type: "file" as const, section: "unstaged" as const, path: "new name" },
+		];
+		const controller = new AbortController();
+		await api.getGitStatusPageStats(
+			target,
+			{ snapshotId: "s?&", filter: ["A", "M"], rows },
+			controller.signal,
+		);
+		const url = new URL(calls[0]?.url ?? "", "http://localhost");
+		expect(url.pathname).toBe("/api/narrators/n%20%2F/git/status-page-stats");
+		expect(url.searchParams.get("workspaceKey")).toBe(target.workspaceKey);
+		expect(url.searchParams.get("snapshotId")).toBe("s?&");
+		expect(url.searchParams.get("filter")).toBe("A,M");
+		expect(JSON.parse(url.searchParams.get("rows") ?? "null")).toEqual(rows);
+		expect(calls[0]?.init?.body).toBeUndefined();
+		controller.abort();
+		expect(calls[0]?.init?.signal?.aborted).toBe(true);
 	});
 
 	test("commit preview reads pin and encode workspace, paths and route identities without writes", async () => {

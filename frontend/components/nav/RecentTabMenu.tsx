@@ -137,27 +137,82 @@ export interface TabContextMenuProps {
 const MENU_EDGE_GAP = 8;
 
 /**
- * Place a menu at the pointer, flipped up and/or left when it would overflow the
- * viewport (a right-click near the bottom, a swipe released near the screen edge).
+ * Where a menu goes for a pointer at (`x`, `y`): at the pointer, flipped left when it would pass
+ * the right edge and up when it would pass the bottom, then clamped so the whole menu (its height
+ * capped at the viewport) stays inside. `maxHeight` is the room from `top` to the bottom edge, so
+ * a menu taller than that scrolls and its last action stays reachable.
+ */
+export function placeRecentTabMenu(p: {
+	x: number;
+	y: number;
+	width: number;
+	/** The menu's natural height (its content, even past a current cap). */
+	height: number;
+	viewWidth: number;
+	viewHeight: number;
+}): { left: number; top: number; maxHeight: number } {
+	const gap = MENU_EDGE_GAP;
+	const height = Math.min(p.height, Math.max(0, p.viewHeight - 2 * gap));
+	const maxLeft = p.viewWidth - p.width - gap;
+	const left = Math.max(gap, p.x <= maxLeft ? p.x : p.x - p.width);
+	const fitsBelow = p.y + height <= p.viewHeight - gap;
+	const wanted = fitsBelow ? p.y : p.y - height;
+	const top = Math.max(gap, Math.min(wanted, p.viewHeight - gap - height));
+	return { left, top, maxHeight: Math.max(0, p.viewHeight - gap - top) };
+}
+
+/**
+ * Place a menu at the pointer (a right-click near the bottom, a swipe released near the screen
+ * edge) with {@link placeRecentTabMenu}, and again whenever its size changes: the touch details
+ * at its top grow when a project's details arrive while it is open, and a menu placed for its
+ * first height would push its last actions off screen. A `ResizeObserver` watches the menu and
+ * its content (the content can grow past the menu's own capped box); disconnected on cleanup.
  */
 function useMenuPosition(x: number, y: number) {
 	const [node, setNode] = useState<HTMLDivElement | null>(null);
-	const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+	const [position, setPosition] = useState<{
+		left: number;
+		top: number;
+		maxHeight: number;
+	} | null>(null);
 	useLayoutEffect(() => {
 		if (!node) return;
-		const { width, height } = node.getBoundingClientRect();
 		const view = node.ownerDocument.defaultView;
-		const maxLeft = (view?.innerWidth ?? x + width) - width - MENU_EDGE_GAP;
-		const maxTop = (view?.innerHeight ?? y + height) - height - MENU_EDGE_GAP;
-		setPosition({
-			left: Math.max(MENU_EDGE_GAP, x <= maxLeft ? x : x - width),
-			top: Math.max(MENU_EDGE_GAP, y <= maxTop ? y : y - height),
-		});
+		const measure = () => {
+			const rect = node.getBoundingClientRect();
+			const height = Math.max(rect.height, node.scrollHeight || 0);
+			const next = placeRecentTabMenu({
+				x,
+				y,
+				width: rect.width,
+				height,
+				viewWidth: view?.innerWidth ?? x + rect.width + MENU_EDGE_GAP,
+				viewHeight: view?.innerHeight ?? y + height + MENU_EDGE_GAP,
+			});
+			setPosition((previous) =>
+				previous &&
+				previous.left === next.left &&
+				previous.top === next.top &&
+				previous.maxHeight === next.maxHeight
+					? previous
+					: next,
+			);
+		};
+		measure();
+		const Observer =
+			(view as (Window & { ResizeObserver?: typeof ResizeObserver }) | null)?.ResizeObserver ??
+			(typeof ResizeObserver === "undefined" ? undefined : ResizeObserver);
+		if (!Observer) return;
+		const observer = new Observer(() => measure());
+		observer.observe(node);
+		if (node.firstElementChild) observer.observe(node.firstElementChild);
+		return () => observer.disconnect();
 	}, [node, x, y]);
 	return {
 		ref: setNode,
 		left: position?.left ?? x,
 		top: position?.top ?? y,
+		maxHeight: position?.maxHeight,
 		measured: position !== null,
 	};
 }
@@ -222,7 +277,11 @@ export function TabContextMenu({
 					top: position.top,
 					zIndex: Z.contextMenu,
 					minWidth: 140,
-					maxHeight: `calc(100dvh - ${2 * MENU_EDGE_GAP}px)`,
+					// The room below its top once measured, so its last action stays reachable.
+					maxHeight:
+						position.maxHeight !== undefined
+							? position.maxHeight
+							: `calc(100dvh - ${2 * MENU_EDGE_GAP}px)`,
 					overflowY: "auto",
 					// Hidden for the one frame before it is measured, so it never flashes off-screen.
 					visibility: position.measured ? "visible" : "hidden",

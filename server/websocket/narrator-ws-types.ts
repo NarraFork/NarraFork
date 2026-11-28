@@ -16,6 +16,7 @@ import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-docum
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
@@ -40,6 +41,8 @@ export interface NarratorListStateSnapshotItem {
 	status: string;
 	substatus?: string[];
 	turnStartedAt?: string;
+	statusEpoch?: string;
+	statusRevision?: number;
 	activeBackgroundTaskCount?: number;
 	activeBackgroundWorkCount?: number;
 	activeBackgroundServiceCount?: number;
@@ -81,6 +84,9 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/narrator-communication").CommunicationServerMessage
+	| import("@shared/reasoning-translation").ReasoningTranslationPatch
+	| import("@shared/reasoning-translation").ReasoningTranslationStatusFrame
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
 	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
@@ -91,6 +97,10 @@ export type NarratorServerMessage =
 	| { type: "human_attention_changed" }
 	/** No task identities or payloads; re-fetch ACL-filtered task queries. */
 	| { type: "scheduled_tasks_changed" }
+	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
+	| { type: "user_preferences_changed" }
+	/** Configuration invalidation only; resolution stays in authorized detail reads. */
+	| { type: "fast_mode_changed"; refreshPreferences?: boolean }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
@@ -303,7 +313,15 @@ export type NarratorServerMessage =
 			narratorId: string;
 			status: string;
 			substatus?: string[];
-			turnStartedAt?: string;
+			/** Omitted fields are unchanged; null explicitly clears a persisted value. */
+			turnStartedAt?: string | null;
+			updatedAt?: string;
+			messageCount?: number;
+			errorMessage?: string | null;
+			errorRetryable?: boolean | null;
+			archivedWithNarratorId?: string | null;
+			statusEpoch?: string;
+			statusRevision?: number;
 			/**
 			 * Present on the done-transition (idle + unread) when background work
 			 * whose completion wakes the narrator (bash tasks / subagents — never
@@ -313,7 +331,22 @@ export type NarratorServerMessage =
 			 */
 			backgroundWorkActive?: boolean;
 	  }
-	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	| {
+			type: "substatus_change";
+			narratorId: string;
+			substatus: string[];
+			/** Versioned producers carry the same complete committed patch as status_change. */
+			status?: string;
+			turnStartedAt?: string | null;
+			updatedAt?: string;
+			messageCount?: number;
+			errorMessage?: string | null;
+			errorRetryable?: boolean | null;
+			archivedWithNarratorId?: string | null;
+			statusEpoch?: string;
+			statusRevision?: number;
+			backgroundWorkActive?: boolean;
+	  }
 	/** Initial state of an `activity` subscription: the narrator's latest tool calls. */
 	| {
 			type: "activity_snapshot";
@@ -324,11 +357,15 @@ export type NarratorServerMessage =
 	| {
 			type: "payment_required";
 			narratorId: string;
+			/** 服务器签发的专用 opaque context，不能由客户端推导凭据身份。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;
 			required?: number;
 			resumeAction: "retry" | "continue";
+			/** Parent copy of a subagent's frame: the parent must not react to it. */
+			isSubagent?: boolean;
 	  }
 	| {
 			/**
@@ -442,6 +479,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			output: string;
+			/** Present only for the exact Agent destination of a child logical run. */
+			subagentOutputCount?: import("@shared/subagent-output-counts").SubagentOutputCount;
 			parentToolUseId?: string;
 	  }
 	// 看门狗检测到 bash/shell 进程运行 ≥60s 时推送，前端据此显示终止按钮
@@ -456,6 +495,7 @@ export type NarratorServerMessage =
 			type: "tool_completed";
 			narratorId: string;
 			toolCallId: string | null;
+			executionAttempt?: number;
 			toolUseId: string;
 			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
 			blockId?: string;
@@ -700,6 +740,7 @@ export type NarratorServerMessage =
 	  }
 	| {
 			type: "tool_started";
+			executionAttempt?: number;
 			streamingEditOrigin?: StreamingEditOrigin;
 			narratorId: string;
 			toolCallId: string | null;
@@ -959,6 +1000,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			/** Parent copy of a subagent's frame: its balance is not the parent's. */
+			isSubagent?: boolean;
 	  }
 	| {
 			type: "queue_status";
@@ -977,6 +1020,8 @@ export type NarratorServerMessage =
 	| {
 			type: "streaming_snapshot";
 			narratorId: string;
+			/** Authoritative live Agent counts, including [] to clear a disconnected terminal run. */
+			subagentOutputCounts?: import("@shared/subagent-output-counts").SubagentOutputCount[];
 			model?: string;
 			provider?: string;
 			streamingBlocks: Array<
@@ -1008,6 +1053,7 @@ export type NarratorServerMessage =
 			>;
 			toolChunks: Array<{
 				toolCallId: string | null;
+				executionAttempt?: number;
 				toolUseId: string;
 				subagentNarratorId?: string;
 				toolName: string;
@@ -1044,6 +1090,8 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
+	/** Observed execution source changed; refetch only the authorized small model summary. */
+	| { type: "runtime_model_changed"; narratorId: string }
 	| { type: "streaming_reset"; narratorId: string; parentToolUseId?: string }
 	/**
 	 * Live tool cards that will never complete, because the attempt that streamed
@@ -1056,6 +1104,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseIds: string[];
 			parentToolUseId?: string;
+			subagentNarratorId?: string;
 	  }
 	| {
 			type: "model_switched";
@@ -1098,6 +1147,19 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			toolUseId?: string;
 			takenOver: boolean;
+	  }
+	/**
+	 * The helpers a first-level subagent launched changed (one started, changed status or
+	 * asks for or got a permission decision). Sent to the ACL root's page, where that
+	 * subagent is a card; `nested` replaces the card's helper rows. Like the takeover
+	 * frame, `toolUseId` is best-effort and the client may match by `subagentNarratorId`.
+	 */
+	| {
+			type: "subagent_nested_changed";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId?: string;
+			nested: SubagentNestedSummary;
 	  }
 	| {
 			type: "subagent_warning";
@@ -1230,7 +1292,9 @@ export type NarratorServerMessage =
 				| "shared"
 				| "unshared"
 				| "grant_changed"
-				| "owner_changed";
+				| "owner_changed"
+				/** The session became a team coordinator or its team was disbanded. */
+				| "team_changed";
 	  }
 	| {
 			type: "team_message";
@@ -1373,4 +1437,9 @@ export type NarratorServerMessage =
 	 * Per-user badge refresh for a room this user is NOT currently viewing.
 	 * Id + count only; the client refetches the summary if it needs more.
 	 */
-	| { type: "chat:unread_changed"; roomId: string; unread: number };
+	| { type: "chat:unread_changed"; roomId: string; unread: number; narratorId?: string }
+	/** Existing authorized narrator subscribers can discover a lazily created discussion. */
+	| { type: "chat:room_created"; roomId: string; narratorId: string }
+	/** A request-correlated ceiling read only after an authorized room join. */
+	| { type: "chat:subscribed"; roomId: string; requestId: string; tailSeq: number }
+	| { type: "chat:subscription_denied"; roomId: string; requestId: string; status: 403 };

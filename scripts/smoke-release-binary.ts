@@ -19,6 +19,7 @@ import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { isValidGitHubRepository } from "../shared/github-repository";
+import { MAX_RELEASE_BINARY_BYTES } from "../shared/release-patch";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { copyReleaseFile, hashReleaseFile, readReleaseText } from "./lib/ci-release-io";
 import {
@@ -37,7 +38,7 @@ export interface SmokeOptions {
 	version: string;
 	output: string;
 }
-const MAX_BINARY = 1024 ** 3;
+const MAX_BINARY = MAX_RELEASE_BINARY_BYTES;
 const MAX_MESSAGE = 64 * 1024;
 
 async function writeSmokeArtifact(

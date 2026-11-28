@@ -19,6 +19,7 @@ export {
 	createSession,
 	DEFAULT_SESSION_TTL_MS,
 	discardHandoffTab,
+	getAllSessionStats,
 	getSession,
 	listSessions,
 	MAX_DEVICE_SCALE_FACTOR,

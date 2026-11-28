@@ -1,4 +1,8 @@
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import {
+	MAX_REASONING_TRANSLATION_ID_LENGTH,
+	MAX_REASONING_TRANSLATION_VISIBLE_TARGETS,
+} from "@shared/reasoning-translation";
 import { RECENT_TABS_WS_BATCH_SIZE } from "@shared/recent-tabs";
 import { z } from "zod";
 import { rejectUnsupportedTerminalResourceSelector } from "./terminals";
@@ -21,8 +25,45 @@ const catchUpCursorSchema = z
 	})
 	.strict();
 
+const reasoningId = z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH);
+
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
+	z.strictObject({
+		type: z.literal("communication_subscribe"),
+		subscriptionId: z.string().min(1).max(128),
+		scope: z.discriminatedUnion("kind", [
+			z.strictObject({
+				kind: z.literal("narrator"),
+				narratorId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+			}),
+			z.strictObject({
+				kind: z.literal("team"),
+				projectId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+				teamId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+			}),
+		]),
+	}),
+	z.strictObject({
+		type: z.literal("communication_unsubscribe"),
+		subscriptionId: z.string().min(1).max(128),
+	}),
+	z.strictObject({
+		type: z.literal("reasoning_translation_visibility"),
+		narratorId: reasoningId,
+		visibilityId: reasoningId,
+		targets: z
+			.array(
+				z.strictObject({
+					ownerNarratorId: reasoningId,
+					messageId: reasoningId,
+					blockId: reasoningId,
+					blockRevision: z.int().min(0),
+					elementId: reasoningId,
+				}),
+			)
+			.max(MAX_REASONING_TRANSLATION_VISIBLE_TARGETS),
+	}),
 	z
 		.object({
 			type: z.literal("editor_file_subscribe"),
@@ -130,6 +171,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("chat_subscribe"),
 		roomIds: z.array(z.string().min(1)).max(50),
+		requestId: z.string().min(1).max(128).optional(),
 	}),
 	z.object({
 		type: z.literal("chat_unsubscribe"),

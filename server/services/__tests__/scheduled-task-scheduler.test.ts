@@ -4,7 +4,11 @@ const hot = new Map<string, unknown>();
 const timers = new Map<string, unknown>();
 let recovery: Promise<void> = Promise.resolve();
 let polls = 0;
+let tracking: Promise<void> = Promise.resolve();
 let dueReads = 0;
+let dueResult: Promise<Array<{ id: string }>> = Promise.resolve([]);
+let dispatched = 0;
+let fenced = false;
 let notifier: unknown;
 const errors: string[] = [];
 const notices = async () => {};
@@ -23,6 +27,9 @@ mock.module("../../lib/hot-safe", () => ({
 mock.module("../../lib/logger", () => ({
 	logger: { info: () => {}, error: (message: string) => errors.push(message) },
 }));
+mock.module("../../lib/shutdown-activity", () => ({
+	isUnattendedShutdownFenced: () => fenced,
+}));
 mock.module("../scheduled-task-notify", () => ({ notifyScheduledRunChanged: notices }));
 mock.module("../scheduled-task-run-service", () => ({
 	setScheduledRunNotifier: (value: unknown) => {
@@ -32,6 +39,7 @@ mock.module("../scheduled-task-run-service", () => ({
 mock.module("../scheduled-task-run-tracker", () => ({
 	pollScheduledRuns: async () => {
 		polls++;
+		await tracking;
 	},
 }));
 mock.module("../scheduled-task-service", () => ({
@@ -40,9 +48,11 @@ mock.module("../scheduled-task-service", () => ({
 		reconcilePausedTasks: async () => {},
 		listDue: async () => {
 			dueReads++;
-			return [];
+			return dueResult;
 		},
-		runTask: async () => {},
+		runTask: async () => {
+			dispatched++;
+		},
 	},
 }));
 const originalInterval = globalThis.setInterval;
@@ -51,17 +61,20 @@ globalThis.setInterval = ((callback: () => void, ms: number) => ({
 	callback,
 	ms,
 })) as unknown as typeof setInterval;
-const { startScheduledTaskScheduler, stopScheduledTaskScheduler } = await import(
-	"../scheduled-task-scheduler"
-);
+const { isScheduledTaskTickActive, startScheduledTaskScheduler, stopScheduledTaskScheduler } =
+	await import("../scheduled-task-scheduler");
 const flush = async () => {
 	for (let i = 0; i < 10; i++) await Promise.resolve();
 };
-afterEach(() => {
-	stopScheduledTaskScheduler();
+afterEach(async () => {
+	await stopScheduledTaskScheduler();
 	recovery = Promise.resolve();
+	tracking = Promise.resolve();
+	dueResult = Promise.resolve([]);
 	polls = 0;
 	dueReads = 0;
+	dispatched = 0;
+	fenced = false;
 	notifier = undefined;
 	errors.length = 0;
 });
@@ -88,9 +101,15 @@ describe("scheduler startup and shutdown", () => {
 		const pending = Promise.withResolvers<void>();
 		recovery = pending.promise;
 		startScheduledTaskScheduler();
-		stopScheduledTaskScheduler();
-		pending.resolve();
+		let stopped = false;
+		const stopping = stopScheduledTaskScheduler().then(() => {
+			stopped = true;
+		});
 		await flush();
+		expect(stopped).toBe(false);
+		pending.resolve();
+		await stopping;
+		expect(stopped).toBe(true);
 		expect(timers.size).toBe(0);
 		expect(dueReads).toBe(0);
 	});
@@ -108,6 +127,66 @@ describe("scheduler startup and shutdown", () => {
 		await flush();
 		expect(dueReads).toBe(1);
 		expect(timers.size).toBe(2);
+	});
+	test("shutdown drains an in-flight due read without dispatching its stale candidates", async () => {
+		const pending = Promise.withResolvers<Array<{ id: string }>>();
+		dueResult = pending.promise;
+		startScheduledTaskScheduler();
+		await flush();
+		expect(isScheduledTaskTickActive()).toBe(true);
+		let stopped = false;
+		const stopping = stopScheduledTaskScheduler().then(() => {
+			stopped = true;
+		});
+		await flush();
+		expect(stopped).toBe(false);
+		pending.resolve([{ id: "stale-due-task" }]);
+		await stopping;
+		expect(isScheduledTaskTickActive()).toBe(false);
+		expect(dispatched).toBe(0);
+	});
+	test("shutdown waits for the current run-tracking sweep", async () => {
+		const pending = Promise.withResolvers<void>();
+		tracking = pending.promise;
+		startScheduledTaskScheduler();
+		await flush();
+		let stopped = false;
+		const stopping = stopScheduledTaskScheduler().then(() => {
+			stopped = true;
+		});
+		await flush();
+		expect(stopped).toBe(false);
+		pending.resolve();
+		await stopping;
+		expect(stopped).toBe(true);
+	});
+	test("shutdown also drains recovery from a replaced startup", async () => {
+		const old = Promise.withResolvers<void>();
+		recovery = old.promise;
+		startScheduledTaskScheduler();
+		recovery = Promise.resolve();
+		startScheduledTaskScheduler();
+		await flush();
+		let stopped = false;
+		const stopping = stopScheduledTaskScheduler().then(() => {
+			stopped = true;
+		});
+		await flush();
+		expect(stopped).toBe(false);
+		old.resolve();
+		await stopping;
+		expect(stopped).toBe(true);
+		expect(timers.size).toBe(0);
+	});
+	test("a shutdown fence prevents dispatch after the due read", async () => {
+		const pending = Promise.withResolvers<Array<{ id: string }>>();
+		dueResult = pending.promise;
+		startScheduledTaskScheduler();
+		await flush();
+		fenced = true;
+		pending.resolve([{ id: "fenced-task" }]);
+		await flush();
+		expect(dispatched).toBe(0);
 	});
 	test("failed catch-up does not dispatch, but existing runs retain a watchdog", async () => {
 		recovery = Promise.reject(new Error("database not ready"));

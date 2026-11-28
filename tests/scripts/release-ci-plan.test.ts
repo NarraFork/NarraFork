@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { CI_PLATFORM_ARTIFACT_LIMIT } from "../../scripts/lib/ci-release-io";
 import {
 	assertCiMainAncestor,
 	ciApiList,
@@ -14,6 +15,7 @@ import {
 	CI_RELEASE_WORKFLOW,
 } from "../../scripts/lib/ci-release-types";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
+import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import { REMOTE_FRONTEND_CAPABILITY } from "../../shared/remote-access/application";
 
 const commit = "a".repeat(40);
@@ -495,6 +497,31 @@ describe("CI release plan trust boundary", () => {
 				helperDistribution: dependencies,
 			},
 		};
+		for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES])
+			expect(() =>
+				validateCiReleasePlan({
+					...plan,
+					baselines: [
+						{
+							...baseline,
+							binaryAsset: { ...baseline.binaryAsset, size },
+							metadata: { ...baseline.metadata, size },
+						},
+					],
+				}),
+			).not.toThrow();
+		expect(() =>
+			validateCiReleasePlan({
+				...plan,
+				baselines: [
+					{
+						...baseline,
+						binaryAsset: { ...baseline.binaryAsset, size: MAX_RELEASE_BINARY_BYTES + 1 },
+						metadata: { ...baseline.metadata, size: MAX_RELEASE_BINARY_BYTES + 1 },
+					},
+				],
+			}),
+		).toThrow();
 		const input = { ...plan, baselines: [baseline] };
 		expect(validateCiReleasePlan(input).baselines[0]?.metadata.helperDistribution).toEqual(
 			dependencies,
@@ -847,7 +874,27 @@ describe("original build provenance plan contract", () => {
 			workflowCommit,
 			buildSource: source,
 		});
+		for (const size of [1024 ** 3 + 1, MAX_RELEASE_BINARY_BYTES, CI_PLATFORM_ARTIFACT_LIMIT])
+			expect(() =>
+				validateCiReleasePlan({
+					...base,
+					buildSource: {
+						...source,
+						platforms: [
+							{ ...source.platforms[0], artifact: { ...source.platforms[0].artifact, size } },
+						],
+					},
+				}),
+			).not.toThrow();
 		for (const changed of [
+			{
+				platforms: [
+					{
+						...source.platforms[0],
+						artifact: { ...source.platforms[0].artifact, size: CI_PLATFORM_ARTIFACT_LIMIT + 1 },
+					},
+				],
+			},
 			{ runId: base.runId },
 			{ runAttempt: 0 },
 			{ workflowCommit: "d".repeat(8) },

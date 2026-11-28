@@ -17,6 +17,7 @@ import {
 	unregisterScheduledRun,
 } from "../scheduled-run-registry";
 import type { ScheduledTaskPrincipal } from "../scheduled-task-acl";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const realSession = { ...(await import("../narrator-session")) };
 const dispatches: Array<{ runId: string; narratorId: string }> = [];
@@ -183,13 +184,15 @@ describe("existing target admission", () => {
 			requireReport: true,
 		});
 		await db.update(narrators).set({ model: "changed" }).where(eq(narrators.id, id));
-		await expect(
-			scheduledTaskService.runTask(row.id, {
-				manual: true,
-				principal: owner,
-				expectedTarget: { id, fingerprint: resolved.fingerprint },
-			}),
-		).rejects.toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.runTask(row.id, {
+					manual: true,
+					principal: owner,
+					expectedTarget: { id, fingerprint: resolved.fingerprint },
+				}),
+			),
+		).toMatchObject({ statusCode: 409 });
 		expect(dispatches).toHaveLength(0);
 	});
 	test("scheduled ACL failures notify and trip the existing failure circuit", async () => {
@@ -230,9 +233,11 @@ describe("existing target admission", () => {
 		const id = await target();
 		const row = await task(id);
 		await db.update(narrators).set({ ownerUserId: admin.userId }).where(eq(narrators.id, id));
-		await expect(
-			scheduledTaskService.runTask(row.id, { manual: true, principal: admin }),
-		).rejects.toMatchObject({ statusCode: 404 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.runTask(row.id, { manual: true, principal: admin }),
+			),
+		).toMatchObject({ statusCode: 404 });
 		await scheduledTaskService.setEnabled(row.id, false, admin);
 		expect(dispatches).toHaveLength(0);
 	});
@@ -408,9 +413,9 @@ describe("bounded waiting and lifecycle", () => {
 		});
 		await scheduledTaskService.reconcileCompletion(row.id);
 		expect((await scheduledTaskService.get(row.id))?.completedAt).toBeNull();
-		await expect(
-			scheduledTaskService.update(row.id, { enabled: true }, owner),
-		).rejects.toMatchObject({ statusCode: 400 });
+		expect(
+			await captureWorkerRejection(scheduledTaskService.update(row.id, { enabled: true }, owner)),
+		).toMatchObject({ statusCode: 400 });
 		expect((await latest(row.id)).status).toBe("waiting");
 	});
 	test("a target holds at most 64 waiters", async () => {

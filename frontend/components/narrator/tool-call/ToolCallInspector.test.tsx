@@ -314,6 +314,7 @@ describe("ToolCallInspector file history advisory", () => {
 			["conflict", "unavailable", false],
 			[undefined, "unavailable", false],
 			["applied", "complete", false],
+			["applied", "disabled", false],
 			["applied", undefined, false],
 		] as const)(`${source} %s/%s warns only for confirmed disk writes with missing history`, async (diskOutcome, historyStatus, warned) => {
 			i18n.addResource(

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -13,6 +13,7 @@ import {
 	remoteDevices,
 	users,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
 import { integrationAuthorityService } from "../integration-authority-service";
@@ -254,6 +255,7 @@ describe("OAuth narrator runtime policy", () => {
 		);
 		registerCoreTools();
 		const routines = settings.routines;
+		const persistedTools = ["ScheduledTaskAdmin", "ScheduledTaskReport"];
 		const original = await db.query.narrators.findFirst({
 			where: eq(narrators.id, ids.narratorV2),
 		});
@@ -265,34 +267,70 @@ describe("OAuth narrator runtime policy", () => {
 			};
 			await db
 				.update(narrators)
-				.set({ enabledTools: ["ScheduledTaskAdmin"] })
+				.set({ enabledTools: persistedTools })
 				.where(eq(narrators.id, ids.narratorV2));
 			const runtime = await resolveOAuthNarratorRuntimePolicy(ids.narratorV2, ids.user);
-			expect(runtime?.allowedTools.has("ScheduledTask")).toBe(false);
 			const groups = await getToolSearchCandidates(ids.narratorV2, ids.user);
-			expect(groups.some((group) => group.toolNames.includes("ScheduledTask"))).toBe(false);
-			expect(
-				await changeLoadedToolGroup(
-					ids.narratorV2,
-					{
-						id: "scheduled_task",
-						description: "Scheduled tasks",
-						toolNames: ["ScheduledTask"],
-					},
-					true,
-					ids.user,
-				),
-			).toBe("denied");
+			for (const [id, toolName] of [
+				["scheduled_task", "ScheduledTask"],
+				["scheduled_task_report", "ScheduledTaskReport"],
+			] as const) {
+				expect(runtime?.allowedTools.has(toolName)).toBe(false);
+				expect(groups.some((group) => group.toolNames.includes(toolName))).toBe(false);
+				expect(
+					await changeLoadedToolGroup(
+						ids.narratorV2,
+						{ id, description: "Scheduled tasks", toolNames: [toolName] },
+						true,
+						ids.user,
+					),
+				).toBe("denied");
+			}
 			expect(
 				(await db.query.narrators.findFirst({ where: eq(narrators.id, ids.narratorV2) }))
 					?.enabledTools,
-			).toEqual(["ScheduledTaskAdmin"]);
+			).toEqual(persistedTools);
 		} finally {
 			settings.routines = routines;
 			await db
 				.update(narrators)
 				.set({ enabledTools: original?.enabledTools ?? null })
 				.where(eq(narrators.id, ids.narratorV2));
+		}
+	});
+
+	test("request read budgets reach narrator, provenance, authority, client and device workers", async () => {
+		const request = new AbortController();
+		const deadlineAt = Date.now() + 10_000;
+		const reads = spyOn(workerPool, "runReadTask");
+		try {
+			const policy = await resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user, {
+				signal: request.signal,
+				deadlineAt,
+			});
+			expect(policy?.grantId).toBe(ids.grant);
+			expect(reads.mock.calls.length).toBeGreaterThanOrEqual(6);
+			for (const [, , options] of reads.mock.calls) {
+				expect(options?.signal).toBe(request.signal);
+				expect(options?.deadlineAt).toBe(deadlineAt);
+			}
+			expect(
+				reads.mock.calls.some(
+					([, params]) =>
+						params.kind === "domainRead" && params.task === "platformIntegrationAuthoritySnapshot",
+				),
+			).toBe(true);
+			request.abort(new Error("OAuth request cancelled"));
+			const count = reads.mock.calls.length;
+			expect(
+				await resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user, {
+					signal: request.signal,
+					deadlineAt,
+				}).catch((error: unknown) => error),
+			).toMatchObject({ message: "OAuth request cancelled" });
+			expect(reads.mock.calls).toHaveLength(count);
+		} finally {
+			reads.mockRestore();
 		}
 	});
 
@@ -370,9 +408,12 @@ describe("OAuth narrator runtime policy", () => {
 			.update(integrationResourceBindings)
 			.set({ sourceId: generateId() })
 			.where(eq(integrationResourceBindings.resourceId, ids.device2));
-		await expect(resolveOAuthNarratorRuntimePolicy(ids.narratorV2, ids.user)).rejects.toThrow(
-			"OAuth narrator device binding is inactive",
+		const rejected = await resolveOAuthNarratorRuntimePolicy(ids.narratorV2, ids.user).catch(
+			(error: unknown) => error,
 		);
+		expect(() => {
+			throw rejected;
+		}).toThrow("OAuth narrator device binding is inactive");
 		await db
 			.update(integrationResourceBindings)
 			.set({ sourceId: ids.client })

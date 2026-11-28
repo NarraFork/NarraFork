@@ -70,7 +70,10 @@ export function PluginInstallModal({ opened, onClose }: { opened: boolean; onClo
 	// fully checked and the admin may uncheck capabilities they want to withhold.
 	const handleInstalled = async (detail: PluginDetail) => {
 		const declared = detail.manifest?.permissions?.host ?? [];
-		if (declared.length === 0) {
+		// An overlay plugin always gets the post-install view, even with nothing to
+		// authorize: it paints over the app for every user, and the admin should know
+		// that before closing the dialog rather than discover it on screen.
+		if (declared.length === 0 && !detail.manifest?.overlay) {
 			close();
 			return;
 		}
@@ -165,14 +168,31 @@ export function PluginInstallModal({ opened, onClose }: { opened: boolean; onClo
 			<Modal
 				opened={opened}
 				onClose={close}
-				title={t("admin.installModal.authorizeTitle", { name: displayName })}
+				title={
+					declared.length > 0
+						? t("admin.installModal.authorizeTitle", { name: displayName })
+						: t("admin.installModal.installedTitle", { name: displayName })
+				}
 				size="md"
 				centered
 			>
 				<Stack gap="sm">
-					<Text size="sm" c="dimmed">
-						{t("admin.installModal.authorizeDescription")}
-					</Text>
+					{installed.manifest?.overlay ? (
+						<Alert
+							color="yellow"
+							variant="light"
+							icon={<IconAlertCircle size={18} />}
+							title={t("admin.installModal.overlayNoticeTitle")}
+							data-plugin-install-overlay-notice=""
+						>
+							<Text size="sm">{t("admin.installModal.overlayNotice")}</Text>
+						</Alert>
+					) : null}
+					{declared.length > 0 ? (
+						<Text size="sm" c="dimmed">
+							{t("admin.installModal.authorizeDescription")}
+						</Text>
+					) : null}
 					{authError && (
 						<Alert color="red" variant="light" icon={<IconAlertCircle size={18} />}>
 							<Text size="sm">{authError}</Text>
@@ -194,14 +214,21 @@ export function PluginInstallModal({ opened, onClose }: { opened: boolean; onClo
 							);
 						})}
 					</Stack>
-					<Group justify="flex-end" mt="xs">
-						<Button variant="subtle" onClick={close} disabled={authorizing}>
-							{t("admin.installModal.authorizeSkip")}
-						</Button>
-						<Button onClick={() => void confirmAuthorization()} loading={authorizing}>
-							{t("admin.installModal.authorizeConfirm")}
-						</Button>
-					</Group>
+					{declared.length > 0 ? (
+						<Group justify="flex-end" mt="xs">
+							<Button variant="subtle" onClick={close} disabled={authorizing}>
+								{t("admin.installModal.authorizeSkip")}
+							</Button>
+							<Button onClick={() => void confirmAuthorization()} loading={authorizing}>
+								{t("admin.installModal.authorizeConfirm")}
+							</Button>
+						</Group>
+					) : (
+						// Overlay notice only: nothing to authorize, just acknowledge.
+						<Group justify="flex-end" mt="xs">
+							<Button onClick={close}>{t("admin.installModal.overlayAcknowledge")}</Button>
+						</Group>
+					)}
 				</Stack>
 			</Modal>
 		);

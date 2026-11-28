@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { parseHTML } from "linkedom";
 import { createPluginAssetShell, createPluginNonce, isAllowedPluginAssetUrl } from "./asset-shell";
 
 describe("host-controlled plugin asset shell", () => {
@@ -55,6 +56,34 @@ describe("host-controlled plugin asset shell", () => {
 		});
 		expect(shell).toContain(
 			'script.onload = () => document.getElementById("plugin-shell-splash")?.remove()',
+		);
+	});
+
+	test("transparent shells omit the splash without relaxing the asset policy", () => {
+		const options = {
+			nonce: createPluginNonce(),
+			pluginId: "com.example.review",
+			contributionId: "dashboard",
+			panelInstanceId: "pui_review",
+			entryUrl: "/api/plugin-assets/com.example.review/1/hash/entry.js",
+		};
+		const { document: dock } = parseHTML(createPluginAssetShell(options));
+		const { document: overlay } = parseHTML(
+			createPluginAssetShell({ ...options, transparent: true }),
+		);
+		expect(dock.getElementById("plugin-shell-splash")).not.toBeNull();
+		expect(overlay.getElementById("plugin-shell-splash")).toBeNull();
+		expect(overlay.head.querySelector("style")?.textContent).toContain(
+			"html,body{background:transparent!important;}",
+		);
+		expect(overlay.head.querySelector("style")?.textContent).toContain(
+			":root{color-scheme:light dark!important;}",
+		);
+		expect(dock.head.querySelector("style")?.textContent).not.toContain("background:transparent");
+		expect(
+			overlay.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
+		).toBe(
+			dock.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
 		);
 	});
 

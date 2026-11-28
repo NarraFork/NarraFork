@@ -1,7 +1,17 @@
 import { apiUrl } from "@frontend/lib/base-path";
 import type { Locale } from "@shared/i18n-locales";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
-import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
+import { writeCurrentUserCache } from "../current-user-cache";
+import {
+	ApiError,
+	apiBase,
+	authorizedFetch,
+	confirmAuthUser,
+	getAuthSnapshot,
+	type RequestOptions,
+	readFetchError,
+	request,
+} from "./client";
 import type { ApiEntity } from "./types";
 
 /** Session result returned on a successful (single-factor or post-MFA) login. */
@@ -19,6 +29,7 @@ export interface MfaChallenge {
 }
 
 export type LoginResult = LoginSession | MfaChallenge;
+export const CURRENT_USER_TIMEOUT_MS = 10_000;
 
 export type StepUpMethod = "totp" | "backup_code" | "passkey";
 /** Mirrors STEP_UP_PURPOSES in server/services/step-up-service.ts. */
@@ -205,7 +216,21 @@ export const authApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
-	me: () => request<ApiEntity>("/auth/me"),
+	me: async (options?: RequestOptions) => {
+		const { generation, hasToken } = getAuthSnapshot();
+		const timeout = AbortSignal.timeout(CURRENT_USER_TIMEOUT_MS);
+		const signal = options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+		const user = await request<ApiEntity>("/auth/me", { ...options, signal });
+		signal.throwIfAborted();
+		if (getAuthSnapshot().generation !== generation) {
+			throw new DOMException("Session changed", "AbortError");
+		}
+		if (hasToken) {
+			writeCurrentUserCache(user);
+			confirmAuthUser(generation, user.id);
+		}
+		return user;
+	},
 
 	// MFA — login second step
 	mfaVerify: (data: { mfaToken: string; method: "totp" | "backup_code"; code: string }) =>

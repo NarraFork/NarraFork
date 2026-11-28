@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Source events → bounded activity projections. This consumer is independent of
  * WebSocket delivery: a missing socket must not prevent durable history.
@@ -26,15 +27,25 @@ import {
 } from "@shared/notification-center";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
-import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import {
+	canReadNarrator,
+	judgeNarratorAccessBatch,
+	listNarratorAudience,
+	type NarratorAclRow,
+} from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	type RecordNotificationInput,
 	recordNotifications as recordNotificationsImpl,
 	syncChatNotificationReads,
 } from "./notification-center-service";
-import { getRecentTabUserIdsForNarrator } from "./recent-tabs-service";
+import {
+	getRecentTabUserIdsForNarrator,
+	getRecentTabUserIdsForNarratorByRecency,
+} from "./recent-tabs-service";
 import { notifyScheduledTaskTransferred } from "./scheduled-task-notify";
+import { readTeamMemberIds } from "./teams/team-members";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 export type { NotificationKind, NotificationLink, RecordNotificationInput };
 export { NOTIFICATION_FANOUT_MAX_RECIPIENTS, NOTIFICATION_PREVIEW_MAX_LENGTH };
@@ -108,39 +119,48 @@ export interface ChatMessageFanoutEvent {
  */
 export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEvent): Promise<void> {
 	const record = await resolveRecordNotifications();
-	const [message] = await db
-		.select({
-			id: chatMessages.id,
-			roomId: chatMessages.roomId,
-			seq: chatMessages.seq,
-			senderUserId: chatMessages.senderUserId,
-			senderGuestName: chatMessages.senderGuestName,
-			senderNarratorId: chatMessages.senderNarratorId,
-			deletedAt: chatMessages.deletedAt,
-			contentText: sql<string>`substr(${chatMessages.contentText}, 1, ${NOTIFICATION_PREVIEW_MAX_LENGTH * 4})`,
-		})
-		.from(chatMessages)
-		.where(eq(chatMessages.id, event.messageId))
-		.limit(1);
+	const [message] = await readQuery(
+		db
+			.select({
+				id: chatMessages.id,
+				roomId: chatMessages.roomId,
+				seq: chatMessages.seq,
+				senderUserId: chatMessages.senderUserId,
+				senderGuestName: chatMessages.senderGuestName,
+				senderNarratorId: chatMessages.senderNarratorId,
+				deletedAt: chatMessages.deletedAt,
+				contentText: sql<string>`substr(${chatMessages.contentText}, 1, ${NOTIFICATION_PREVIEW_MAX_LENGTH * 4})`,
+			})
+			.from(chatMessages)
+			.where(eq(chatMessages.id, event.messageId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!message || message.deletedAt || message.roomId !== event.roomId) return;
 
-	const room = await db.query.chatRooms.findFirst({
-		where: eq(chatRooms.id, event.roomId),
-		columns: { id: true, kind: true },
-	});
+	const room = await readQuery(
+		db.query.chatRooms.findFirst({
+			where: eq(chatRooms.id, event.roomId),
+			columns: { id: true, kind: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!room || !isConversationRoomKind(room.kind)) return;
 	if (event.roomKind && !isConversationRoomKind(event.roomKind)) return;
 
-	const members = await db
-		.select({
-			userId: chatRoomMembers.userId,
-			lastReadSeq: chatRoomMembers.lastReadSeq,
-			muted: chatRoomMembers.muted,
-		})
-		.from(chatRoomMembers)
-		.where(eq(chatRoomMembers.roomId, event.roomId))
-		.orderBy(asc(chatRoomMembers.lastReadSeq))
-		.limit(CHAT_MEMBER_FANOUT_LIMIT);
+	const members = await readQuery(
+		db
+			.select({
+				userId: chatRoomMembers.userId,
+				lastReadSeq: chatRoomMembers.lastReadSeq,
+				muted: chatRoomMembers.muted,
+			})
+			.from(chatRoomMembers)
+			.where(eq(chatRoomMembers.roomId, event.roomId))
+			.orderBy(asc(chatRoomMembers.lastReadSeq))
+			.limit(CHAT_MEMBER_FANOUT_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 
 	const senderId = message.senderUserId ?? event.senderUserId;
 	const recipients = members.filter((member) => {
@@ -160,16 +180,22 @@ export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEve
 
 	let title = "";
 	if (senderId) {
-		const sender = await db.query.users.findFirst({
-			where: eq(users.id, senderId),
-			columns: { username: true },
-		});
+		const sender = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, senderId),
+				columns: { username: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (sender?.username) title = sender.username;
 	} else if (message.senderNarratorId) {
-		const bot = await db.query.narrators.findFirst({
-			where: eq(narrators.id, message.senderNarratorId),
-			columns: { id: true, title: true, handle: true },
-		});
+		const bot = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, message.senderNarratorId),
+				columns: { id: true, title: true, handle: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (bot) title = botDisplayName(bot);
 	} else if (message.senderGuestName) {
 		title = message.senderGuestName;
@@ -232,6 +258,8 @@ function buildPermissionPreview(toolName: string, hint: string | null | undefine
  * tabs stand in for the interested audience and the cap applies.
  */
 async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[]> {
+	const teamId = teamIdOfNarrator(row.id);
+	if (teamId) return await resolveTeamRecipients(teamId, row);
 	const candidates = new Set<string>();
 	if (row.ownerUserId) candidates.add(row.ownerUserId);
 
@@ -251,10 +279,13 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 	const ids = [...candidates].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
 	const adminIds = new Set(
 		(
-			await db
-				.select({ id: users.id })
-				.from(users)
-				.where(and(eq(users.role, "admin"), inArray(users.id, ids)))
+			await readQuery(
+				db
+					.select({ id: users.id })
+					.from(users)
+					.where(and(eq(users.role, "admin"), inArray(users.id, ids))),
+				{ executionPolicy: "worker-required" },
+			)
 		).map((u) => u.id),
 	);
 
@@ -270,6 +301,49 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 	return allowed;
 }
 
+/** Candidates of each source the team's people list looks at for one notification. */
+const TEAM_NOTIFY_CANDIDATES = 50;
+
+/**
+ * Recipients of a call waiting in a team tree (M1): the team's members only. A call of the
+ * team's tree waits for a member, and only members (write access on the coordinator) may decide
+ * it, so onlookers are not told. The members come from the team's people list (owner, explicit
+ * and project grants, recent speakers; each already judged by write access on the coordinator,
+ * which is also the deciding ACL of its subagents); recent-tab viewers are added when they may
+ * write. Bounded: at most {@link TEAM_NOTIFY_CANDIDATES} candidates per source and
+ * {@link NOTIFICATION_FANOUT_MAX_RECIPIENTS} recipients.
+ */
+async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promise<string[]> {
+	const allowed = new Set(await readTeamMemberIds(teamId, TEAM_NOTIFY_CANDIDATES));
+	// The most recently visited holders: a crowd of onlooker tabs cannot push a writer out by id.
+	const tabs = (
+		await getRecentTabUserIdsForNarratorByRecency(row.id, NOTIFICATION_FANOUT_MAX_RECIPIENTS)
+	).filter((id) => !allowed.has(id));
+	if (tabs.length > 0) {
+		const admins = new Set(
+			(
+				await readQuery(
+					db
+						.select({ id: users.id })
+						.from(users)
+						.where(and(eq(users.role, "admin"), inArray(users.id, tabs))),
+					{ executionPolicy: "worker-required" },
+				)
+			).map((u) => u.id),
+		);
+		// One batch judgement for all of them (a handful of queries), not one check per user.
+		const verdicts = await judgeNarratorAccessBatch(
+			row,
+			tabs.map((userId) => ({ userId, isAdmin: admins.has(userId) })),
+		);
+		for (const userId of tabs) {
+			if (allowed.size >= NOTIFICATION_FANOUT_MAX_RECIPIENTS) break;
+			if (verdicts.get(userId)?.write) allowed.add(userId);
+		}
+	}
+	return [...allowed].slice(0, NOTIFICATION_FANOUT_MAX_RECIPIENTS);
+}
+
 /**
  * Project a new pending permission offer into notification-center rows.
  *
@@ -281,36 +355,42 @@ async function resolvePermissionRecipients(row: NarratorAclRow): Promise<string[
 export async function fanoutPermissionRequestNotifications(
 	event: PermissionFanoutEvent,
 ): Promise<void> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, event.requestId),
-		columns: {
-			id: true,
-			narratorId: true,
-			status: true,
-			permissionDecidedAt: true,
-			toolName: true,
-			canonicalFilePath: true,
-			resolvedFilePath: true,
-		},
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, event.requestId),
+			columns: {
+				id: true,
+				narratorId: true,
+				status: true,
+				permissionDecidedAt: true,
+				toolName: true,
+				canonicalFilePath: true,
+				resolvedFilePath: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!toolCall || toolCall.narratorId !== event.narratorId) return;
 	if (toolCall.permissionDecidedAt) return;
 	// Only live offers — not success/fail historical rows replayed through events.
 	if (toolCall.status !== "pending" && toolCall.status !== "initializing") return;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, event.narratorId),
-		columns: {
-			id: true,
-			title: true,
-			ownerUserId: true,
-			visibility: true,
-			writeAudience: true,
-			type: true,
-			aclRootNarratorId: true,
-			contextProjectId: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, event.narratorId),
+			columns: {
+				id: true,
+				title: true,
+				ownerUserId: true,
+				visibility: true,
+				writeAudience: true,
+				type: true,
+				aclRootNarratorId: true,
+				contextProjectId: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) return;
 
 	const aclRow: NarratorAclRow = {
@@ -384,11 +464,14 @@ export function initNotificationFanout(): void {
 	};
 	const deleted = (event: { roomId: string }) => {
 		guard("chat:message_deleted", async () => {
-			const members = await db
-				.select({ userId: chatRoomMembers.userId })
-				.from(chatRoomMembers)
-				.where(eq(chatRoomMembers.roomId, event.roomId))
-				.limit(NOTIFICATION_FANOUT_MAX_RECIPIENTS);
+			const members = await readQuery(
+				db
+					.select({ userId: chatRoomMembers.userId })
+					.from(chatRoomMembers)
+					.where(eq(chatRoomMembers.roomId, event.roomId))
+					.limit(NOTIFICATION_FANOUT_MAX_RECIPIENTS),
+				{ executionPolicy: "worker-required" },
+			);
 			for (const member of members) {
 				eventBus.emit({
 					type: "notification_center_changed",

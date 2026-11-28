@@ -1,3 +1,4 @@
+import { isCheckpointStop } from "@server/services/agent-runtime/checkpoint-stop";
 import {
 	isAdminToolExecutionAllowed,
 	mcpServerMarker,
@@ -5,6 +6,7 @@ import {
 } from "@server/services/tool-load-markers";
 import {
 	beginToolStartAdmission,
+	checkpointStopForSignal,
 	convertToolStartGrantToExecution,
 	getUpdateCoordinationStatus,
 	inertUpdateExecutionLease,
@@ -423,10 +425,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
-	if (
-		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent")
-	) {
+	if (tu.name === "Agent" && typeof tu.input.stop !== "string") {
 		return "resumable";
 	}
 	return "ordinary";
@@ -476,9 +475,6 @@ async function upsertDeferredTool(
 			executionAttempt: binding.attempt,
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
-			...(tu.name === "Await" && typeof tu.input.type === "string"
-				? { awaitType: tu.input.type }
-				: {}),
 			...(tu.name === "Agent"
 				? {
 						runInBackground: tu.input.run_in_background === true || tu.input.background === true,
@@ -838,6 +834,7 @@ async function executeToolUntraced(
 			config.toolExecutionBindings?.get(tu),
 	);
 	admissionState.toolCallBinding = toolCallBinding;
+	let permissionRuleCheckpointPaused = false;
 	let permissionRuleTerminationReason =
 		"Permission rule request finished without consuming its approval";
 	// A direct persisted recovery uses the exact same path as a loop receipt.
@@ -853,7 +850,9 @@ async function executeToolUntraced(
 	const fileToolName = ["Write", "Edit", "StructSed"].includes(tu.name)
 		? (tu.name as "Write" | "Edit" | "StructSed")
 		: undefined;
-	let preparedNoDispatch: ReturnType<NonNullable<AgentConfig["prepareToolNoDispatch"]>> | undefined;
+	let preparedNoDispatch:
+		| Awaited<ReturnType<NonNullable<AgentConfig["prepareToolNoDispatch"]>>>
+		| undefined;
 	const proofContext = (): ToolContext => ({
 		narratorId: config.narratorId,
 		cwd: config.cwd,
@@ -879,12 +878,12 @@ async function executeToolUntraced(
 		)
 			return;
 		if (config.prepareToolNoDispatch) {
-			preparedNoDispatch = config.prepareToolNoDispatch(proofContext(), fileToolName);
+			preparedNoDispatch = await config.prepareToolNoDispatch(proofContext(), fileToolName);
 		} else if (!config.recordToolNoDispatch) {
 			const { getDefaultLocalFileChangeRuntime } = await import(
 				"@server/services/file-change-runtime"
 			);
-			preparedNoDispatch = (await getDefaultLocalFileChangeRuntime()).prepareHostNoDispatch(
+			preparedNoDispatch = await (await getDefaultLocalFileChangeRuntime()).prepareHostNoDispatch(
 				proofContext(),
 				fileToolName,
 			);
@@ -940,6 +939,15 @@ async function executeToolUntraced(
 			await preAdmitToolExecution(tu, config, { state: admissionState });
 		}
 		config.assertWorkspaceCurrent?.();
+		// A frozen epoch or a stale registry entry must not revive the removed waiter.
+		if (tu.name === "Await") {
+			return {
+				output:
+					"Await is retired and cannot execute. Use Watch to register a non-blocking observation.",
+				isError: true,
+				durationMs: 0,
+			};
+		}
 		const tool = toolRegistry.get(tu.name);
 
 		// Defense-in-depth: when unified native search is enabled for this provider/model,
@@ -1192,6 +1200,14 @@ async function executeToolUntraced(
 						: undefined,
 				}));
 		} catch (err) {
+			if (isCheckpointStop(err) && !config.signal.aborted) {
+				const own = checkpointStopForSignal(config.signal, config.narratorId);
+				if (own?.updateEpoch === err.updateEpoch) {
+					own.cleanupFailure = err.cleanupFailure;
+					permissionRuleCheckpointPaused = true;
+					throw own;
+				}
+			}
 			return {
 				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
@@ -1590,6 +1606,8 @@ async function executeToolUntraced(
 						childTu,
 						{
 							...config,
+							// The script reads the file, not the model: its text is never annotated.
+							annotateToolResult: undefined,
 							defaultDeviceId,
 							signal: combinedSignal,
 							permissionHandler: async (...args) => {
@@ -1804,10 +1822,22 @@ async function executeToolUntraced(
 				}
 			}
 
+			const annotationCwd = frozenExecution?.target.cwd ?? config.cwd;
+			// Ran on this server, and the session's own Reads go here too.
+			const annotationLocal =
+				(frozenExecution?.target.deviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID &&
+				(config.defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID;
 			// If the tool already truncated its output, pass through as-is.
 			if (result.truncated) {
 				return {
-					output: finalOutput,
+					output: await annotateToolOutput(config, tu, effectiveInput, finalOutput, result, {
+						cwd: annotationCwd,
+						local: annotationLocal,
+						fullOutputPath:
+							typeof result.metadata?.fullOutputPath === "string"
+								? result.metadata.fullOutputPath
+								: undefined,
+					}),
 					isError: result.isError,
 					fatal: result.fatal,
 					durationMs: Date.now() - start,
@@ -1826,7 +1856,14 @@ async function executeToolUntraced(
 			}
 			const truncated = truncateOutput(result.output);
 			return {
-				output: truncated.content + appendNotice,
+				output: await annotateToolOutput(
+					config,
+					tu,
+					effectiveInput,
+					truncated.content + appendNotice,
+					result,
+					{ cwd: annotationCwd, local: annotationLocal, fullOutputPath: truncated.outputPath },
+				),
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
@@ -1843,6 +1880,14 @@ async function executeToolUntraced(
 				pipelineExitConfirmationStateId,
 			};
 		} catch (err) {
+			if (isCheckpointStop(err) && !config.signal.aborted) {
+				const own = checkpointStopForSignal(config.signal, config.narratorId);
+				if (own?.updateEpoch === err.updateEpoch) {
+					own.cleanupFailure = err.cleanupFailure;
+					permissionRuleCheckpointPaused = true;
+					throw own;
+				}
+			}
 			permissionRuleTerminationReason = err instanceof Error ? err.message : String(err);
 			// A failed durable claim must still reject (not become a normal tool result).
 			if (claimingExecution) throw err;
@@ -1874,11 +1919,19 @@ async function executeToolUntraced(
 			}
 		}
 	} catch (error) {
+		if (isCheckpointStop(error) && !config.signal.aborted) {
+			const own = checkpointStopForSignal(config.signal, config.narratorId);
+			if (own?.updateEpoch === error.updateEpoch) {
+				own.cleanupFailure = error.cleanupFailure;
+				permissionRuleCheckpointPaused = true;
+				throw own;
+			}
+		}
 		permissionRuleTerminationReason = error instanceof Error ? error.message : String(error);
 		throw error;
 	} finally {
 		releaseToolAdmissionState(admissionState);
-		if (tu.name === "RequestPermissionRule" && toolCallBinding) {
+		if (tu.name === "RequestPermissionRule" && toolCallBinding && !permissionRuleCheckpointPaused) {
 			// Final deny, abort, routing failures and every early return must close an
 			// unconsumed approval. The service CAS protects applied/existing/denied receipts.
 			const { terminatePermissionRuleRequest } = await import(
@@ -1900,6 +1953,41 @@ async function executeToolUntraced(
 				attemptClaimed,
 			);
 		}
+	}
+}
+
+/**
+ * `AgentConfig.annotateToolResult` over a finished call's text (a team coordinator's soft-limit
+ * reminders). The tool has already run; a failing annotator keeps the text unchanged.
+ */
+async function annotateToolOutput(
+	config: AgentConfig,
+	tu: AgentToolUse,
+	input: Record<string, unknown>,
+	output: string,
+	result: ToolResult,
+	where: { cwd: string; local: boolean; fullOutputPath?: string },
+): Promise<string> {
+	if (!config.annotateToolResult) return output;
+	try {
+		return (
+			(await config.annotateToolResult({
+				toolName: tu.name,
+				toolUseId: tu.toolUseId,
+				input,
+				output,
+				isError: result.isError ?? false,
+				metadata: result.metadata,
+				...where,
+			})) ?? output
+		);
+	} catch (error) {
+		logger.warn("Tool result annotation failed; the result is kept as it was", {
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			error: String(error),
+		});
+		return output;
 	}
 }
 

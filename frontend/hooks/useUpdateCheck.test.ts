@@ -89,7 +89,7 @@ function installDom(): () => void {
 		previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 	}
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
-	const store = new Map<string, string>();
+	const store = new Map<string, string>([["narrafork_token", "test-admin"]]);
 	const values: Record<string, unknown> = {
 		window,
 		document: window.document,
@@ -143,7 +143,13 @@ let renders: UpdateCheckResult[] = [];
 let checkUpdateCalls = 0;
 const originalCheckUpdate = api.checkUpdate;
 const originalGetSettings = api.getSettings;
+const originalGetRuntimeSettings = api.getRuntimeSettings;
+
+import { setToken } from "../lib/api/client";
+import { runtimeSettingsQueryOptions } from "./useRuntimeSettings";
+
 const originalUpdateSettings = api.updateSettings;
+const originalUpdateRuntimeSettings = api.updateRuntimeSettings;
 const originalFetch = globalThis.fetch;
 const originalApplyUpdate = api.applyUpdate;
 let applyState: ReturnType<typeof useUpdateApply> | undefined;
@@ -207,9 +213,15 @@ beforeEach(() => {
 	promptState = undefined;
 	renders = [];
 	checkUpdateCalls = 0;
+	api.updateRuntimeSettings = async (input) =>
+		(await api.updateSettings(input)) as unknown as Awaited<
+			ReturnType<typeof originalUpdateRuntimeSettings>
+		>;
 	api.getSettings = async () => ({
 		update: { source: "github", githubRepository: "fork/project" },
 	});
+	api.getRuntimeSettings = async () =>
+		(await api.getSettings()) as unknown as Awaited<ReturnType<typeof originalGetRuntimeSettings>>;
 	api.checkUpdate = async () => {
 		checkUpdateCalls++;
 		return {
@@ -235,7 +247,9 @@ afterEach(async () => {
 	// Restore the patched API method and the DOM globals even if an expectation threw.
 	api.checkUpdate = originalCheckUpdate;
 	api.getSettings = originalGetSettings;
+	api.getRuntimeSettings = originalGetRuntimeSettings;
 	api.updateSettings = originalUpdateSettings;
+	api.updateRuntimeSettings = originalUpdateRuntimeSettings;
 	api.applyUpdate = originalApplyUpdate;
 	applyState = undefined;
 	globalThis.fetch = originalFetch;
@@ -440,7 +454,7 @@ describe("update source behavior", () => {
 		let calls = 0;
 		globalThis.fetch = (async () => {
 			calls++;
-			queryClient?.setQueryData(["settings"], {
+			queryClient?.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 				update: { source: "github", githubRepository: "fork/project", channel: "beta" },
 			});
 			return Response.json({ code: "VERSION_CHANGED", error: "stale" }, { status: 409 });
@@ -645,7 +659,7 @@ describe("useUpdateCheck saved settings", () => {
 				finish = resolve;
 			});
 		await mountAs("admin");
-		queryClient?.setQueryData(["settings"], {
+		queryClient?.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 			update: { source: "github", githubRepository: "fork/project", channel: "beta" },
 		});
 		finish({ updateAvailable: true, currentVersion: "1.0.0", latestVersion: "1.1.0" });
@@ -665,7 +679,7 @@ describe("useUpdateCheck saved settings", () => {
 			});
 		};
 		const pendingSettings = queryClient?.fetchQuery({
-			queryKey: ["settings"],
+			queryKey: runtimeSettingsQueryOptions().queryKey,
 			queryFn: api.getSettings,
 		});
 		await mountAs("admin");
@@ -810,7 +824,9 @@ describe("first GitHub check mirror prompt", () => {
 		});
 		await mountAs("admin");
 		expect(promptState?.opened).toBe(false);
-		queryClient?.setQueryData(["settings"], { update: { source: "update-server" } });
+		queryClient?.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+			update: { source: "update-server" },
+		});
 		await latest().refetch();
 		await settle();
 		expect(promptState?.opened).toBe(false);
@@ -852,6 +868,38 @@ describe("first GitHub check mirror prompt", () => {
 		expect(writes).toBe(0);
 	});
 
+	test("an administrator PATCH finishing after token replacement cannot seed the new user's runtime cache", async () => {
+		configure("TIMEOUT");
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(true);
+		const complete = { managementOnly: true };
+		queryClient?.setQueryData(["settings"], complete);
+		let finish!: (value: Awaited<ReturnType<typeof api.updateRuntimeSettings>>) => void;
+		let signal: AbortSignal | undefined;
+		api.updateRuntimeSettings = async (_input, options) => {
+			signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+			return new Promise((resolve) => {
+				finish = resolve;
+			});
+		};
+		const pending = promptState?.confirm();
+		await settle();
+		setToken("replacement-user");
+		finish({
+			revision: 2,
+			agent: { defaultModel: "x", summaryModel: "x" },
+			outline: { enabled: false },
+			requestEvidence: { autoPin: "off" },
+			summaryModelAvailable: true,
+			update: { source: "update-server", serverUrl: "https://admin-private.example" },
+		});
+		await pending;
+		await settle();
+		expect(signal?.aborted).toBe(true);
+		expect(queryClient?.getQueryData(runtimeSettingsQueryOptions().queryKey)).toBeUndefined();
+		expect(queryClient?.getQueryData(["settings"])).toEqual(complete);
+		expect(promptState?.opened).toBe(false);
+	});
 	test("confirmation patches only mirror fields, refreshes checks and preserves prepared state", async () => {
 		configure("TIMEOUT");
 		let payload: Record<string, unknown> | undefined;
@@ -898,7 +946,9 @@ describe("first GitHub check mirror prompt", () => {
 		});
 		expect(promptState?.opened).toBe(false);
 		expect(checks).toBe(2);
-		expect(queryClient?.getQueryData(["settings"])).toEqual(await api.getSettings());
+		expect(queryClient?.getQueryData(runtimeSettingsQueryOptions().queryKey)).toEqual(
+			await api.getSettings(),
+		);
 		expect(queryClient?.getQueryData(["update-status", "1.1.0"])).toEqual(prepared);
 	});
 
@@ -978,7 +1028,7 @@ describe("first GitHub check mirror prompt", () => {
 		expect(writes).toBe(1);
 		expect(promptState?.opened).toBe(true);
 		expect(promptState?.error).toBe("updateSourceChanged");
-		expect(queryClient?.getQueryData(["settings"])).toEqual(concurrent);
+		expect(queryClient?.getQueryData(runtimeSettingsQueryOptions().queryKey)).toEqual(concurrent);
 	});
 
 	test("rechecks settings before saving and refuses changed sources", async () => {

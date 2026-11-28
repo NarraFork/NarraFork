@@ -20,6 +20,13 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import {
+	isPoolCooldownActive,
+	type PoolCooldown,
+	type PoolCooldownReason,
+	poolFailureState,
+	selectPoolEntry,
+} from "./credential-pool";
 import { SessionAffinity } from "./session-affinity";
 
 export { withProviderKey } from "../provider-keys";
@@ -42,14 +49,9 @@ import { ApiError } from "./types";
 const MINUTE = 60_000;
 const STICKY_LIMIT = 5_000;
 
-export type KeyCooldownReason = "rate_limited" | "quota" | "forbidden";
+export type KeyCooldownReason = PoolCooldownReason;
 
-interface Cooldown {
-	until: number;
-	reason: KeyCooldownReason;
-}
-
-const cooldowns = new Map<string, Cooldown>();
+const cooldowns = new Map<string, PoolCooldown>();
 /** `${providerId}\0${session}` → key id; the key this session last used (no expiry). */
 const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
 
@@ -57,10 +59,15 @@ const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
  * Why a key is resting, if it is: a recent failure, or a usage window the quota cache
  * has seen used up (until it resets). For selection and the key list.
  */
-export function keyCooldown(keyId: string, now = Date.now()): Cooldown | undefined {
+export function keyCooldown(
+	keyId: string,
+	now = Date.now(),
+	includeQuota = true,
+): PoolCooldown | undefined {
 	const cooldown = cooldowns.get(keyId);
-	const failed = cooldown && cooldown.until > now ? cooldown : undefined;
-	const exhausted = keyQuotaBlockedUntil(keyId, now);
+	const failed = isPoolCooldownActive(cooldown?.until, now) ? cooldown : undefined;
+	// Routing validates the quota identity itself; the legacy pool probe cannot do so.
+	const exhausted = includeQuota ? keyQuotaBlockedUntil(keyId, now) : undefined;
 	if (exhausted !== undefined && exhausted > (failed?.until ?? 0)) {
 		return { until: exhausted, reason: "quota" };
 	}
@@ -83,22 +90,18 @@ export function selectProviderKey(
 	session?: string,
 	exclude?: ReadonlySet<string>,
 	now = Date.now(),
+	isEligible?: (key: ProviderKey) => boolean,
 ): ProviderKey | undefined {
-	const keys = usableProviderKeys(providerId).filter((key) => !exclude?.has(key.id));
-	if (keys.length === 0) return undefined;
-	const ready = keys.filter((key) => !keyCooldown(key.id, now));
 	const stickyKey = session ? `${providerId}\0${session}` : undefined;
-	const pinned = stickyKey ? sticky.get(stickyKey, now) : undefined;
-	const chosen =
-		ready.find((key) => key.id === pinned) ??
-		ready[0] ??
-		[...keys].sort(
-			(a, b) => (keyCooldown(a.id, now)?.until ?? 0) - (keyCooldown(b.id, now)?.until ?? 0),
-		)[0];
-	if (stickyKey && chosen) {
-		// set() refreshes the binding and prunes past the cap.
-		sticky.set(stickyKey, chosen.id, now);
-	}
+	const keys = getProviderKeyStore().list(providerId);
+	const chosen = selectPoolEntry(isEligible ? keys.filter(isEligible) : keys, {
+		now,
+		exclude,
+		stickyId: stickyKey ? sticky.get(stickyKey, now) : undefined,
+		cooldownUntil: (key) => keyCooldown(key.id, now)?.until,
+		fallbackToCooling: true,
+	});
+	if (stickyKey && chosen) sticky.set(stickyKey, chosen.id, now);
 	return chosen;
 }
 
@@ -137,31 +140,56 @@ export function classifyKeyFault(err: unknown): KeyFault | null {
 	}
 }
 
-/** Apply a fault to a key. Returns whether another key should be tried. */
 export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now()): boolean {
 	const fault = classifyKeyFault(err);
 	if (!fault) return false;
-	if (fault.kind === "invalid") {
+	// A concurrent attempt may already have disabled this same identity. The fault
+	// still permits failover, but must not rewrite disabled state or its cooldown.
+	if (getProviderKeyStore().get(key.id)?.disabled) return true;
+	const failure = poolFailureState(fault, 0, 1, now);
+	if (failure.disabledReason === "invalid") {
 		try {
 			getProviderKeyStore().update(key.id, { disabled: true, disabledReason: "invalid" });
 		} catch {
-			// The key file is unreadable: keep the key in rotation rather than fail here.
+			// The key file is unreadable: do not overwrite it to persist the disable.
 			cooldowns.set(key.id, { until: now + 10 * MINUTE, reason: "forbidden" });
 		}
 		logger.warn("Provider key rejected by upstream; turned off", {
 			providerId: key.providerId,
 			keyId: key.id,
 		});
-	} else {
-		cooldowns.set(key.id, { until: now + fault.ms, reason: fault.reason });
+	} else if (failure.cooldown) {
+		cooldowns.set(key.id, failure.cooldown);
 		logger.info("Provider key cooling down", {
 			providerId: key.providerId,
 			keyId: key.id,
-			reason: fault.reason,
-			seconds: Math.round(fault.ms / 1000),
+			reason: failure.cooldown.reason,
+			seconds: Math.round((failure.cooldown.until - now) / 1000),
 		});
 	}
 	return true;
+}
+
+function keyFingerprint(key: ProviderKey): string {
+	return JSON.stringify([key.apiKey, key.network ?? null]);
+}
+
+/** Snapshot mutable key identity; concurrent disabling changes write eligibility, not identity. */
+function captureKeyAttempt(
+	key: ProviderKey,
+	connection: Pick<ProviderAdapter, "isDiagnosticConnectionCurrent">,
+): () => boolean {
+	const { id, providerId } = key;
+	const version = keyFingerprint(key);
+	return () => {
+		const live = getProviderKeyStore().get(id);
+		return (
+			!!live &&
+			live.providerId === providerId &&
+			keyFingerprint(live) === version &&
+			connection.isDiagnosticConnectionCurrent?.() !== false
+		);
+	};
 }
 
 /**
@@ -170,7 +198,12 @@ export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now())
  * difference.
  */
 export class PooledProvider implements ProviderAdapter {
-	private readonly adapters = new Map<string, { signature: string; adapter: ProviderAdapter }>();
+	private readonly adapters = new Map<
+		string,
+		{ signature: string; adapter: ProviderAdapter; preparedModel?: string }
+	>();
+	private preparedModel?: string;
+	isDiagnosticConnectionCurrent?: ProviderAdapter["isDiagnosticConnectionCurrent"];
 	readonly mayLeakXmlToolCalls?: boolean;
 	supportsNativeMediaInput?: ProviderAdapter["supportsNativeMediaInput"];
 	toolLoadingTarget?: ProviderAdapter["toolLoadingTarget"];
@@ -181,6 +214,7 @@ export class PooledProvider implements ProviderAdapter {
 	constructor(
 		private readonly providerId: string,
 		private readonly build: (key: ProviderKey) => ProviderAdapter,
+		private readonly isEligible?: (key: ProviderKey, model: string) => boolean,
 	) {
 		const probe = this.current();
 		this.mayLeakXmlToolCalls = probe.mayLeakXmlToolCalls;
@@ -195,10 +229,10 @@ export class PooledProvider implements ProviderAdapter {
 			this.getActiveReasoningSource = () => this.current().getActiveReasoningSource?.();
 		}
 		if (probe.generateImage) {
-			this.generateImage = (params) => {
-				const key = selectProviderKey(this.providerId, params.conversationId);
-				if (!key) throw new Error("This provider has no usable API key");
-				const adapter = this.adapterFor(key);
+			this.generateImage = async (params) => {
+				const key = this.selectForModel(params.chatModel ?? params.model, params.conversationId);
+				if (!key) throw new Error("This provider has no usable API key or eligible transport");
+				const adapter = this.adapterFor(key, params.chatModel ?? params.model);
 				const generateImage = adapter.generateImage;
 				if (!generateImage) throw new Error("This provider does not support image generation");
 				return generateImage.call(adapter, params).then((result) => ({
@@ -209,50 +243,77 @@ export class PooledProvider implements ProviderAdapter {
 		}
 		if (probe.generateWithHistoryWithMeta) {
 			this.generateWithHistoryWithMeta = (systemInstruction, content, model, locale, options) =>
-				this.withFailover((adapter) =>
+				this.withFailover(model, (adapter) =>
 					(
 						adapter.generateWithHistoryWithMeta as NonNullable<
 							ProviderAdapter["generateWithHistoryWithMeta"]
 						>
-					)(systemInstruction, content, model, locale, options),
+					).call(adapter, systemInstruction, content, model, locale, options),
 				);
 		}
 	}
 
-	private adapterFor(key: ProviderKey): ProviderAdapter {
-		const signature = JSON.stringify([key.apiKey, key.network ?? null]);
-		const cached = this.adapters.get(key.id);
-		if (cached?.signature === signature) return cached.adapter;
-		const adapter = this.build(key);
-		this.adapters.set(key.id, { signature, adapter });
-		return adapter;
+	private adapterFor(key: ProviderKey, model = this.preparedModel): ProviderAdapter {
+		const signature = keyFingerprint(key);
+		let entry = this.adapters.get(key.id);
+		if (entry?.signature !== signature) {
+			entry = { signature, adapter: this.build(key) };
+			this.adapters.set(key.id, entry);
+		}
+		if (model !== undefined && entry.preparedModel !== model) {
+			entry.adapter.prepareForModel?.(model);
+			entry.preparedModel = model;
+		}
+		return entry.adapter;
 	}
 
-	/** The adapter for formatting work that does not depend on the key. */
-	private current(): ProviderAdapter {
+	prepareForModel(model: string): void {
+		this.preparedModel = model;
+		this.current();
+	}
+
+	private selectForModel(model: string, session?: string, exclude?: ReadonlySet<string>) {
+		const eligible = this.isEligible;
+		return selectProviderKey(
+			this.providerId,
+			session,
+			exclude,
+			Date.now(),
+			eligible ? (key) => eligible(key, model) : undefined,
+		);
+	}
+
+	/** Formatting can initialize a delegate; transport eligibility gates actual attempts below. */
+	private current(model = this.preparedModel): ProviderAdapter {
 		const key = selectProviderKey(this.providerId);
 		if (!key) throw new Error("This provider has no usable API key");
-		return this.adapterFor(key);
+		return this.adapterFor(key, model);
 	}
 
 	private async withFailover<T extends object | string>(
+		model: string,
 		run: (adapter: ProviderAdapter) => Promise<T>,
 	): Promise<T> {
 		const tried = new Set<string>();
 		for (;;) {
-			const key = selectProviderKey(this.providerId, undefined, tried);
-			if (!key) throw new Error("This provider has no usable API key");
+			const key = this.selectForModel(model, undefined, tried);
+			if (!key) throw new Error("This provider has no usable API key or eligible transport");
 			tried.add(key.id);
+			const isAttemptCurrent = captureKeyAttempt(key, this);
 			try {
-				const result = await run(this.adapterFor(key));
-				clearKeyCooldown(key.id);
-				if (typeof result === "object" && result !== null && !("credentialId" in result)) {
-					return { ...result, credentialId: key.id };
-				}
-				return result;
+				const adapter = this.adapterFor(key, model);
+				const result = await run(adapter);
+				if (isAttemptCurrent() && !getProviderKeyStore().get(key.id)?.disabled)
+					clearKeyCooldown(key.id);
+				// The key is the credential; an inner adapter's own id is the connection's.
+				return typeof result === "object" && result !== null
+					? { ...result, credentialId: key.id }
+					: result;
 			} catch (err) {
 				const more =
-					reportKeyFault(key, err) && !!selectProviderKey(this.providerId, undefined, tried);
+					isAttemptCurrent() &&
+					reportKeyFault(key, err) &&
+					!!this.selectForModel(model, undefined, tried);
 				if (!more) throw err;
 			}
 		}
@@ -262,37 +323,80 @@ export class PooledProvider implements ProviderAdapter {
 		return this.current().formatTools(tools);
 	}
 
-	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory> {
-		return this.current().buildHistory(dbMessages, model, narratorId);
+	async buildHistory(
+		dbMessages: DbMessage[],
+		model: string,
+		narratorId?: string,
+	): Promise<BuiltHistory> {
+		const adapter = this.current(model);
+		return adapter.buildHistory(dbMessages, model, narratorId);
 	}
 
 	injectSystemPrompt(history: unknown[], systemPrompt: string, model: string, locale?: string) {
 		this.current().injectSystemPrompt(history, systemPrompt, model, locale);
 	}
 
+	supportsDiagnosticFork(model: string, credentialId?: string): boolean {
+		const key = usableProviderKeys(this.providerId).find((key) => key.id === credentialId);
+		return (
+			!!key &&
+			this.isEligible?.(key, model) !== false &&
+			this.adapterFor(key, model).supportsDiagnosticFork?.(model, credentialId) === true
+		);
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		if (params.diagnosticFork) {
+			params.diagnosticFork.validateCredential?.();
+			const key = usableProviderKeys(this.providerId).find(
+				(key) => key.id === params.diagnosticFork?.credentialId,
+			);
+			if (!key || this.isEligible?.(key, params.model) === false)
+				throw new Error("The parent diagnostic credential is unavailable");
+			const adapter = this.adapterFor(key, params.model);
+			if (!adapter.supportsDiagnosticFork?.(params.model, key.id)) {
+				throw new Error("The parent diagnostic credential cannot safely fork this request");
+			}
+			// Never bind/rebind the parent's affinity, fail over, or report key faults.
+			for await (const event of adapter.chat({
+				...params,
+				onRequestStart: () => params.onRequestStart?.({ credentialId: key.id }),
+			})) {
+				yield { ...event, credentialId: key.id };
+			}
+			return;
+		}
 		const session = params.stickySessionKey ?? params.conversationId;
 		const tried = new Set<string>();
 		for (;;) {
-			const key = selectProviderKey(this.providerId, session, tried);
-			if (!key) throw new Error("This provider has no usable API key");
+			const key = this.selectForModel(params.model, session, tried);
+			if (!key) throw new Error("This provider has no usable API key or eligible transport");
 			tried.add(key.id);
+			const isAttemptCurrent = captureKeyAttempt(key, this);
 			let streamed = false;
 			try {
-				for await (const event of this.adapterFor(key).chat({
+				const adapter = this.adapterFor(key, params.model);
+				for await (const event of adapter.chat({
 					...params,
 					onRequestStart: (info) =>
-						params.onRequestStart?.({ credentialId: info?.credentialId ?? key.id }),
+						params.onRequestStart?.({
+							credentialId: key.id,
+							validateDiagnosticCredential: () =>
+								isAttemptCurrent() &&
+								!getProviderKeyStore().get(key.id)?.disabled &&
+								info?.validateDiagnosticCredential?.() !== false,
+						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: event.credentialId ?? key.id };
+					yield { ...event, credentialId: key.id };
 				}
-				clearKeyCooldown(key.id);
+				if (isAttemptCurrent() && !getProviderKeyStore().get(key.id)?.disabled)
+					clearKeyCooldown(key.id);
 				return;
 			} catch (err) {
 				if (params.signal.aborted) throw err;
-				const faulted = reportKeyFault(key, err);
-				const next = faulted && !streamed && selectProviderKey(this.providerId, session, tried);
+				const faulted = isAttemptCurrent() && reportKeyFault(key, err);
+				const next = faulted && !streamed && this.selectForModel(params.model, session, tried);
 				if (!next) throw err;
 				logger.info("Retrying with the provider's next key", {
 					providerId: this.providerId,
@@ -304,7 +408,7 @@ export class PooledProvider implements ProviderAdapter {
 	}
 
 	generate(text: string, model: string): Promise<string> {
-		return this.withFailover((adapter) => adapter.generate(text, model));
+		return this.withFailover(model, (adapter) => adapter.generate(text, model));
 	}
 
 	generateWithMeta(
@@ -313,7 +417,7 @@ export class PooledProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.withFailover((adapter) =>
+		return this.withFailover(model, (adapter) =>
 			adapter.generateWithMeta(text, model, systemInstruction, options),
 		);
 	}
@@ -325,7 +429,7 @@ export class PooledProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string> {
-		return this.withFailover((adapter) =>
+		return this.withFailover(model, (adapter) =>
 			adapter.generateWithHistory(systemInstruction, content, model, locale, options),
 		);
 	}

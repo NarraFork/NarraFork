@@ -6,7 +6,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +25,8 @@ const { invalidateScheduledTaskAssociations, listNarratorScheduledTasks } = awai
 	"../scheduled-task-associations"
 );
 const { saveSettings, settings } = await import("../../lib/settings");
+const { getProviderKeyStore } = await import("../../lib/provider-keys");
+const { resolveNarratorFastMode } = await import("../narrator-fast-mode");
 const { getModelOverride, replaceModelOverridesForTests, setModelCatalogAutoUpdate } = await import(
 	"../../lib/model-catalog"
 );
@@ -201,6 +203,21 @@ beforeEach(async () => {
 });
 
 describe("data portability · 全链路", () => {
+	test("overwriting imported sessions refreshes cached primary and inherited fast mode", async () => {
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'off' WHERE id = 'sess-1'");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, acl_root_narrator_id, created_at, updated_at)
+			 VALUES ('fast-child', 'subagent', 'sess-1', '2026-10-01', '2026-10-01')`,
+		);
+		const zip = await readFile((await exportData()).zipPath);
+		sqlite.run("UPDATE narrators SET fast_mode_override = 'on' WHERE id = 'sess-1'");
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(true);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(true);
+		const preview = await previewImport(toArrayBuffer(zip), "fast-mode.zip");
+		await applyImport(preview.token, { conflictDefault: "overwrite" });
+		expect((await resolveNarratorFastMode("sess-1")).effectiveFastMode).toBe(false);
+		expect((await resolveNarratorFastMode("fast-child")).effectiveFastMode).toBe(false);
+	});
 	test("会话导入覆盖与清空只使本地 workspace 候选失效，不改已有名字", async () => {
 		sqlite.run(
 			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('workspace-owner', 'workspace-owner', 'x', '2026-10-01T00:00:00Z')",
@@ -755,6 +772,65 @@ describe("data portability · scheduled task boundaries", () => {
 		).toEqual([]);
 	});
 
+	test("committed clear still reconciles waits and team caches when plugin credential cleanup fails", async () => {
+		seedTask("clear-plugin-failure", {
+			schedule: { kind: "cron", expr: "0 * * * *", end: { type: "count", count: 1 } },
+			firedCount: 1,
+			nextRunAt: null,
+			lastRunId: "clear-plugin-pending",
+			lastStatus: "waiting",
+		});
+		seedRun("clear-plugin-pending", "clear-plugin-failure");
+		sqlite.run(
+			`INSERT INTO projects (id, name, created_at, updated_at)
+			 VALUES ('clear-team-project', 'Team clear', ?, ?)`,
+			[taskTimestamp, taskTimestamp],
+		);
+		sqlite.run(
+			`INSERT INTO project_teams (narrator_id, project_id, base_branch, created_at, updated_at)
+			 VALUES ('sess-1', 'clear-team-project', 'main', ?, ?)`,
+			[taskTimestamp, taskTimestamp],
+		);
+		const { isTeamSessionCached, teamSessionMemoSize } = await import("../teams/team-session-memo");
+		expect(isTeamSessionCached("sess-1")).toBe(true);
+		const pluginCredentials = await import("../../lib/credential-transfer/plugin");
+		const cleanup = spyOn(pluginCredentials, "clearPluginCredentialSecrets").mockRejectedValue(
+			new Error("fixture credential cleanup failure"),
+		);
+		const events: number[] = [];
+		const observe = () => {
+			events.push(count("narrators"));
+		};
+		eventBus.on("scheduled_task:changed", observe);
+		try {
+			await expect(clearData("all")).rejects.toThrow("fixture credential cleanup failure");
+			expect(cleanup).toHaveBeenCalledTimes(1);
+			expect(count("narrators")).toBe(0);
+			expect(count("project_teams")).toBe(0);
+			expect(teamSessionMemoSize()).toBe(0);
+			expect(events.length).toBeGreaterThan(0);
+			expect(events.every((sessions) => sessions === 0)).toBe(true);
+			expect(taskState("clear-plugin-failure")).toMatchObject({
+				completedAt: expect.any(String),
+				firedCount: 1,
+				lastStatus: "interrupted",
+				targetNarratorId: null,
+			});
+			expect(runState("clear-plugin-pending")).toMatchObject({
+				status: "interrupted",
+				errorKind: "cancelled",
+			});
+			expect(
+				sqlite
+					.query("SELECT name FROM sqlite_temp_master WHERE name LIKE 'cleared_scheduled_waits_%'")
+					.all(),
+			).toEqual([]);
+		} finally {
+			cleanup.mockRestore();
+			eventBus.off("scheduled_task:changed", observe);
+		}
+	});
+
 	test("failed session clearing rolls back cancellation, projections and target references without invalidation", async () => {
 		seedTask("rollback-task", { lastRunId: "rollback-run", lastStatus: "waiting", firedCount: 1 });
 		seedRun("rollback-run", "rollback-task");
@@ -1201,6 +1277,74 @@ describe("逐模型设置随供应商一起导出", () => {
 			expect(agent().autoExcludedProviders).toEqual(["openai-2", "openai-extra"]);
 		} finally {
 			while (restores.length) restores.pop()?.();
+			saveSettings(original);
+		}
+	});
+
+	test("跨 custom/NUG 的 id 与前缀冲突统一避让，会话跟随新前缀", async () => {
+		const original = structuredClone(settings);
+		try {
+			await seed(1);
+			sqlite.run(
+				`INSERT INTO narrators (id, type, model, created_at, updated_at)
+				 VALUES ('sess-cross', 'primary', 'cross:gpt', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')`,
+			);
+			const exported = structuredClone(settings);
+			exported.customApiProviders = [
+				apiProvider("remote-custom", "cross", "remote-key", "https://remote.example/v1"),
+			];
+			exported.nugProviders = [
+				{
+					id: "remote-nug",
+					name: "remote-nug",
+					prefix: "nug-cross",
+					baseUrl: "https://nug.example",
+					apiKey: "nug-key",
+					defaultModel: "",
+				},
+			];
+			saveSettings(exported);
+			const passphrase = "cross-provider-pass";
+			const zip = await readFile(
+				(await exportData({ requests: false, sessions: true, providers: true }, { passphrase }))
+					.zipPath,
+			);
+			const preview = await previewImport(toArrayBuffer(zip), "cross-provider.zip");
+
+			sqlite.run("DELETE FROM narrator_message_refs");
+			sqlite.run("DELETE FROM narrator_tool_calls");
+			sqlite.run("DELETE FROM narrator_messages");
+			sqlite.run("DELETE FROM narrators");
+			const local = structuredClone(original);
+			local.customApiProviders = [
+				apiProvider("local-other", "nug-cross", "local-key", "https://local.example/v1"),
+			];
+			local.nugProviders = [
+				{
+					id: "remote-custom",
+					name: "local-nug",
+					prefix: "cross",
+					baseUrl: "https://local-nug.example",
+					apiKey: "local-nug-key",
+					defaultModel: "",
+				},
+			];
+			saveSettings(local);
+			await applyImport(preview.token, { conflictDefault: "skip", passphrase });
+
+			const custom = settings.customApiProviders?.find((item) => item.prefix === "cross-2");
+			expect(custom).toBeDefined();
+			expect(custom?.id).not.toBe("remote-custom");
+			expect(settings.nugProviders?.some((item) => item.prefix === "nug-cross-2")).toBe(true);
+			expect(
+				(
+					sqlite.prepare("SELECT model FROM narrators WHERE id = 'sess-cross'").get() as {
+						model: string;
+					}
+				).model,
+			).toBe("cross-2:gpt");
+			expect(getProviderKeyStore().firstGroupKey(custom?.id ?? "")).toBe("remote-key");
+		} finally {
 			saveSettings(original);
 		}
 	});

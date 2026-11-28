@@ -1,5 +1,13 @@
 import parserSource from "@babel/parser" with { type: "text" };
 import { PLUGIN_UI_SHARED_MODULES } from "@frontend/plugin-runtime/contract";
+import { hotSafe } from "@server/lib/hot-safe";
+import { WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
+import {
+	type PoolWorker,
+	WorkerPool,
+	type WorkerTaskContext,
+} from "@server/lib/worker-runtime/pool";
+import { TaskQueueError } from "@server/lib/worker-runtime/queue";
 import { GEN_UI_FILE_LIMITS as LIMITS } from "@shared/gen-ui-files";
 import { GEN_UI_KIT_GLOBAL, GEN_UI_KIT_MODULE } from "@shared/gen-ui-kit";
 import { type SourceFile, uiError } from "./files";
@@ -176,74 +184,128 @@ async function sharedModules(kit?: {
 	};
 }
 
-let active = 0;
+interface CompileRequest {
+	files: SourceFile[];
+	kit?: { components: string[] };
+}
+interface CompileResult {
+	js: string;
+	css: string;
+}
+
+async function compilerWorker(
+	context: WorkerTaskContext,
+): Promise<PoolWorker<CompileRequest, CompileResult>> {
+	// Keep the original phase boundary: loading trusted runtime exports is not compilation.
+	await builtinExports();
+	context.signal.throwIfAborted();
+	const url = URL.createObjectURL(new Blob([COMPILER_SOURCE], { type: "application/javascript" }));
+	let handle: WorkerHandle<Worker>;
+	try {
+		handle = WorkerHandle.bunThread(url);
+	} catch (error) {
+		URL.revokeObjectURL(url);
+		throw error;
+	}
+	const worker = handle.resource;
+	return {
+		get closed() {
+			return handle.closed;
+		},
+		async close() {
+			await handle.close();
+			URL.revokeObjectURL(url);
+		},
+		async run({ files, kit }, { signal }) {
+			const modules = await sharedModules(kit);
+			signal.throwIfAborted();
+			return new Promise<CompileResult>((resolve, reject) => {
+				const finish = (result?: CompileResult, error?: unknown) => {
+					clearTimeout(timer);
+					signal.removeEventListener("abort", abort);
+					worker.onmessage = null;
+					worker.onerror = null;
+					worker.removeEventListener("close", exited);
+					if (result) resolve(result);
+					else reject(error);
+				};
+				const abort = () => finish(undefined, signal.reason);
+				const exited = () => finish(undefined, uiError("UI compiler worker exited"));
+				const timer = setTimeout(() => {
+					void handle.close().catch(() => {});
+					finish(undefined, uiError("UI compilation exceeded 15 seconds", 408));
+				}, LIMITS.timeoutMs);
+				worker.onmessage = ({ data }: MessageEvent<CompileResult & { error?: string }>) => {
+					if (data?.error) finish(undefined, uiError(data.error));
+					else if (
+						typeof data?.js !== "string" ||
+						typeof data?.css !== "string" ||
+						Buffer.byteLength(data.js) + Buffer.byteLength(data.css) > LIMITS.outputBytes
+					)
+						finish(undefined, uiError("Invalid or oversized UI compilation output", 413));
+					else finish({ js: data.js, css: data.css });
+				};
+				worker.onerror = (event) => finish(undefined, uiError(event.message.slice(0, 600)));
+				worker.addEventListener("close", exited, { once: true });
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+				else
+					try {
+						worker.postMessage({ files, modules, maxOutputBytes: LIMITS.outputBytes });
+					} catch (error) {
+						finish(undefined, error);
+					}
+			});
+		},
+	};
+}
+
+// No waiting queue and no worker reuse: the previous concurrency-2 rejection remains intact.
+const compilerOwner = hotSafe(
+	"narrafork.genUi.compilerWorkers.v1",
+	() =>
+		new WorkerPool<CompileRequest, CompileResult>({
+			concurrency: 2,
+			maxQueued: 0,
+			reuse: false,
+			create: compilerWorker,
+		}),
+);
+
+/** Permanent HMR-shared admission latch; waits for pending creation and actual native exits. */
+export function closeGenUiCompilerWorkers(): Promise<void> {
+	return compilerOwner.close(uiError("UI compiler workers are closed", 503));
+}
+
 export async function compilePreview(
 	files: SourceFile[],
 	signal: AbortSignal,
 	kit?: { components: string[] },
-): Promise<{ js: string; css: string }> {
+): Promise<CompileResult> {
 	signal.throwIfAborted();
-	if (
-		files.length > LIMITS.files ||
-		files.some((file) => file.bytes.byteLength > LIMITS.fileBytes) ||
-		files.reduce((sum, file) => sum + file.bytes.byteLength, 0) > LIMITS.sourceBytes
-	)
+	if (files.length > LIMITS.files || files.some((file) => file.bytes.byteLength > LIMITS.fileBytes))
 		throw uiError("UI compiler input exceeds its file/source limits", 413);
-	if (active >= 2) throw uiError("UI compiler is busy; retry shortly", 429);
-	active++;
-	const url = URL.createObjectURL(new Blob([COMPILER_SOURCE], { type: "application/javascript" }));
-	let worker: Worker | undefined;
+	const bytes = files.reduce((sum, file) => sum + file.bytes.byteLength, 0);
+	if (bytes > LIMITS.sourceBytes)
+		throw uiError("UI compiler input exceeds its file/source limits", 413);
 	const started = Date.now();
 	try {
-		const modules = await sharedModules(kit);
-		signal.throwIfAborted();
-		return await new Promise((resolve, reject) => {
-			worker = new Worker(url);
-			const abort = () => {
-				cleanup();
-				reject(signal.reason ?? uiError("UI compilation cancelled", 408));
-			};
-			const timer = setTimeout(() => {
-				cleanup();
-				reject(uiError("UI compilation exceeded 15 seconds", 408));
-			}, LIMITS.timeoutMs);
-			const cleanup = () => {
-				clearTimeout(timer);
-				signal.removeEventListener("abort", abort);
-				worker?.terminate();
-			};
-			worker.onmessage = ({ data }: MessageEvent<{ js: string; css: string; error?: string }>) => {
-				cleanup();
-				if (data.error) reject(uiError(data.error));
-				else if (
-					typeof data.js !== "string" ||
-					typeof data.css !== "string" ||
-					Buffer.byteLength(data.js) + Buffer.byteLength(data.css) > LIMITS.outputBytes
-				)
-					reject(uiError("Invalid or oversized UI compilation output", 413));
-				else resolve({ js: data.js, css: data.css });
-			};
-			worker.onerror = (event) => {
-				cleanup();
-				reject(uiError(event.message.slice(0, 600)));
-			};
-			signal.addEventListener("abort", abort, { once: true });
-			if (signal.aborted) {
-				abort();
-				return;
-			}
-			worker.postMessage({ files, modules, maxOutputBytes: LIMITS.outputBytes });
-		});
+		return await compilerOwner.run({ files, kit }, { signal, bytes, deadlineAt: Infinity });
+	} catch (error) {
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
+			throw uiError("UI compiler is busy; retry shortly", 429);
+		throw error;
 	} finally {
-		worker?.terminate();
-		URL.revokeObjectURL(url);
-		active--;
-		if (Date.now() - started >= 1000) {
-			const { logger } = await import("@server/lib/logger");
-			logger.warn("Slow GenUI compilation", {
-				elapsedMs: Date.now() - started,
-				files: files.length,
-			});
-		}
+		// A diagnostic sink must not skip cleanup or change a successful compilation.
+		if (Date.now() - started >= 1000)
+			try {
+				const { logger } = await import("@server/lib/logger");
+				logger.warn("Slow GenUI compilation", {
+					elapsedMs: Date.now() - started,
+					files: files.length,
+				});
+			} catch {
+				/* Observability is not execution authority. */
+			}
 	}
 }

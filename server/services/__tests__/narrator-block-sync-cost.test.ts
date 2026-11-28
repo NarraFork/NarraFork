@@ -4,10 +4,13 @@
  * and search text is written by the index job, not the writer.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -21,7 +24,9 @@ const workerPool = await import("../../lib/db-worker/pool");
 const { runBlockIndexQueueSlice } = await import("../../lib/db-worker/block-backfill-query");
 const readIndex: import("../narrator-block-index").IndexQueueReader = async (params) =>
 	runBlockIndexQueueSlice(sqlite, params);
-const { ensureFts } = await import("../../db/fts");
+const fts = await import("../../db/fts");
+const { ensureFts } = fts;
+const { logger } = await import("../../lib/logger");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 ensureFts(sqlite, { wasClean: true });
@@ -39,11 +44,11 @@ beforeEach(() => {
 			NOW,
 		]);
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	settings.narratorBlocks.compactJson = false;
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 /** Every column the sync writes, of every block, assets and ledger bindings included. */
@@ -306,6 +311,125 @@ describe("a write syncs only what it queued", () => {
 		).toBeTruthy();
 		blockSync.flushChangedEnvelopes();
 		expect(queued()).toEqual([]);
+	});
+});
+
+describe("index transaction timing", () => {
+	let clock: number;
+	let wall: number;
+	let timing: { beginOrAcquireMs: number; callbackMs: number; finishMs: number };
+	const originalTransaction = sqlite.transaction.bind(sqlite);
+	const originalReplace = fts.replaceBlockIndexRow;
+	let warn: ReturnType<typeof spyOn<typeof logger, "warn">>;
+	let replace: ReturnType<typeof spyOn<typeof fts, "replaceBlockIndexRow">>;
+
+	beforeEach(async () => {
+		await narratorStore.appendInput("n1", "damson");
+		clock = 1_000;
+		wall = Date.UTC(2099, 0, 1);
+		timing = { beginOrAcquireMs: 2, callbackMs: 3, finishMs: 5 };
+		spyOn(performance, "now").mockImplementation(() => clock);
+		spyOn(Date, "now").mockImplementation(() => wall);
+		warn = spyOn(logger, "warn").mockImplementation(() => {});
+		// Keep real SQLite writes/rollback; advance a deterministic clock at each boundary.
+		spyOn(sqlite, "transaction").mockImplementation((fn) => {
+			const run = originalTransaction(fn);
+			return Object.assign((...args: Parameters<typeof fn>) => {
+				clock += timing.beginOrAcquireMs;
+				const result = run(...args);
+				clock += timing.finishMs;
+				return result;
+			}, run);
+		});
+		replace = spyOn(fts, "replaceBlockIndexRow").mockImplementation((...args) => {
+			clock += timing.callbackMs;
+			return originalReplace(...args);
+		});
+	});
+
+	afterEach(() => {
+		blockIndex.setBlockIndexAutoRunForTests(false);
+		mock.restore();
+	});
+
+	test("normal writes clear the queue without a diagnostic", async () => {
+		await blockIndex.runBlockIndex(readIndex);
+		expect(warn).not.toHaveBeenCalled();
+		expect(owed()).toEqual([]);
+		expect(indexed("damson")).toHaveLength(1);
+	});
+
+	test.each([
+		"beginOrAcquireMs",
+		"callbackMs",
+		"finishMs",
+	] as const)("slow %s is separated from the other phases", async (phase) => {
+		timing[phase] += 200;
+		await blockIndex.runBlockIndex(readIndex);
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledWith("Slow block index write", {
+			elapsedMs: 210,
+			...timing,
+			chars: 6,
+			written: 1,
+			nextChars: 16 * 1024,
+			suppressed: 0,
+		});
+		expect(timing.beginOrAcquireMs + timing.callbackMs + timing.finishMs).toBe(210);
+		expect(owed()).toEqual([]);
+		expect(indexed("damson")).toHaveLength(1);
+	});
+
+	test("slow logs retain the one-minute limit and suppressed count", async () => {
+		timing.finishMs += 200;
+		const [blockId] = owed();
+		await blockIndex.runBlockIndex(readIndex);
+		wall += 59_999;
+		clock += 1_000; // Past the existing pacing deadline, without sleeping.
+		blockIndex.queueBlockIndex(blockId);
+		await blockIndex.runBlockIndex(readIndex);
+		expect(warn).toHaveBeenCalledTimes(1);
+		wall += 1;
+		clock += 1_000;
+		blockIndex.queueBlockIndex(blockId);
+		await blockIndex.runBlockIndex(readIndex);
+		expect(warn).toHaveBeenCalledTimes(2);
+		expect(warn.mock.calls[1]).toEqual([
+			"Slow block index write",
+			{
+				elapsedMs: 210,
+				...timing,
+				chars: 6,
+				written: 1,
+				nextChars: 4 * 1024,
+				suppressed: 1,
+			},
+		]);
+		expect(owed()).toEqual([]);
+	});
+
+	test("a failed write rolls back, keeps the queue and schedules the same retry", async () => {
+		const pending = owed();
+		replace.mockImplementationOnce((...args) => {
+			originalReplace(...args);
+			clock += 200;
+			throw new Error("injected index write failure");
+		});
+		const timeout = spyOn(globalThis, "setTimeout");
+		blockIndex.setBlockIndexAutoRunForTests(true);
+		await blockIndex.runBlockIndex(readIndex);
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledWith("Block index job failed; it retries", {
+			error: "Error: injected index write failure",
+		});
+		expect(timeout).toHaveBeenCalledWith(expect.any(Function), 30_000);
+		expect(owed()).toEqual(pending);
+		expect(indexed("damson")).toEqual([]);
+		blockIndex.setBlockIndexAutoRunForTests(false);
+		await blockIndex.runBlockIndex(readIndex);
+		expect(owed()).toEqual([]);
+		expect(indexed("damson")).toHaveLength(1);
+		expect(warn).toHaveBeenCalledTimes(1);
 	});
 });
 

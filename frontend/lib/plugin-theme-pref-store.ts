@@ -19,59 +19,15 @@
  * `usePluginThemes.ts` re-exports the hook from here, so existing imports keep working.
  */
 
-const PLUGIN_THEME_STORAGE_KEY = "narrafork_plugin_theme";
+import { appearanceStore, subscribeAppearancePreferences } from "./appearance-preference-store";
 
-const prefListeners = new Set<() => void>();
-let prefStorageListener: ((e: StorageEvent) => void) | null = null;
+export const subscribePluginThemePref = subscribeAppearancePreferences;
 
-function ensurePrefStorageListener() {
-	if (prefStorageListener) return;
-	prefStorageListener = (e: StorageEvent) => {
-		if (e.key === PLUGIN_THEME_STORAGE_KEY) {
-			for (const cb of prefListeners) cb();
-		}
-	};
-	window.addEventListener("storage", prefStorageListener);
-}
-
-function removePrefStorageListenerIfIdle() {
-	if (prefListeners.size > 0 || !prefStorageListener) return;
-	window.removeEventListener("storage", prefStorageListener);
-	prefStorageListener = null;
-}
-
-/** `useSyncExternalStore` subscribe: cross-tab changes arrive via the storage event. */
-export function subscribePluginThemePref(cb: () => void): () => void {
-	prefListeners.add(cb);
-	ensurePrefStorageListener();
-	return () => {
-		prefListeners.delete(cb);
-		removePrefStorageListenerIfIdle();
-	};
-}
-
-/**
- * The persisted active plugin theme key, or `null` for the default look.
- *
- * Safe to call before React mounts and in contexts where `localStorage` throws
- * (private mode, embedded webviews with storage disabled).
- */
+/** Readable before React mounts; no API or Query dependency is introduced here. */
 export function readActivePluginThemeKey(): string | null {
-	try {
-		return localStorage.getItem(PLUGIN_THEME_STORAGE_KEY);
-	} catch {
-		return null;
-	}
+	return (appearanceStore.get("pluginTheme") as string) || null;
 }
 
-/** Persist the active plugin theme key (or clear it) and notify same-tab subscribers. */
 export function writeActivePluginThemeKey(key: string | null): void {
-	try {
-		if (key) localStorage.setItem(PLUGIN_THEME_STORAGE_KEY, key);
-		else localStorage.removeItem(PLUGIN_THEME_STORAGE_KEY);
-	} catch {
-		// Ignore storage failures (private mode, quota, etc.).
-	}
-	// The `storage` event does not fire in the tab that wrote it, so notify locally.
-	for (const cb of prefListeners) cb();
+	appearanceStore.set("pluginTheme", key ?? "");
 }

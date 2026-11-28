@@ -49,7 +49,7 @@ function options(): UseHeaderToolbarOptions {
 		toggleDetails: mock(() => {}),
 		toggleTerminalTool: mock(() => {}),
 		toggleSpecTool: mock(() => {}),
-		updateExecutionDeviceMutation: { mutate: mock(() => {}) },
+		updateExecutionDeviceMutation: { mutate: mock(() => {}), isPending: false },
 		onRequireDeviceDirectory: () => {},
 		renderLod: 4,
 		renderLodIsDefault: true,
@@ -178,6 +178,37 @@ describe("panel toolbar controller", () => {
 		expect(overlay().props.controlled.opened).toBe(true);
 		await act(async () => overlay().props.controlled.onClose());
 		expect(overlay().props.controlled.opened).toBe(false);
+	});
+
+	test("communication uses the dock toggle and reports its open state", async () => {
+		const toggleToolPanel = mock(() => {});
+		const props = options();
+		props.dock = {
+			openToolTypes: new Set(["communication"]),
+			toggleToolPanel,
+		} as unknown as NonNullable<UseHeaderToolbarOptions["dock"]>;
+		await render(props);
+		expect(narratorToolbarItem("communication")?.hosts).toEqual(["dock", "drawer"]);
+		expect(controller.toolbarEntryActive("communication")).toBe(true);
+		controller.activateToolbarEntry("communication");
+		expect(toggleToolPanel).toHaveBeenCalledWith("communication");
+		expect(props.setMobileToolPanel).not.toHaveBeenCalled();
+	});
+
+	test("communication falls back to a mobile drawer and toggles it closed", async () => {
+		const props = options();
+		const setMobileToolPanel = mock(
+			(_value: Parameters<UseHeaderToolbarOptions["setMobileToolPanel"]>[0]) => {},
+		);
+		await render({ ...props, mobileToolPanel: "communication", setMobileToolPanel });
+		expect(controller.toolbarEntryActive("communication")).toBe(true);
+		controller.activateToolbarEntry("communication");
+		expect(setMobileToolPanel).toHaveBeenCalledTimes(1);
+		const update = setMobileToolPanel.mock.calls[0]?.[0] as unknown as (
+			kind: "communication" | null,
+		) => "communication" | null;
+		expect(update(null)).toBe("communication");
+		expect(update("communication")).toBeNull();
 	});
 
 	test("terminal uses the host callback, with the standalone toggle as fallback", async () => {

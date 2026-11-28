@@ -1,0 +1,1 @@
+CREATE INDEX "idx_bg_tasks_active" ON "background_tasks" USING btree ("status") WHERE "status" IN ('running','paused');

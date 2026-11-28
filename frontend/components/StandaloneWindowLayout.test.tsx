@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
 	createRootRoute,
@@ -13,11 +14,12 @@ import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
 import { isStandaloneWindowPath } from "../lib/standalone-window";
 
-let token: string | null = "test-token";
+const { getToken, setToken, clearToken: clearStoredToken } = await import("../lib/api/client");
 let cleared = 0;
 let retries = 0;
 let shellMounts = 0;
 let appearanceCalls = 0;
+const fastModeUpdates = mock(() => {});
 let namespacePromise: Promise<void> = Promise.resolve();
 let auth = {
 	data: { id: "user" } as { id: string } | undefined,
@@ -29,9 +31,8 @@ let auth = {
 const apiModule = await import("../lib/api");
 mock.module("../lib/api", () => ({
 	...apiModule,
-	getToken: () => token,
 	clearToken: () => {
-		token = null;
+		clearStoredToken();
 		cleared++;
 	},
 }));
@@ -51,6 +52,9 @@ mock.module("../lib/i18n", () => ({
 mock.module("../hooks/useUserPreferences", () => ({
 	useUserPreferences: () => ({ data: undefined }),
 }));
+mock.module("../hooks/useFastModeUpdates", () => ({
+	useFastModeUpdates: fastModeUpdates,
+}));
 mock.module("../hooks/useAuthenticatedAppearance", () => ({
 	useAuthenticatedAppearance: () => {
 		appearanceCalls++;
@@ -66,11 +70,28 @@ mock.module("./AuthenticatedAppLayout", () => ({
 		);
 	},
 }));
+mock.module("./UnattendedModeBanner", () => ({
+	UnattendedModeBanner: () => <div data-unattended-mode-banner />,
+}));
+const runtimeListener = 1;
+const runtimeSubscriptions = {
+	addListener: mock(() => runtimeListener),
+	removeListener: mock((_listener: number) => {}),
+	onConnectionChange: mock(() => () => {}),
+};
+mock.module("../lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		connect: () => {},
+		disconnect: () => {},
+		...runtimeSubscriptions,
+	},
+}));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const { RootLayout } = await import("./AppRootLayout");
 const { StandaloneWindowLayout } = await import("./StandaloneWindowLayout");
 
 let root: Root;
+let queryClient: QueryClient;
 let container: HTMLElement;
 const originals = new Map<string, PropertyDescriptor | undefined>();
 
@@ -98,6 +119,7 @@ beforeEach(() => {
 		window,
 		document: window.document,
 		navigator: window.navigator,
+		localStorage: window.localStorage,
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
 		Node: window.Node,
@@ -110,7 +132,11 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
-	token = "test-token";
+	setToken("test-token");
+	for (const subscription of Object.values(runtimeSubscriptions)) subscription.mockClear();
+	queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false, gcTime: 0 } },
+	});
 	namespacePromise = Promise.resolve();
 	cleared = retries = shellMounts = appearanceCalls = 0;
 	auth = {
@@ -127,6 +153,7 @@ beforeEach(() => {
 afterEach(async () => {
 	root.unmount();
 	await new Promise((resolve) => setTimeout(resolve, 0));
+	queryClient.clear();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -176,9 +203,11 @@ async function render(path: string) {
 	});
 	await router.load();
 	root.render(
-		<MantineProvider>
-			<RouterProvider router={router} />
-		</MantineProvider>,
+		<QueryClientProvider client={queryClient}>
+			<MantineProvider>
+				<RouterProvider router={router} />
+			</MantineProvider>
+		</QueryClientProvider>,
 	);
 	return router;
 }
@@ -205,17 +234,26 @@ test("window namespace has a segment boundary", () => {
 });
 
 test("private window renders only target and cleans up viewport ownership", async () => {
+	fastModeUpdates.mockClear();
 	await render("/windows/target");
 	await waitFor(() => !!container.querySelector("[data-target]"));
 	expect(container.querySelector("[data-navigation]")).toBeNull();
 	expect(container.querySelector("[data-standalone-window]")).not.toBeNull();
+	expect(container.querySelector("[data-unattended-mode-banner]")).not.toBeNull();
 	expect(shellMounts).toBe(0);
 	expect(appearanceCalls).toBeGreaterThan(0);
+	expect(fastModeUpdates).toHaveBeenCalled();
+	expect(runtimeSubscriptions.addListener).toHaveBeenCalledWith(
+		{ types: ["settings_runtime_changed", "model_catalog_changed"] },
+		expect.any(Function),
+	);
+	expect(runtimeSubscriptions.onConnectionChange).toHaveBeenCalledTimes(1);
 	await waitFor(
 		() => document.documentElement.getAttribute("data-nf-authenticated-app-shell") === "true",
 	);
 	expect(document.documentElement.getAttribute("data-nf-authenticated-app-shell")).toBe("true");
 	root.unmount();
+	expect(runtimeSubscriptions.removeListener).toHaveBeenCalledWith(runtimeListener);
 	expect(document.documentElement.hasAttribute("data-nf-authenticated-app-shell")).toBe(false);
 	root = createRoot(container);
 });
@@ -248,7 +286,7 @@ test("public shares never mount private layout even with a session", async () =>
 });
 
 test("login preserves complete window URL and restores the target afterwards", async () => {
-	token = null;
+	clearStoredToken();
 	const router = await render(
 		"/windows/target?file=%E4%B8%AD%E6%96%87.txt&workspaceKey=repo#patch",
 	);
@@ -258,7 +296,7 @@ test("login preserves complete window URL and restores the target afterwards", a
 		"/windows/target?file=%E4%B8%AD%E6%96%87.txt&workspaceKey=repo#patch",
 	);
 	expect(container.querySelector("[data-target]")).toBeNull();
-	token = "new-token";
+	setToken("new-token");
 	await router.navigate({ href: redirect.redirect });
 	await waitFor(() => !!container.querySelector("[data-target]"));
 	expect(shellMounts).toBe(0);
@@ -273,7 +311,7 @@ test("an expired session hides content, clears credentials and redirects", async
 	};
 	await render("/windows/target");
 	await waitFor(() => !!container.querySelector("[data-login]"));
-	expect(token).toBeNull();
+	expect(getToken()).toBeNull();
 	expect(cleared).toBe(1);
 	expect(container.querySelector("[data-target]")).toBeNull();
 });
@@ -291,7 +329,7 @@ for (const [status, code] of [
 		};
 		await render("/windows/target");
 		await waitFor(() => !!container.querySelector('[role="alert"]'));
-		expect(token).toBe("test-token");
+		expect(getToken()).toBe("test-token");
 		expect(cleared).toBe(0);
 		expect(container.querySelector("[data-target]")).toBeNull();
 		(container.querySelector("button") as HTMLButtonElement).click();

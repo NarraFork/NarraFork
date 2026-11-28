@@ -1,6 +1,7 @@
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { modelCatalogApi } from "../lib/api/model-catalog";
 import {
@@ -13,7 +14,21 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
+import { followOptionLabel } from "../lib/follow-model-label";
+import { createModelOptionsFilter } from "../lib/model-search";
 import type { ProviderCapabilityKey } from "./usePlatform";
+import { useRuntimeSettings } from "./useRuntimeSettings";
+
+/** Current/default references for mounted session UI, without provider/catalog configuration. */
+export function useModelRuntimeSettings(enabled = true) {
+	const query = useRuntimeSettings(enabled);
+	return {
+		...query,
+		settingsData: query.data,
+		defaultModelValue: query.data?.agent.defaultModel ?? "",
+		summaryModelValue: query.data?.agent.summaryModel ?? "",
+	};
+}
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODELS_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
@@ -209,11 +224,14 @@ export function classifyFallbackModelPresence(args: {
  * Replaces duplicated model-building logic across NarratorPanel,
  * sessions/index and settings pages.
  */
-export function useAllModels() {
+export function useAllModels(enabled = true) {
 	const qc = useQueryClient();
-	const { data: settingsData } = useQuery({
+	// The follow-default/summary rows and their groups are shown to people: never the sentinel.
+	const { t } = useTranslation("narrator");
+	const { data: settingsData, dataUpdatedAt: settingsUpdatedAt } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		enabled,
 		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
@@ -222,13 +240,14 @@ export function useAllModels() {
 	// settings (which carry the NUG model list + `available` flags) so the picker
 	// reflects recovery/outage live.
 	useEffect(() => {
-		if (settingsData?.commandcodeModelsPending !== true) return;
+		if (!enabled || settingsData?.commandcodeModelsPending !== true) return;
 		const timer = setTimeout(() => {
 			void qc.invalidateQueries({ queryKey: ["settings"] });
 		}, 1_500);
 		return () => clearTimeout(timer);
-	}, [settingsData?.commandcodeModelsPending, qc]);
+	}, [enabled, settingsData?.commandcodeModelsPending, qc]);
 	useEffect(() => {
+		if (!enabled) return;
 		const onAvailabilityChanged = () => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		};
@@ -242,27 +261,14 @@ export function useAllModels() {
 				onAvailabilityChanged as EventListener,
 			);
 		};
-	}, [qc]);
+	}, [enabled, qc]);
 
-	// auto:<model> rows and their sources. Keyed under ["settings"] so every settings
-	// invalidation refreshes them. Settings pages that write the cache with setQueryData do
-	// not invalidate, so the fields that decide auto candidates are part of the key too.
-	const autoInputs = settingsData
-		? JSON.stringify([
-				settingsData.agent?.hiddenModels,
-				settingsData.agent?.disabledProviders,
-				settingsData.agent?.autoExcludedProviders,
-				settingsData.agent?.customModels?.length,
-				...[settingsData.customApiProviders, settingsData.nugProviders].map(
-					(list?: Array<{ prefix?: string; disabled?: boolean }>) =>
-						list?.map((p) => [p.prefix, p.disabled]),
-				),
-			])
-		: "";
+	// Legacy management views still need complete rows. A small cache generation replaces
+	// the former configuration-JSON key; session UI uses runtime/options instead.
 	const { data: autoModelsData } = useQuery({
-		queryKey: ["settings", "auto-models", autoInputs],
+		queryKey: ["settings", "auto-models", settingsUpdatedAt],
 		queryFn: modelCatalogApi.autoModels,
-		enabled: !!settingsData,
+		enabled: enabled && !!settingsData,
 		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 		placeholderData: (previous) => previous,
@@ -730,13 +736,14 @@ export function useAllModels() {
 			value: string,
 			provider: string,
 			targetValue: string,
+			unsetLabel: string,
 		): ModelOption => {
 			const target = visibleModels.find((m) => m.value === targetValue);
 			return {
 				value,
-				// `|| targetValue` guards against an empty target label; `|| value`
-				// guards against an empty targetValue so the label is never "".
-				label: target?.label || targetValue || value,
+				// The target's label, else its value; with no target configured, the role's
+				// "not configured" text — never the sentinel `value` itself.
+				label: followOptionLabel(target?.label, targetValue, unsetLabel),
 				provider,
 				...(target?.pricing ? { pricing: target.pricing } : {}),
 				...(target?.officialInputUsd != null ? { officialInputUsd: target.officialInputUsd } : {}),
@@ -761,13 +768,14 @@ export function useAllModels() {
 		// hardcoded fallback: showing a concrete model here would present a
 		// provider the user never configured as the current default, and the
 		// resulting failure would name that phantom model instead of the real
-		// cause. `buildFollowOption` already falls back to labelling the entry
-		// with its own sentinel when the target is empty.
+		// cause. `buildFollowOption` labels the entry "not configured" when the
+		// target is empty.
 		const defaultModelValue = settingsData?.agent?.defaultModel || "";
 		const followDefaultOption = buildFollowOption(
 			FOLLOW_DEFAULT_MODEL,
 			"__default__",
 			defaultModelValue,
+			t("followDefaultUnset"),
 		);
 
 		// Use `||` (not `??`) so a stored empty string (e.g. after the summary
@@ -776,12 +784,13 @@ export function useAllModels() {
 		// summary model follows the default model. Never surface a hardcoded
 		// model that is not actually configured: it would masquerade as a real
 		// selection and mislead the user. Both may be "" pre-setup, in which case
-		// `buildFollowOption` labels the entry with its sentinel value.
+		// `buildFollowOption` labels the entry "not configured".
 		const summaryModelValue = settingsData?.agent?.summaryModel || defaultModelValue;
 		const followSummaryOption = buildFollowOption(
 			FOLLOW_SUMMARY_MODEL,
 			"__summary__",
 			summaryModelValue,
+			t("followSummaryUnset"),
 		);
 
 		// --- auto:<model> (docs/PROVIDER-SOURCING-DESIGN.md §4.1, §10.2) ---
@@ -812,10 +821,10 @@ export function useAllModels() {
 		];
 		const groupedModels = groupModelsByProvider(visibleWithDefault, {
 			...providerLabels,
-			__default__: "Default",
-			__summary__: "Summary",
+			__default__: t("modelGroupDefault"),
+			__summary__: t("modelGroupSummary"),
 			__auto__: "Auto",
-			__agg__: "Aggregations",
+			__agg__: t("modelGroupAggregations"),
 		});
 
 		// Provider prefix → NUG provider id. Model pickers group by prefix, so this
@@ -826,6 +835,14 @@ export function useAllModels() {
 			if (group.nugProviderId) nugProviderIdByPrefix[group.prefix] = group.nugProviderId;
 		}
 
+		// The full metadata snapshot survives the grouped value/label projection.
+		// Hidden models enrich already-stored pool references without becoming options.
+		// Its identity changes only with the settings/auto-model snapshots.
+		const modelOptionsFilter = createModelOptionsFilter(
+			{ providerLabels, defaultModelValue, summaryModelValue },
+			[...allModels, followDefaultOption, followSummaryOption, ...autoOptions, ...aggModels],
+		);
+
 		return {
 			/** All models (including hidden) — disabled providers filtered out. */
 			allModels,
@@ -835,6 +852,11 @@ export function useAllModels() {
 			visibleWithDefault,
 			/** Grouped for Mantine Select (includes "follow default" and aggregations). */
 			groupedModels,
+			/**
+			 * `filter` for model Select / MultiSelect: matches provider display name,
+			 * prefix and model id, and resolves Default/Summary rows to their target.
+			 */
+			modelOptionsFilter,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
 			/** The "follow summary" ModelOption. */
@@ -887,5 +909,5 @@ export function useAllModels() {
 			/** `auto:<model>` rows, each with its sources in routing order. */
 			autoModels: autoOptions,
 		};
-	}, [settingsData, autoModelsData]);
+	}, [settingsData, autoModelsData, t]);
 }

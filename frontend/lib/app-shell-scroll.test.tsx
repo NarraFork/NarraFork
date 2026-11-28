@@ -13,7 +13,12 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { useAppShellMainScrollRestoration } from "./app-shell-scroll";
+import {
+	AppShellMainScrollStore,
+	enterAppShellMainScrollEntry,
+	useAppShellMainScrollRestoration,
+} from "./app-shell-scroll";
+import { IOS_SCROLL_TO_TOP_ROUTE_EVENT } from "./ios-scroll-to-top";
 import {
 	isMobileViewportWidth,
 	MANTINE_SM_BREAKPOINT_PX,
@@ -207,6 +212,28 @@ describe("authenticated AppShell scroll contract", () => {
 		container.remove();
 	});
 
+	test("route entry and cleanup notify the root bridge before restoring or capturing Main", () => {
+		const { document: domDocument } = parseHTML(
+			`<!doctype html><html><body><main id="${APP_SHELL_MAIN_ID}"></main></body></html>`,
+		);
+		const document = domDocument as unknown as Document;
+		const main = document.getElementById(APP_SHELL_MAIN_ID) as HTMLElement;
+		const store = new AppShellMainScrollStore();
+		store.capture("next", { scrollTop: 170 });
+		main.scrollTop = 420;
+		const notifications: number[] = [];
+		document.addEventListener(IOS_SCROLL_TO_TOP_ROUTE_EVENT, () => {
+			notifications.push(main.scrollTop);
+		});
+		const cleanup = enterAppShellMainScrollEntry("next", document, store);
+		expect(notifications).toEqual([420]);
+		expect(main.scrollTop).toBe(170);
+		main.scrollTop = 230;
+		cleanup?.();
+		expect(notifications).toEqual([420, 230]);
+		expect(store.restore("next", { scrollTop: 0 })).toEqual({ top: 230 });
+	});
+
 	test("mobile query is the exact complement of Mantine sm at boundary widths", () => {
 		expect(MOBILE_VIEWPORT_MEDIA_QUERY).toBe("not all and (min-width: 48em)");
 		expect(MANTINE_SM_BREAKPOINT_PX).toBe(768);
@@ -243,8 +270,15 @@ describe("authenticated AppShell scroll contract", () => {
 			"@media (display-mode: standalone), (display-mode: window-controls-overlay) ",
 		]);
 		expect(css.slice(0, mainRuleStart)).not.toContain("overflow-y: auto");
-		// Main stays the only scroll container: the overlay rule must not introduce one.
-		expect(css.slice(mainRuleEnd).match(/overflow-y: auto/g)).toBe(null);
+		// The only additional root scroll owner is the iOS bridge's opt-in attribute.
+		// Overlay rules and every other selector must keep Main's ownership unchanged.
+		const bridgeRule =
+			/html\[data-nf-authenticated-app-shell="true"\]\[data-nf-ios-scroll-to-top="true"\]\s*\{([^{}]*)\}/;
+		const laterRules = css.slice(mainRuleEnd);
+		expect(laterRules.match(bridgeRule)?.[1]).toContain("overflow-y: auto");
+		expect(laterRules.replace(bridgeRule, "").match(/overflow-y: auto/g)).toBe(null);
+		const rootRule = css.match(/html\[data-nf-authenticated-app-shell="true"\]\s*\{([^{}]*)\}/);
+		expect(rootRule?.[1]).toContain("overflow-y: hidden");
 	});
 
 	/**

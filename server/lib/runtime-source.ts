@@ -15,8 +15,7 @@ import {
 	readRuntimeRegistrationColumn,
 } from "./validators/runtime-registration";
 
-/** Source chains longer than this are refused rather than walked. */
-export const MAX_POLICY_SOURCE_DEPTH = 16;
+export { MAX_POLICY_SOURCE_DEPTH } from "./validators/runtime-registration";
 
 export interface RuntimeSourceRow {
 	policySourceNarratorId?: string | null;
@@ -68,6 +67,23 @@ export function teamMembersWhere(rootId: string): SQL | undefined {
 	return and(
 		eq(narrators.parentNarratorId, rootId),
 		sql`coalesce(json_extract(${narrators.runtimeRegistrationJson}, '$.controller.narratorId'), json_extract(${narrators.runtimeRegistrationJson}, '$.run.deliverTo.narratorId')) = ${rootId}`,
+	);
+}
+
+/**
+ * Narrator statuses Send, Await and Watch can still address.
+ *
+ * `idle` is finished with its last turn but still addressable. `working` and
+ * `waiting` are in progress. `archived` is finished and is not part of this set.
+ * There is no time cutoff: an old idle member stays, an archived one does not.
+ */
+export const ADDRESSABLE_NARRATOR_STATUSES = ["idle", "working", "waiting"] as const;
+
+/** Team members the caller can still address. Archived history is excluded. */
+export function addressableTeamMembersWhere(rootId: string): SQL | undefined {
+	return and(
+		teamMembersWhere(rootId),
+		inArray(narrators.status, [...ADDRESSABLE_NARRATOR_STATUSES]),
 	);
 }
 

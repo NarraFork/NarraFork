@@ -8,6 +8,7 @@ import {
 	scheduledTaskRuns,
 	scheduledTasks,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getExecutionOwner, getRunControl } from "./agent-runtime/ownership";
@@ -39,18 +40,21 @@ export async function recoverScheduledRuns(): Promise<Set<string>> {
 	const blockedRecovery = new Set<string>();
 	let cursor: string | undefined;
 	for (;;) {
-		const rows = await db
-			.select({ run: scheduledTaskRuns, task: scheduledTasks })
-			.from(scheduledTaskRuns)
-			.innerJoin(scheduledTasks, eq(scheduledTasks.id, scheduledTaskRuns.taskId))
-			.where(
-				and(
-					inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
-					cursor ? gt(scheduledTaskRuns.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(scheduledTaskRuns.id))
-			.limit(PAGE_SIZE);
+		const rows = await readQuery(
+			db
+				.select({ run: scheduledTaskRuns, task: scheduledTasks })
+				.from(scheduledTaskRuns)
+				.innerJoin(scheduledTasks, eq(scheduledTasks.id, scheduledTaskRuns.taskId))
+				.where(
+					and(
+						inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
+						cursor ? gt(scheduledTaskRuns.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(scheduledTaskRuns.id))
+				.limit(PAGE_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const { run, task } of rows) {
 			if (!run.narratorId) {
 				await finalizeScheduledRun(run.id, "interrupted", {
@@ -64,10 +68,13 @@ export async function recoverScheduledRuns(): Promise<Set<string>> {
 			// receipt yet. Preserve a conservative recovery fence for that session's
 			// persisted identity too; never let a later restart replay the queued input.
 			if (!run.logicalRunId) {
-				const narrator = await db.query.narrators.findFirst({
-					where: eq(narrators.id, run.narratorId),
-					columns: { logicalRunId: true },
-				});
+				const narrator = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, run.narratorId),
+						columns: { logicalRunId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				if (narrator?.logicalRunId) {
 					run.logicalRunId = narrator.logicalRunId;
 					const changed = await db
@@ -151,26 +158,37 @@ export async function filterScheduledRecoveryNarrators(
 				break;
 			}
 			const row: { parentNarratorId: string | null; logicalRunId: string | null } | undefined =
-				await db.query.narrators.findFirst({
-					where: eq(narrators.id, id),
-					columns: { parentNarratorId: true, logicalRunId: true },
-				});
+				await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, id),
+						columns: { parentNarratorId: true, logicalRunId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 			if (!row) break;
-			const terminal = await db
-				.select({ id: scheduledTaskRuns.id })
-				.from(scheduledTaskRuns)
-				.where(
-					and(
-						eq(scheduledTaskRuns.narratorId, id),
-						// A terminal waiting occurrence never owned this conversation.
-						isNotNull(scheduledTaskRuns.startedAt),
-						row.logicalRunId
-							? eq(scheduledTaskRuns.logicalRunId, row.logicalRunId)
-							: isNull(scheduledTaskRuns.logicalRunId),
-						inArray(scheduledTaskRuns.status, ["completed", "failed", "interrupted", "timed_out"]),
-					),
-				)
-				.limit(1);
+			const terminal = await readQuery(
+				db
+					.select({ id: scheduledTaskRuns.id })
+					.from(scheduledTaskRuns)
+					.where(
+						and(
+							eq(scheduledTaskRuns.narratorId, id),
+							// A terminal waiting occurrence never owned this conversation.
+							isNotNull(scheduledTaskRuns.startedAt),
+							row.logicalRunId
+								? eq(scheduledTaskRuns.logicalRunId, row.logicalRunId)
+								: isNull(scheduledTaskRuns.logicalRunId),
+							inArray(scheduledTaskRuns.status, [
+								"completed",
+								"failed",
+								"interrupted",
+								"timed_out",
+							]),
+						),
+					)
+					.limit(1),
+				{ executionPolicy: "worker-required" },
+			);
 			if (terminal.length) {
 				blocked = true;
 				break;
@@ -232,10 +250,13 @@ async function currentBlock(
 	for (const id of ids) {
 		const member = members.find((item) => item.narratorId === id);
 		const expected = member?.logicalRunId ?? registration.logicalRunId;
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { logicalRunId: true, substatus: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { logicalRunId: true, substatus: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!expected || narrator?.logicalRunId !== expected) continue;
 		if (getRunControl(id) && !ownsLiveWait(id)) continue;
 		if (
@@ -243,29 +264,35 @@ async function currentBlock(
 			narrator.substatus?.includes("quota_exhausted")
 		)
 			return "provider_wait";
-		const question = await db
-			.select({ id: narratorQuestions.id })
-			.from(narratorQuestions)
-			.where(
-				and(
-					eq(narratorQuestions.narratorId, id),
-					eq(narratorQuestions.status, "open"),
-					gte(narratorQuestions.createdAt, startedAt),
-				),
-			)
-			.limit(1);
+		const question = await readQuery(
+			db
+				.select({ id: narratorQuestions.id })
+				.from(narratorQuestions)
+				.where(
+					and(
+						eq(narratorQuestions.narratorId, id),
+						eq(narratorQuestions.status, "open"),
+						gte(narratorQuestions.createdAt, startedAt),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 		if (question.length) return "question";
-		const outline = await db
-			.select({ id: outlineQuestions.blockId })
-			.from(outlineQuestions)
-			.where(
-				and(
-					eq(outlineQuestions.askerNarratorId, id),
-					eq(outlineQuestions.state, "open"),
-					gte(outlineQuestions.createdAt, startedAt),
-				),
-			)
-			.limit(1);
+		const outline = await readQuery(
+			db
+				.select({ id: outlineQuestions.blockId })
+				.from(outlineQuestions)
+				.where(
+					and(
+						eq(outlineQuestions.askerNarratorId, id),
+						eq(outlineQuestions.state, "open"),
+						gte(outlineQuestions.createdAt, startedAt),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 		if (outline.length) return "question";
 	}
 	return null;
@@ -305,6 +332,13 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 	const registration = getScheduledRunById(run.id);
 	if (!registration || registration.narratorId !== run.narratorId) return;
 	const executionEpoch = registration.executionEpoch;
+	const logicalRunId = registration.logicalRunId;
+	const matchesExecution = () =>
+		getScheduledRunById(run.id) === registration &&
+		registration.logicalRunId === logicalRunId &&
+		registration.executionEpoch === executionEpoch;
+	// The page is only an observation: attachment may have advanced while the Worker read it.
+	if ((logicalRunId ?? null) !== run.logicalRunId) return;
 	const now = Date.now();
 	const deadline = scheduledRunDeadlineReason(
 		{ ...run, blockedWaitMinutes: registration.blockedWaitMinutes },
@@ -349,8 +383,10 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 		return;
 	}
 	const block = await currentBlock(registration, run.startedAt ?? run.createdAt);
+	if (!matchesExecution()) return;
 	await markScheduledRunBlocked(run.id, block);
-	if (block || !terminal || terminal.logicalRunId !== run.logicalRunId) return;
+	if (!matchesExecution() || block || !terminal || terminal.logicalRunId !== run.logicalRunId)
+		return;
 	if (now - terminal.settledAt < SETTLE_GRACE_MS) return;
 	const { backgroundOccupancyStore } = await import("./background-occupancy-store");
 	await backgroundOccupancyStore.flush();
@@ -365,7 +401,7 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 		await flushInboxPublicationBarrier(member.narratorId);
 		if (await peekInbox(member.narratorId)) return;
 	}
-	if (getScheduledRunById(run.id) !== registration || registration.terminal !== terminal) return;
+	if (!matchesExecution() || registration.terminal !== terminal) return;
 	if (run.requireReport && !run.outcome && !run.nudged && (await claimScheduledRunNudge(run.id))) {
 		const { sendScheduledTaskMessage } = await import("./narrator-session");
 		try {
@@ -399,17 +435,20 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 export function pollScheduledRuns(): Promise<void> {
 	if (state.polling) return state.polling;
 	state.polling = (async () => {
-		const rows = await db
-			.select()
-			.from(scheduledTaskRuns)
-			.where(
-				and(
-					inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
-					state.cursor ? gt(scheduledTaskRuns.id, state.cursor) : undefined,
-				),
-			)
-			.orderBy(asc(scheduledTaskRuns.id))
-			.limit(PAGE_SIZE);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
+						state.cursor ? gt(scheduledTaskRuns.id, state.cursor) : undefined,
+					),
+				)
+				.orderBy(asc(scheduledTaskRuns.id))
+				.limit(PAGE_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		state.cursor = rows.length === PAGE_SIZE ? rows.at(-1)?.id : undefined;
 		for (const row of rows) {
 			try {

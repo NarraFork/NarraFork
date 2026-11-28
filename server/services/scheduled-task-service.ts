@@ -34,6 +34,7 @@ import {
 } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -200,10 +201,13 @@ async function normalizeLegacyTask(task: ScheduledTask, now = new Date()): Promi
 	if (task.schedule) return task;
 	const schedule = readTaskSchedule(task);
 	const creator = task.createdBy
-		? await db.query.users.findFirst({
-				where: eq(users.id, task.createdBy),
-				columns: { username: true },
-			})
+		? await readQuery(
+				db.query.users.findFirst({
+					where: eq(users.id, task.createdBy),
+					columns: { username: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: undefined;
 	const nextAt = task.nextRunAt ? Date.parse(task.nextRunAt) : Number.NaN;
 	const [updated] = await db
@@ -225,7 +229,10 @@ async function normalizeLegacyTask(task: ScheduledTask, now = new Date()): Promi
 		.where(and(rowVersion(task), isNull(scheduledTasks.schedule)))
 		.returning();
 	const current =
-		updated ?? (await db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, task.id) }));
+		updated ??
+		(await readQuery(db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, task.id) }), {
+			executionPolicy: "worker-required",
+		}));
 	if (!current) throw new NotFoundError("ScheduledTask", task.id);
 	return current;
 }
@@ -343,28 +350,34 @@ async function decorate(task: TaskSummary | ScheduledTask, principal: ScheduledT
 	const ownerId = taskOwnerId(task);
 	const ids = [...new Set([ownerId, task.createdBy].filter((id): id is string => !!id))];
 	const people = ids.length
-		? await db.query.users.findMany({
-				where: inArray(users.id, ids),
-				columns: { id: true, username: true },
-				limit: 2,
-			})
+		? await readQuery(
+				db.query.users.findMany({
+					where: inArray(users.id, ids),
+					columns: { id: true, username: true },
+					limit: 2,
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: [];
 	const owner = people.find((u) => u.id === ownerId) ?? null;
 	const person = people.find((u) => u.id === task.createdBy);
 	const source = task.creatorNarratorId
-		? await db.query.narrators.findFirst({
-				where: eq(narrators.id, task.creatorNarratorId),
-				columns: {
-					id: true,
-					title: true,
-					type: true,
-					ownerUserId: true,
-					visibility: true,
-					writeAudience: true,
-					contextProjectId: true,
-					aclRootNarratorId: true,
-				},
-			})
+		? await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, task.creatorNarratorId),
+					columns: {
+						id: true,
+						title: true,
+						type: true,
+						ownerUserId: true,
+						visibility: true,
+						writeAudience: true,
+						contextProjectId: true,
+						aclRootNarratorId: true,
+					},
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: undefined;
 	const canOpen = !!source && (await canReadNarrator(source, principal));
 	const {
@@ -378,10 +391,13 @@ async function decorate(task: TaskSummary | ScheduledTask, principal: ScheduledT
 	} = task;
 	const schedule = readTaskSchedule(task);
 	const lastRun = task.lastRunId
-		? await db.query.scheduledTaskRuns.findFirst({
-				where: eq(scheduledTaskRuns.id, task.lastRunId),
-				columns: { requireReport: true },
-			})
+		? await readQuery(
+				db.query.scheduledTaskRuns.findFirst({
+					where: eq(scheduledTaskRuns.id, task.lastRunId),
+					columns: { requireReport: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: undefined;
 	return {
 		...safe,
@@ -422,7 +438,9 @@ async function decorate(task: TaskSummary | ScheduledTask, principal: ScheduledT
 
 export const scheduledTaskService = {
 	async get(id: string): Promise<ScheduledTask | undefined> {
-		return db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) });
+		return readQuery(db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) }), {
+			executionPolicy: "worker-required",
+		});
 	},
 
 	async detail(id: string, principal?: ScheduledTaskPrincipal) {
@@ -450,59 +468,62 @@ export const scheduledTaskService = {
 		const lifecycle = filters.lifecycle ?? "active";
 		const query = filters.q?.trim();
 		const match = query ? `%${query.replace(/[\\%_]/g, "\\$&")}%` : null;
-		const rows = await db
-			.select(summaryColumns)
-			.from(scheduledTasks)
-			.where(
-				and(
-					taskReadableWhere(live),
-					lifecycle === "ended"
-						? isNotNull(scheduledTasks.completedAt)
-						: lifecycle !== "all"
-							? isNull(scheduledTasks.completedAt)
+		const rows = await readQuery(
+			db
+				.select(summaryColumns)
+				.from(scheduledTasks)
+				.where(
+					and(
+						taskReadableWhere(live),
+						lifecycle === "ended"
+							? isNotNull(scheduledTasks.completedAt)
+							: lifecycle !== "all"
+								? isNull(scheduledTasks.completedAt)
+								: undefined,
+						lifecycle === "paused" ? eq(scheduledTasks.enabled, false) : undefined,
+						filters.attention
+							? or(
+									inArray(verdict, ["failed", "timed_out", "incomplete", "blocked", "interrupted"]),
+									eq(scheduledTasks.pauseReason, "circuit_breaker"),
+								)
 							: undefined,
-					lifecycle === "paused" ? eq(scheduledTasks.enabled, false) : undefined,
-					filters.attention
-						? or(
-								inArray(verdict, ["failed", "timed_out", "incomplete", "blocked", "interrupted"]),
-								eq(scheduledTasks.pauseReason, "circuit_breaker"),
-							)
-						: undefined,
-					filters.result ? eq(verdict, filters.result) : undefined,
-					filters.creator === "mine"
-						? eq(scheduledTasks.createdBy, live.userId)
-						: filters.creator
-							? eq(scheduledTasks.creatorKind, filters.creator)
+						filters.result ? eq(verdict, filters.result) : undefined,
+						filters.creator === "mine"
+							? eq(scheduledTasks.createdBy, live.userId)
+							: filters.creator
+								? eq(scheduledTasks.creatorKind, filters.creator)
+								: undefined,
+						filters.owner ? taskOwnerWhere(filters.owner) : undefined,
+						filters.projectId ? eq(scheduledTasks.projectId, filters.projectId) : undefined,
+						filters.kind ? eq(scheduledTasks.scheduleKind, filters.kind) : undefined,
+						filters.runContext ? eq(scheduledTasks.runContext, filters.runContext) : undefined,
+						match
+							? or(
+									sql`${scheduledTasks.name} like ${match} escape '\\'`,
+									and(
+										live.isAdmin ? undefined : taskOwnerWhere(live.userId),
+										sql`${scheduledTasks.prompt} like ${match} escape '\\'`,
+									),
+								)
 							: undefined,
-					filters.owner ? taskOwnerWhere(filters.owner) : undefined,
-					filters.projectId ? eq(scheduledTasks.projectId, filters.projectId) : undefined,
-					filters.kind ? eq(scheduledTasks.scheduleKind, filters.kind) : undefined,
-					filters.runContext ? eq(scheduledTasks.runContext, filters.runContext) : undefined,
-					match
-						? or(
-								sql`${scheduledTasks.name} like ${match} escape '\\'`,
-								and(
-									live.isAdmin ? undefined : taskOwnerWhere(live.userId),
-									sql`${scheduledTasks.prompt} like ${match} escape '\\'`,
-								),
-							)
-						: undefined,
-				),
-			)
-			.orderBy(
-				...(filters.sort === "name"
-					? [asc(scheduledTasks.name), asc(scheduledTasks.id)]
-					: filters.sort === "createdAt"
-						? [desc(scheduledTasks.createdAt), desc(scheduledTasks.id)]
-						: filters.sort === "lastRun"
-							? [desc(scheduledTasks.lastRunAt), desc(scheduledTasks.id)]
-							: [
-									asc(sql`case when ${scheduledTasks.nextRunAt} is null then 1 else 0 end`),
-									asc(scheduledTasks.nextRunAt),
-									asc(scheduledTasks.id),
-								]),
-			)
-			.limit(LIST_MAX + 1);
+					),
+				)
+				.orderBy(
+					...(filters.sort === "name"
+						? [asc(scheduledTasks.name), asc(scheduledTasks.id)]
+						: filters.sort === "createdAt"
+							? [desc(scheduledTasks.createdAt), desc(scheduledTasks.id)]
+							: filters.sort === "lastRun"
+								? [desc(scheduledTasks.lastRunAt), desc(scheduledTasks.id)]
+								: [
+										asc(sql`case when ${scheduledTasks.nextRunAt} is null then 1 else 0 end`),
+										asc(scheduledTasks.nextRunAt),
+										asc(scheduledTasks.id),
+									]),
+				)
+				.limit(LIST_MAX + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		const tasks = [];
 		for (const row of rows.slice(0, LIST_MAX)) tasks.push(await decorate(row, live));
 		return { tasks, truncated: rows.length > LIST_MAX };
@@ -541,11 +562,14 @@ export const scheduledTaskService = {
 		}
 		return ownerLocks.acquire(live.userId, async () => {
 			const maxActive = boundedSetting(settings.scheduledTasks?.maxActivePerOwner, 100, 1000);
-			const quota = await db
-				.select({ id: scheduledTasks.id })
-				.from(scheduledTasks)
-				.where(and(taskOwnerWhere(live.userId), isNull(scheduledTasks.completedAt)))
-				.limit(maxActive);
+			const quota = await readQuery(
+				db
+					.select({ id: scheduledTasks.id })
+					.from(scheduledTasks)
+					.where(and(taskOwnerWhere(live.userId), isNull(scheduledTasks.completedAt)))
+					.limit(maxActive),
+				{ executionPolicy: "worker-required" },
+			);
 			if (quota.length >= maxActive)
 				throw new ValidationError(`At most ${maxActive} unfinished scheduled tasks per owner`);
 			if (data.runContext === "project") await assertTaskProjectWrite(data.projectId, live);
@@ -559,10 +583,13 @@ export const scheduledTaskService = {
 				undefined,
 				minimumInterval(provenance?.kind === "narrator"),
 			);
-			const creator = await db.query.users.findFirst({
-				where: eq(users.id, live.userId),
-				columns: { username: true },
-			});
+			const creator = await readQuery(
+				db.query.users.findFirst({
+					where: eq(users.id, live.userId),
+					columns: { username: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			const ts = now.toISOString();
 			const next = nextTaskOccurrence({
 				schedule,
@@ -674,6 +701,11 @@ export const scheduledTaskService = {
 			);
 			const cadenceChanged =
 				scheduleSignature(old) !== scheduleSignature(schedule) || timezone !== existing.timezone;
+			const scheduleChanged =
+				data.schedule !== undefined ||
+				data.cronExpr !== undefined ||
+				data.timezone !== undefined ||
+				data.enabled !== undefined;
 			if (cadenceChanged)
 				normalizeSchedule(
 					schedule,
@@ -690,10 +722,13 @@ export const scheduledTaskService = {
 			}
 			// Execution settings cannot be changed while the accepted snapshot is in use.
 			if (existing.activeRunId && Object.keys(data).some((key) => key !== "name")) throw conflict();
-			let waiting = await db.query.scheduledTaskRuns.findFirst({
-				where: and(eq(scheduledTaskRuns.taskId, id), eq(scheduledTaskRuns.status, "waiting")),
-				columns: { id: true },
-			});
+			let waiting = await readQuery(
+				db.query.scheduledTaskRuns.findFirst({
+					where: and(eq(scheduledTaskRuns.taskId, id), eq(scheduledTaskRuns.status, "waiting")),
+					columns: { id: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			const enabled = data.enabled ?? existing.enabled;
 			const firedCount = cadenceChanged ? 0 : existing.firedCount;
 			const scheduleCursorAt =
@@ -736,17 +771,24 @@ export const scheduledTaskService = {
 							(data.cwd !== undefined && data.cwd !== version.cwd)
 								? { reuseNarratorId: null }
 								: {}),
-							schedule,
-							scheduleKind: schedule.kind,
-							cronExpr: scheduleToLegacyCron(schedule) ?? "",
-							timezone,
-							firedCount,
-							scheduleCursorAt,
-							scheduleRevision: version.scheduleRevision + (cadenceChanged ? 1 : 0),
-							nextRunAt: enabled || schedule.kind === "at" ? next : null,
-							completedAt: !next && !version.activeRunId && !waiting ? now.toISOString() : null,
-							enabled,
-							pauseReason: enabled ? null : "user",
+							// A Worker read may predate a claim. Non-schedule edits must not
+							// restore its old cursor, count or next occurrence after admission.
+							...(scheduleChanged
+								? {
+										schedule,
+										scheduleKind: schedule.kind,
+										cronExpr: scheduleToLegacyCron(schedule) ?? "",
+										timezone,
+										firedCount,
+										scheduleCursorAt,
+										scheduleRevision: version.scheduleRevision + (cadenceChanged ? 1 : 0),
+										nextRunAt: enabled || schedule.kind === "at" ? next : null,
+										completedAt:
+											!next && !version.activeRunId && !waiting ? now.toISOString() : null,
+										enabled,
+										pauseReason: enabled ? null : ("user" as const),
+									}
+								: {}),
 							...(data.enabled === true ? { consecutiveFailures: 0 } : {}),
 							lastModifiedBy: modifiedBy(live, "update", provenance),
 							updatedAt: stamp(version.updatedAt),
@@ -916,15 +958,18 @@ export const scheduledTaskService = {
 	},
 
 	async listDue(at: Date = new Date()): Promise<ScheduledTask[]> {
-		return db.query.scheduledTasks.findMany({
-			where: and(
-				or(eq(scheduledTasks.enabled, true), eq(scheduledTasks.scheduleKind, "at")),
-				isNull(scheduledTasks.completedAt),
-				lte(scheduledTasks.nextRunAt, at.toISOString()),
-			),
-			orderBy: [asc(scheduledTasks.nextRunAt), asc(scheduledTasks.id)],
-			limit: DUE_BATCH,
-		});
+		return readQuery(
+			db.query.scheduledTasks.findMany({
+				where: and(
+					or(eq(scheduledTasks.enabled, true), eq(scheduledTasks.scheduleKind, "at")),
+					isNull(scheduledTasks.completedAt),
+					lte(scheduledTasks.nextRunAt, at.toISOString()),
+				),
+				orderBy: [asc(scheduledTasks.nextRunAt), asc(scheduledTasks.id)],
+				limit: DUE_BATCH,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 	},
 
 	/** Startup skips every elapsed occurrence; overflow stays overdue and is consumed in later bounded batches. */
@@ -932,12 +977,15 @@ export const scheduledTaskService = {
 		let cursor = "";
 		const at = new Date();
 		for (;;) {
-			const rows = await db
-				.select({ id: scheduledTasks.id })
-				.from(scheduledTasks)
-				.where(gt(scheduledTasks.id, cursor))
-				.orderBy(asc(scheduledTasks.id))
-				.limit(DUE_BATCH);
+			const rows = await readQuery(
+				db
+					.select({ id: scheduledTasks.id })
+					.from(scheduledTasks)
+					.where(gt(scheduledTasks.id, cursor))
+					.orderBy(asc(scheduledTasks.id))
+					.limit(DUE_BATCH),
+				{ executionPolicy: "worker-required" },
+			);
 			if (!rows.length) break;
 			for (const original of rows) {
 				cursor = original.id;
@@ -1006,10 +1054,13 @@ export const scheduledTaskService = {
 			until,
 		);
 		if (!slice) return;
-		const waiting = await db.query.scheduledTaskRuns.findFirst({
-			where: and(eq(scheduledTaskRuns.taskId, task.id), eq(scheduledTaskRuns.status, "waiting")),
-			columns: { id: true },
-		});
+		const waiting = await readQuery(
+			db.query.scheduledTaskRuns.findFirst({
+				where: and(eq(scheduledTaskRuns.taskId, task.id), eq(scheduledTaskRuns.status, "waiting")),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const ts = stamp(task.updatedAt);
 		const runId = generateId();
 		db.transaction((tx) => {
@@ -1058,18 +1109,21 @@ export const scheduledTaskService = {
 
 	/** Pausing freezes repeat counts, not a calendar end date. Sweep a bounded keyset page. */
 	async reconcilePausedTasks() {
-		const rows = await db
-			.select({ id: scheduledTasks.id })
-			.from(scheduledTasks)
-			.where(
-				and(
-					eq(scheduledTasks.enabled, false),
-					isNull(scheduledTasks.completedAt),
-					gt(scheduledTasks.id, pausedSweep.cursor),
-				),
-			)
-			.orderBy(asc(scheduledTasks.id))
-			.limit(DUE_BATCH);
+		const rows = await readQuery(
+			db
+				.select({ id: scheduledTasks.id })
+				.from(scheduledTasks)
+				.where(
+					and(
+						eq(scheduledTasks.enabled, false),
+						isNull(scheduledTasks.completedAt),
+						gt(scheduledTasks.id, pausedSweep.cursor),
+					),
+				)
+				.orderBy(asc(scheduledTasks.id))
+				.limit(DUE_BATCH),
+			{ executionPolicy: "worker-required" },
+		);
 		pausedSweep.cursor = rows.length === DUE_BATCH ? (rows.at(-1)?.id ?? "") : "";
 		for (const row of rows) await this.reconcileCompletion(row.id);
 	},
@@ -1077,16 +1131,19 @@ export const scheduledTaskService = {
 		let task = await this.get(id);
 		if (!task || task.activeRunId || task.completedAt) return;
 		task = await normalizeLegacyTask(task);
-		const active = await db
-			.select({ id: scheduledTaskRuns.id })
-			.from(scheduledTaskRuns)
-			.where(
-				and(
-					eq(scheduledTaskRuns.taskId, id),
-					inArray(scheduledTaskRuns.status, UNFINISHED_RUN_STATUSES),
-				),
-			)
-			.limit(1);
+		const active = await readQuery(
+			db
+				.select({ id: scheduledTaskRuns.id })
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						eq(scheduledTaskRuns.taskId, id),
+						inArray(scheduledTaskRuns.status, UNFINISHED_RUN_STATUSES),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required" },
+		);
 		if (active.length) return;
 		const schedule = readTaskSchedule(task);
 		const next = nextTaskOccurrence(
@@ -1164,7 +1221,10 @@ export const scheduledTaskService = {
 			cwd ??= project.gitPath;
 		}
 		if (task.narratorMode === "reuse" && task.reuseNarratorId) {
-			const existing = await narratorService.getById(task.reuseNarratorId).catch(() => null);
+			const existing = await narratorService.getById(task.reuseNarratorId).catch((error) => {
+				if (error instanceof NotFoundError) return null;
+				throw error;
+			});
 			if (
 				existing &&
 				existing.status !== "archived" &&
@@ -1224,45 +1284,51 @@ export const scheduledTaskService = {
 			scheduledTaskRuns.outcome,
 			scheduledTaskRuns.requireReport,
 		);
-		const rows = await db
-			.select()
-			.from(scheduledTaskRuns)
-			.where(
-				and(
-					eq(scheduledTaskRuns.taskId, taskId),
-					cursor
-						? or(
-								lt(scheduledTaskRuns.createdAt, cursor.at),
-								and(
-									eq(scheduledTaskRuns.createdAt, cursor.at),
-									lt(scheduledTaskRuns.id, cursor.id),
-								),
-							)
-						: undefined,
-					opts.result ? eq(verdict, opts.result) : undefined,
-				),
-			)
-			.orderBy(desc(scheduledTaskRuns.createdAt), desc(scheduledTaskRuns.id))
-			.limit(limit + 1);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						eq(scheduledTaskRuns.taskId, taskId),
+						cursor
+							? or(
+									lt(scheduledTaskRuns.createdAt, cursor.at),
+									and(
+										eq(scheduledTaskRuns.createdAt, cursor.at),
+										lt(scheduledTaskRuns.id, cursor.id),
+									),
+								)
+							: undefined,
+						opts.result ? eq(verdict, opts.result) : undefined,
+					),
+				)
+				.orderBy(desc(scheduledTaskRuns.createdAt), desc(scheduledTaskRuns.id))
+				.limit(limit + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		const items = rows.slice(0, limit);
 		const canSeeOutput = canEditTask(task, live);
 		const narratorIds = [
 			...new Set(items.flatMap((run) => (run.narratorId ? [run.narratorId] : []))),
 		];
 		const targets = narratorIds.length
-			? await db.query.narrators.findMany({
-					where: inArray(narrators.id, narratorIds),
-					limit,
-					columns: {
-						id: true,
-						type: true,
-						ownerUserId: true,
-						visibility: true,
-						writeAudience: true,
-						contextProjectId: true,
-						aclRootNarratorId: true,
-					},
-				})
+			? await readQuery(
+					db.query.narrators.findMany({
+						where: inArray(narrators.id, narratorIds),
+						limit,
+						columns: {
+							id: true,
+							type: true,
+							ownerUserId: true,
+							visibility: true,
+							writeAudience: true,
+							contextProjectId: true,
+							aclRootNarratorId: true,
+						},
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: [];
 		const readableTargets = new Set<string>();
 		for (const target of targets)

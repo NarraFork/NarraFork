@@ -11,6 +11,7 @@ import type { ExecutorPathRule } from "@shared/executor-path-rules";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { projects, remoteDevices } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { isSecureDirectDeviceUrl } from "../lib/device-url";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -232,10 +233,14 @@ export function slugifyDeviceName(name: string): string {
 async function ensureUniqueSlug(desired: string): Promise<string> {
 	let candidate = desired;
 	for (let attempt = 0; attempt < 20; attempt++) {
-		const existing = await db.query.remoteDevices.findFirst({
-			where: eq(remoteDevices.slug, candidate),
-			columns: { id: true },
-		});
+		const existing = await readQueryFirst(
+			db.query.remoteDevices.findMany({
+				limit: 1,
+				where: eq(remoteDevices.slug, candidate),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!existing) return candidate;
 		candidate = `${desired}-${randomBytes(2).toString("hex")}`;
 	}
@@ -299,10 +304,10 @@ async function normalizeProjectScope(
 	if (scope === "global" && !preserveGlobalProjectContext) return null;
 	const value = projectId?.trim();
 	if (!value) throw new ValidationError("projectId is required for this device scope");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, value),
-		columns: { id: true },
-	});
+	const project = await readQueryFirst(
+		db.query.projects.findMany({ limit: 1, where: eq(projects.id, value), columns: { id: true } }),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!project) throw new ValidationError("Project not found");
 	return value;
 }
@@ -368,17 +373,24 @@ export async function createDevice(input: CreateDeviceInput): Promise<CreateDevi
 }
 
 export async function listDevices(): Promise<RemoteDeviceView[]> {
-	const rows = await db.query.remoteDevices.findMany({
-		where: isNull(remoteDevices.revokedAt),
-		orderBy: (d, { asc }) => [asc(d.createdAt)],
-	});
+	const rows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: isNull(remoteDevices.revokedAt),
+			orderBy: (d, { asc }) => [asc(d.createdAt)],
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return rows.map(toDeviceView);
 }
 
 export async function getDevice(id: string): Promise<RemoteDeviceView | null> {
-	const row = await db.query.remoteDevices.findFirst({
-		where: and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)),
-	});
+	const row = await readQueryFirst(
+		db.query.remoteDevices.findMany({
+			limit: 1,
+			where: and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return row ? toDeviceView(row) : null;
 }
 
@@ -415,9 +427,10 @@ export async function requireAuthorizedDeviceForProject(
 
 /** Fetch the raw row (including tokenHash) — used by the connection layer. */
 export async function getDeviceRow(id: string): Promise<RemoteDeviceRow | null> {
-	const row = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, id),
-	});
+	const row = await readQueryFirst(
+		db.query.remoteDevices.findMany({ limit: 1, where: eq(remoteDevices.id, id) }),
+		{ executionPolicy: "worker-required" },
+	);
 	return row ?? null;
 }
 
@@ -606,11 +619,16 @@ export async function verifyDeviceToken(
 	identifier: string,
 	token: string,
 ): Promise<RemoteDeviceRow | null> {
-	const bySlug = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.slug, identifier),
-	});
+	const bySlug = await readQueryFirst(
+		db.query.remoteDevices.findMany({ limit: 1, where: eq(remoteDevices.slug, identifier) }),
+		{ executionPolicy: "worker-required" },
+	);
 	const row =
-		bySlug ?? (await db.query.remoteDevices.findFirst({ where: eq(remoteDevices.id, identifier) }));
+		bySlug ??
+		(await readQueryFirst(
+			db.query.remoteDevices.findMany({ limit: 1, where: eq(remoteDevices.id, identifier) }),
+			{ executionPolicy: "worker-required" },
+		));
 	if (!row || row.revokedAt) return null;
 	// Constant-time compare of the SHA-256 hashes (both fixed 32-byte hex) so token
 	// verification does not leak information through response timing.

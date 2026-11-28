@@ -1,24 +1,17 @@
 import { ActionIcon, Group, Modal, Select, Stack, Text, Tooltip } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderOpen, IconInfoCircle } from "@tabler/icons-react";
-import { lazy, Suspense, useMemo } from "react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { PathFlavor, RuleTargetSelector } from "../../lib/api/types";
 import { Z } from "../../lib/z-index";
+import { DeviceDirectoryBrowser } from "../common/DeviceDirectoryPicker";
+import { LOCAL_DEVICE } from "../common/device-directory-options";
 import { DIRECTORY_BROWSER_MODAL_STYLES } from "../common/directory-browser-modal";
 import { PathInput } from "../common/PathInput";
 import { RemotePathInput } from "./RemotePathInput";
 import { type PermissionTargetDevice, selectorDevice } from "./RuleTargetSelector";
-
-const DirectoryBrowser = lazy(() =>
-	import("../common/DirectoryPicker").then((module) => ({ default: module.DirectoryBrowser })),
-);
-const RemoteDirectoryBrowser = lazy(() =>
-	import("./RemoteDirectoryBrowser").then((module) => ({
-		default: module.RemoteDirectoryBrowser,
-	})),
-);
 
 export function TargetPathInput({
 	value,
@@ -173,34 +166,23 @@ export function TargetPathInput({
 				zIndex={Z.modal}
 				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
-				{opened && hostTarget && (
-					<Suspense fallback={null}>
-						<DirectoryBrowser
-							onSelect={(path) => {
-								onChange(path);
-								onCommit?.(path);
-								close();
-							}}
-							onCancel={close}
-							isWide={isWide}
-						/>
-					</Suspense>
-				)}
-				{opened && !hostTarget && listDeviceDirectory && (
-					<Suspense fallback={null}>
-						<RemoteDirectoryBrowser
-							deviceLabel={remoteDevice?.name ?? deviceId ?? ""}
-							initialPath={value.trim() || undefined}
-							listDirectory={(path, opts) => listDeviceDirectory(path, opts)}
-							queryKey={deviceQueryKey}
-							onSelect={(path) => {
-								onChange(path);
-								onCommit?.(path);
-								close();
-							}}
-							onCancel={close}
-						/>
-					</Suspense>
+				{opened && (
+					<DeviceDirectoryBrowser
+						// A host rule browses this server; a device rule browses that device.
+						deviceId={hostTarget ? LOCAL_DEVICE : (deviceId ?? "")}
+						deviceLabel={remoteDevice?.name ?? deviceId ?? ""}
+						// The host browser starts at home; a device starts at the path already typed.
+						initialPath={hostTarget ? undefined : value.trim() || undefined}
+						listDirectory={listDeviceDirectory ?? undefined}
+						queryKey={deviceQueryKey}
+						onSelect={(path) => {
+							onChange(path);
+							onCommit?.(path);
+							close();
+						}}
+						onCancel={close}
+						isWide={isWide}
+					/>
 				)}
 			</Modal>
 		</Stack>

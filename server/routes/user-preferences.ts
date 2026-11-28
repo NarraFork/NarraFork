@@ -1,3 +1,4 @@
+import { type AppearanceValues, isAccountAppearanceValues } from "@shared/appearance-preferences";
 import {
 	DEFAULT_TYPOGRAPHY,
 	LEGACY_LINE_HEIGHT_RANGE,
@@ -5,20 +6,25 @@ import {
 	lineHeightPercentFromLegacy,
 	lineHeightPercentFromStored,
 } from "@shared/pretext-layout/typography";
-import { eq } from "drizzle-orm";
-import { Hono } from "hono";
+import { eq, sql } from "drizzle-orm";
+import { type Context, Hono } from "hono";
 import { db, sqlite } from "../db";
 import { userPreferences } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { userPreferencesLock } from "../lib/async-mutex";
-import { ValidationError } from "../lib/errors";
+import { AppError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { saveSettings, settings } from "../lib/settings";
 import {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createRecentTabFolderSchema,
+	MAX_HIDDEN_PLUGIN_OVERLAYS,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
+	pluginOverlayVisibilityPatchSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
@@ -39,6 +45,8 @@ import {
 	clearRecentTabs,
 	createRecentTabFolder,
 	dissolveRecentTabFolder,
+	filterReadableRecentTabs,
+	getRecentTabState,
 	getRuntimePatches,
 	listLegacyTabs,
 	listPage,
@@ -54,6 +62,14 @@ import { enrichTabs } from "../services/user-preferences-service";
 
 export const userPreferencesRoutes = new Hono();
 
+/**
+ * Preferences reads run on the database Worker. Every writer of the merged JSON columns
+ * holds `userPreferencesLock`, so a read taken inside the lock cannot be overwritten.
+ */
+function prefsRead(c: Context) {
+	return { executionPolicy: "worker-required" as const, signal: c.req.raw.signal, maxRows: 1 };
+}
+
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
 	fastModeDefault: false,
@@ -66,6 +82,7 @@ const DEFAULTS = {
 	showTokenUsage: false,
 	showOutputStats: true,
 	compactAuxiliaryContent: true,
+	appearancePreferences: "{}",
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	// Narrator transcript typography. Sourced from the shared neutral setting rather
@@ -167,6 +184,7 @@ const INSERT_COLUMNS = [
 	"show_token_usage",
 	"show_output_stats",
 	"compact_auxiliary_content",
+	"appearance_preferences",
 	"terminal_theme",
 	"terminal_font_size",
 	"narrator_font_scale_percent",
@@ -232,6 +250,12 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
 	} catch {
 		return {};
 	}
+}
+
+/** Invalid/corrupt storage never becomes a client preference or an unchecked PATCH base. */
+function parseAppearancePreferences(value: unknown): AppearanceValues {
+	const parsed = parseJsonObject(value);
+	return isAccountAppearanceValues(parsed) ? parsed : {};
 }
 
 function maskRecordFields(
@@ -356,8 +380,10 @@ function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
+	// The compatibility shadow is not ACL-filtered storage. Never serialize it directly.
+	const { recentTabs: _shadow, ...preferences } = pref;
 	return {
-		...pref,
+		...preferences,
 		narratorLineHeightV2Percent: lineHeightPercentFromStored(
 			pref.narratorLineHeightV2Percent,
 			pref.narratorLineHeightScalePercent,
@@ -366,6 +392,7 @@ function serializeUserPreferences(
 		outlineDigestServerTimeZone: serverTimeZone(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
+		appearancePreferences: parseAppearancePreferences(pref.appearancePreferences),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
 		notifyDingtalkSecret: maskSecret(pref.notifyDingtalkSecret),
 		notifyFeishuWebhook: maskSecret(pref.notifyFeishuWebhook),
@@ -374,19 +401,254 @@ function serializeUserPreferences(
 		navLayout: parseJsonObject(pref.navLayout),
 		narratorToolbarLayout: parseJsonObject(pref.narratorToolbarLayout),
 		specTabLayout: parseJsonObject(pref.specTabLayout),
+		hiddenPluginOverlays: parseHiddenPluginOverlays(pref.hiddenPluginOverlays),
 	};
+}
+
+/** Stored ids, tolerating a malformed column (it only ever reads back as "hide nothing"). */
+function parseHiddenPluginOverlays(value: unknown): string[] {
+	return parseJsonArray(value)
+		.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 256)
+		.slice(0, MAX_HIDDEN_PLUGIN_OVERLAYS);
+}
+
+// Source projection: never fetch the preference row and then discard private/heavy fields.
+const UI_PREFERENCE_COLUMNS = {
+	autoLoadOlderMessages: userPreferences.autoLoadOlderMessages,
+	fastModeDefault: userPreferences.fastModeDefault,
+	treatAsLocalAccess: userPreferences.treatAsLocalAccess,
+	language: userPreferences.language,
+	wordWrapMarkdown: userPreferences.wordWrapMarkdown,
+	wordWrapCode: userPreferences.wordWrapCode,
+	wordWrapDiff: userPreferences.wordWrapDiff,
+	replyInUserLanguage: userPreferences.replyInUserLanguage,
+	showTokenUsage: userPreferences.showTokenUsage,
+	showOutputStats: userPreferences.showOutputStats,
+	compactAuxiliaryContent: userPreferences.compactAuxiliaryContent,
+	appearancePreferences: userPreferences.appearancePreferences,
+	terminalTheme: userPreferences.terminalTheme,
+	terminalFontSize: userPreferences.terminalFontSize,
+	narratorFontScalePercent: userPreferences.narratorFontScalePercent,
+	narratorLetterSpacingPercent: userPreferences.narratorLetterSpacingPercent,
+	narratorLineHeightScalePercent: userPreferences.narratorLineHeightScalePercent,
+	narratorLineHeightV2Percent: userPreferences.narratorLineHeightV2Percent,
+	narratorParagraphScalePercent: userPreferences.narratorParagraphScalePercent,
+	recentTabsShowDirectory: userPreferences.recentTabsShowDirectory,
+	addSubagentToRecentTabs: userPreferences.addSubagentToRecentTabs,
+	recentTabsGroupMode: userPreferences.recentTabsGroupMode,
+	notifyOnDone: userPreferences.notifyOnDone,
+	notifyOnWaiting: userPreferences.notifyOnWaiting,
+	notifyPwaEnabled: userPreferences.notifyPwaEnabled,
+	notifySoundEnabled: userPreferences.notifySoundEnabled,
+	notifySoundType: userPreferences.notifySoundType,
+	notifySoundBuiltin: userPreferences.notifySoundBuiltin,
+	notifySoundFileId: userPreferences.notifySoundFileId,
+	notifySoundVolume: userPreferences.notifySoundVolume,
+	notifySoundMaxConcurrent: userPreferences.notifySoundMaxConcurrent,
+	notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+	notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
+	enterQueueMode: userPreferences.enterQueueMode,
+	ctrlEnterQueueMode: userPreferences.ctrlEnterQueueMode,
+	navLayout: userPreferences.navLayout,
+	narratorToolbarLayout: userPreferences.narratorToolbarLayout,
+	hiddenPluginOverlays: userPreferences.hiddenPluginOverlays,
+	gitIdentityContextMenu: userPreferences.gitIdentityContextMenu,
+	gitIdentityCreateModal: userPreferences.gitIdentityCreateModal,
+	gitIdentityFolderContextMenu: userPreferences.gitIdentityFolderContextMenu,
+} as const;
+const UI_PREFERENCES_MAX_BYTES = 64 * 1024;
+
+/** Bound raw UTF-8 bytes BEFORE JSON.parse, including whitespace and chunked requests. */
+async function readBoundedPreferencesJson(request: Request): Promise<unknown> {
+	const tooLarge = () =>
+		new AppError(
+			"Preferences request exceeds the 64 KiB budget",
+			413,
+			"PREFERENCES_BODY_TOO_LARGE",
+		);
+	if (Number(request.headers.get("Content-Length")) > UI_PREFERENCES_MAX_BYTES) {
+		void request.body?.cancel().catch(() => {});
+		throw tooLarge();
+	}
+	const reader = request.body?.getReader();
+	if (!reader) throw new ValidationError("Request body must be valid JSON");
+	const bytes = new Uint8Array(UI_PREFERENCES_MAX_BYTES);
+	let size = 0;
+	let interrupt: (error: Error) => void = () => {};
+	const interrupted = new Promise<never>((_resolve, reject) => {
+		interrupt = reject;
+	});
+	const abort = () => {
+		interrupt(new AppError("Preferences request interrupted", 408, "PREFERENCES_BODY_TIMEOUT"));
+		void reader.cancel().catch(() => {});
+	};
+	const timer = setTimeout(abort, 10_000);
+	request.signal.addEventListener("abort", abort, { once: true });
+	try {
+		if (request.signal.aborted) throw new DOMException("Request aborted", "AbortError");
+		for (;;) {
+			const { done, value } = await Promise.race([reader.read(), interrupted]);
+			if (done) break;
+			if (size + value.byteLength > UI_PREFERENCES_MAX_BYTES) throw tooLarge();
+			bytes.set(value, size);
+			size += value.byteLength;
+		}
+		try {
+			return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size)));
+		} catch {
+			throw new ValidationError("Request body must be valid JSON");
+		}
+	} finally {
+		clearTimeout(timer);
+		request.signal.removeEventListener("abort", abort);
+		void reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+}
+
+const uiPreferencesPatchSchema = updateUserPreferencesSchema
+	.omit({
+		outlineDigestTimeZone: true,
+		outlineDigestTime: true,
+		notifyDingtalkWebhook: true,
+		notifyDingtalkSecret: true,
+		notifyFeishuWebhook: true,
+		notifyFeishuSecret: true,
+		commands: true,
+		gatewayConfig: true,
+	})
+	.strict();
+
+function assertUIPreferencesBudget(value: unknown) {
+	if (Buffer.byteLength(JSON.stringify(value), "utf8") > UI_PREFERENCES_MAX_BYTES) {
+		throw new AppError(
+			"UI preferences exceed the 64 KiB budget; use the detail view",
+			413,
+			"UI_PREFERENCES_TOO_LARGE",
+		);
+	}
+}
+
+type StoredUIPreferences = Pick<
+	typeof userPreferences.$inferSelect,
+	keyof typeof UI_PREFERENCE_COLUMNS
+>;
+function serializeUIPreferences(pref?: Partial<StoredUIPreferences>) {
+	const values: Record<string, unknown> = {};
+	for (const key of Object.keys(UI_PREFERENCE_COLUMNS)) {
+		values[key] =
+			pref && key in pref ? pref[key as keyof typeof pref] : DEFAULTS[key as keyof typeof DEFAULTS];
+	}
+	const result = {
+		...values,
+		narratorLineHeightV2Percent: lineHeightPercentFromStored(
+			pref ? pref.narratorLineHeightV2Percent : DEFAULTS.narratorLineHeightV2Percent,
+			pref?.narratorLineHeightScalePercent ?? DEFAULTS.narratorLineHeightScalePercent,
+		),
+		appearancePreferences: parseAppearancePreferences(pref?.appearancePreferences),
+		navLayout: parseJsonObject(pref?.navLayout),
+		narratorToolbarLayout: parseJsonObject(pref?.narratorToolbarLayout),
+		hiddenPluginOverlays: parseHiddenPluginOverlays(pref?.hiddenPluginOverlays),
+		setupWizardCompleted: instanceSetupWizardCompleted(),
+	};
+	assertUIPreferencesBudget(result);
+	return result;
+}
+
+async function readUIPreferences(userId: string, signal?: AbortSignal) {
+	const [pref] = await readQuery(
+		db
+			.select(UI_PREFERENCE_COLUMNS)
+			.from(userPreferences)
+			.where(eq(userPreferences.userId, userId))
+			.limit(1),
+		{ maxRows: 1, signal },
+	);
+	return serializeUIPreferences(pref);
+}
+
+async function writeUIPreferences(userId: string, body: unknown, isAdmin: boolean) {
+	assertUIPreferencesBudget(body);
+	const parsed = uiPreferencesPatchSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return userPreferencesLock.acquire(userId, async () => {
+		const d = parsed.data;
+		// Reads needed for merges are restricted to the same small UI projection.
+		const [existing] = await readQuery(
+			db
+				.select(UI_PREFERENCE_COLUMNS)
+				.from(userPreferences)
+				.where(eq(userPreferences.userId, userId))
+				.limit(1),
+			{ maxRows: 1 },
+		);
+		const setupCompleted = instanceSetupWizardCompleted();
+		const lineHeight = lineHeightWrite(d);
+		const now = new Date().toISOString();
+		const values = {
+			...d,
+			setupWizardCompleted: setupCompleted || (isAdmin && d.setupWizardCompleted === true),
+			...(lineHeight.v2 === null
+				? {}
+				: {
+						narratorLineHeightV2Percent: lineHeight.v2,
+						narratorLineHeightScalePercent: lineHeight.legacy as number,
+					}),
+			appearancePreferences:
+				d.appearancePreferences === undefined
+					? undefined
+					: JSON.stringify({
+							...parseAppearancePreferences(existing?.appearancePreferences),
+							...d.appearancePreferences,
+						}),
+			navLayout: d.navLayout === undefined ? undefined : JSON.stringify(d.navLayout),
+			narratorToolbarLayout:
+				d.narratorToolbarLayout === undefined ? undefined : JSON.stringify(d.narratorToolbarLayout),
+			updatedAt: now,
+		};
+		// Validate the actual merged wire DTO before any write; undefined is not an edit.
+		const supplied = Object.fromEntries(
+			Object.entries(values).filter(([, value]) => value !== undefined),
+		);
+		serializeUIPreferences({ ...existing, ...supplied });
+		await db
+			.insert(userPreferences)
+			.values({
+				id: generateId(),
+				userId,
+				createdAt: now,
+				...values,
+			})
+			.onConflictDoUpdate({ target: userPreferences.userId, set: values });
+		if (d.setupWizardCompleted === true && isAdmin && !setupCompleted) {
+			saveSettings({ ...settings, setupWizardCompleted: true });
+		}
+		if (
+			d.fastModeDefault !== undefined &&
+			d.fastModeDefault !== (existing?.fastModeDefault ?? DEFAULTS.fastModeDefault)
+		) {
+			eventBus.emit({ type: "user:fast_mode_default_changed", userId });
+		}
+		eventBus.emit({ type: "user_preferences:changed", userId });
+		return readUIPreferences(userId);
+	});
 }
 
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const legacyTabs = await listLegacyTabs(userId);
-	const recentTabs = await enrichTabs(
-		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
-		userId,
+	if (c.req.query("view") === "ui") {
+		return c.json(await readUIPreferences(userId, c.req.raw.signal));
+	}
+	const legacyTabs = (await listLegacyTabs(userId)).map((tab) => ({ ...tab }));
+	const pref = await readQueryFirst(
+		db.query.userPreferences.findMany({
+			where: eq(userPreferences.userId, userId),
+			limit: 1,
+		}),
+		prefsRead(c),
 	);
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-	});
+	await enrichTabs(legacyTabs, userId);
+	const recentTabs = filterReadableRecentTabs(userId, legacyTabs);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -394,24 +656,52 @@ userPreferencesRoutes.get("/", async (c) => {
 			outlineDigestServerTimeZone: serverTimeZone(),
 			recentTabs,
 			commands: [],
+			appearancePreferences: {},
 			gatewayConfig: {},
 			navLayout: {},
 			narratorToolbarLayout: {},
 			specTabLayout: {},
+			hiddenPluginOverlays: [],
 		});
 	}
 
 	return c.json(serializeUserPreferences(pref, recentTabs));
 });
 
+userPreferencesRoutes.get("/ui", async (c) =>
+	c.json(await readUIPreferences(c.get("user").sub, c.req.raw.signal)),
+);
+userPreferencesRoutes.patch("/ui", async (c) =>
+	c.json(
+		await writeUIPreferences(
+			c.get("user").sub,
+			await readBoundedPreferencesJson(c.req.raw),
+			c.get("user").role === "admin",
+		),
+	),
+);
+
 userPreferencesRoutes.patch("/", async (c) => {
 	const userId = c.get("user").sub;
+	if (c.req.query("view") === "ui") {
+		return c.json(
+			await writeUIPreferences(
+				userId,
+				await readBoundedPreferencesJson(c.req.raw),
+				c.get("user").role === "admin",
+			),
+		);
+	}
 	const body = await c.req.json();
 
 	const updated = await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
 		const mergedBody = isRecord(body) ? { ...body } : body;
 		if (isRecord(mergedBody)) {
 			for (const field of TOP_LEVEL_SECRET_FIELDS) {
@@ -448,6 +738,14 @@ userPreferencesRoutes.patch("/", async (c) => {
 		// Atomic upsert — avoids read-then-write race condition
 		const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
 		const navLayoutJson = d.navLayout != null ? JSON.stringify(d.navLayout) : null;
+		// Merge only supplied keys against the latest account row under the per-user lock.
+		const appearancePreferencesJson =
+			d.appearancePreferences !== undefined
+				? JSON.stringify({
+						...parseAppearancePreferences(existing?.appearancePreferences),
+						...d.appearancePreferences,
+					})
+				: null;
 		const narratorToolbarLayoutJson =
 			d.narratorToolbarLayout != null ? JSON.stringify(d.narratorToolbarLayout) : null;
 
@@ -476,6 +774,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   show_token_usage = COALESCE(?, show_token_usage),
 		   show_output_stats = COALESCE(?, show_output_stats),
 		   compact_auxiliary_content = COALESCE(?, compact_auxiliary_content),
+		   appearance_preferences = COALESCE(?, appearance_preferences),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
 		   narrator_font_scale_percent = COALESCE(?, narrator_font_scale_percent),
@@ -529,6 +828,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
 				(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
 				(d.compactAuxiliaryContent ?? DEFAULTS.compactAuxiliaryContent) ? 1 : 0,
+				appearancePreferencesJson ?? DEFAULTS.appearancePreferences,
 				d.terminalTheme ?? DEFAULTS.terminalTheme,
 				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
 				d.narratorFontScalePercent ?? DEFAULTS.narratorFontScalePercent,
@@ -580,6 +880,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
 				d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
 				d.compactAuxiliaryContent != null ? (d.compactAuxiliaryContent ? 1 : 0) : null,
+				appearancePreferencesJson,
 				d.terminalTheme ?? null,
 				d.terminalFontSize ?? null,
 				d.narratorFontScalePercent ?? null,
@@ -624,10 +925,20 @@ userPreferencesRoutes.patch("/", async (c) => {
 			],
 		);
 
-		return db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		if (
+			d.fastModeDefault !== undefined &&
+			d.fastModeDefault !== (existing?.fastModeDefault ?? DEFAULTS.fastModeDefault)
+		) {
+			eventBus.emit({ type: "user:fast_mode_default_changed", userId });
+		}
+
+		const [saved] = await readQuery(
+			db.select().from(userPreferences).where(eq(userPreferences.userId, userId)).limit(1),
+			prefsRead(c),
+		);
+		return saved;
 	});
+	if (updated) eventBus.emit({ type: "user_preferences:changed", userId });
 	return c.json(updated ? serializeUserPreferences(updated) : updated);
 });
 
@@ -656,7 +967,7 @@ userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
 
 // === Recent Tabs endpoints ===
 
-/** Cursor-paginated authoritative recent tabs, split into project/work sections. */
+/** Cursor-paginated work list; `projects` remains an empty compatibility section. */
 userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = recentTabsPageQuerySchema.safeParse({
@@ -666,6 +977,20 @@ userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await listPage(userId, parsed.data.section, parsed.data.cursor, parsed.data.limit));
+});
+
+/**
+ * Whether one tab is in the sidebar and pinned, wherever it sits in the list: the "pin to
+ * sidebar" buttons of project and team pages read it for a tab outside the loaded pages.
+ */
+userPreferencesRoutes.get("/recent-tabs/state", (c) => {
+	const userId = c.get("user").sub;
+	const parsed = recentTabStateQuerySchema.safeParse({
+		type: c.req.query("type"),
+		id: c.req.query("id"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(getRecentTabState(userId, parsed.data.type, parsed.data.id));
 });
 
 /** Fetch bounded live-only patches for currently rendered tabs. */
@@ -681,8 +1006,8 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = upsertRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { updateOnly, beforeKey, afterKey, ...tab } = parsed.data;
-	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
+	const { updateOnly, beforeKey, afterKey, pin, ...tab } = parsed.data;
+	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey, pin }));
 });
 
 /** Atomically upsert several tabs with one revision. */
@@ -790,10 +1115,14 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { graphViewports: true },
-		});
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				columns: { graphViewports: true },
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
 
 		let viewports: Record<string, { x: number; y: number; zoom: number }> = {};
 		try {
@@ -836,32 +1165,103 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
  * 写入某个叙述者的大纲标签排布。整张映射按 narratorId 合并写入，
  * 其他叙述者的记录不受影响。
  */
+/**
+ * Show or hide one plugin's overlay views for the calling user only.
+ *
+ * Overlays appear by default once a plugin is installed; this is the personal opt-out.
+ * Hiding the newest id first and capping the list keeps the column bounded even if a
+ * client loops; the oldest remembered ids fall off, which at worst re-shows an overlay
+ * of a plugin the person hid long ago.
+ */
+userPreferencesRoutes.patch("/plugin-overlays", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = pluginOverlayVisibilityPatchSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { pluginId, hidden } = parsed.data;
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	const next = await userPreferencesLock.acquire(userId, async () => {
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				columns: { hiddenPluginOverlays: true },
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
+		const others = parseHiddenPluginOverlays(existing?.hiddenPluginOverlays).filter(
+			(stored) => stored !== pluginId,
+		);
+		const ids = (hidden ? [pluginId, ...others] : others).slice(0, MAX_HIDDEN_PLUGIN_OVERLAYS);
+		const json = JSON.stringify(ids);
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, hidden_plugin_overlays, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   hidden_plugin_overlays = ?,
+			   updated_at = ?`,
+			[id, userId, json, now, now, json, now],
+		);
+		return ids;
+	});
+
+	eventBus.emit({ type: "user_preferences:changed", userId });
+	return c.json({ hiddenPluginOverlays: next });
+});
+
+userPreferencesRoutes.get("/spec-tab-layout", async (c) => {
+	const userId = c.get("user").sub;
+	const narratorId = c.req.query("narratorId");
+	const parsed = specTabLayoutPatchSchema.shape.narratorId.safeParse(narratorId);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// json_quote keeps ids containing quotes/dots a literal key, not a JSON path.
+	const path = `$.${JSON.stringify(parsed.data)}`;
+	const [row] = await readQuery(
+		db
+			.select({
+				layout: sql<
+					string | null
+				>`CASE WHEN json_valid(${userPreferences.specTabLayout}) THEN json_extract(${userPreferences.specTabLayout}, ${path}) ELSE NULL END`,
+			})
+			.from(userPreferences)
+			.where(eq(userPreferences.userId, userId))
+			.limit(1),
+		{ maxRows: 1, signal: c.req.raw.signal },
+	);
+	const layout = specTabLayoutPatchSchema
+		.omit({ narratorId: true })
+		.safeParse(parseJsonObject(row?.layout));
+	const result = layout.success ? layout.data : { order: [], pinned: [] };
+	assertUIPreferencesBudget(result);
+	return c.json(result);
+});
+
 userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
 	const userId = c.get("user").sub;
-	const parsed = specTabLayoutPatchSchema.safeParse(await c.req.json());
+	const parsed = specTabLayoutPatchSchema.safeParse(await readBoundedPreferencesJson(c.req.raw));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const { narratorId, order, pinned } = parsed.data;
+	assertUIPreferencesBudget({ order, pinned });
 	const now = new Date().toISOString();
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { specTabLayout: true },
-		});
-		const layouts = parseJsonObject(existing?.specTabLayout);
-		layouts[narratorId] = { order, pinned };
-		const specTabLayout = JSON.stringify(layouts);
+		const path = `$.${JSON.stringify(narratorId)}`;
+		const layout = JSON.stringify({ order, pinned });
+		// Merge atomically in SQLite; never bring the full historical layout map to JS.
 		sqlite.run(
 			`INSERT INTO user_preferences (id, user_id, spec_tab_layout, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?)
+			 VALUES (?, ?, json_set('{}', ?, json(?)), ?, ?)
 			 ON CONFLICT (user_id) DO UPDATE SET
-			   spec_tab_layout = ?,
+			   spec_tab_layout = json_set(CASE WHEN json_valid(spec_tab_layout) THEN spec_tab_layout ELSE '{}' END, ?, json(?)),
 			   updated_at = ?`,
-			[id, userId, specTabLayout, now, now, specTabLayout, now],
+			[id, userId, path, layout, now, now, path, layout, now],
 		);
 	});
 
+	eventBus.emit({ type: "user_preferences:changed", userId });
 	return c.json({ ok: true });
 });

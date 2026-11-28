@@ -1,8 +1,11 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { ensureNotificationsTableForTests, NOTIFICATION_RETENTION_MAX_AGE_MS } = await import(
@@ -49,10 +52,11 @@ beforeEach(async () => {
 afterEach(async () => {
 	await stopNotificationCenterMaintenance();
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDb);
 	cleanDb(sqlite);
+	await closeRuntimeTestDb(sqlite);
 });
 
 test("maintenance removes age and count overflow with stable timestamp ties", async () => {

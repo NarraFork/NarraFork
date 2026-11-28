@@ -26,6 +26,8 @@ import { fileURLToPath } from "node:url";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
+import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { TaskQueue } from "../lib/worker-runtime/queue";
 import type { DatabaseVerificationPort } from "./backend/lifecycle-port";
 import { sqliteVerificationPort } from "./backend/sqlite-verification";
 import { getDbPath } from "./connection";
@@ -75,10 +77,19 @@ function buildProbeCommand(): string[] {
  * output beyond the cap means the report is dropped and the caller reports `unavailable` — an
  * inconclusive verdict, never a false `ok`.
  */
-async function readBounded(stream: ReadableStream<Uint8Array> | null): Promise<string> {
+async function readBounded(
+	stream: ReadableStream<Uint8Array> | null,
+	onOverflow: () => void,
+	signal?: AbortSignal,
+): Promise<string> {
 	if (!stream) return "";
 	const decoder = new TextDecoder();
 	const reader = stream.getReader();
+	const abort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	signal?.addEventListener("abort", abort, { once: true });
+	if (signal?.aborted) abort();
 	let out = "";
 	let bytes = 0;
 	try {
@@ -86,13 +97,16 @@ async function readBounded(stream: ReadableStream<Uint8Array> | null): Promise<s
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (!value) continue;
+			const remaining = MAX_PROBE_OUTPUT_BYTES - bytes;
+			out += decoder.decode(value.subarray(0, remaining), { stream: true });
 			bytes += value.byteLength;
-			out += decoder.decode(value, { stream: true });
+			if (bytes >= MAX_PROBE_OUTPUT_BYTES) onOverflow();
 		}
 		out += decoder.decode();
 	} catch {
 		// Partial output is still useful for diagnostics.
 	} finally {
+		signal?.removeEventListener("abort", abort);
 		try {
 			await reader.cancel();
 		} catch {
@@ -103,11 +117,18 @@ async function readBounded(stream: ReadableStream<Uint8Array> | null): Promise<s
 }
 
 interface BackgroundProbeState {
+	/** Only a cold-created owner has complete launch/exit provenance. Never stamp legacy state. */
+	ownerVersion?: 1;
+	restartRequired?: boolean;
 	scheduled: boolean;
 	timer: ReturnType<typeof setTimeout> | undefined;
-	/** Live probe subprocesses, so shutdown can kill them instead of orphaning the scan. */
-	running: Set<{ kill: () => void }>;
-	/** Set by cancel; makes the post-probe bookkeeping a no-op for an aborted run. */
+	/** Owners remain registered until real subprocess exit has been confirmed. */
+	running: Set<WorkerHandle<Bun.Subprocess<"ignore", "pipe", "pipe">> | { kill: () => void }>;
+	queue: TaskQueue;
+	closing?: Promise<{ timerCleared: boolean; killed: number }>;
+	permanent?: boolean;
+	tasks: Set<Promise<unknown>>;
+	/** Cancellation closes admission; isolated tests reopen only after a complete drain. */
 	cancelled: boolean;
 }
 
@@ -117,76 +138,175 @@ interface BackgroundProbeState {
  * probe subprocess against the same database.
  */
 const probeState = hotSafe<BackgroundProbeState>("narrafork.dbIntegrityProbe", () => ({
+	ownerVersion: 1,
+	restartRequired: false,
 	scheduled: false,
 	timer: undefined,
 	running: new Set(),
+	queue: new TaskQueue({ concurrency: 1, maxQueued: 8, maxQueuedBytes: 0 }),
+	tasks: new Set(),
 	cancelled: false,
 }));
+// Inspect provenance before adding compatibility fields: an empty legacy registry does not prove exit.
+probeState.restartRequired ||= probeState.ownerVersion !== 1 || !probeState.queue;
+probeState.queue ??= new TaskQueue({ concurrency: 1, maxQueued: 8, maxQueuedBytes: 0 });
+probeState.tasks ??= new Set();
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+function trackProbeTask<T>(work: Promise<T>): Promise<T> {
+	probeState.tasks.add(work);
+	void work.then(
+		() => probeState.tasks.delete(work),
+		() => probeState.tasks.delete(work),
+	);
+	return work;
+}
+async function awaitProbeDeadline<T>(work: Promise<T>, deadlineAt: number): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("Integrity probe shutdown deadline exceeded")),
+					Math.max(0, deadlineAt - Date.now()),
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
-/** Run the read-only probe in a subprocess. Never throws; failures resolve to `unavailable`. */
-export async function runIntegrityProbe(
+async function stopIntegrityProbe(
+	process: Bun.Subprocess<"ignore", "pipe", "pipe">,
+): Promise<void> {
+	let exitConfirmed = false;
+	const exited = process.exited.then(() => {
+		exitConfirmed = true;
+	});
+	void exited.catch(() => {});
+	try {
+		process.kill("SIGTERM");
+	} catch {
+		/* retain ownership until actual exit */
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			exited,
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, 250);
+			}),
+		]);
+	} catch {
+		/* a rejected exit observation is not confirmation */
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!exitConfirmed) {
+		try {
+			process.kill("SIGKILL");
+		} catch {
+			/* exit observation is still required */
+		}
+	}
+	await exited;
+}
+
+/** Run the read-only probe in a subprocess. Failures remain inconclusive, never a false healthy result. */
+async function executeIntegrityProbe(
 	mode: IntegrityProbeMode,
 	options: {
 		timeoutMs?: number;
 		/** test-only: override the spawned command (timeout / oversized-output coverage). */
 		command?: string[];
+		signal?: AbortSignal;
 	} = {},
 ): Promise<IntegrityProbeReport> {
+	if (probeState.restartRequired) {
+		return {
+			status: "unavailable",
+			mode,
+			details: "integrity probe owner requires a cold restart",
+			durationMs: 0,
+		};
+	}
 	const dbPath = getDbPath();
 	const startedAt = Date.now();
 	if (!existsSync(dbPath)) {
 		return { status: "unavailable", mode, details: "database file not found", durationMs: 0 };
 	}
 
-	let proc: ReturnType<typeof Bun.spawn> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	let handle: { kill: () => void } | undefined;
+	let handle: WorkerHandle<Bun.Subprocess<"ignore", "pipe", "pipe">> | undefined;
+	let permit: Awaited<ReturnType<TaskQueue["acquire"]>> | undefined;
+	let abort: (() => void) | undefined;
+	const outputController = new AbortController();
 	try {
-		proc = Bun.spawn(options.command ?? buildProbeCommand(), {
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-			// GUI 模式（管理器面板托管的后端）下不隐藏会让 probe 子进程弹出控制台窗口。
-			windowsHide: true,
-			// The probe is another NarraFork process and re-runs
-			// `neutralizeAmbientProxyEnv()`; pass the real ambient proxy values so its
-			// snapshot matches ours rather than the blanked placeholders.
-			env: {
-				...envWithAmbientProxy(),
-				[DB_INTEGRITY_PATH_ENV]: dbPath,
-				[DB_INTEGRITY_MODE_ENV]: mode,
-				// The probe must not re-enter server startup paths that take the instance lock.
-				NARRAFORK_ALLOW_MULTIPLE: "1",
+		permit = await probeState.queue.acquire({ deadlineAt: Infinity, signal: options.signal });
+		if (probeState.cancelled || options.signal?.aborted)
+			return {
+				status: "unavailable",
+				mode,
+				details: "probe cancelled",
+				durationMs: Date.now() - startedAt,
+			};
+		handle = WorkerHandle.subprocess(
+			options.command ?? buildProbeCommand(),
+			{
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				// GUI 模式（管理器面板托管的后端）下不隐藏会让 probe 子进程弹出控制台窗口。
+				windowsHide: true,
+				// The probe is another NarraFork process and re-runs
+				// `neutralizeAmbientProxyEnv()`; pass the real ambient proxy values so its
+				// snapshot matches ours rather than the blanked placeholders.
+				env: {
+					...envWithAmbientProxy(),
+					[DB_INTEGRITY_PATH_ENV]: dbPath,
+					[DB_INTEGRITY_MODE_ENV]: mode,
+					// The probe must not re-enter server startup paths that take the instance lock.
+					NARRAFORK_ALLOW_MULTIPLE: "1",
+				},
 			},
-		});
+			stopIntegrityProbe,
+		);
 
-		const spawned = proc;
-		// Registered so shutdown can terminate a scan in flight. A probe that outlives its parent
-		// keeps a read-only handle on a file the replacement process may be swapping (recoverWithCli)
-		// or rewriting (admin VACUUM), and its report has nowhere to go.
-		handle = {
-			kill: () => {
-				try {
-					spawned.kill();
-				} catch {
-					// best effort
-				}
-			},
+		const spawned = handle.resource;
+		const owned = handle;
+		probeState.running.add(owned);
+		const stop = () => {
+			outputController.abort();
+			void owned.close().catch(() => {});
 		};
-		probeState.running.add(handle);
-
+		abort = stop;
+		options.signal?.addEventListener("abort", abort, { once: true });
+		if (options.signal?.aborted) abort();
 		let timedOut = false;
+		let overflow = false;
 		timer = setTimeout(() => {
 			timedOut = true;
-			handle?.kill();
+			stop();
 		}, options.timeoutMs ?? PROBE_TIMEOUT_MS);
-
+		const onOverflow = () => {
+			overflow = true;
+			stop();
+		};
 		const [stdout, stderr] = await Promise.all([
-			readBounded(spawned.stdout as ReadableStream<Uint8Array> | null),
-			readBounded(spawned.stderr as ReadableStream<Uint8Array> | null),
+			readBounded(spawned.stdout, onOverflow, outputController.signal),
+			readBounded(spawned.stderr, onOverflow, outputController.signal),
 		]);
-		const exitCode = await spawned.exited;
+		const exitCode = await handle.exited;
 
+		if (overflow || probeState.cancelled || options.signal?.aborted) {
+			return {
+				status: "unavailable",
+				mode,
+				details: overflow ? "probe output limit exceeded" : "probe cancelled",
+				durationMs: Date.now() - startedAt,
+			};
+		}
 		if (timedOut) {
 			return {
 				status: "unavailable",
@@ -206,6 +326,7 @@ export async function runIntegrityProbe(
 			durationMs: Date.now() - startedAt,
 		};
 	} catch (err) {
+		if (handle) void handle.close().catch(() => {});
 		return {
 			status: "unavailable",
 			mode,
@@ -214,8 +335,28 @@ export async function runIntegrityProbe(
 		};
 	} finally {
 		if (timer) clearTimeout(timer);
-		if (handle) probeState.running.delete(handle);
+		if (abort) options.signal?.removeEventListener("abort", abort);
+		outputController.abort();
+		if (handle) {
+			// Never return the admission slot while a source DB descriptor can still be live.
+			await handle.close();
+			probeState.running.delete(handle);
+		}
+		permit?.release();
 	}
+}
+export function runIntegrityProbe(
+	mode: IntegrityProbeMode,
+	options: { timeoutMs?: number; command?: string[]; signal?: AbortSignal } = {},
+): Promise<IntegrityProbeReport> {
+	if (probeState.cancelled && !probeState.restartRequired)
+		return Promise.resolve({
+			status: "unavailable",
+			mode,
+			details: "probe cancelled",
+			durationMs: 0,
+		});
+	return trackProbeTask(executeIntegrityProbe(mode, options));
 }
 
 export interface BackgroundIntegrityCheckOptions {
@@ -243,6 +384,7 @@ export type BackgroundIntegrityDecision =
 	| "already_scheduled"
 	| "disabled_by_env"
 	| "hot_reload"
+	| "restart_required"
 	| "repair_pending"
 	| "clean_shutdown"
 	/** The backend has no out-of-band verification concept — not a failure, and not a silent "ok". */
@@ -257,7 +399,10 @@ export type BackgroundIntegrityDecision =
 export function scheduleBackgroundIntegrityCheck(
 	options: BackgroundIntegrityCheckOptions,
 ): BackgroundIntegrityDecision {
-	if (probeState.scheduled) return "already_scheduled";
+	if (probeState.scheduled || probeState.closing || probeState.permanent)
+		return "already_scheduled";
+	if (probeState.restartRequired) return "restart_required";
+	if (probeState.cancelled) return "already_scheduled";
 
 	// Gate on the backend's capability BEFORE reading env or markers: a backend with no out-of-band
 	// verification has nothing for any of those knobs to configure. Note what this must never become:
@@ -308,24 +453,31 @@ export function scheduleBackgroundIntegrityCheck(
 	}
 
 	probeState.scheduled = true;
-	probeState.cancelled = false;
 	const mode: IntegrityProbeMode = forceFull ? "full" : "quick";
 	const delayMs = options.delayMs ?? DEFAULT_PROBE_DELAY_MS;
 
 	const timer = setTimeout(() => {
 		probeState.timer = undefined;
-		void (async () => {
-			logger.info("Background database integrity check started", {
-				mode,
-				reason: options.wasClean ? "forced" : "unclean_shutdown",
-				backendId: verification.backendId,
-				probe: probeCapability.value.description,
-			});
-			const report = await (options.probe ?? runIntegrityProbe)(mode);
-			if (probeState.cancelled) return;
-			handleProbeReport(report);
-			options.onSettled?.(report);
-		})();
+		if (probeState.cancelled) return;
+		void trackProbeTask(
+			(async () => {
+				logger.info("Background database integrity check started", {
+					mode,
+					reason: options.wasClean ? "forced" : "unclean_shutdown",
+					backendId: verification.backendId,
+					probe: probeCapability.value.description,
+				});
+				const report = await (options.probe ?? runIntegrityProbe)(mode);
+				if (probeState.cancelled) return;
+				handleProbeReport(report);
+				options.onSettled?.(report);
+			})(),
+		).catch((error) => {
+			if (!probeState.cancelled)
+				logger.error("Background database integrity check failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+		});
 	}, delayMs);
 	probeState.timer = timer;
 	// Never hold the event loop open just for the probe.
@@ -410,22 +562,56 @@ function handleProbeReport(report: IntegrityProbeReport): void {
  * Called from the graceful-shutdown sequence. Without it the probe subprocess is orphaned for up to
  * {@link PROBE_TIMEOUT_MS} and keeps scanning a database the next process may be replacing.
  */
-export function cancelBackgroundIntegrityCheck(): { timerCleared: boolean; killed: number } {
+export function cancelBackgroundIntegrityCheck(
+	options: { permanent?: boolean; deadlineAt?: number } = {},
+): Promise<{ timerCleared: boolean; killed: number }> {
+	if (options.permanent) probeState.permanent = true;
+	const deadlineAt = options.deadlineAt ?? Date.now() + DEFAULT_SHUTDOWN_TIMEOUT_MS;
+	if (probeState.closing) return awaitProbeDeadline(probeState.closing, deadlineAt);
 	probeState.cancelled = true;
 	const timerCleared = probeState.timer !== undefined;
-	if (probeState.timer) {
-		clearTimeout(probeState.timer);
-		probeState.timer = undefined;
-	}
-	let killed = 0;
-	for (const handle of probeState.running) {
-		handle.kill();
-		killed++;
-	}
-	probeState.running.clear();
+	clearTimeout(probeState.timer);
+	probeState.timer = undefined;
+	const handles = [...probeState.running];
+	const drained = probeState.queue.close();
+	probeState.closing = (async () => {
+		await Promise.all(
+			handles.map(async (handle) => {
+				if ("close" in handle) await handle.close();
+				else {
+					handle.kill();
+					throw new Error("Legacy integrity probe exit cannot be confirmed; cold restart required");
+				}
+			}),
+		);
+		await drained;
+		if (probeState.restartRequired)
+			throw new Error(
+				"Legacy integrity probe ownership cannot be confirmed; cold restart required",
+			);
+		while (probeState.tasks.size) await Promise.allSettled([...probeState.tasks]);
+		probeState.scheduled = false;
+		return { timerCleared, killed: handles.length };
+	})();
+	void probeState.closing.catch(() => {});
+	return awaitProbeDeadline(probeState.closing, deadlineAt);
+}
+export function getIntegrityCheckShutdownSnapshot() {
+	return {
+		stopped: probeState.cancelled,
+		pendingProcesses: probeState.running.size,
+		pendingTasks: probeState.tasks.size,
+		scheduled: probeState.timer !== undefined,
+	};
+}
+
+/** Reset only isolated tests, and never hide a subprocess whose exit remains unconfirmed. */
+export async function resetBackgroundIntegrityCheckForTests(): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only integrity probe reset");
+	await cancelBackgroundIntegrityCheck();
+	probeState.queue = new TaskQueue({ concurrency: 1, maxQueued: 8, maxQueuedBytes: 0 });
+	probeState.closing = undefined;
+	probeState.permanent = false;
+	probeState.cancelled = false;
 	probeState.scheduled = false;
-	if (timerCleared || killed > 0) {
-		logger.info("Background database integrity check cancelled", { timerCleared, killed });
-	}
-	return { timerCleared, killed };
 }

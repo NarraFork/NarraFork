@@ -1,9 +1,9 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 import type { PermissionResult } from "../../lib/agent";
 import { localBackend } from "../../lib/agent/execution/registry";
+import { drainContextCharacterRefreshes } from "../../lib/context-characters";
 import { appendRuntimePolicyTrait, parseRuntimePolicyTraits } from "../../lib/runtime-policy-trait";
 import { settings } from "../../lib/settings";
 import { isRuntimeToolAllowed, resolveRuntimePolicy } from "../agent-runtime/policy";
@@ -16,10 +16,16 @@ import {
 	unattendedPermissionDecision,
 	unregisterScheduledRun,
 } from "../scheduled-run-registry";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDb = { ...(await import("../../db")) };
+// Readers and snapshot writers resolve the same committed file through these exports.
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+await closePrefixSnapshotStore();
 const realRunService = { ...(await import("../scheduled-task-run-service")) };
 const registrations = new Map<string, ScheduledRunRegistration>();
 const handled: Array<{ runId: string; reason: string }> = [];
@@ -50,6 +56,7 @@ const { handlePermission, resolvePermission } = await import("../narrator-permis
 const { pendingPermissions } = await import("../narrator-session-state");
 let sequence = 0;
 const controllers: AbortController[] = [];
+const permissionRequests: Promise<PermissionResult>[] = [];
 
 async function request(
 	toolName: string,
@@ -133,14 +140,20 @@ async function request(
 			? { permissionMode: "readOnly", allowKnowledgeWrite: false }
 			: undefined,
 	);
+	permissionRequests.push(result);
 	return { id, result, controller };
 }
 
 async function waitForPending(id: string, result: Promise<PermissionResult>) {
 	let completed = false;
-	void result.then(() => {
-		completed = true;
-	});
+	void result.then(
+		() => {
+			completed = true;
+		},
+		() => {
+			completed = true;
+		},
+	);
 	const deadline = Date.now() + 2000;
 	while (!pendingPermissions.has(`${id}-call`) && !completed && Date.now() < deadline)
 		await new Promise<void>((resolve) => setTimeout(resolve, 5));
@@ -150,6 +163,9 @@ async function waitForPending(id: string, result: Promise<PermissionResult>) {
 
 afterEach(async () => {
 	for (const controller of controllers.splice(0)) controller.abort();
+	await Promise.allSettled(permissionRequests.splice(0));
+	await drainContextCharacterRefreshes({ deadlineAt: Date.now() + 5000 });
+	await closePrefixSnapshotStore();
 	registrations.clear();
 	for (const run of listRegisteredScheduledRuns()) unregisterScheduledRun(run.runId);
 	broadcasts.length = 0;
@@ -159,7 +175,15 @@ afterEach(async () => {
 	await db.delete(narratorMessages);
 	await db.delete(narrators);
 });
-afterAll(() => sqlite.close());
+afterAll(async () => {
+	await drainContextCharacterRefreshes({ deadlineAt: Date.now() + 5000 });
+	await closePrefixSnapshotStore();
+	await fixture.close();
+	mock.module("../../db", () => realDb);
+	mock.module("../scheduled-task-run-service", () => realRunService);
+	mock.module("../narrator-service", () => realNarratorService);
+	mock.module("../../websocket/narrator-ws", () => realWs);
+});
 
 describe("unattended permission narrowing", () => {
 	test("permission guidance preserves the legacy default and makes reporting optional", () => {

@@ -16,7 +16,10 @@
  */
 import { db } from "@server/db";
 import { narrators, narratorToolCalls, projects } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { toolRegistry } from "@server/lib/agent/tool-registry";
+import { DbReadError } from "@server/lib/db-worker/errors";
+import { SELECT_ROWS_MAX_ROWS } from "@server/lib/db-worker/protocol";
 import {
 	type ExecutionLogCursor,
 	encodeExecutionLogCursor,
@@ -191,6 +194,10 @@ export interface ExecutionLogFacets {
 	toolNamesSampled: boolean;
 }
 
+export interface ExecutionLogReadOptions {
+	signal?: AbortSignal;
+}
+
 const EXECUTION_LOG_STATUSES: ExecutionLogStatus[] = [
 	"initializing",
 	"pending",
@@ -348,6 +355,7 @@ export class ExecutionLogService {
 		filters: ExecutionLogFilters,
 		limit = 50,
 		cursor?: ExecutionLogCursor,
+		options: ExecutionLogReadOptions = {},
 	): Promise<ExecutionLogListResult> {
 		const requestedLimit = Number.isFinite(limit) ? Math.trunc(limit) : 50;
 		const boundedLimit = Math.min(Math.max(requestedLimit, 1), MAX_EXECUTION_LOG_LIMIT);
@@ -355,7 +363,8 @@ export class ExecutionLogService {
 		// A payload search needs its window resolved BEFORE the where clause is
 		// built, because the window is itself a `startedAt` predicate — that is what
 		// keeps the LIKE bounded.
-		const window = filters.q && filters.searchPayload ? await this.resolvePayloadWindow() : null;
+		const window =
+			filters.q && filters.searchPayload ? await this.resolvePayloadWindow(options) : null;
 
 		const conditions = this.buildWhereConditions(filters, window);
 		if (cursor) {
@@ -366,14 +375,21 @@ export class ExecutionLogService {
 			);
 		}
 
-		const rows = await this.database
-			.select({ ...LIST_COLUMNS, ...SUMMARY_HINT_COLUMNS })
-			.from(narratorToolCalls)
-			.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
-			.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
-			.where(and(...conditions))
-			.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
-			.limit(boundedLimit + 1);
+		const rows = await readQuery(
+			this.database
+				.select({ ...LIST_COLUMNS, ...SUMMARY_HINT_COLUMNS })
+				.from(narratorToolCalls)
+				.leftJoin(narrators, eq(narratorToolCalls.narratorId, narrators.id))
+				.leftJoin(projects, eq(narratorProjectIdColumn, projects.id))
+				.where(and(...conditions))
+				.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
+				.limit(boundedLimit + 1),
+			{
+				signal: options.signal,
+				diagnosticSource: "execution-log.list",
+				maxRows: boundedLimit + 1,
+			},
+		);
 
 		const hasMore = rows.length > boundedLimit;
 		const page = hasMore ? rows.slice(0, boundedLimit) : rows;
@@ -471,22 +487,32 @@ export class ExecutionLogService {
 	 * stays correct if the registry has not been populated yet (as in a unit test
 	 * that never imports the agent tools module).
 	 */
-	async listFacets(): Promise<ExecutionLogFacets> {
+	async listFacets(options: ExecutionLogReadOptions = {}): Promise<ExecutionLogFacets> {
 		const registered = new Set(toolRegistry.all().map((tool) => tool.name));
 
-		const observed = await this.database
-			.select({
-				toolName: sql<string | null>`tool_name`,
-				provider: sql<string | null>`provider`,
-			})
-			.from(
-				sql`(SELECT ${narratorToolCalls.toolName} AS tool_name, ${narratorToolCalls.provider} AS provider
+		const observed = await readQuery(
+			this.database
+				.select({
+					toolName: sql<string | null>`tool_name`,
+					provider: sql<string | null>`provider`,
+				})
+				.from(
+					sql`(SELECT ${narratorToolCalls.toolName} AS tool_name, ${narratorToolCalls.provider} AS provider
 					FROM ${narratorToolCalls}
 					ORDER BY ${narratorToolCalls.startedAt} DESC, ${narratorToolCalls.id} DESC
 					LIMIT ${FACET_WINDOW_ROWS}) AS recent`,
-			)
-			.groupBy(sql`tool_name`, sql`provider`);
+				)
+				.groupBy(sql`tool_name`, sql`provider`)
+				.limit(SELECT_ROWS_MAX_ROWS + 1),
+			{
+				signal: options.signal,
+				diagnosticSource: "execution-log.facets",
+				maxRows: Math.min(FACET_WINDOW_ROWS, SELECT_ROWS_MAX_ROWS),
+			},
+		);
 
+		if (observed.length > SELECT_ROWS_MAX_ROWS)
+			throw new DbReadError("DB_READ_BUDGET", "Read query exceeded its row budget");
 		const providers = new Set<string>();
 		for (const row of observed) {
 			if (row.toolName) registered.add(row.toolName);
@@ -505,13 +531,20 @@ export class ExecutionLogService {
 	 * Oldest `startedAt` a payload search may read, or null when the table is
 	 * smaller than the window (in which case the search is already exhaustive).
 	 */
-	private async resolvePayloadWindow(): Promise<string | null> {
-		const [boundary] = await this.database
-			.select({ startedAt: narratorToolCalls.startedAt })
-			.from(narratorToolCalls)
-			.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
-			.limit(1)
-			.offset(this.payloadSearchWindowRows);
+	private async resolvePayloadWindow(options: ExecutionLogReadOptions): Promise<string | null> {
+		const [boundary] = await readQuery(
+			this.database
+				.select({ startedAt: narratorToolCalls.startedAt })
+				.from(narratorToolCalls)
+				.orderBy(desc(narratorToolCalls.startedAt), desc(narratorToolCalls.id))
+				.limit(1)
+				.offset(this.payloadSearchWindowRows),
+			{
+				signal: options.signal,
+				diagnosticSource: "execution-log.payload-window",
+				maxRows: 1,
+			},
+		);
 		return boundary?.startedAt ?? null;
 	}
 

@@ -633,11 +633,12 @@ describe("TOOL_CALL_RESET_FIELDS", () => {
 });
 
 describe("buildRecoveryNotifyPrompt", () => {
-	test("lists every alias and tells the model to Await them", () => {
+	test("lists every alias and relies on non-blocking completion notification", () => {
 		const prompt = buildRecoveryNotifyPrompt([{ alias: "explore-1" }, { alias: "plan-2" }]);
 		expect(prompt).toContain("- explore-1");
 		expect(prompt).toContain("- plan-2");
-		expect(prompt).toContain('Await({ type: "agent"');
+		expect(prompt).toContain("Results notify automatically");
+		expect(prompt).not.toContain("Await(");
 	});
 });
 

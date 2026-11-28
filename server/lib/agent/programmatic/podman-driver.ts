@@ -4,6 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
+import { WorkerHandle } from "../../worker-runtime/lifecycle";
 import { PROGRAMMATIC_LIMITS, ProgrammaticError } from "./protocol";
 import type {
 	CleanupReport,
@@ -57,9 +58,16 @@ function command(
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
+		const exited = new Promise<number>((resolve) =>
+			child.once("close", (code) => resolve(code ?? -1)),
+		);
+		const handle = new WorkerHandle(child, exited, () => {
+			child.kill("SIGKILL");
+		});
 		const chunks: Buffer[] = [];
 		let bytes = 0;
 		let settled = false;
+		let failure: Error | undefined;
 		const finish = (error?: Error, code = -1) => {
 			if (settled) return;
 			settled = true;
@@ -68,8 +76,10 @@ function command(
 			error ? reject(error) : resolve({ code, stdout: Buffer.concat(chunks).toString("utf8") });
 		};
 		const stop = (error: Error) => {
-			child.kill("SIGKILL");
-			finish(error);
+			failure ??= error;
+			// A cancelled availability/cleanup helper remains owned until its real
+			// process and stdio have closed; sending SIGKILL is not exit evidence.
+			void handle.close().catch(() => {});
 		};
 		const abort = () => stop(new ProgrammaticError("CANCELLED", "Availability check cancelled"));
 		const timer = setTimeout(
@@ -82,7 +92,7 @@ function command(
 			[child.stderr, false],
 		] as const) {
 			stream.on("data", (chunk: Buffer) => {
-				if (settled) return;
+				if (settled || failure) return;
 				bytes += chunk.length;
 				if (bytes > COMMAND_OUTPUT_BYTES) {
 					stop(new ProgrammaticError("OUTPUT_LIMIT", "Podman command output exceeded budget"));
@@ -91,8 +101,9 @@ function command(
 				if (keep) chunks.push(chunk);
 			});
 		}
-		child.once("error", (error) => finish(error));
-		child.once("close", (code) => finish(undefined, code ?? -1));
+		child.once("error", stop);
+		void handle.exited.then((code) => finish(failure, code));
+		if (signal?.aborted) abort();
 	});
 }
 
@@ -331,21 +342,21 @@ export function createPodmanDriver(options: {
 			windowsHide: true,
 		});
 		let exitCode: number | null = null;
-		let clientClosed = false;
 		let cleanup: Promise<CleanupReport> | undefined;
 		const exited = new Promise<number>((resolve) => {
 			child.once("exit", (code) => {
-				clientClosed = true;
 				exitCode = code ?? -1;
 				resolve(exitCode);
 			});
 			child.once("error", () => {
 				if (child.pid === undefined) {
-					clientClosed = true;
 					exitCode = -1;
 					resolve(-1);
 				}
 			});
+		});
+		const launcher = new WorkerHandle(child, exited, () => {
+			child.kill("SIGKILL");
 		});
 		const terminate = (): Promise<CleanupReport> => {
 			cleanup ??= (async () => {
@@ -354,8 +365,7 @@ export function createPodmanDriver(options: {
 				writer.close();
 				try {
 					// First reap the launcher so cancellation cannot race a later container creation.
-					if (!clientClosed) child.kill("SIGKILL");
-					if (!(await boundedExit(exited)))
+					if (!(await boundedExit(launcher.close().then(() => exitCode ?? -1))))
 						return {
 							confirmed: false,
 							exitCode,

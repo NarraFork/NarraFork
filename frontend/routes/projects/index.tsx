@@ -1,5 +1,6 @@
 import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
-import { ProjectSummaryCard } from "@frontend/components/project/ProjectSummaryCard";
+import { ProjectListCard } from "@frontend/components/project/ProjectListCard";
+import { sortProjects } from "@frontend/components/project/project-page-model";
 import {
 	Alert,
 	Button,
@@ -18,11 +19,12 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconAlertCircle } from "@tabler/icons-react";
+import { IconAlertCircle, IconPlus, IconSearch } from "@tabler/icons-react";
 import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
+import { useProjectSummaries } from "../../hooks/useProjectOverview";
 import {
 	useCreateProject,
 	useCreateProjectStream,
@@ -47,6 +49,7 @@ function ProjectGridSkeleton() {
 	return (
 		<SimpleGrid
 			cols={{ base: 1, sm: 2, lg: 3 }}
+			spacing="sm"
 			aria-busy="true"
 			data-testid="project-list-skeleton"
 		>
@@ -62,6 +65,8 @@ function ProjectGridSkeleton() {
 
 function ProjectListPage() {
 	const { data: projects, isLoading } = useProjects();
+	// One request for every card's numbers (running sessions, teams, waiting, last activity).
+	const summaries = useProjectSummaries(!!projects?.length);
 	// Only probed when the list is empty: it exists purely to tell "no projects yet"
 	// apart from "none of them are yours".
 	const hiddenProjects = useHiddenProjectExistence(!isLoading && !projects?.length);
@@ -186,9 +191,23 @@ function ProjectListPage() {
 			return haystack.toLowerCase().includes(normalizedProjectFilter);
 		});
 	}, [normalizedProjectFilter, projects]);
-	const displayedProjects = filteredProjects.slice(0, PROJECT_LIST_RENDER_LIMIT);
-	const hiddenProjectCount = Math.max(0, filteredProjects.length - displayedProjects.length);
-	const showProjectFilter = (projects?.length ?? 0) > PROJECT_LIST_RENDER_LIMIT || !!projectFilter;
+	const summaryMap = useMemo(
+		() => new Map((summaries.data?.summaries ?? []).map((row) => [row.projectId, row])),
+		[summaries.data],
+	);
+	// Waiting on you first, then the most recent activity.
+	const sortedProjects = useMemo(
+		() =>
+			sortProjects(
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				filteredProjects.map((project: any) => ({ ...project, id: String(project.id) })),
+				summaryMap,
+			),
+		[filteredProjects, summaryMap],
+	);
+	const displayedProjects = sortedProjects.slice(0, PROJECT_LIST_RENDER_LIMIT);
+	const hiddenProjectCount = Math.max(0, sortedProjects.length - displayedProjects.length);
+	const now = new Date();
 
 	// Parse git clone progress for a progress bar
 	const progressPercent = parseGitProgress(createProjectStream.cloneProgress);
@@ -197,14 +216,45 @@ function ProjectListPage() {
 	const mutationError = createProjectStream.error ?? createProject.error;
 
 	return (
-		<Stack>
-			<Group justify="space-between">
-				<Group gap="xs" wrap="nowrap">
-					<MobileNavButton />
-					<Title order={2}>{t("title")}</Title>
+		<Stack gap="md" data-testid="project-list">
+			<Stack gap={6}>
+				<Group justify="space-between" wrap="wrap" gap="sm">
+					<Group gap="xs" wrap="nowrap">
+						<MobileNavButton />
+						<Title order={2}>{t("title")}</Title>
+						{!!projects?.length && (
+							<Text c="dimmed" size="lg" style={{ fontVariantNumeric: "tabular-nums" }}>
+								{projects.length}
+							</Text>
+						)}
+					</Group>
+					<Group gap="xs" wrap="nowrap" style={{ flex: "1 1 260px", justifyContent: "flex-end" }}>
+						{!!projects?.length && (
+							<TextInput
+								placeholder={t("projectSearchPlaceholder")}
+								value={projectFilter}
+								leftSection={<IconSearch size={14} aria-hidden />}
+								onChange={(event) => setProjectFilter(event.currentTarget.value)}
+								style={{ flex: "1 1 auto", maxWidth: 260 }}
+								aria-label={t("projectSearchPlaceholder")}
+							/>
+						)}
+						<Button
+							variant="default"
+							leftSection={<IconPlus size={14} aria-hidden />}
+							onClick={guardedOpen}
+							style={{ flexShrink: 0 }}
+						>
+							{t("newProject")}
+						</Button>
+					</Group>
 				</Group>
-				<Button onClick={guardedOpen}>{t("newProject")}</Button>
-			</Group>
+				{!!projects?.length && (
+					<Text size="sm" c="dimmed">
+						{t("list.subtitle")}
+					</Text>
+				)}
+			</Stack>
 
 			{isLoading ? (
 				<ProjectGridSkeleton />
@@ -216,21 +266,24 @@ function ProjectListPage() {
 				</Text>
 			) : (
 				<Stack gap="sm">
-					{showProjectFilter && (
-						<TextInput
-							placeholder={t("projectSearchPlaceholder")}
-							value={projectFilter}
-							onChange={(event) => setProjectFilter(event.currentTarget.value)}
-						/>
-					)}
 					{filteredProjects.length === 0 ? (
 						<Text c="dimmed">{t("noProjectMatches")}</Text>
 					) : (
 						<>
-							<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
-								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-								{displayedProjects.map((project: any) => (
-									<ProjectSummaryCard key={project.id} project={project} />
+							<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="sm">
+								{displayedProjects.map((project) => (
+									<ProjectListCard
+										key={project.id}
+										project={{
+											id: project.id,
+											name: String(project.name ?? ""),
+											gitPath: project.gitPath ? String(project.gitPath) : null,
+											status: project.status ? String(project.status) : null,
+											updatedAt: project.updatedAt ? String(project.updatedAt) : null,
+										}}
+										summary={summaryMap.get(project.id)}
+										now={now}
+									/>
 								))}
 							</SimpleGrid>
 							{hiddenProjectCount > 0 && (
@@ -329,6 +382,7 @@ function ProjectListPage() {
 							/>
 						}
 					>
+						{/* Suggestions open upwards: the dialog's Create button sits right below. */}
 						<DirectoryPicker
 							label={t("repositoryPath")}
 							placeholder={pathPlaceholder}
@@ -338,6 +392,7 @@ function ProjectListPage() {
 							error={repoPathError}
 							required
 							disabled={isCloning}
+							dropdownPosition="top"
 						/>
 					</Suspense>
 					{isCloning && (

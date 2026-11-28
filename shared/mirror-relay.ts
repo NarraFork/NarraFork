@@ -32,7 +32,8 @@ export function mirrorUploadConcurrency(
 	return concurrency;
 }
 export const MAX_MIRROR_JOB_TIMEOUT_MS = 300 * 60_000;
-export const MAX_MIRROR_TRANSFER_TIMEOUT_MS = 60 * 60_000;
+const MAX_MIRROR_TRANSFER_TIMEOUT_MINUTES = 100;
+export const MAX_MIRROR_TRANSFER_TIMEOUT_MS = MAX_MIRROR_TRANSFER_TIMEOUT_MINUTES * 60_000;
 /** Explicit deployment configuration, not data accepted from an unsigned relay payload. */
 export function mirrorTimeoutMinutes(value: unknown, fallback: number, maximum: number): number {
 	if (value === undefined || value === "") return fallback * 60_000;
@@ -47,7 +48,7 @@ export function mirrorJobTimeoutMs(kind: RelayKind, value?: unknown): number {
 	return mirrorTimeoutMinutes(value, kind === "main" ? 25 : 120, 300);
 }
 export function mirrorTransferTimeoutMs(value?: unknown): number {
-	return mirrorTimeoutMinutes(value, 15, 60);
+	return mirrorTimeoutMinutes(value, 15, MAX_MIRROR_TRANSFER_TIMEOUT_MINUTES);
 }
 export function validateMirrorJobTimeoutMs(value: number): number {
 	if (!Number.isSafeInteger(value) || value < 1 || value > MAX_MIRROR_JOB_TIMEOUT_MS)

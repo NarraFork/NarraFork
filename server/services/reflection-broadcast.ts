@@ -30,6 +30,7 @@
 
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
+import { nestedSubagentRootOf } from "./nested-subagent-routing";
 
 /** Who owns a reflection gate and where it can be watched from. */
 export interface ReflectionBroadcastRoute {
@@ -47,9 +48,13 @@ export interface ReflectionBroadcastRoute {
  * (owner === target) is indistinguishable from the pre-fan-out behaviour.
  */
 export function reflectionBroadcastTargets(route: ReflectionBroadcastRoute): string[] {
-	const targets = [route.narratorId, route.broadcastTargetId].filter(
-		(id): id is string => typeof id === "string" && id.length > 0,
-	);
+	// A nested subagent's gate is also watched from its ACL root's page, where the people
+	// who approve its work look (`nested-subagent-routing`).
+	const targets = [
+		route.narratorId,
+		route.broadcastTargetId,
+		nestedSubagentRootOf(route.narratorId),
+	].filter((id): id is string => typeof id === "string" && id.length > 0);
 	return [...new Set(targets)];
 }
 

@@ -9,6 +9,7 @@ import { flushRuntimePublications, runtimePublication } from "../agent-runtime/p
 import { discardBackgroundBashResult } from "../background-bash-result";
 import { backgroundTaskService } from "../background-task-service";
 import { projectPendingInjection } from "../parent-injection-queue";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 const PARENT = "bash-notice-result-parent";
 const paths = new Set<string>();
@@ -66,7 +67,7 @@ async function notices() {
 }
 
 function outputPath(content: string) {
-	const path = /captured output saved to: ([^\n]+)/.exec(content)?.[1];
+	const path = /Captured output saved to: ([^\n]+)/i.exec(content)?.[1];
 	if (!path) throw new Error(`Missing output file in: ${content.slice(0, 200)}`);
 	paths.add(path);
 	return path;
@@ -111,7 +112,7 @@ describe("real Bash terminal publication result", () => {
 			const path = outputPath(content);
 			expect(await fs.readFile(path, "utf8")).toBe(output);
 			expect(content).toContain('device: "local"');
-			expect(content).toContain("No Await is needed");
+			expect(content).toContain("No observation is needed");
 			expect(content).toContain("If Read reports that the file was cleaned up");
 			expect(content).toContain("may retain only a preview");
 			expect(content).toContain("does not guarantee complete output");
@@ -136,7 +137,7 @@ describe("real Bash terminal publication result", () => {
 		expect(await fs.readFile(outputPath((await notices())[0].outputPreview), "utf8")).toBe(output);
 	});
 
-	test("failed spill retains original bounded DB output for Await", async () => {
+	test("failed spill retains original bounded DB output for Watch", async () => {
 		const task = await create();
 		const mock = spyOn(fs, "writeFile").mockRejectedValue(new Error("disk unavailable"));
 		try {
@@ -145,7 +146,7 @@ describe("real Bash terminal publication result", () => {
 			expect(row?.output).toBe("x".repeat(512 * 1024));
 			const content = (await notices())[0].outputPreview;
 			expect(content).toContain("captured output file unavailable");
-			expect(content).toContain("Await");
+			expect(content).toContain("Watch");
 			expect(content).toContain("[exit code: 2]");
 			expect(Buffer.byteLength(content)).toBeLessThan(5120);
 		} finally {
@@ -169,8 +170,10 @@ describe("real Bash terminal publication result", () => {
 		});
 		try {
 			expect(
-				await backgroundTaskService.markCompleted(task.id, "x".repeat(5120), 0, task.controller),
-			).toBe(false);
+				await captureWorkerRejection(
+					backgroundTaskService.markCompleted(task.id, "x".repeat(5120), 0, task.controller),
+				),
+			).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
 			expect(spill).not.toBe("");
 			expect(await Bun.file(spill).exists()).toBe(false);
 			expect(await notices()).toHaveLength(0);

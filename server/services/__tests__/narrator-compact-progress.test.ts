@@ -6,10 +6,14 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getRuntimeTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -41,6 +45,10 @@ const historyTokens = await import("../narrator-history-token-estimate");
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 
+// Every compact below reads through the DB read Worker. Bun's native `.resolves` / `.rejects`
+// matchers wait on a pending promise in a nested loop that can leave a Worker's reply
+// undelivered until the 30 s read timeout fires: settle with a plain await, then assert.
+
 function makeReporter(isSegment = false) {
 	return createCompactProgressReporter({
 		narratorId: "n-compact-progress",
@@ -54,10 +62,10 @@ beforeEach(() => {
 	broadcasts = [];
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
 	mock.restore();
 });
 
@@ -251,19 +259,21 @@ describe("compact metadata lookup failure cleanup", () => {
 		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
 			summary: "Retained history summary",
 		});
-		await expect(runCustomCompact(narratorId, "en")).rejects.toThrow("upstreamModelId");
+		expect(await captureWorkerRejectionThrower(runCustomCompact(narratorId, "en"))).toThrow(
+			"upstreamModelId",
+		);
 		const markerId = await assertSettledFailure(false);
 		expect(generate).not.toHaveBeenCalled();
 
 		broadcasts = [];
 		const invalidRetry = await retryFailedCompact(narratorId, "en", markerId, "anthropic:");
-		await expect(invalidRetry.promise).rejects.toThrow("upstreamModelId");
+		expect(await captureWorkerRejectionThrower(invalidRetry.promise)).toThrow("upstreamModelId");
 		await assertSettledFailure(false);
 		expect(generate).not.toHaveBeenCalled();
 
 		broadcasts = [];
 		const retry = await retryFailedCompact(narratorId, "en", markerId, validModel, "compact-user");
-		await expect(retry.promise).resolves.toBe(true);
+		expect(await retry.promise).toBe(true);
 		expect(generate.mock.calls[0]?.[4]).toBe(validModel);
 		expect(generate.mock.calls[0]?.[9]).toBe("compact-user");
 		expect(await narratorService.getCompactSummary(narratorId, retry.messageId)).toMatchObject({
@@ -277,9 +287,9 @@ describe("compact metadata lookup failure cleanup", () => {
 		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
 			summary: "Retained segment summary",
 		});
-		await expect(runSegmentCompact(narratorId, "en", ["m-metadata"])).rejects.toThrow(
-			"upstreamModelId",
-		);
+		expect(
+			await captureWorkerRejectionThrower(runSegmentCompact(narratorId, "en", ["m-metadata"])),
+		).toThrow("upstreamModelId");
 		const markerId = await assertSettledFailure(true);
 		expect(generate).not.toHaveBeenCalled();
 		// Restore the segment's original visibility through its normal undo API.
@@ -394,7 +404,7 @@ describe("compact context occupancy bookkeeping", () => {
 
 		percent = 1.1;
 		await narratorService.updateCompactSummary(narratorId, messageId, "A much shorter summary");
-		await expect(refreshCompactContextPercentAfter(narratorId, messageId, "en")).resolves.toBe(1.1);
+		expect(await refreshCompactContextPercentAfter(narratorId, messageId, "en")).toBe(1.1);
 
 		expect(
 			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
@@ -448,9 +458,7 @@ describe("compact context occupancy bookkeeping", () => {
 
 		percent = 60;
 		await narratorService.updateCompactSummary(narratorId, messageId, "Edited summary");
-		await expect(refreshCompactContextPercentAfter(narratorId, messageId, "en")).resolves.toBe(
-			undefined,
-		);
+		expect(await refreshCompactContextPercentAfter(narratorId, messageId, "en")).toBe(undefined);
 		expect(
 			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
 		).toBe(5);
@@ -482,7 +490,7 @@ describe("compact context occupancy bookkeeping", () => {
 		);
 		expect(editedId).not.toBe(messageId);
 		broadcasts = [];
-		await expect(refreshCompactContextPercentAfter(narratorId, editedId, "en")).resolves.toBe(1.1);
+		expect(await refreshCompactContextPercentAfter(narratorId, editedId, "en")).toBe(1.1);
 
 		expect(
 			(await narratorService.getCompactSummary(narratorId, editedId)).contextPercentAfter,

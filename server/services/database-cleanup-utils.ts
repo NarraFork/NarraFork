@@ -9,7 +9,9 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "backgroundRunning"
 	| "nonArchived"
 	| "nonStaleStatus"
-	| "recentActivity";
+	| "recentActivity"
+	/** A team coordinator whose team still has live work items (they record its worktrees). */
+	| "teamLiveWork";
 
 export interface NarratorCleanupRecord {
 	id: string;
@@ -53,6 +55,8 @@ export interface BuildNarratorCleanupPlanOptions {
 	staleCutoffIso?: string;
 	runningTerminalIds?: Set<string>;
 	rootNarratorIds?: Set<string>;
+	/** Coordinators whose teams have live work: deleting them is refused, so they are kept. */
+	liveTeamIds?: Set<string>;
 }
 
 export interface NarratorCleanupPlan {
@@ -63,6 +67,7 @@ export interface NarratorCleanupPlan {
 interface EligibilityContext {
 	staleCutoffIso?: string;
 	runningTerminalIds: Set<string>;
+	liveTeamIds: Set<string>;
 }
 
 interface EligibilityResult {
@@ -77,6 +82,9 @@ function getEligibilityResult(
 ): EligibilityResult {
 	if (ctx.runningTerminalIds.has(narrator.id)) {
 		return { ok: false, reasonCode: "runningTerminal" };
+	}
+	if (ctx.liveTeamIds.has(narrator.id)) {
+		return { ok: false, reasonCode: "teamLiveWork" };
 	}
 	if (narrator.isBackground && narrator.backgroundStatus === "running") {
 		return { ok: false, reasonCode: "backgroundRunning" };
@@ -167,6 +175,7 @@ export function buildNarratorCleanupPlan(
 	const ctx: EligibilityContext = {
 		staleCutoffIso: options.staleCutoffIso,
 		runningTerminalIds,
+		liveTeamIds: options.liveTeamIds ?? new Set<string>(),
 	};
 	const byId = new Map(narrators.map((n) => [n.id, n]));
 	const childrenMap = new Map<string | null, NarratorCleanupRecord[]>();

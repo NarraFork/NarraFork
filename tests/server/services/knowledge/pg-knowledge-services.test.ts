@@ -410,6 +410,7 @@ describe("P6 knowledge services on real PostgreSQL", () => {
 					const submission = await write.createSubmissionGuarded({
 						submissionId: generateId(),
 						draftId: draft.id,
+						expectedDraft: draft,
 						entryId: entry.id,
 						collectionId: col.id,
 						title: null,

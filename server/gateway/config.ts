@@ -1,3 +1,11 @@
+import { readQuery } from "@server/db/worker-read";
+import { DbReadError } from "@server/lib/db-worker/errors";
+import {
+	DbReadTaskExecutionError,
+	DbReadTaskTimeoutError,
+	WorkersUnavailableError,
+} from "@server/lib/db-worker/pool";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 /**
  * Gateway configuration loader.
  *
@@ -37,25 +45,40 @@ function parseCommaSeparated(value: string | undefined): string[] | undefined {
 async function loadDbConfig(): Promise<Partial<GatewayConfig>> {
 	try {
 		// Find admin user (or first user)
-		const allUsers = await db
-			.select({ id: users.id, role: users.role })
-			.from(users)
-			.orderBy(users.createdAt)
-			.limit(5);
+		const allUsers = await readQuery(
+			db.select({ id: users.id, role: users.role }).from(users).orderBy(users.createdAt).limit(5),
+			{ executionPolicy: "worker-required", maxRows: 5 },
+		);
 		if (allUsers.length === 0) return {};
 
 		const admin = allUsers.find((u) => u.role === "admin");
 		const userId = admin?.id ?? allUsers[0].id;
 
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { gatewayConfig: true },
-		});
+		const pref = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { gatewayConfig: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!pref?.gatewayConfig) return {};
 
 		const parsed = JSON.parse(typeof pref.gatewayConfig === "string" ? pref.gatewayConfig : "{}");
 		return parsed as Partial<GatewayConfig>;
 	} catch (err) {
+		if (
+			err instanceof DbReadError ||
+			err instanceof DbReadTaskExecutionError ||
+			err instanceof WorkersUnavailableError ||
+			err instanceof DbReadTaskTimeoutError ||
+			(typeof err === "object" &&
+				err !== null &&
+				"code" in err &&
+				typeof err.code === "string" &&
+				err.code.startsWith("DB_READ_")) ||
+			err instanceof DrizzleQueryError
+		)
+			throw err;
 		logger.warn("[gateway] Failed to load config from database", {
 			error: err instanceof Error ? err.message : String(err),
 		});

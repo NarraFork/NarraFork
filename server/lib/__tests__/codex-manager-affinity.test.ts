@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexManager } from "../codex-manager";
+import { type CallContext, CodexManager } from "../codex-manager";
 
 function createManagerWithCredentials(
 	creds: Array<{
@@ -66,7 +66,85 @@ afterEach(() => {
 	}
 });
 
+test.each([
+	"disable",
+	"replace",
+] as const)("rejects a diagnostic credential changed by %s during acquisition", async (change) => {
+	const { manager, tmpHome } = createManagerWithCredentials([{ id: "cred-a", priority: 0 }]);
+	tempHomes.push(tmpHome);
+	const context = await manager.acquireContext();
+	const refresh = Promise.withResolvers<CallContext>();
+	const ensure = spyOn(
+		manager as unknown as { tryEnsureToken(): Promise<CallContext | null> },
+		"tryEnsureToken",
+	).mockReturnValue(refresh.promise);
+	try {
+		const pending = manager.acquireDiagnosticContext(context.id);
+		expect(ensure).toHaveBeenCalledTimes(1);
+		if (change === "disable") {
+			manager.setDisabled(context.id, true);
+		} else {
+			expect(
+				manager.importFromTransfer(
+					[{ ...context.credential, accessToken: "replacement-token" }],
+					() => "replace",
+				).replaced,
+			).toBe(1);
+		}
+		refresh.resolve(context);
+		await expect(pending).rejects.toThrow("The parent Codex credential is unavailable");
+	} finally {
+		ensure.mockRestore();
+		manager.dispose();
+	}
+});
+
 describe("CodexManager session affinity", () => {
+	test("consecutive failures reset on success and evict affinity at the threshold", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-a", priority: 0 },
+			{ id: "cred-b", priority: 1 },
+		]);
+		tempHomes.push(tmpHome);
+		manager.setLoadBalancingMode("balanced");
+		const first = await manager.acquireContext("session-1");
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.disabled).toBe(false);
+		manager.reportSuccess(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.failureCount).toBe(0);
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		manager.reportFailure(first.id);
+		expect(manager.snapshot().entries.find((entry) => entry.id === first.id)?.disabledReason).toBe(
+			"too_many_failures",
+		);
+		expect(manager.snapshot().stickySessionCount).toBe(0);
+		expect((await manager.acquireContext("session-1")).id).not.toBe(first.id);
+		manager.dispose();
+	});
+
+	test("self-healing only revives failure-disabled credentials, not manual or banned ones", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "failed", priority: 0 },
+			{ id: "manual", priority: 1 },
+			{ id: "banned", priority: 2 },
+		]);
+		tempHomes.push(tmpHome);
+		manager.setDisabled("manual", true);
+		manager.markBanned("banned");
+		manager.reportFailure("failed");
+		manager.reportFailure("failed");
+		expect(manager.reportFailure("failed")).toBe(false);
+		expect((await manager.acquireContext("session-1")).id).toBe("failed");
+		const snapshot = manager.snapshot();
+		expect(snapshot.availableEntries.map((entry) => entry.id)).toEqual(["failed"]);
+		expect(snapshot.entries.find((entry) => entry.id === "failed")?.failureCount).toBe(0);
+		expect(snapshot.entries.find((entry) => entry.id === "manual")?.disabledReason).toBe("manual");
+		expect(snapshot.entries.find((entry) => entry.id === "banned")?.disabledReason).toBe("banned");
+		manager.dispose();
+	});
+
 	test("balanced 模式下同一 session 复用同一 credential", async () => {
 		const { manager, tmpHome } = createManagerWithCredentials([
 			{ id: "cred-a", priority: 0 },

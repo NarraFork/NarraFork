@@ -19,6 +19,12 @@ import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
 import { logger } from "../logger";
 import {
+	COMMAND_CODE_KEY_OWNER,
+	getProviderKeyStore,
+	nugKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "../provider-keys";
+import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
 	getGeminiProviderConfig,
@@ -30,14 +36,18 @@ import {
 	resolveProvider,
 	settings,
 } from "../settings";
+import { getSourceGroup } from "../sourcing/source-groups";
+import { getServiceTemplate } from "../sourcing/templates";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
 import { buildCommandCodeProvider } from "./commandcode-provider";
+import { reportCredentialId } from "./credential-report";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
+import { isNugRelayEligible } from "./nug-delegate-config";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import { PooledProvider, usableProviderKeys, withProviderKey } from "./pooled-provider";
@@ -90,6 +100,10 @@ export interface ChatParams extends ProtocolChatParams {
 	stickySessionKey?: string;
 	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
 	transportSessionKey?: string;
+	/** Diagnostic calls are never allowed to run upstream-hosted tools. */
+	diagnostic?: boolean;
+	/** Opt-in adapters append this after projecting the unchanged anchor request. */
+	diagnosticFork?: { suffix: string; credentialId?: string; validateCredential?: () => boolean };
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */
@@ -119,7 +133,10 @@ export interface ChatParams extends ProtocolChatParams {
 	 * to distinguish a real empty upstream response from local request preparation
 	 * paths that completed without ever contacting the API.
 	 */
-	onRequestStart?: (info?: { credentialId?: string }) => void;
+	onRequestStart?: (info?: {
+		credentialId?: string;
+		validateDiagnosticCredential?: () => boolean;
+	}) => void;
 	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
@@ -235,6 +252,12 @@ export interface GenerateMetaResult {
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** Synchronously prepare model-dependent routing before formatting or sending a request. */
+	prepareForModel?(model: string): void;
+	/** This adapter can append the diagnostic suffix without replacing the request prefix. */
+	supportsDiagnosticFork?(model: string, credentialId?: string): boolean;
+	/** Production configured adapters carry a read-only check against live settings. */
+	isDiagnosticConnectionCurrent?(): boolean;
 	/** Native wire capability, intersected with effective model input metadata. */
 	supportsNativeMediaInput?(
 		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
@@ -351,13 +374,38 @@ function hasTokenDancePrefixConflict(): boolean {
 
 builtinProviderSources.register("tokendance", {
 	resolve: (provider) => {
-		if (provider !== "tokendance" || !getTokenDanceRuntimeConfig()) return null;
+		if (provider !== "tokendance" || settings.tokendance?.disabled) return null;
+		const runtime = getTokenDanceRuntimeConfig();
+		const stored = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+		if (!runtime && stored.length === 0) return null;
 		if (hasTokenDancePrefixConflict()) {
 			throw new Error(
 				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
 			);
 		}
-		return new TokenDanceProvider();
+		if (getServiceTemplate("tokendance").multiCredential && stored.length > 0) {
+			const keys = usableProviderKeys(TOKENDANCE_KEY_OWNER);
+			const first = keys[0];
+			if (!first) throw new Error("This provider has no usable API key");
+			const build = (key: (typeof keys)[number]) =>
+				new TokenDanceProvider(
+					key.apiKey,
+					withProviderKey(
+						{
+							...runtime,
+							...settings.tokendance,
+							apiKey: key.apiKey,
+							generation: runtime?.generation ?? 0,
+							disabled: false,
+						},
+						key,
+					),
+				);
+			return stored.length === 1 && !first.network
+				? reportCredentialId(build(first), "tokendance")
+				: new PooledProvider(TOKENDANCE_KEY_OWNER, build);
+		}
+		return reportCredentialId(new TokenDanceProvider(), "tokendance");
 	},
 	listReadiness: () => {
 		const config = getTokenDanceRuntimeConfig();
@@ -392,8 +440,28 @@ builtinProviderSources.register("codex", {
 });
 
 builtinProviderSources.register("CommandCode", {
-	resolve: (provider, model) =>
-		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	resolve: (provider, model) => {
+		if (provider !== "CommandCode") return null;
+		if (settings.commandCode?.disabled) return null;
+		const stored = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER);
+		if (getServiceTemplate("command-code").multiCredential && stored.length > 0) {
+			const keys = usableProviderKeys(COMMAND_CODE_KEY_OWNER);
+			const first = keys[0];
+			if (!first) throw new Error("This provider has no usable API key");
+			const build = (key: (typeof keys)[number]) => {
+				const config = withProviderKey({ ...settings.commandCode, apiKey: key.apiKey }, key);
+				const adapter = buildCommandCodeProvider(model, config, key.apiKey);
+				if (!adapter) throw new Error("This provider has no usable API key");
+				return adapter;
+			};
+			return stored.length === 1 && !first.network
+				? reportCredentialId(build(first), "CommandCode")
+				: new PooledProvider(COMMAND_CODE_KEY_OWNER, build);
+		}
+		// CLI auth is a fallback only when no managed credentials exist, not when disabled.
+		const adapter = buildCommandCodeProvider(model, settings.commandCode);
+		return adapter ? reportCredentialId(adapter, "CommandCode") : null;
+	},
 	listReadiness: () => [
 		{
 			id: "builtin:CommandCode",
@@ -421,6 +489,7 @@ function registerCredentialProviderSource<
 	getConfig: (prefix: string) => T | undefined,
 	create: (config: T) => ProviderAdapter,
 	isComplete: (config: T) => boolean = (config) => !!config.apiKey.trim(),
+	isEligible?: (config: T, model: string) => boolean,
 ): void {
 	const adapterFor = (prefix: string, model: string, config: T): ProviderAdapter => {
 		// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
@@ -449,16 +518,56 @@ function registerCredentialProviderSource<
 		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
 			if (!config) return null;
-			// Custom API providers can hold several keys. One plain key (the one settings
-			// shows, with no network identity of its own) keeps the direct adapter.
-			const keys = kind === "nug" ? [] : usableProviderKeys(config.id);
-			const plain =
-				keys.length === 0 ||
-				(keys.length === 1 && keys[0]?.apiKey === config.apiKey && !keys[0]?.network);
-			if (plain) return adapterFor(prefix, model, config);
-			return new PooledProvider(config.id, (key) =>
-				adapterFor(prefix, model, withProviderKey(config, key)),
+			// Storage owners retain their S1 compatibility names until S5; whether a group
+			// supports a pool is a template capability, not a provider-kind exception.
+			const owner = kind === "nug" ? nugKeyOwner(config.id) : config.id;
+			const template = getServiceTemplate(
+				getSourceGroup(config.id)?.templateId ?? "openai-compatible",
 			);
+			const stored = template.multiCredential ? getProviderKeyStore().list(owner) : [];
+			const keys = template.multiCredential ? usableProviderKeys(owner) : [];
+			if (stored.length > 0 && keys.length === 0) {
+				throw new Error("This provider has no usable API key");
+			}
+			// Custom APIs retain their historical single-usable-first-key fast path.
+			// Newly pooled namespaced owners use real ids whenever multiple keys exist.
+			const plain =
+				stored.length === 0 ||
+				(keys.length === 1 &&
+					keys[0]?.apiKey === config.apiKey &&
+					!keys[0]?.network &&
+					(owner === config.id || stored.length === 1));
+			const selectedConfig = keys[0] ? withProviderKey(config, keys[0]) : config;
+			const configVersion = JSON.stringify(config);
+			const proxyVersion = JSON.stringify(settings.proxy);
+			const protocolVersion = resolveModelProtocol(prefix, model);
+			// A single-credential connection is billed to the connection itself.
+			const adapter: ProviderAdapter = plain
+				? reportCredentialId(adapterFor(prefix, model, selectedConfig), config.id)
+				: new PooledProvider(
+						owner,
+						(key) => adapterFor(prefix, model, withProviderKey(config, key)),
+						isEligible
+							? (key, value) => isEligible(withProviderKey(config, key), value)
+							: undefined,
+					);
+			// Also protects stream quota publication for families without diagnostic forks.
+			adapter.isDiagnosticConnectionCurrent = () => {
+				const live = getConfig(prefix);
+				if (
+					!live ||
+					JSON.stringify(live) !== configVersion ||
+					JSON.stringify(settings.proxy) !== proxyVersion ||
+					resolveModelProtocol(prefix, model) !== protocolVersion
+				)
+					return false;
+				if (!plain) return true;
+				const stored = getProviderKeyStore().list(owner);
+				return stored.length === 0
+					? keys.length === 0
+					: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
+			};
+			return adapter;
 		},
 		listReadiness: () =>
 			listConfigs().map((config) => ({
@@ -480,8 +589,13 @@ registerCredentialProviderSource(
 	"nug",
 	() => settings.nugProviders ?? [],
 	getNugProviderConfig,
-	(config) => new NugProvider(config),
+	(config) =>
+		new NugProvider(
+			config,
+			settings.nugProviders?.find((entry) => entry.id === config.id) ?? config,
+		),
 	(config) => !!config.apiKey.trim() && !!config.baseUrl.trim(),
+	isNugRelayEligible,
 );
 registerCredentialProviderSource(
 	"openai",
@@ -603,9 +717,7 @@ function buildResolution(
 		provider === requestedProvider
 			? requestedModel
 			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
-	if (adapter instanceof NugProvider || adapter instanceof TokenDanceProvider) {
-		adapter.prepareForModel(model);
-	}
+	adapter.prepareForModel?.(model);
 	return {
 		requestedProvider,
 		requestedModel,

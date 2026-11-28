@@ -273,6 +273,11 @@ export function createPostgresKnowledgeReadStore(db: PgDb): KnowledgeReadStore {
 			return (rows[0] as KnowledgeEntryRow | undefined) ?? null;
 		},
 
+		async getEntryDetailById(entryId, signal) {
+			signal?.throwIfAborted();
+			return this.getEntryById(entryId);
+		},
+
 		async getEntryAclById(entryId) {
 			const rows = await db
 				.select(ENTRY_ACL_SELECT)

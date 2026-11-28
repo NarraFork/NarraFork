@@ -34,7 +34,7 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import {
 	aclEvents,
 	aclGrants,
@@ -50,6 +50,10 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "../../db/schema";
+import { readDomainTask, readQuery, readQueryFirst } from "../../db/worker-read";
+import { KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE } from "../../lib/db-worker/knowledge-entry-query";
+import { runReadTask, WorkersUnavailableError } from "../../lib/db-worker/pool";
+import { AppError } from "../../lib/errors";
 import type {
 	AclEventReadRow,
 	KeywordInjectionCandidateRow,
@@ -62,6 +66,7 @@ import type {
 	KnowledgeRevisionRow,
 	KnowledgeSubmissionRoutingRow,
 } from "./read-store";
+import { readKnowledgeIds, readKnowledgePages } from "./sqlite-read-pages";
 import type { KnowledgeCollectionRow } from "./write-store";
 
 const ENTRY_ACL_COLUMNS = {
@@ -219,435 +224,571 @@ function personalInjectionWhere(opts: {
 	);
 }
 
-// Compatibility for callers whose contract is still synchronous. These methods are
-// reachable only through the binding's explicit SQLite capability check.
-export const sqliteKnowledgeInjectionReads = {
-	listKeywordInjectionCandidates(opts: {
-		collectionId?: string;
-		projectId?: string;
-		limit: number;
-	}) {
-		return db
-			.select({
-				id: knowledgeEntries.id,
-				collectionId: knowledgeEntries.collectionId,
-				title: knowledgeEntries.title,
-				currentRevisionId: knowledgeEntries.currentRevisionId,
-				tagsJson: knowledgeEntries.tagsJson,
-				keywordsJson: knowledgeEntries.keywordsJson,
-				updatedAt: knowledgeEntries.updatedAt,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			)
-			.orderBy(desc(knowledgeEntries.updatedAt))
-			.limit(opts.limit)
-			.all();
-	},
-	keywordInjectionCandidatesSignature(opts: { collectionId?: string; projectId?: string }) {
-		const row = db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			)
-			.get();
-		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
-	},
-	snippetsByEntryIds(ids: string[], maxChars: number) {
-		if (!ids.length) return [];
-		return db
-			.select({
-				id: knowledgeEntries.id,
-				snippet: sql<
-					string | null
-				>`substr(coalesce(${knowledgeEntries.currentContent}, ${knowledgeEntries.title}), 1, ${maxChars})`,
-			})
-			.from(knowledgeEntries)
-			.where(inArray(knowledgeEntries.id, ids))
-			.all();
-	},
-	listInjectedEntryIds(narratorId: string, compactSeq: number) {
-		return db
-			.select({
-				entryId: knowledgeInjectionEvents.entryId,
-				personalEntryId: knowledgeInjectionEvents.personalEntryId,
-			})
-			.from(knowledgeInjectionEvents)
-			.where(
-				and(
-					eq(knowledgeInjectionEvents.narratorId, narratorId),
-					eq(knowledgeInjectionEvents.compactSeq, compactSeq),
-				),
-			)
-			.all()
-			.map((row) =>
-				row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
-			);
-	},
-};
+function keywordSignatureQuery(opts: { collectionId?: string; projectId?: string }) {
+	return db
+		.select({
+			cnt: sql<number>`count(*)`,
+			maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
+		})
+		.from(knowledgeEntries)
+		.where(
+			and(
+				eq(knowledgeEntries.status, "active"),
+				isNotNull(knowledgeEntries.currentKeywords),
+				opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+				projectScopeClause(opts.projectId),
+			),
+		);
+}
+
+const signatureReadOptions = { maxRows: 1, diagnosticSource: "knowledge.keyword-signature" };
 
 export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
-	async listPersonalEntries(opts) {
+	async listPersonalEntries(opts, options = {}) {
 		const { content, ...columns } = getTableColumns(knowledgeDrafts);
-		return db
-			.select({ ...columns, contentLength: sql<number>`length(${content})` })
-			.from(knowledgeDrafts)
-			.where(
-				and(
-					eq(knowledgeDrafts.authorUserId, opts.userId),
-					opts.status ? eq(knowledgeDrafts.status, opts.status) : undefined,
-				),
-			)
-			.orderBy(desc(knowledgeDrafts.updatedAt))
-			.limit(Math.max(1, Math.min(opts.limit, 200)))
-			.all();
-	},
-	async getEntryRevisionPointers(ids) {
-		if (!ids.length) return [];
-		return db
-			.select({ id: knowledgeEntries.id, currentRevisionId: knowledgeEntries.currentRevisionId })
-			.from(knowledgeEntries)
-			.where(inArray(knowledgeEntries.id, ids))
-			.limit(200)
-			.all();
-	},
-	async getPersonalEntryById(id) {
-		return (
-			(await db.query.knowledgeDrafts.findFirst({ where: eq(knowledgeDrafts.id, id) })) ?? null
+		return readQuery(
+			db
+				.select({ ...columns, contentLength: sql<number>`length(${content})` })
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, opts.userId),
+						opts.status ? eq(knowledgeDrafts.status, opts.status) : undefined,
+					),
+				)
+				.orderBy(desc(knowledgeDrafts.updatedAt))
+				.limit(Math.max(1, Math.min(opts.limit, 200))),
+			{ ...options, executionPolicy: "worker-required" },
 		);
 	},
-	async getEntryById(entryId) {
-		const row = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, entryId),
-		});
-		return (row as KnowledgeEntryRow | undefined) ?? null;
+	async getEntryRevisionPointers(ids, options = {}) {
+		if (!ids.length) return [];
+		return readQuery(
+			db
+				.select({ id: knowledgeEntries.id, currentRevisionId: knowledgeEntries.currentRevisionId })
+				.from(knowledgeEntries)
+				.where(inArray(knowledgeEntries.id, ids))
+				.limit(200),
+			{ ...options, executionPolicy: "worker-required" },
+		);
+	},
+	async getPersonalEntryById(id, options = {}) {
+		return (
+			(await readQueryFirst(
+				db.query.knowledgeDrafts.findMany({ limit: 1, where: eq(knowledgeDrafts.id, id) }),
+				{ ...options, executionPolicy: "worker-required" },
+			)) ?? null
+		);
+	},
+	async getEntryById(entryId, options = {}) {
+		const row = await readDomainTask(
+			sqlite,
+			"knowledgeEntryDetail",
+			{ entryId },
+			{ ...options, executionPolicy: "worker-required" },
+		);
+		if (!row) return null;
+		return {
+			...row,
+			tagsJson: row.tagsJson === null ? null : JSON.parse(row.tagsJson),
+			keywordsJson: row.keywordsJson === null ? null : JSON.parse(row.keywordsJson),
+			metadataJson: row.metadataJson === null ? null : JSON.parse(row.metadataJson),
+			controlledTagsJson:
+				row.controlledTagsJson === null ? null : JSON.parse(row.controlledTagsJson),
+			reviewTagsJson: row.reviewTagsJson === null ? null : JSON.parse(row.reviewTagsJson),
+		};
 	},
 
-	async getEntryAclById(entryId) {
-		const row = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, entryId),
-			columns: ENTRY_ACL_COLUMNS,
-		});
+	async getEntryDetailById(entryId, signal, options = {}) {
+		signal ??= options.signal;
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		try {
+			return await runReadTask<KnowledgeEntryRow | null>(
+				sqlite.filename,
+				{ kind: "knowledgeEntryDetail", entryId },
+				{ ...options, signal, timeoutMs: options.timeoutMs ?? 10_000 },
+			);
+		} catch (err) {
+			if (err instanceof Error && "code" in err && err.code === KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE) {
+				throw new AppError(err.message, 413, KNOWLEDGE_ENTRY_DETAIL_TOO_LARGE);
+			}
+			throw err;
+		}
+	},
+
+	async getEntryAclById(entryId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, entryId),
+				columns: ENTRY_ACL_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getEntryGraphById(entryId) {
-		const row = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, entryId),
-			columns: ENTRY_GRAPH_COLUMNS,
-		});
+	async getEntryGraphById(entryId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, entryId),
+				columns: ENTRY_GRAPH_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getEntriesAclByIds(entryIds) {
+	async getEntriesAclByIds(entryIds, options = {}) {
+		if (entryIds.length > 100)
+			return readKnowledgeIds(entryIds, (ids) =>
+				sqliteKnowledgeReadStore.getEntriesAclByIds(ids, options),
+			);
 		if (entryIds.length === 0) return [];
-		return db.query.knowledgeEntries.findMany({
-			where: inArray(knowledgeEntries.id, entryIds),
-			columns: ENTRY_ACL_COLUMNS,
-		});
+		return readQuery(
+			db.query.knowledgeEntries.findMany({
+				where: inArray(knowledgeEntries.id, entryIds),
+				columns: ENTRY_ACL_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async getEntriesGraphByIds(entryIds) {
+	async getEntriesGraphByIds(entryIds, options = {}) {
+		if (entryIds.length > 100)
+			return readKnowledgeIds(entryIds, (ids) =>
+				sqliteKnowledgeReadStore.getEntriesGraphByIds(ids, options),
+			);
 		if (entryIds.length === 0) return [];
-		return db.query.knowledgeEntries.findMany({
-			where: inArray(knowledgeEntries.id, entryIds),
-			columns: ENTRY_GRAPH_COLUMNS,
-		});
+		return readQuery(
+			db.query.knowledgeEntries.findMany({
+				where: inArray(knowledgeEntries.id, entryIds),
+				columns: ENTRY_GRAPH_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listEntries(opts) {
+	async listEntries(opts, options = {}) {
 		const after = opts.after;
-		return db.query.knowledgeEntries.findMany({
-			where: and(
-				opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-				after
-					? or(
-							lt(knowledgeEntries.updatedAt, after.updatedAt),
-							and(
-								eq(knowledgeEntries.updatedAt, after.updatedAt),
-								lt(knowledgeEntries.id, after.id),
-							),
-						)
-					: undefined,
-			),
-			columns: ENTRY_LIST_COLUMNS,
-			orderBy: (e, { desc: d }) => [d(e.updatedAt), d(e.id)],
-			limit: opts.limit,
-		}) as Promise<KnowledgeEntryListRow[]>;
+		return readQuery(
+			db.query.knowledgeEntries.findMany({
+				where: and(
+					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+					after
+						? or(
+								lt(knowledgeEntries.updatedAt, after.updatedAt),
+								and(
+									eq(knowledgeEntries.updatedAt, after.updatedAt),
+									lt(knowledgeEntries.id, after.id),
+								),
+							)
+						: undefined,
+				),
+				columns: ENTRY_LIST_COLUMNS,
+				orderBy: (e, { desc: d }) => [d(e.updatedAt), d(e.id)],
+				limit: opts.limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		) as Promise<KnowledgeEntryListRow[]>;
 	},
 
-	async listEntriesOrdered(opts) {
+	async listEntriesOrdered(opts, options = {}) {
 		const { limit, order, ...filter } = opts;
-		return db.query.knowledgeEntries.findMany({
-			where: entryListWhere(filter, order),
-			columns: ENTRY_LIST_COLUMNS,
-			orderBy:
-				order.sort === "title"
-					? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
-					: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)],
-			limit,
-		}) as Promise<KnowledgeEntryListRow[]>;
+		return readQuery(
+			db.query.knowledgeEntries.findMany({
+				where: entryListWhere(filter, order),
+				columns: ENTRY_LIST_COLUMNS,
+				orderBy:
+					order.sort === "title"
+						? [asc(knowledgeEntries.title), asc(knowledgeEntries.id)]
+						: [desc(knowledgeEntries.updatedAt), desc(knowledgeEntries.id)],
+				limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		) as Promise<KnowledgeEntryListRow[]>;
 	},
 
-	async findEntryBySlug(collectionId, slug) {
-		const row = await db.query.knowledgeEntries.findFirst({
-			where: and(eq(knowledgeEntries.collectionId, collectionId), eq(knowledgeEntries.slug, slug)),
-			columns: { id: true },
-		});
+	async findEntryBySlug(collectionId, slug, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: and(
+					eq(knowledgeEntries.collectionId, collectionId),
+					eq(knowledgeEntries.slug, slug),
+				),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getCollectionById(collectionId) {
-		const row = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, collectionId),
-		});
+	async getCollectionById(collectionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: eq(knowledgeCollections.id, collectionId),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return (row as KnowledgeCollectionRow | undefined) ?? null;
 	},
 
-	async getCollectionAclById(collectionId) {
-		const row = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, collectionId),
-			columns: COLLECTION_ACL_COLUMNS,
-		});
+	async getCollectionAclById(collectionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: eq(knowledgeCollections.id, collectionId),
+				columns: COLLECTION_ACL_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getCollectionSummaryById(collectionId) {
-		const row = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, collectionId),
-			columns: COLLECTION_SUMMARY_COLUMNS,
-		});
+	async getCollectionSummaryById(collectionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: eq(knowledgeCollections.id, collectionId),
+				columns: COLLECTION_SUMMARY_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getCollectionsAclByIds(collectionIds) {
+	async getCollectionsAclByIds(collectionIds, options = {}) {
+		if (collectionIds.length > 100)
+			return readKnowledgeIds(collectionIds, (ids) =>
+				sqliteKnowledgeReadStore.getCollectionsAclByIds(ids, options),
+			);
 		if (collectionIds.length === 0) return [];
-		return db.query.knowledgeCollections.findMany({
-			where: inArray(knowledgeCollections.id, collectionIds),
-			columns: COLLECTION_ACL_COLUMNS,
-		});
+		return readQuery(
+			db.query.knowledgeCollections.findMany({
+				where: inArray(knowledgeCollections.id, collectionIds),
+				columns: COLLECTION_ACL_COLUMNS,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listCollections(opts) {
-		return db.query.knowledgeCollections.findMany({
-			where: opts.projectId ? eq(knowledgeCollections.projectId, opts.projectId) : undefined,
-			orderBy: (c, { asc: a }) => [a(c.name)],
-			limit: opts.limit,
-		}) as Promise<KnowledgeCollectionRow[]>;
+	async listCollections(opts, options = {}) {
+		return readQuery(
+			db.query.knowledgeCollections.findMany({
+				where: opts.projectId ? eq(knowledgeCollections.projectId, opts.projectId) : undefined,
+				orderBy: (c, { asc: a }) => [a(c.name)],
+				limit: opts.limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		) as Promise<KnowledgeCollectionRow[]>;
 	},
 
-	async findCollectionBySlug(opts) {
-		const row = await db.query.knowledgeCollections.findFirst({
-			where: opts.projectId
-				? and(
-						eq(knowledgeCollections.projectId, opts.projectId),
-						eq(knowledgeCollections.slug, opts.slug),
-					)
-				: eq(knowledgeCollections.slug, opts.slug),
-			columns: { id: true },
-		});
+	async findCollectionBySlug(opts, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: opts.projectId
+					? and(
+							eq(knowledgeCollections.projectId, opts.projectId),
+							eq(knowledgeCollections.slug, opts.slug),
+						)
+					: eq(knowledgeCollections.slug, opts.slug),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async collectionExists(collectionId) {
-		const row = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, collectionId),
-			columns: { id: true },
-		});
+	async collectionExists(collectionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: eq(knowledgeCollections.id, collectionId),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row !== undefined;
 	},
 
-	async getRevisionById(revisionId) {
-		const row = await db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, revisionId),
-		});
+	async getRevisionById(revisionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeRevisions.findMany({
+				limit: 1,
+				where: eq(knowledgeRevisions.id, revisionId),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return (row as KnowledgeRevisionRow | undefined) ?? null;
 	},
 
-	async getRevisionEntryId(revisionId) {
-		const row = await db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, revisionId),
-			columns: { id: true, entryId: true },
-		});
+	async getRevisionEntryId(revisionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeRevisions.findMany({
+				limit: 1,
+				where: eq(knowledgeRevisions.id, revisionId),
+				columns: { id: true, entryId: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async listRevisionMeta(entryId, limit) {
-		const rows = await db
-			.select({
-				id: knowledgeRevisions.id,
-				entryId: knowledgeRevisions.entryId,
-				version: knowledgeRevisions.version,
-				format: knowledgeRevisions.format,
-				contentHash: knowledgeRevisions.contentHash,
-				changeNote: knowledgeRevisions.changeNote,
-				authorUserId: knowledgeRevisions.authorUserId,
-				baseRevisionId: knowledgeRevisions.baseRevisionId,
-				createdAt: knowledgeRevisions.createdAt,
-				contentLength: sql<number>`length(${knowledgeRevisions.content})`,
-			})
-			.from(knowledgeRevisions)
-			.where(eq(knowledgeRevisions.entryId, entryId))
-			.orderBy(desc(knowledgeRevisions.version))
-			.limit(limit);
+	async listRevisionMeta(entryId, limit, options = {}) {
+		const rows = await readQuery(
+			db
+				.select({
+					id: knowledgeRevisions.id,
+					entryId: knowledgeRevisions.entryId,
+					version: knowledgeRevisions.version,
+					format: knowledgeRevisions.format,
+					contentHash: knowledgeRevisions.contentHash,
+					changeNote: knowledgeRevisions.changeNote,
+					authorUserId: knowledgeRevisions.authorUserId,
+					baseRevisionId: knowledgeRevisions.baseRevisionId,
+					createdAt: knowledgeRevisions.createdAt,
+					contentLength: sql<number>`length(${knowledgeRevisions.content})`,
+				})
+				.from(knowledgeRevisions)
+				.where(eq(knowledgeRevisions.entryId, entryId))
+				.orderBy(desc(knowledgeRevisions.version))
+				.limit(limit),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows.map((row) => ({ ...row, contentLength: Number(row.contentLength) }));
 	},
 
-	async userExists(userId) {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true },
-		});
+	async userExists(userId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.users.findMany({ limit: 1, where: eq(users.id, userId), columns: { id: true } }),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row !== undefined;
 	},
 
-	async getUserRoleById(userId) {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, role: true },
-		});
+	async getUserRoleById(userId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, userId),
+				columns: { id: true, role: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async getUsernameById(userId) {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { username: true },
-		});
+	async getUsernameById(userId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, userId),
+				columns: { username: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async listUsernamesByIds(userIds) {
+	async listUsernamesByIds(userIds, options = {}) {
+		if (userIds.length > 100)
+			return readKnowledgeIds(userIds, (ids) =>
+				sqliteKnowledgeReadStore.listUsernamesByIds(ids, options),
+			);
 		if (userIds.length === 0) return [];
-		return db.query.users.findMany({
-			where: inArray(users.id, userIds),
-			columns: { id: true, username: true },
-		});
+		return readQuery(
+			db.query.users.findMany({
+				where: inArray(users.id, userIds),
+				columns: { id: true, username: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listUserIdsAndRoles(opts) {
-		return db.query.users.findMany({
-			where: opts.role ? eq(users.role, opts.role as "admin" | "user") : undefined,
-			columns: { id: true, role: true },
-			...(opts.limit !== undefined ? { limit: opts.limit } : {}),
-		});
+	async listUserIdsAndRoles(opts, options = {}) {
+		return readQuery(
+			db.query.users.findMany({
+				where: opts.role ? eq(users.role, opts.role as "admin" | "user") : undefined,
+				columns: { id: true, role: true },
+				...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listExistingUserIds(userIds) {
+	async listExistingUserIds(userIds, options = {}) {
+		if (userIds.length > 100)
+			return readKnowledgeIds(userIds, (ids) =>
+				sqliteKnowledgeReadStore.listExistingUserIds(ids, options),
+			);
 		if (userIds.length === 0) return [];
-		return db.query.users.findMany({
-			where: inArray(users.id, userIds),
-			columns: { id: true },
-		});
+		return readQuery(
+			db.query.users.findMany({
+				where: inArray(users.id, userIds),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listUsersDetailed() {
-		return db.query.users.findMany({
-			columns: { id: true, username: true, role: true },
-		});
+	async listUsersDetailed(options = {}) {
+		return readQuery(
+			db.query.users.findMany({
+				columns: { id: true, username: true, role: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listKnowledgeLevels() {
-		return db.query.knowledgeLevels.findMany({ orderBy: (l, { asc: a }) => [a(l.rank)] });
+	async listKnowledgeLevels(options = {}) {
+		return readQuery(
+			db.query.knowledgeLevels.findMany({ orderBy: (l, { asc: a }) => [a(l.rank)] }),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async getKnowledgeLevelById(levelId) {
-		const row = await db.query.knowledgeLevels.findFirst({
-			where: eq(knowledgeLevels.id, levelId),
-		});
+	async getKnowledgeLevelById(levelId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeLevels.findMany({ limit: 1, where: eq(knowledgeLevels.id, levelId) }),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async findKnowledgeLevelByName(name, excludeId) {
-		const row = await db.query.knowledgeLevels.findFirst({
-			where: excludeId
-				? and(eq(knowledgeLevels.name, name), ne(knowledgeLevels.id, excludeId))
-				: eq(knowledgeLevels.name, name),
-			columns: { id: true },
-		});
+	async findKnowledgeLevelByName(name, excludeId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeLevels.findMany({
+				limit: 1,
+				where: excludeId
+					? and(eq(knowledgeLevels.name, name), ne(knowledgeLevels.id, excludeId))
+					: eq(knowledgeLevels.name, name),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async findKnowledgeLevelByRank(rank, excludeId) {
-		const row = await db.query.knowledgeLevels.findFirst({
-			where: excludeId
-				? and(eq(knowledgeLevels.rank, rank), ne(knowledgeLevels.id, excludeId))
-				: eq(knowledgeLevels.rank, rank),
-			columns: { id: true },
-		});
+	async findKnowledgeLevelByRank(rank, excludeId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeLevels.findMany({
+				limit: 1,
+				where: excludeId
+					? and(eq(knowledgeLevels.rank, rank), ne(knowledgeLevels.id, excludeId))
+					: eq(knowledgeLevels.rank, rank),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async knowledgeLevelInUse(levelName) {
+	async knowledgeLevelInUse(levelName, options = {}) {
 		// Levels are referenced BY NAME from entries, collections (both axes) and
 		// clearance credentials — the same four probes the delete guard always ran.
 		const [entryRef, collectionDefaultRef, collectionClassRef, grantRef] = await Promise.all([
-			db.query.knowledgeEntries.findFirst({
-				where: eq(knowledgeEntries.classificationLevel, levelName),
-				columns: { id: true },
-			}),
-			db.query.knowledgeCollections.findFirst({
-				where: eq(knowledgeCollections.defaultLevel, levelName),
-				columns: { id: true },
-			}),
-			db.query.knowledgeCollections.findFirst({
-				where: eq(knowledgeCollections.classificationLevel, levelName),
-				columns: { id: true },
-			}),
-			db.query.aclGrants.findFirst({
-				where: and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, levelName)),
-				columns: { id: true },
-			}),
+			readQueryFirst(
+				db.query.knowledgeEntries.findMany({
+					limit: 1,
+					where: eq(knowledgeEntries.classificationLevel, levelName),
+					columns: { id: true },
+				}),
+				{ ...options, executionPolicy: "worker-required" },
+			),
+			readQueryFirst(
+				db.query.knowledgeCollections.findMany({
+					limit: 1,
+					where: eq(knowledgeCollections.defaultLevel, levelName),
+					columns: { id: true },
+				}),
+				{ ...options, executionPolicy: "worker-required" },
+			),
+			readQueryFirst(
+				db.query.knowledgeCollections.findMany({
+					limit: 1,
+					where: eq(knowledgeCollections.classificationLevel, levelName),
+					columns: { id: true },
+				}),
+				{ ...options, executionPolicy: "worker-required" },
+			),
+			readQueryFirst(
+				db.query.aclGrants.findMany({
+					limit: 1,
+					where: and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, levelName)),
+					columns: { id: true },
+				}),
+				{ ...options, executionPolicy: "worker-required" },
+			),
 		]);
 		return Boolean(entryRef || collectionDefaultRef || collectionClassRef || grantRef);
 	},
 
-	async listKnowledgeTags(collectionId) {
+	async listKnowledgeTags(collectionId, options = {}) {
 		if (collectionId) {
-			return db.query.knowledgeTags.findMany({
-				where: eq(knowledgeTags.collectionId, collectionId),
-			});
+			return readQuery(
+				db.query.knowledgeTags.findMany({
+					where: eq(knowledgeTags.collectionId, collectionId),
+				}),
+				{ ...options, executionPolicy: "worker-required" },
+			);
 		}
-		return db.query.knowledgeTags.findMany();
+		return readQuery(db.query.knowledgeTags.findMany(), {
+			...options,
+			executionPolicy: "worker-required",
+		});
 	},
 
-	async getKnowledgeTagById(tagId) {
-		const row = await db.query.knowledgeTags.findFirst({
-			where: eq(knowledgeTags.id, tagId),
-		});
+	async getKnowledgeTagById(tagId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeTags.findMany({ limit: 1, where: eq(knowledgeTags.id, tagId) }),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async listKnowledgeTagTypes() {
-		return db.query.knowledgeTagTypes.findMany({
-			orderBy: (tt, { asc: a }) => [a(tt.sortOrder), a(tt.createdAt)],
-		});
+	async listKnowledgeTagTypes(options = {}) {
+		return readQuery(
+			db.query.knowledgeTagTypes.findMany({
+				orderBy: (tt, { asc: a }) => [a(tt.sortOrder), a(tt.createdAt)],
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async getKnowledgeTagTypeById(tagTypeId) {
-		const row = await db.query.knowledgeTagTypes.findFirst({
-			where: eq(knowledgeTagTypes.id, tagTypeId),
-		});
+	async getKnowledgeTagTypeById(tagTypeId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeTagTypes.findMany({ limit: 1, where: eq(knowledgeTagTypes.id, tagTypeId) }),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async listKnowledgeAclGrantRows(opts) {
+	async listKnowledgeAclGrantRows(opts, options = {}) {
 		const principals = opts?.principals;
+		if (principals && principals.length > 100) {
+			const rows = new Map<
+				string,
+				Awaited<ReturnType<KnowledgeReadStore["listKnowledgeAclGrantRows"]>>[number]
+			>();
+			for (let offset = 0; offset < principals.length; offset += 100) {
+				for (const row of await sqliteKnowledgeReadStore.listKnowledgeAclGrantRows(
+					{
+						...opts,
+						principals: principals.slice(offset, offset + 100),
+					},
+					options,
+				))
+					rows.set(row.id, row);
+			}
+			return [...rows.values()];
+		}
 		const principalClause =
 			principals && principals.length > 0
 				? or(
@@ -659,120 +800,165 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 						),
 					)
 				: undefined;
-		return db.query.aclGrants.findMany({
-			columns: GRANT_COLUMNS,
-			where: and(knowledgeGrantScopeWhere(), principalClause),
-		});
+		return readQuery(
+			db.query.aclGrants.findMany({
+				columns: GRANT_COLUMNS,
+				where: and(knowledgeGrantScopeWhere(), principalClause),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async getAclGrantById(grantId) {
-		const row = await db.query.aclGrants.findFirst({
-			columns: GRANT_COLUMNS,
-			where: eq(aclGrants.id, grantId),
-		});
+	async getAclGrantById(grantId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.aclGrants.findMany({
+				limit: 1,
+				columns: GRANT_COLUMNS,
+				where: eq(aclGrants.id, grantId),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row ?? null;
 	},
 
-	async findEntryLink(input) {
-		const row = await db.query.knowledgeEntryLinks.findFirst({
-			where: and(
-				eq(knowledgeEntryLinks.fromEntryId, input.fromEntryId),
-				eq(knowledgeEntryLinks.toEntryId, input.toEntryId),
-				eq(knowledgeEntryLinks.linkType, input.linkType as never),
-			),
-		});
+	async findEntryLink(input, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeEntryLinks.findMany({
+				limit: 1,
+				where: and(
+					eq(knowledgeEntryLinks.fromEntryId, input.fromEntryId),
+					eq(knowledgeEntryLinks.toEntryId, input.toEntryId),
+					eq(knowledgeEntryLinks.linkType, input.linkType as never),
+				),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return (row as KnowledgeEntryLinkRow | undefined) ?? null;
 	},
 
-	async getEntryLinkById(linkId) {
-		const row = await db.query.knowledgeEntryLinks.findFirst({
-			where: eq(knowledgeEntryLinks.id, linkId),
-		});
+	async getEntryLinkById(linkId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeEntryLinks.findMany({
+				limit: 1,
+				where: eq(knowledgeEntryLinks.id, linkId),
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return (row as KnowledgeEntryLinkRow | undefined) ?? null;
 	},
 
-	async listEntryLinks(entryId, direction) {
-		const rows = await db.query.knowledgeEntryLinks.findMany({
-			where:
-				direction === "out"
-					? eq(knowledgeEntryLinks.fromEntryId, entryId)
-					: direction === "in"
-						? eq(knowledgeEntryLinks.toEntryId, entryId)
-						: or(
-								eq(knowledgeEntryLinks.fromEntryId, entryId),
-								eq(knowledgeEntryLinks.toEntryId, entryId),
-							),
-			orderBy: (l, { desc: d }) => [d(l.createdAt)],
-		});
+	async listEntryLinks(entryId, direction, options = {}) {
+		const rows = await readQuery(
+			db.query.knowledgeEntryLinks.findMany({
+				where:
+					direction === "out"
+						? eq(knowledgeEntryLinks.fromEntryId, entryId)
+						: direction === "in"
+							? eq(knowledgeEntryLinks.toEntryId, entryId)
+							: or(
+									eq(knowledgeEntryLinks.fromEntryId, entryId),
+									eq(knowledgeEntryLinks.toEntryId, entryId),
+								),
+				orderBy: (l, { desc: d }) => [d(l.createdAt)],
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows as KnowledgeEntryLinkRow[];
 	},
 
-	async listEntryLinksTouching(entryIds, limit) {
+	async listEntryLinksTouching(entryIds, limit, options = {}) {
 		if (entryIds.length === 0) return [];
-		const rows = await db.query.knowledgeEntryLinks.findMany({
-			where: or(
-				inArray(knowledgeEntryLinks.fromEntryId, entryIds),
-				inArray(knowledgeEntryLinks.toEntryId, entryIds),
-			),
-			limit,
-		});
+		const rows = await readQuery(
+			db.query.knowledgeEntryLinks.findMany({
+				where: or(
+					inArray(
+						knowledgeEntryLinks.fromEntryId,
+						sql`(select value from json_each(${JSON.stringify(entryIds)}))`,
+					),
+					inArray(
+						knowledgeEntryLinks.toEntryId,
+						sql`(select value from json_each(${JSON.stringify(entryIds)}))`,
+					),
+				),
+				limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows as KnowledgeEntryLinkRow[];
 	},
 
-	async getSubmissionRoutingById(submissionId) {
-		const row = await db.query.knowledgeSubmissions.findFirst({
-			where: eq(knowledgeSubmissions.id, submissionId),
-			columns: {
-				id: true,
-				entryId: true,
-				collectionId: true,
-				submitterUserId: true,
-				status: true,
-			},
-		});
+	async getSubmissionRoutingById(submissionId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeSubmissions.findMany({
+				limit: 1,
+				where: eq(knowledgeSubmissions.id, submissionId),
+				columns: {
+					id: true,
+					entryId: true,
+					collectionId: true,
+					submitterUserId: true,
+					status: true,
+				},
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return (row as KnowledgeSubmissionRoutingRow | undefined) ?? null;
 	},
 
-	async listActiveDraftHolderIds(entryId, limit) {
-		return db.query.knowledgeDrafts.findMany({
-			where: and(
-				eq(knowledgeDrafts.entryId, entryId),
-				inArray(knowledgeDrafts.status, ["active"]),
-				isNotNull(knowledgeDrafts.baseRevisionId),
-			),
-			columns: { authorUserId: true },
-			limit,
-		});
+	async listActiveDraftHolderIds(entryId, limit, options = {}) {
+		return readQuery(
+			db.query.knowledgeDrafts.findMany({
+				where: and(
+					eq(knowledgeDrafts.entryId, entryId),
+					inArray(knowledgeDrafts.status, ["active"]),
+					isNotNull(knowledgeDrafts.baseRevisionId),
+				),
+				columns: { authorUserId: true },
+				limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async findActivePersonalEntryId(entryId, authorUserId) {
-		const row = await db.query.knowledgeDrafts.findFirst({
-			where: and(
-				eq(knowledgeDrafts.entryId, entryId),
-				eq(knowledgeDrafts.authorUserId, authorUserId),
-				eq(knowledgeDrafts.status, "active"),
-			),
-			columns: { id: true },
-		});
+	async findActivePersonalEntryId(entryId, authorUserId, options = {}) {
+		const row = await readQueryFirst(
+			db.query.knowledgeDrafts.findMany({
+				limit: 1,
+				where: and(
+					eq(knowledgeDrafts.entryId, entryId),
+					eq(knowledgeDrafts.authorUserId, authorUserId),
+					eq(knowledgeDrafts.status, "active"),
+				),
+				columns: { id: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return row?.id ?? null;
 	},
 
-	async listActivePersonalEntriesForEntries(entryIds, authorUserId) {
+	async listActivePersonalEntriesForEntries(entryIds, authorUserId, options = {}) {
+		if (entryIds.length > 100)
+			return readKnowledgeIds(entryIds, (ids) =>
+				sqliteKnowledgeReadStore.listActivePersonalEntriesForEntries(ids, authorUserId, options),
+			);
 		if (entryIds.length === 0) return [];
-		const rows = await db.query.knowledgeDrafts.findMany({
-			where: and(
-				inArray(knowledgeDrafts.entryId, entryIds),
-				eq(knowledgeDrafts.authorUserId, authorUserId),
-				eq(knowledgeDrafts.status, "active"),
-			),
-			columns: { id: true, entryId: true, baseRevisionId: true },
-		});
+		const rows = await readQuery(
+			db.query.knowledgeDrafts.findMany({
+				where: and(
+					inArray(knowledgeDrafts.entryId, entryIds),
+					eq(knowledgeDrafts.authorUserId, authorUserId),
+					eq(knowledgeDrafts.status, "active"),
+				),
+				columns: { id: true, entryId: true, baseRevisionId: true },
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows.flatMap((r) =>
 			r.entryId ? [{ id: r.id, entryId: r.entryId, baseRevisionId: r.baseRevisionId }] : [],
 		);
 	},
 
-	async listKnowledgeAclEventRows(opts) {
+	async listKnowledgeAclEventRows(opts, options = {}) {
 		const conds = [like(aclEvents.scopeType, "knowledge%")];
 		if (opts.eventType) conds.push(eq(aclEvents.eventType, opts.eventType));
 		if (opts.subjectId) conds.push(eq(aclEvents.subjectId, opts.subjectId));
@@ -788,130 +974,171 @@ export const sqliteKnowledgeReadStore: KnowledgeReadStore = {
 				) as never,
 			);
 		}
-		const rows = await db.query.aclEvents.findMany({
-			where: and(...conds),
-			orderBy: (e, { desc: d }) => [d(e.createdAt), d(e.id)],
-			limit: opts.limit,
-		});
+		const rows = await readQuery(
+			db.query.aclEvents.findMany({
+				where: and(...conds),
+				orderBy: (e, { desc: d }) => [d(e.createdAt), d(e.id)],
+				limit: opts.limit,
+			}),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows as AclEventReadRow[];
 	},
 
-	async listPersonalKeywordInjectionCandidates(opts) {
-		return db
-			.select({
-				id: knowledgeDrafts.id,
-				collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`,
-				title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`,
-				currentRevisionId: sql<null>`null`,
-				tagsJson: sql<null>`null`,
-				keywordsJson: knowledgeDrafts.keywordsJson,
-				updatedAt: knowledgeDrafts.updatedAt,
-			})
-			.from(knowledgeDrafts)
-			.where(personalInjectionWhere(opts))
-			.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
-			.limit(opts.limit);
+	async listPersonalKeywordInjectionCandidates(opts, options = {}) {
+		return readKnowledgePages(
+			opts.limit,
+			100,
+			(offset, pageSize) =>
+				db
+					.select({
+						id: knowledgeDrafts.id,
+						collectionId: sql<string>`coalesce(${knowledgeDrafts.targetCollectionId}, '')`.as(
+							"collection_id",
+						),
+						title: sql<string>`coalesce(${knowledgeDrafts.title}, '')`.as("title"),
+						// Worker column metadata needs distinct names for both NULL projections.
+						currentRevisionId: sql<null>`null`.as("current_revision_id"),
+						tagsJson: sql<null>`null`.as("tags_json"),
+						keywordsJson: knowledgeDrafts.keywordsJson,
+						updatedAt: knowledgeDrafts.updatedAt,
+					})
+					.from(knowledgeDrafts)
+					.where(personalInjectionWhere(opts))
+					.orderBy(desc(knowledgeDrafts.updatedAt), knowledgeDrafts.id)
+					.limit(pageSize)
+					.offset(offset),
+			options,
+		);
 	},
-	async personalKeywordInjectionSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
-			})
-			.from(knowledgeDrafts)
-			.where(personalInjectionWhere(opts));
-		return `${Number(rows[0]?.cnt ?? 0)}:${rows[0]?.maxUpdated ?? ""}`;
+	async personalKeywordInjectionSignature(opts, options = {}) {
+		const row = await readQueryFirst(
+			db
+				.select({
+					cnt: sql<number>`count(*)`,
+					maxUpdated: sql<string>`coalesce(max(${knowledgeDrafts.updatedAt}), '')`,
+				})
+				.from(knowledgeDrafts)
+				.where(personalInjectionWhere(opts)),
+			{
+				...options,
+				...signatureReadOptions,
+				executionPolicy: "worker-required",
+				signal: opts.signal ?? options.signal,
+			},
+		);
+		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},
-	async personalInjectionSnippets(userId, ids, maxChars) {
+	async personalInjectionSnippets(userId, ids, maxChars, options = {}) {
 		if (!ids.length) return [];
-		return db
-			.select({
-				id: knowledgeDrafts.id,
-				snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, ${maxChars})`,
-			})
-			.from(knowledgeDrafts)
-			.where(
-				and(
-					eq(knowledgeDrafts.authorUserId, userId),
-					eq(knowledgeDrafts.status, "active"),
-					isNull(knowledgeDrafts.entryId),
-					inArray(knowledgeDrafts.id, ids),
+		return readQuery(
+			db
+				.select({
+					id: knowledgeDrafts.id,
+					snippet: sql<string>`substr(${knowledgeDrafts.content}, 1, ${maxChars})`,
+				})
+				.from(knowledgeDrafts)
+				.where(
+					and(
+						eq(knowledgeDrafts.authorUserId, userId),
+						eq(knowledgeDrafts.status, "active"),
+						isNull(knowledgeDrafts.entryId),
+						inArray(knowledgeDrafts.id, ids),
+					),
 				),
-			);
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listKeywordInjectionCandidates(opts) {
-		const rows = await db
-			.select({
-				id: knowledgeEntries.id,
-				collectionId: knowledgeEntries.collectionId,
-				title: knowledgeEntries.title,
-				currentRevisionId: knowledgeEntries.currentRevisionId,
-				tagsJson: knowledgeEntries.tagsJson,
-				keywordsJson: knowledgeEntries.keywordsJson,
-				updatedAt: knowledgeEntries.updatedAt,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			)
-			.orderBy(desc(knowledgeEntries.updatedAt))
-			.limit(opts.limit);
+	async listKeywordInjectionCandidates(opts, options = {}) {
+		const rows = await readKnowledgePages(
+			opts.limit,
+			100,
+			(offset, pageSize) =>
+				db
+					.select({
+						id: knowledgeEntries.id,
+						collectionId: knowledgeEntries.collectionId,
+						title: knowledgeEntries.title,
+						currentRevisionId: knowledgeEntries.currentRevisionId,
+						tagsJson: knowledgeEntries.tagsJson,
+						keywordsJson: knowledgeEntries.keywordsJson,
+						updatedAt: knowledgeEntries.updatedAt,
+					})
+					.from(knowledgeEntries)
+					.where(
+						and(
+							eq(knowledgeEntries.status, "active"),
+							isNotNull(knowledgeEntries.currentKeywords),
+							opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+							projectScopeClause(opts.projectId),
+						),
+					)
+					.orderBy(desc(knowledgeEntries.updatedAt), asc(knowledgeEntries.id))
+					.limit(pageSize)
+					.offset(offset),
+			options,
+		);
 		return rows as KeywordInjectionCandidateRow[];
 	},
 
-	async keywordInjectionCandidatesSignature(opts) {
-		const rows = await db
-			.select({
-				cnt: sql<number>`count(*)`,
-				maxUpdated: sql<string>`coalesce(max(${knowledgeEntries.updatedAt}), '')`,
-			})
-			.from(knowledgeEntries)
-			.where(
-				and(
-					eq(knowledgeEntries.status, "active"),
-					isNotNull(knowledgeEntries.currentKeywords),
-					opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-					projectScopeClause(opts.projectId),
-				),
-			);
-		const row = rows[0];
+	async keywordInjectionCandidatesSignature(opts, options = {}) {
+		const row = await readQueryFirst(keywordSignatureQuery(opts), {
+			...options,
+			...signatureReadOptions,
+			executionPolicy: "worker-required",
+			signal: opts.signal ?? options.signal,
+		});
 		return `${Number(row?.cnt ?? 0)}:${row?.maxUpdated ?? ""}`;
 	},
 
-	async snippetsByEntryIds(entryIds, maxChars) {
+	async snippetsByEntryIds(entryIds, maxChars, options = {}) {
 		if (entryIds.length === 0) return [];
-		return db
-			.select({
-				id: knowledgeEntries.id,
-				snippet: sql<
-					string | null
-				>`substr(coalesce(${knowledgeEntries.currentContent}, ${knowledgeEntries.title}), 1, ${maxChars})`,
-			})
-			.from(knowledgeEntries)
-			.where(inArray(knowledgeEntries.id, entryIds));
+		return readQuery(
+			db
+				.select({
+					id: knowledgeEntries.id,
+					snippet: sql<
+						string | null
+					>`substr(coalesce(${knowledgeEntries.currentContent}, ${knowledgeEntries.title}), 1, ${maxChars})`,
+				})
+				.from(knowledgeEntries)
+				.where(inArray(knowledgeEntries.id, entryIds)),
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	},
 
-	async listInjectedEntryIds(narratorId, compactSeq) {
-		const rows = await db
-			.select({
-				entryId: knowledgeInjectionEvents.entryId,
-				personalEntryId: knowledgeInjectionEvents.personalEntryId,
-			})
-			.from(knowledgeInjectionEvents)
-			.where(
-				and(
-					eq(knowledgeInjectionEvents.narratorId, narratorId),
-					eq(knowledgeInjectionEvents.compactSeq, compactSeq),
+	async listInjectedEntryIds(narratorId, compactSeq, options = {}) {
+		const rows = await readQuery(
+			db
+				.select({
+					entryId: knowledgeInjectionEvents.entryId,
+					personalEntryId: knowledgeInjectionEvents.personalEntryId,
+				})
+				.from(knowledgeInjectionEvents)
+				.where(
+					and(
+						eq(knowledgeInjectionEvents.narratorId, narratorId),
+						eq(knowledgeInjectionEvents.compactSeq, compactSeq),
+					),
 				),
-			);
+			{ ...options, executionPolicy: "worker-required" },
+		);
 		return rows.map((row) =>
 			row.personalEntryId ? `personal:${row.personalEntryId}` : `global:${row.entryId}`,
 		);
 	},
+};
+
+export const sqliteKnowledgeInjectionReads = {
+	listKeywordInjectionCandidates: (
+		...args: Parameters<KnowledgeReadStore["listKeywordInjectionCandidates"]>
+	) => sqliteKnowledgeReadStore.listKeywordInjectionCandidates(...args),
+	keywordInjectionCandidatesSignature: (
+		...args: Parameters<KnowledgeReadStore["keywordInjectionCandidatesSignature"]>
+	) => sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature(...args),
+	snippetsByEntryIds: (...args: Parameters<KnowledgeReadStore["snippetsByEntryIds"]>) =>
+		sqliteKnowledgeReadStore.snippetsByEntryIds(...args),
+	listInjectedEntryIds: (...args: Parameters<KnowledgeReadStore["listInjectedEntryIds"]>) =>
+		sqliteKnowledgeReadStore.listInjectedEntryIds(...args),
 };

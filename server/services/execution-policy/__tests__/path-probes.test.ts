@@ -127,11 +127,23 @@ function seededEngine(rules: LegacyExecutionPolicyRuleSet) {
 		engine as unknown as {
 			loadedCache: Map<
 				string,
-				{ settingsRevision: number; promise: Promise<LoadedExecutionPolicy> }
+				{
+					settingsRevision: number;
+					promise: Promise<LoadedExecutionPolicy>;
+					controller: AbortController;
+					waiters: number;
+					settled: boolean;
+				}
 			>;
 		}
 	).loadedCache;
-	cache.set(policy.narratorId, { settingsRevision, promise: Promise.resolve(policy) });
+	cache.set(policy.narratorId, {
+		settingsRevision,
+		promise: Promise.resolve(policy),
+		controller: new AbortController(),
+		waiters: 0,
+		settled: true,
+	});
 	return { engine, narratorId: policy.narratorId };
 }
 

@@ -22,18 +22,22 @@
  */
 
 import type { SubagentToolCallHeader } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	handoffStreamingEditOrigin,
 	type StreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
-import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import {
+	normalizeSubagentToolInputSummary,
+	type SubagentToolInputSummary,
+} from "@shared/subagent-tool-summary";
 import {
 	type LivePatch,
 	patchReflection,
 	patchSendDeliveryTargets,
-	patchSubagentActivity,
 	patchSubagentTakeover,
 	patchToolCallFields,
+	type SubagentActivityUpdate,
 } from "./vlist-live-patch";
 
 /** The four reflection families, each with its own suggestion `type` tag. */
@@ -115,6 +119,10 @@ export function toolCompletedPatch(opts: {
 		...(opts.durationMs != null ? { durationMs: opts.durationMs } : {}),
 		...(opts.updatedInput ? { inputJson: opts.updatedInput } : {}),
 		...(opts.metadata ? { _metadata: opts.metadata } : {}),
+		// The live body written by `patchToolLiveOutput` while the call ran. A reloaded
+		// document never carries it, so the finished card must not either.
+		_streamingOutput: undefined,
+		_structuredProgress: undefined,
 	};
 	return (messages) => patchToolCallFields(messages, opts.toolUseId, fields, opts.blockId);
 }
@@ -281,55 +289,85 @@ export function backgroundTaskPatch(opts: {
  */
 export function subagentConclusionPatch(opts: {
 	toolUseId: string;
+	subagentNarratorId?: string;
 	output: unknown;
 	hasError: boolean;
 	completedAt?: string | number;
 	durationMs?: number;
 }): LivePatch {
-	return (messages) =>
-		patchToolCallFields(messages, opts.toolUseId, {
-			outputJson: opts.output,
-			status: opts.hasError ? "fail" : "success",
-			...(opts.completedAt != null ? { completedAt: opts.completedAt } : {}),
-			...(opts.durationMs != null ? { durationMs: opts.durationMs } : {}),
+	return (messages) => {
+		let changed = false;
+		const next = messages.map((message) => {
+			if (opts.subagentNarratorId) {
+				const block = messageBody(message).find(
+					(entry) => entry.type === "tool_use" && entry.id === opts.toolUseId,
+				);
+				const call = message.toolCalls?.find((entry) => entry.toolUseId === opts.toolUseId);
+				const owner =
+					block?._subagentActivity?.subagentNarratorId ??
+					call?._subagentActivity?.subagentNarratorId;
+				// Unknown ownership waits for the identity/checkpoint channel; a result
+				// from an older child must never finish its replacement's card.
+				if (owner !== opts.subagentNarratorId) return message;
+			}
+			const result = patchToolCallFields([message], opts.toolUseId, {
+				outputJson: opts.output,
+				status: opts.hasError ? "fail" : "success",
+				...(opts.completedAt != null ? { completedAt: opts.completedAt } : {}),
+				...(opts.durationMs != null ? { durationMs: opts.durationMs } : {}),
+			});
+			changed ||= result.changed;
+			return result.messages[0];
 		});
+		return { messages: changed ? next : messages, changed };
+	};
 }
 
 /**
  * A child tool event routed to the PARENT card's activity summary (the "recent
  * calls" rows). Mirrors useNarratorChunksWS.ts:1223-1237 / 1403-1411.
  */
-export function subagentActivityPatch(opts: {
+export function subagentActivityUpdate(opts: {
 	parentToolUseId: string;
 	toolUseId: string;
 	toolName: string;
 	status: string;
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	createdAt?: string | number | null;
 	timing?: SubagentToolCallHeader["timing"];
 	subagentNarratorId?: string | null;
 	model?: string | null;
 	reasoningEffort?: string | null;
 	inputSummary?: SubagentToolInputSummary | null;
-}): LivePatch {
+}): SubagentActivityUpdate {
 	const header: SubagentToolCallHeader = {
 		toolCallId: opts.toolCallId ?? null,
+		...(typeof opts.executionAttempt === "number" &&
+		Number.isSafeInteger(opts.executionAttempt) &&
+		opts.executionAttempt >= 0
+			? { executionAttempt: opts.executionAttempt }
+			: {}),
 		toolUseId: opts.toolUseId,
 		toolName: opts.toolName,
 		status: opts.status,
-		createdAt: opts.createdAt ?? opts.timing?.streamStartedAt ?? Date.now(),
+		createdAt: opts.createdAt ?? opts.timing?.streamStartedAt ?? null,
 		timing: opts.timing ?? null,
-		// Conditional for the same reason as the chunked path's twin: the upsert merges
-		// by spreading, so an explicit `undefined` would erase the label a previous
-		// event set. `tool_completed` sends no summary of its own.
-		...(opts.inputSummary ? { inputSummary: opts.inputSummary } : {}),
+		// Sparse lifecycle events keep the previous label. Snapshot chunks still pass
+		// through the same whitelist/cap as live frames before entering the reducer.
+		...(opts.inputSummary !== undefined
+			? { inputSummary: normalizeSubagentToolInputSummary(opts.inputSummary) }
+			: {}),
 	};
-	return (messages) =>
-		patchSubagentActivity(messages, opts.parentToolUseId, header, {
+	return {
+		parentToolUseId: opts.parentToolUseId,
+		header,
+		meta: {
 			...(opts.subagentNarratorId != null ? { subagentNarratorId: opts.subagentNarratorId } : {}),
 			...(opts.model != null ? { model: opts.model } : {}),
 			...(opts.reasoningEffort != null ? { reasoningEffort: opts.reasoningEffort } : {}),
-		});
+		},
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

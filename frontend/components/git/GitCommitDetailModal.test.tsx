@@ -576,8 +576,11 @@ describe("Git commit preview with real query observers", () => {
 		await queryClient.refetchQueries({ queryKey: ["gitCommitDetail", TARGET.workspaceKey, SHA_A] });
 		await waitFor(() => bodyText().includes(`Detail denied ${status}`), "detail failure");
 		expect(details).toHaveBeenCalledTimes(2);
-		// Prove this is a stale-data error, not just an initial-load failure.
-		expect(queryClient.getQueriesData({ queryKey: ["gitCommitDetail"] })[0]?.[1]).toEqual(detail());
+		expect(
+			queryClient
+				.getQueriesData({ queryKey: ["gitCommitDetail"] })
+				.every(([, data]) => data === undefined),
+		).toBe(true);
 		expect(
 			document.body.querySelector("[data-commit-message], [data-commit-file], [data-diff-row]"),
 		).toBeNull();
@@ -601,7 +604,11 @@ describe("Git commit preview with real query observers", () => {
 		await waitFor(() => bodyText().includes("CACHED_PRIVATE_PATCH"), "initial patch");
 		await queryClient.refetchQueries({ queryKey: ["gitCommitDiff", TARGET.workspaceKey, SHA_A] });
 		await waitFor(() => bodyText().includes(`Patch denied ${status}`), "patch failure");
-		expect(queryClient.getQueriesData({ queryKey: ["gitCommitDiff"] })[0]?.[1]).toEqual(cached);
+		expect(
+			queryClient
+				.getQueriesData({ queryKey: ["gitCommitDiff"] })
+				.every(([, data]) => data === undefined),
+		).toBe(true);
 		expect(bodyText()).not.toContain("CACHED_PRIVATE_PATCH");
 		expect(document.body.querySelector("[data-diff-row], [data-git-patch-metadata]")).toBeNull();
 	});
@@ -646,7 +653,9 @@ describe("Git commit preview with real query observers", () => {
 			.mockResolvedValueOnce(workspace())
 			.mockReturnValueOnce(nextWorkspace.promise);
 		const details = spyOn(api, "getGitCommitDetail")
-			.mockRejectedValueOnce(new ApiError("Workspace changed", 409))
+			.mockRejectedValueOnce(
+				new ApiError("Workspace changed", 409, { code: "GIT_WORKSPACE_CHANGED" }),
+			)
 			.mockResolvedValue(detail(SHA_A, { message: "NEW_WORKSPACE_DETAIL" }));
 		const reset = spyOn(queryClient, "resetQueries");
 		renderWorkspacePreview();

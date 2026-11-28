@@ -39,6 +39,8 @@ export interface ImageViewerProps {
 	embedded?: boolean;
 	onClose?: () => void;
 	onFullscreen?: () => void;
+	/** A plain click on the picture (not a pan) — e.g. open the enlarged view. */
+	onImageClick?: () => void;
 	onError?: React.ReactEventHandler<HTMLImageElement>;
 }
 
@@ -47,6 +49,7 @@ export function ImageViewer({
 	embedded = false,
 	onClose,
 	onFullscreen,
+	onImageClick,
 	onError,
 }: ImageViewerProps) {
 	const { t } = useTranslation("common");
@@ -105,6 +108,7 @@ export function ImageViewer({
 			onContextMenu={handleContextMenu}
 			enableRotateKey
 			closeOnBackdropClick={!embedded}
+			onContentActivate={onImageClick}
 			renderToolbarExtra={({ rotate }) => (
 				<>
 					<Tooltip label={t("imageViewer_rotateLeft")} withinPortal zIndex={PANZOOM_TOOLTIP_Z}>

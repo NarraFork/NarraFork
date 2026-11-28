@@ -36,6 +36,17 @@ export interface PretextDocumentLoadOptions {
 		messageId: string,
 		signal?: AbortSignal,
 	) => Promise<{ seq: number }>;
+	/** Host-owned canonical recovery (e.g. chat ACK + fixed seq interval). */
+	refreshWindow?: (args: {
+		narratorId: string;
+		window: PretextDocumentInput;
+		signal: AbortSignal;
+	}) => Promise<PretextDocumentInput>;
+	/** Synchronous final barrier projection after async preparation, immediately before commit. */
+	finalizeRefreshWindow?: (window: PretextDocumentInput) => PretextDocumentInput;
+	/** Never replace retained history with a tail after a temporary recovery failure. */
+	refreshFailurePolicy?: "retain";
+	onRefreshError?: (error: unknown) => void;
 	onProgress?: (loadedMessages: number) => void;
 	/** Explicit structural reloads supersede a pending transport, never a normal mount. */
 	forceTailReload?: boolean;
@@ -490,6 +501,7 @@ export async function loadPretextDocumentOlder(
 	previous: PretextDocumentInput,
 	options: PretextDocumentLoadOptions = {},
 ): Promise<PretextDocumentInput> {
+	if (options.signal?.aborted) throw abortTailError();
 	if (!previous.hasPrev || previous.oldestLoadedSeq == null) return previous;
 	const pageSize = resolvePageSize(options.pageSize);
 	const maxMessages = Math.max(1, Math.trunc(options.maxMessages ?? DEFAULT_MAX_MESSAGES));
@@ -497,7 +509,9 @@ export async function loadPretextDocumentOlder(
 	const page = await fetchPage(narratorId, {
 		beforeSeq: previous.oldestLoadedSeq,
 		limit: pageSize,
+		signal: options.signal,
 	});
+	if (options.signal?.aborted) throw abortTailError();
 	if (page.messages.length === 0) {
 		// The server has no older rows after all; close the upward window.
 		return { ...previous, hasPrev: false };

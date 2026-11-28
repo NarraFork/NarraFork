@@ -17,7 +17,7 @@
  * flow, before execution — so this file asserts scope, not ACL. That distinction is the reason
  * `all_narrators` requires approval in the first place.
  */
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -27,9 +27,17 @@ import {
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../../server/db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
+const { createSqliteSearchQueryExecutor } = await import(
+	"../../../server/services/search/sqlite-worker-runner"
+);
 const searchStore = createSqliteSearchStore(async (sql, params) =>
 	sqlite.prepare<Record<string, unknown>, Array<string | number | null>>(sql).all(...params),
 );
@@ -65,12 +73,15 @@ function seedMessage(params: {
 	text: string;
 	createdAt: string;
 	seq?: number;
+	role?: "user" | "assistant" | "system" | "sys" | "disp";
+	origin?: "user" | "assistant" | "system" | null;
 }) {
 	db.insert(narratorMessages)
 		.values({
 			id: params.id,
 			narratorId: params.ownerId,
-			role: "assistant",
+			role: params.role ?? "assistant",
+			origin: params.origin ?? null,
 			contentJson: [{ type: "text", text: params.text }],
 			contentText: params.text,
 			createdAt: params.createdAt,
@@ -92,12 +103,12 @@ function seedMessage(params: {
 async function recallSearch(
 	narratorId: string,
 	args: Record<string, unknown>,
+	signal = new AbortController().signal,
 ): Promise<{ ids: string[]; snippets: string[]; isError: boolean }> {
-	const result = await recallTool.execute(
-		{ action: "search", ...args },
-		// The loop supplies far more context; the search path reads only `narratorId`.
-		{ narratorId } as never,
-	);
+	const result = await recallTool.execute({ action: "search", ...args }, {
+		narratorId,
+		signal,
+	} as never);
 	const meta = result.metadata as { results?: Array<{ id: string; snippet: string }> } | undefined;
 	return {
 		ids: (meta?.results ?? []).map((r) => r.id),
@@ -126,6 +137,46 @@ afterEach(() => {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
+});
+
+describe("Recall search cancellation", () => {
+	it("propagates turn cancellation through the SQLite search executor and stops a batch", async () => {
+		const controller = new AbortController();
+		const runTask = mock(async (_path, _query, options: { signal?: AbortSignal }) => {
+			controller.abort();
+			options.signal?.throwIfAborted();
+			return { columns: [], rows: [] };
+		});
+		const workerStore = createSqliteSearchStore(
+			createSqliteSearchQueryExecutor("recall-test.db", { runTask }),
+		);
+		const search = spyOn(searchStore, "searchRecallMessages").mockImplementation(
+			workerStore.searchRecallMessages,
+		);
+		try {
+			await expect(
+				recallSearch("narr-self", { query: ["pomegranate", "quince"] }, controller.signal),
+			).rejects.toMatchObject({ code: "SEARCH_QUERY_CANCELLED" });
+			expect(runTask.mock.calls[0]?.[2].signal?.aborted).toBe(true);
+			expect(runTask).toHaveBeenCalledTimes(1);
+			expect(search).toHaveBeenCalledTimes(1);
+		} finally {
+			search.mockRestore();
+		}
+	});
+
+	it("does not dispatch a single query if the turn was already cancelled", async () => {
+		const reason = new Error("stopped");
+		const search = spyOn(searchStore, "searchRecallMessages");
+		try {
+			await expect(
+				recallSearch("narr-self", { query: "quince" }, AbortSignal.abort(reason)),
+			).rejects.toBe(reason);
+			expect(search).not.toHaveBeenCalled();
+		} finally {
+			search.mockRestore();
+		}
+	});
 });
 
 describe("Recall search scope", () => {
@@ -306,5 +357,90 @@ describe("Recall result presentation", () => {
 		const { ids, isError } = await recallSearch("narr-self", { query: "***" });
 		expect(ids).toEqual([]);
 		expect(isError).toBe(true);
+	});
+});
+
+describe("Recall agent-facing filtering and total budgets", () => {
+	for (const query of ["constraints", "要求"]) {
+		it(`filters protocol role and explicit human origin before limit for ${query}`, async () => {
+			for (const [index, origin] of ["assistant", "system", null, "user"].entries()) {
+				seedMessage({
+					id: `authorship-${index}`,
+					ownerId: "narr-self",
+					refFor: ["narr-self"],
+					text: `${query} from author ${index}`,
+					role: "user",
+					origin: origin as "assistant" | "system" | "user" | null,
+					createdAt: index === 3 ? EARLY : LATE,
+					seq: index,
+				});
+			}
+			seedMessage({
+				id: "assistant-repeats",
+				ownerId: "narr-self",
+				refFor: ["narr-self"],
+				text: `${query} repeated by assistant`,
+				role: "assistant",
+				origin: "user",
+				createdAt: LATE,
+				seq: 5,
+			});
+			expect(
+				(await recallSearch("narr-self", { query, roles: ["user"], origins: ["user"], limit: 1 }))
+					.ids,
+			).toEqual(["authorship-3"]);
+			expect(
+				(
+					await recallSearch("narr-self", {
+						query,
+						roles: ["user"],
+						origins: ["unknown"],
+						limit: 1,
+					})
+				).ids,
+			).toEqual(["authorship-2"]);
+		});
+	}
+
+	it("keeps a global permission grant narrowed to the explicit requested conversation", async () => {
+		for (const ownerId of ["narr-self", "narr-other"])
+			seedMessage({
+				id: ownerId,
+				ownerId,
+				refFor: [ownerId],
+				text: "scope request",
+				createdAt: EARLY,
+			});
+		expect(
+			(
+				await recallSearch("narr-self", {
+					query: "scope",
+					narrator_id: "narr-other",
+					all_narrators: true,
+				})
+			).ids,
+		).toEqual(["narr-other"]);
+		expect(
+			(await recallSearch("narr-self", { query: "scope", narrator_id: "narr-other" })).isError,
+		).toBe(true);
+	});
+
+	it("deduplicates alternatives under one total result limit and honours requested time order", async () => {
+		for (let seq = 0; seq < 4; seq++)
+			seedMessage({
+				id: `union-${seq}`,
+				ownerId: "narr-self",
+				refFor: ["narr-self"],
+				text: `alpha bravo requirements ${seq}`,
+				createdAt: seq < 2 ? EARLY : LATE,
+				seq,
+			});
+		const result = await recallSearch("narr-self", {
+			query: ["alpha", "bravo"],
+			limit: 2,
+			sort: "oldest",
+		});
+		expect(result.ids).toEqual(["union-0", "union-1"]);
+		expect(new Set(result.ids).size).toBe(2);
 	});
 });

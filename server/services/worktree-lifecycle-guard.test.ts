@@ -1,10 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
-import { normalizePathForComparison } from "../lib/platform-path";
+import { resolve } from "node:path";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import {
-	assertLifecycleProtectionCurrent,
 	assertWorkspaceAdmission,
 	canonicalWorkspaceAdmissionTarget,
+	confirmLifecyclePathRemoved,
 	createLifecycleGuard,
 	type LifecycleGuardPorts,
 	type ResourceClaim,
@@ -24,6 +25,25 @@ function fixture(claims: ResourceClaim[] = [], complete = true) {
 	return { ports, guard: createLifecycleGuard(ports) };
 }
 const target = { path: "/real/worktree" };
+
+function shadowIdentityFixture(claims: ResourceClaim[] = [], existing = false) {
+	const shadowTarget = {
+		deviceId: "local" as const,
+		path: "/fixture-home/.narrafork/tree-snapshots/new-shadow",
+	};
+	const identities = new Map([
+		["/", "fixture:root"],
+		["/fixture-home", "fixture:home"],
+		["/fixture-home/.narrafork", "fixture:private-root"],
+	]);
+	if (existing) identities.set(shadowTarget.path, "fixture:existing-shadow");
+	const ports: LifecycleGuardPorts = {
+		canonicalPath: async (path) => path.replace("/fixture-alias/", "/fixture-home/"),
+		pathIdentity: async (path) => identities.get(path) ?? null,
+		readClaims: async () => ({ claims, complete: true }),
+	};
+	return { ports, guard: createLifecycleGuard(ports), shadowTarget, identities };
+}
 
 function latch() {
 	let release!: () => void;
@@ -46,9 +66,6 @@ describe("explicit deletion effects and identity contexts", () => {
 				expect(await revalidateLifecycleTarget(target.path)).toBe(target.path);
 				await withWorkspaceAdmission(target, async () => undefined);
 				expect(() => assertWorkspaceAdmission({ path: "/real/worktree/child" })).not.toThrow();
-				await expect(
-					assertLifecycleProtectionCurrent([target], "identity is not deletion authority"),
-				).rejects.toBeInstanceOf(ResourceProtectionError);
 			}),
 		);
 		expect(readClaims).not.toHaveBeenCalled();
@@ -56,6 +73,8 @@ describe("explicit deletion effects and identity contexts", () => {
 	test("identity context cannot waive a subsequent real sink's claims", async () => {
 		const { ports } = fixture([{ kind: "registry", id: "independent", ...target }]);
 		ports.pathIdentity = async () => "device:inode";
+		const readClaims = mock(ports.readClaims);
+		ports.readClaims = readClaims;
 		const sink = mock(async () => undefined);
 		await withLifecycleGuardPorts(ports, () =>
 			withLifecycleContext([target.path], async () => {
@@ -65,6 +84,7 @@ describe("explicit deletion effects and identity contexts", () => {
 				expect(() => assertWorkspaceAdmission(target)).not.toThrow();
 			}),
 		);
+		expect(readClaims).toHaveBeenCalledTimes(1);
 		expect(sink).not.toHaveBeenCalled();
 	});
 	test("target-free context can publish a later real sink and block only that target", async () => {
@@ -76,13 +96,68 @@ describe("explicit deletion effects and identity contexts", () => {
 					await withProtectionReservation([target], "real sink", async () => {
 						expect(() => assertWorkspaceAdmission(target)).toThrow(ResourceProtectionError);
 						expect(() => assertWorkspaceAdmission({ path: "/real/sibling" })).not.toThrow();
-						await assertLifecycleProtectionCurrent([target], "real sink fallback");
+						await withProtectionReservation([target], "real sink fallback", async () => undefined);
 						return "removed";
 					}),
 				).toBe("removed");
 			}),
 		);
 		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+	});
+	test("a nested real sink rereads claims rather than inheriting prior deletion authority", async () => {
+		const claims: ResourceClaim[] = [];
+		const { ports } = fixture(claims);
+		ports.pathIdentity = async () => "device:inode";
+		const sink = mock(async () => undefined);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([target.path], () =>
+				withProtectionReservation([target], "entry", async () => {
+					claims.push({ kind: "registry", id: "late-independent-owner", ...target });
+					await expect(
+						withProtectionReservation([target], "real sink fallback", sink),
+					).rejects.toMatchObject({ inspection: { status: "protected" } });
+					expect(() => assertWorkspaceAdmission(target)).toThrow(ResourceProtectionError);
+				}),
+			),
+		);
+		expect(sink).not.toHaveBeenCalled();
+		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+	});
+	test("aborted identity context does not prepare paths or dispatch its body", async () => {
+		const { ports } = fixture();
+		const canonicalPath = mock(ports.canonicalPath);
+		ports.canonicalPath = canonicalPath;
+		const controller = new AbortController();
+		controller.abort();
+		const body = mock(async () => undefined);
+		await withLifecycleGuardPorts(ports, async () => {
+			await expect(
+				withLifecycleContext([target.path], body, controller.signal),
+			).rejects.toBeInstanceOf(ResourceProtectionError);
+		});
+		expect(canonicalPath).not.toHaveBeenCalled();
+		expect(body).not.toHaveBeenCalled();
+	});
+	test("nested identity context observes cancellation after preparation before body dispatch", async () => {
+		const { ports } = fixture();
+		const controller = new AbortController();
+		const nestedPath = "/real/sibling";
+		ports.canonicalPath = async (path) => {
+			if (path === nestedPath) controller.abort();
+			return path;
+		};
+		ports.pathIdentity = async () => "device:inode";
+		const body = mock(async () => undefined);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([target.path], async () => {
+				await expect(
+					withLifecycleContext([nestedPath], body, controller.signal),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+				expect(await revalidateLifecycleTarget(target.path)).toBe(target.path);
+				expect(() => assertWorkspaceAdmission(target)).not.toThrow();
+			}),
+		);
+		expect(body).not.toHaveBeenCalled();
 	});
 	test("identity contexts still reject inode replacement", async () => {
 		const { ports } = fixture();
@@ -94,6 +169,20 @@ describe("explicit deletion effects and identity contexts", () => {
 				await expect(revalidateLifecycleTarget(target.path)).rejects.toBeInstanceOf(
 					ResourceProtectionError,
 				);
+			}),
+		);
+	});
+	test("native footprint identities do not merge POSIX literal backslashes with separators", async () => {
+		const literal = resolve(
+			process.platform === "win32" ? "/real/literal-worktree" : "/real/literal\\worktree",
+		);
+		const nested = resolve("/real/literal/worktree");
+		const { ports } = fixture();
+		ports.pathIdentity = async (path) => (path === literal ? "device:literal" : "device:nested");
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([literal, nested], async () => {
+				expect(await revalidateLifecycleTarget(literal)).toBe(literal);
+				expect(await revalidateLifecycleTarget(nested)).toBe(nested);
 			}),
 		);
 	});
@@ -178,25 +267,55 @@ describe("explicit deletion effects and identity contexts", () => {
 });
 
 describe("canonical cwd spelling", () => {
-	test("Windows cwd keeps filesystem casing while ownership keys still ignore case", async () => {
-		const requested = "C:\\Users\\Alice\\MyProject";
+	test("local cwd keeps filesystem casing and uses native ownership identity", async () => {
+		const requested =
+			process.platform === "win32" ? "C:\\Users\\Alice\\MyProject" : "/Users/Alice/MyProject";
+		const key = localPathSemantics.identityKey(resolve(requested));
 		const ports: LifecycleGuardPorts = {
 			canonicalAdmissionPath: async () => requested,
-			canonicalPath: async (path) => path.replaceAll("\\", "/").toLowerCase(),
+			canonicalPath: async (path) => localPathSemantics.identityKey(resolve(path)),
 			readClaims: async () => ({
 				complete: true,
-				claims: [{ kind: "narrator", id: "owner", path: "c:/users/alice/myproject" }],
+				claims: [{ kind: "narrator", id: "owner", path: key }],
 			}),
 		};
 		const target = await withLifecycleGuardPorts(ports, () =>
 			canonicalWorkspaceAdmissionTarget({ deviceId: "local", path: requested }),
 		);
 		expect(target.canonicalCwd).toBe(requested);
-		expect(target.path).toBe(normalizePathForComparison(requested));
+		expect(target.path).toBe(key);
 		const guard = createLifecycleGuard(ports);
 		for (const path of [requested, requested.toUpperCase(), requested.toLowerCase()]) {
-			expect((await guard.inspect([{ path }], "delete")).status).toBe("protected");
+			expect((await guard.inspect([{ path }], "delete")).status).toBe(
+				path === requested || process.platform === "win32" ? "protected" : "clear",
+			);
 		}
+	});
+
+	test("native admission distinguishes POSIX literal backslashes from path separators", async () => {
+		const literal = resolve(
+			process.platform === "win32" ? "/real/literal-worktree" : "/real/literal\\worktree",
+		);
+		const nested = resolve("/real/literal/worktree");
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, async () => {
+			const admission = await canonicalWorkspaceAdmissionTarget({ path: literal });
+			expect(admission.canonicalCwd).toBe(literal);
+			expect(admission.path).toBe(localPathSemantics.identityKey(literal));
+			expect(admission.path).not.toBe(localPathSemantics.identityKey(nested));
+			await guard.withProtectionReservation(
+				[{ path: literal }],
+				"delete literal name",
+				async () => {
+					await expect(
+						withWorkspaceAdmission({ path: literal }, async () => undefined),
+					).rejects.toBeInstanceOf(ResourceProtectionError);
+					expect(await withWorkspaceAdmission({ path: nested }, async () => "independent")).toBe(
+						"independent",
+					);
+				},
+			);
+		});
 	});
 
 	test("remote cwd spelling is left untouched and does not probe local filesystem", async () => {
@@ -231,6 +350,7 @@ describe("read-only lifecycle protection", () => {
 	}
 	for (const [name, claim] of [
 		["nested child", { kind: "registry", id: "nested", path: "/real/worktree/child" }],
+		["dot-prefixed child", { kind: "registry", id: "dot-child", path: "/real/worktree/..cache" }],
 		["ancestor", { kind: "registry", id: "ancestor", path: "/real" }],
 		["canonical alias", { kind: "registry", id: "alias", path: "/alias/worktree" }],
 		["ordinary cwd", { kind: "narrator", id: "cwd", path: "/real/worktree/src" }],
@@ -277,6 +397,31 @@ describe("read-only lifecycle protection", () => {
 			"unavailable",
 		);
 	});
+	for (const path of [
+		"C:\\Work\\Project",
+		"\\\\server\\share\\Project",
+		"/Work/literal\\Project",
+	]) {
+		test(`remote shadow syntax is validated independently of the host: ${path}`, async () => {
+			const { ports } = fixture([
+				{ kind: "registry", id: "remote-shadow", deviceId: "remote", shadowKey: `remote\0${path}` },
+			]);
+			const canonicalPath = mock(ports.canonicalPath);
+			ports.canonicalPath = canonicalPath;
+			expect((await createLifecycleGuard(ports).inspect([target], "local delete")).status).toBe(
+				"clear",
+			);
+			expect(canonicalPath).not.toHaveBeenCalledWith(path);
+		});
+	}
+	for (const path of ["relative/project", "C:drive-relative", "\\drive-rooted"]) {
+		test(`ambiguous remote shadow syntax remains unverifiable: ${path}`, async () => {
+			const { guard } = fixture([
+				{ kind: "registry", id: "remote-shadow", deviceId: "remote", shadowKey: `remote\0${path}` },
+			]);
+			expect((await guard.inspect([target], "local delete")).status).toBe("unavailable");
+		});
+	}
 	for (const reason of ["truncated", "read error", "aborted", "over budget", "empty target"]) {
 		test(`${reason} never becomes complete ownership evidence`, async () => {
 			const { ports } = fixture([], reason !== "truncated");
@@ -300,53 +445,47 @@ describe("read-only lifecycle protection", () => {
 			expect(result).toMatchObject({ status: "unavailable", complete: false });
 		});
 	}
-	test("legacy migration gates deletion, not exclusive cold shadow creation", async () => {
-		const { ports } = fixture();
-		const includeLegacy: boolean[] = [];
-		ports.readClaims = async (_deadline, _signal, _targets, legacy = true) => {
-			includeLegacy.push(legacy);
-			return { complete: !legacy, claims: [] };
-		};
-		const guard = createLifecycleGuard(ports);
-		expect(
-			await guard.withShadowCreationReservation(
-				{ deviceId: "local", ...target },
-				async () => "created",
-			),
-		).toBe("created");
-		// A diagnostic label cannot grant creation policy to a normal inspection.
-		expect((await guard.inspect([target], "shadow initialization")).status).toBe("unavailable");
-		expect((await guard.inspect([target], "shadow destroy")).status).toBe("unavailable");
-		expect(includeLegacy).toEqual([false, true, true]);
+	test("operation labels cannot bypass incomplete legacy inventory", async () => {
+		const { guard } = fixture([], false);
+		const sink = mock(async () => undefined);
+		for (const operation of [
+			"shadow initialization",
+			"shadow initialization rollback",
+			"shadow destroy",
+		]) {
+			expect((await guard.inspect([target], operation)).status).toBe("unavailable");
+			await expect(
+				guard.withProtectionReservation([target], operation, sink),
+			).rejects.toMatchObject({ inspection: { status: "unavailable" } });
+		}
+		expect(sink).not.toHaveBeenCalled();
 	});
 
-	test("cold shadow initialization still refuses a direct physical owner", async () => {
+	test("real shadow deletion refuses direct physical owners", async () => {
 		const physical = treeSnapshotPhysicalDir("local", target.path);
 		for (const kind of ["narrator", "registry"] as const) {
-			const direct = fixture([{ kind, id: "direct-D-owner", path: physical }]);
+			const { guard } = fixture([{ kind, id: "direct-D-owner", path: physical }]);
+			const sink = mock(async () => undefined);
 			await expect(
-				direct.guard.withShadowCreationReservation(
-					{ deviceId: "local", path: physical },
-					async () => undefined,
+				guard.withProtectionReservation(
+					[{ deviceId: "local", path: physical }],
+					"shadow destroy",
+					sink,
 				),
 			).rejects.toMatchObject({ inspection: { status: "protected" } });
+			expect(sink).not.toHaveBeenCalled();
 		}
 	});
-	test("cold creation still refuses a live business reference", async () => {
-		const { ports } = fixture();
-		ports.readClaims = async (_deadline, _signal, _targets, legacy) => {
-			expect(legacy).toBe(false);
-			return {
-				complete: true,
-				claims: [{ kind: "registry", id: "independent", path: target.path }],
-			};
-		};
+	test("real shadow deletion refuses a live lineage reference without a cwd", async () => {
+		const physical = treeSnapshotPhysicalDir("local", target.path);
+		const { guard } = fixture([
+			{ kind: "registry", id: "independent", shadowKey: treeSnapshotKey("local", target.path) },
+		]);
+		const sink = mock(async () => undefined);
 		await expect(
-			createLifecycleGuard(ports).withShadowCreationReservation(
-				{ deviceId: "local", ...target },
-				async () => undefined,
-			),
+			guard.withProtectionReservation([{ path: physical }], "shadow destroy", sink),
 		).rejects.toMatchObject({ inspection: { status: "protected" } });
+		expect(sink).not.toHaveBeenCalled();
 	});
 
 	test("streamed references do not inherit a global historical byte cap", async () => {
@@ -414,6 +553,202 @@ describe("read-only lifecycle protection", () => {
 	});
 });
 
+describe("shadow publication identity and retirement claims", () => {
+	for (const ancestor of ["/", "/fixture-home", "/fixture-home/.narrafork"]) {
+		test(`ordinary cwd ancestor ${ancestor} permits shared checkout identity use`, async () => {
+			const { ports, shadowTarget } = shadowIdentityFixture([
+				{ kind: "narrator", id: "ordinary-cwd", path: ancestor, state: "idle" },
+			]);
+			const readClaims = mock(ports.readClaims);
+			ports.readClaims = readClaims;
+			await withLifecycleGuardPorts(ports, () =>
+				withLifecycleContext([shadowTarget.path], async () => {
+					expect(await revalidateLifecycleTarget(shadowTarget.path)).toBe(shadowTarget.path);
+				}),
+			);
+			expect(readClaims).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const suffix of ["", "/descendant"]) {
+		test(`an exact or descendant claim ${suffix || "exact"} protects shadow retirement`, async () => {
+			const { guard, shadowTarget } = shadowIdentityFixture([
+				{
+					kind: "narrator",
+					id: "independent-target",
+					path: `/fixture-home/.narrafork/tree-snapshots/new-shadow${suffix}`,
+				},
+			]);
+			const remove = mock(async () => undefined);
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", remove),
+			).rejects.toMatchObject({
+				inspection: { status: "protected", claims: [{ id: "independent-target" }] },
+			});
+			expect(remove).not.toHaveBeenCalled();
+		});
+	}
+
+	for (const claim of [
+		{ kind: "registry", id: "registry-ancestor" },
+		{ kind: "receipt", id: "receipt-ancestor" },
+		{ kind: "narrator", id: "repository-cwd", repositoryKey: "repository" },
+		{ kind: "narrator", id: "shadow-cwd", shadowKey: treeSnapshotKey("local", "/source") },
+		{ kind: "narrator", id: "scoped-cwd", scopeProjectId: "project" },
+	] satisfies Array<Omit<ResourceClaim, "path">>) {
+		test(`${claim.id} protects a missing shadow destination`, async () => {
+			const { guard, shadowTarget } = shadowIdentityFixture([{ ...claim, path: "/fixture-home" }]);
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected", claims: [{ id: claim.id }] } });
+		});
+	}
+
+	test("canonical ancestor aliases protect retirement while remote paths stay remote", async () => {
+		const { ports, guard, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "remote-exact", deviceId: "remote", path: "/fixture-home" },
+			{ kind: "narrator", id: "canonical-ancestor", path: "/fixture-alias/.narrafork" },
+		]);
+		const canonical = ports.canonicalPath;
+		ports.canonicalPath = async (path) => {
+			if (path === "/fixture-home") throw new Error("remote path must not be canonicalized");
+			return canonical(path);
+		};
+		await expect(
+			guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+		).rejects.toMatchObject({
+			inspection: { status: "protected", claims: [{ id: "canonical-ancestor" }] },
+		});
+	});
+
+	test("a missing identity port preserves ancestor retirement protection", async () => {
+		const { ports, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		delete ports.pathIdentity;
+		await expect(
+			createLifecycleGuard(ports).withProtectionReservation(
+				[shadowTarget],
+				"shadow retirement",
+				async () => undefined,
+			),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("a dangling raw alias retains protection at its canonical destination", async () => {
+		const { ports, shadowTarget, identities } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		identities.set(shadowTarget.path, "fixture:dangling-link");
+		const canonical = ports.canonicalPath;
+		ports.canonicalPath = async (path) =>
+			path === shadowTarget.path
+				? "/fixture-home/.narrafork/tree-snapshots/missing-link-target"
+				: canonical(path);
+		await expect(
+			createLifecycleGuard(ports).withProtectionReservation(
+				[shadowTarget],
+				"shadow retirement",
+				async () => undefined,
+			),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("an existing shadow retains ancestor protection", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture(
+			[{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" }],
+			true,
+		);
+		await expect(
+			guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+		).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+
+	test("a prepared private stage retains its frozen inode", async () => {
+		const { ports, shadowTarget, identities } = shadowIdentityFixture([], true);
+		await withLifecycleGuardPorts(ports, () =>
+			withLifecycleContext([shadowTarget.path], async () => {
+				expect(await revalidateLifecycleTarget(shadowTarget.path)).toBe(shadowTarget.path);
+				identities.set(shadowTarget.path, "fixture:replacement");
+				await expect(revalidateLifecycleTarget(shadowTarget.path)).rejects.toMatchObject({
+					inspection: { status: "unavailable" },
+				});
+			}),
+		);
+	});
+
+	test("a recreated path cannot inherit the removed target's identity", async () => {
+		const { ports, guard, shadowTarget, identities } = shadowIdentityFixture([], true);
+		await withLifecycleGuardPorts(ports, () =>
+			guard.withProtectionReservation([shadowTarget], "existing target removal", async () => {
+				identities.delete(shadowTarget.path);
+				await confirmLifecyclePathRemoved(shadowTarget.path);
+				identities.set(shadowTarget.path, "fixture:recreated-shadow");
+				for (const path of [
+					shadowTarget.path,
+					shadowTarget.path.replace("/fixture-home/", "/fixture-alias/"),
+				])
+					await expect(revalidateLifecycleTarget(path)).rejects.toMatchObject({
+						inspection: { status: "unavailable" },
+					});
+			}),
+		);
+	});
+
+	for (const replacement of ["parent inode", "target symlink", "unconfirmed target inode"]) {
+		test(`${replacement} replacement during claim reads fails closed`, async () => {
+			const { ports, shadowTarget, identities } = shadowIdentityFixture();
+			ports.readClaims = async () => {
+				if (replacement === "parent inode")
+					identities.set("/fixture-home/.narrafork", "fixture:replacement-parent");
+				else if (replacement === "target symlink") ports.canonicalPath = async () => "/redirected";
+				else identities.set(shadowTarget.path, "fixture:unconfirmed-birth");
+				return { complete: true, claims: [] };
+			};
+			await expect(
+				createLifecycleGuard(ports).withProtectionReservation(
+					[shadowTarget],
+					"shadow retirement",
+					async () => undefined,
+				),
+			).rejects.toMatchObject({ inspection: { status: "unavailable" } });
+		});
+	}
+
+	test("an independent conflicting reservation protects its descendant shadow", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture();
+		const entered = latch();
+		const finish = latch();
+		const retirement = guard.withProtectionReservation(
+			[{ path: "/fixture-home" }],
+			"independent parent retirement",
+			async () => {
+				entered.release();
+				await finish.promise;
+			},
+		);
+		await entered.promise;
+		try {
+			await expect(
+				guard.withProtectionReservation([shadowTarget], "shadow retirement", async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected" } });
+		} finally {
+			finish.release();
+			await retirement;
+		}
+	});
+
+	test("the same ancestor protects deletion and rollback", async () => {
+		const { guard, shadowTarget } = shadowIdentityFixture([
+			{ kind: "narrator", id: "ordinary-ancestor", path: "/fixture-home" },
+		]);
+		for (const operation of ["shadow destroy", "shadow initialization rollback"])
+			await expect(
+				guard.withProtectionReservation([shadowTarget], operation, async () => undefined),
+			).rejects.toMatchObject({ inspection: { status: "protected" } });
+	});
+});
+
 describe("Git-root compatibility requires positive identity proof", () => {
 	test("repo-root cwd does not own a distinct linked child worktree", async () => {
 		const { ports } = fixture([{ kind: "narrator", id: "root-session", path: "/real" }]);
@@ -456,6 +791,25 @@ test("cwd ordinary subdirectory is not an exact Git root and cannot waive its ch
 });
 
 describe("same-process reservation and workspace admission", () => {
+	test("dot-prefixed children remain contained for both retirement and in-flight admission", async () => {
+		const { ports, guard } = fixture();
+		const child = { path: `${target.path}/..cache/nested` };
+		const sink = mock(async () => undefined);
+		await withLifecycleGuardPorts(ports, async () => {
+			await guard.withProtectionReservation([target], "retire parent", async () => {
+				await expect(withWorkspaceAdmission(child, sink)).rejects.toBeInstanceOf(
+					ResourceProtectionError,
+				);
+				await withWorkspaceAdmission({ path: "/real/sibling" }, async () => undefined);
+			});
+			await withWorkspaceAdmission(child, async () => {
+				await expect(
+					guard.withProtectionReservation([target], "retire parent", sink),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+			});
+		});
+		expect(sink).not.toHaveBeenCalled();
+	});
 	test("retiring a child checkout permits a new parent cwd but still rejects exact or nested references", async () => {
 		const { ports, guard } = fixture();
 		await withLifecycleGuardPorts(ports, () =>
@@ -539,7 +893,7 @@ describe("same-process reservation and workspace admission", () => {
 		expect(() => assertWorkspaceAdmission(target)).not.toThrow();
 	}, 6000);
 	test("late registry/switch commit is rejected until retirement releases; retry succeeds", async () => {
-		const { guard } = fixture();
+		const { ports, guard } = fixture();
 		let enter!: () => void;
 		let release!: () => void;
 		const entered = new Promise<void>((resolve) => {
@@ -558,26 +912,28 @@ describe("same-process reservation and workspace admission", () => {
 			expect(() => assertWorkspaceAdmission({ path: "/real/worktree/nested" })).toThrow(
 				ResourceProtectionError,
 			);
-			await expect(withWorkspaceAdmission(target, register)).rejects.toBeInstanceOf(
-				ResourceProtectionError,
-			);
+			await expect(
+				withLifecycleGuardPorts(ports, () => withWorkspaceAdmission(target, register)),
+			).rejects.toBeInstanceOf(ResourceProtectionError);
 			expect(register).toHaveBeenCalledTimes(0);
 		} finally {
 			release();
 			await retirement;
 		}
-		await withWorkspaceAdmission(target, register);
+		await withLifecycleGuardPorts(ports, () => withWorkspaceAdmission(target, register));
 		expect(register).toHaveBeenCalledTimes(1);
 	});
 	test("claim commit in flight blocks retirement before durable registration exists", async () => {
-		const { guard } = fixture();
-		await withWorkspaceAdmission(target, async () => {
-			const destroy = mock(async () => undefined);
-			await expect(
-				guard.withProtectionReservation([target], "retire", destroy),
-			).rejects.toBeInstanceOf(ResourceProtectionError);
-			expect(destroy).toHaveBeenCalledTimes(0);
-		});
+		const { ports, guard } = fixture();
+		await withLifecycleGuardPorts(ports, () =>
+			withWorkspaceAdmission(target, async () => {
+				const destroy = mock(async () => undefined);
+				await expect(
+					guard.withProtectionReservation([target], "retire", destroy),
+				).rejects.toBeInstanceOf(ResourceProtectionError);
+				expect(destroy).toHaveBeenCalledTimes(0);
+			}),
+		);
 	});
 	test("nested sink reuses reservation without reentrant mutex deadlock", async () => {
 		const { guard } = fixture();

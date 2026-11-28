@@ -32,17 +32,21 @@
  * operations of the port and nothing else, because inventing a repository layer to
  * illustrate a slice would be a worse outcome than the slice itself.
  *
- * ISOLATION: the SQLite backend runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the SQLite backend runs on a disposable file/WAL database, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { registrationCodes, userPreferences, users } from "../../../db/schema";
 import { AppError } from "../../../lib/errors";
 import { generateId } from "../../../lib/id";
+import {
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "../../__tests__/narrator-worker-fixture";
 import type {
 	RegistrationAccountDraft,
 	RegistrationAccountStore,
@@ -53,7 +57,9 @@ import {
 	type InvitationState,
 } from "../../registration/invitation-rules";
 
-const { db, sqlite } = getTestDb();
+const dbFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = dbFixture;
+await dbFixture.ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
@@ -262,9 +268,10 @@ function draftFor(overrides: Partial<RegistrationAccountDraft> = {}): Registrati
 	};
 }
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
+	await dbFixture.close();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,7 +311,9 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 		test("an unknown invitation is rejected and creates nothing", async () => {
 			const draft = draftFor({ invitationCode: "definitely-not-issued" });
 
-			await expect(backend.store.createAccount(draft)).rejects.toThrow("Invalid registration code");
+			expect(await captureWorkerRejectionThrower(backend.store.createAccount(draft))).toThrow(
+				"Invalid registration code",
+			);
 			expect(await backend.accountIds()).toEqual([]);
 		});
 
@@ -312,9 +321,11 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 			const code = await backend.issue();
 			const first = await backend.store.createAccount(draftFor({ invitationCode: code }));
 
-			await expect(
-				backend.store.createAccount(draftFor({ username: "bob", invitationCode: code })),
-			).rejects.toThrow("already been used");
+			expect(
+				await captureWorkerRejectionThrower(
+					backend.store.createAccount(draftFor({ username: "bob", invitationCode: code })),
+				),
+			).toThrow("already been used");
 			// The first account survives; the second was never created.
 			expect(await backend.accountIds()).toEqual([first.account.id]);
 			expect(await backend.consumedBy(code)).toBe(first.account.id);
@@ -323,9 +334,11 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 		test("a revoked invitation is rejected as revoked, not as expired or spent", async () => {
 			const code = await backend.issue({ revoked: true });
 
-			await expect(backend.store.createAccount(draftFor({ invitationCode: code }))).rejects.toThrow(
-				"was revoked",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					backend.store.createAccount(draftFor({ invitationCode: code })),
+				),
+			).toThrow("was revoked");
 			expect(await backend.accountIds()).toEqual([]);
 		});
 
@@ -333,9 +346,11 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 			const code = await backend.issue({ expiresInHours: 1 });
 			const twoHoursLater = new Date(Date.now() + 2 * HOUR_MS).toISOString();
 
-			await expect(
-				backend.store.createAccount(draftFor({ invitationCode: code, nowIso: twoHoursLater })),
-			).rejects.toThrow("has expired");
+			expect(
+				await captureWorkerRejectionThrower(
+					backend.store.createAccount(draftFor({ invitationCode: code, nowIso: twoHoursLater })),
+				),
+			).toThrow("has expired");
 			expect(await backend.consumedBy(code)).toBeNull();
 			expect(await backend.accountIds()).toEqual([]);
 		});
@@ -343,9 +358,11 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 		test("an invitation bound to another username is rejected", async () => {
 			const code = await backend.issue({ boundUsername: "alice" });
 
-			await expect(
-				backend.store.createAccount(draftFor({ username: "bob", invitationCode: code })),
-			).rejects.toThrow("different username");
+			expect(
+				await captureWorkerRejectionThrower(
+					backend.store.createAccount(draftFor({ username: "bob", invitationCode: code })),
+				),
+			).toThrow("different username");
 			expect(await backend.accountIds()).toEqual([]);
 
 			// Still usable by the person it was issued for.
@@ -363,11 +380,13 @@ for (const backend of [sqliteBackend, inMemoryBackend]) {
 			const doomedId = generateId();
 			await backend.poisonPreferences(doomedId);
 
-			await expect(
-				backend.store.createAccount(
-					draftFor({ userId: doomedId, username: "alice", invitationCode: code }),
+			expect(
+				await captureWorkerRejectionThrower(
+					backend.store.createAccount(
+						draftFor({ userId: doomedId, username: "alice", invitationCode: code }),
+					),
 				),
-			).rejects.toThrow();
+			).toThrow();
 
 			expect(await backend.accountIds()).toEqual([]);
 			expect(await backend.consumedBy(code)).toBeNull();
@@ -414,11 +433,13 @@ describe("SQLite rollback, at the row level", () => {
 		const doomedId = generateId();
 		await sqliteBackend.poisonPreferences(doomedId);
 
-		await expect(
-			sqliteRegistrationAccountStore.createAccount(
-				draftFor({ userId: doomedId, username: "alice", invitationCode: code }),
+		expect(
+			await captureWorkerRejectionThrower(
+				sqliteRegistrationAccountStore.createAccount(
+					draftFor({ userId: doomedId, username: "alice", invitationCode: code }),
+				),
 			),
-		).rejects.toThrow();
+		).toThrow();
 
 		expect(await db.query.users.findFirst({ where: eq(users.username, "alice") })).toBeUndefined();
 		// Only the row this test seeded remains, so the atomic section contributed none.

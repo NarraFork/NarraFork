@@ -582,7 +582,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			}
 		} finally {
 			executor.mockRestore();
-			clearBufferedMessages(narratorId);
+			await clearBufferedMessages(narratorId);
 		}
 	}
 

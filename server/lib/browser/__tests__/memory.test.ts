@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,6 +11,7 @@ const home = await mkdtemp(join(tmpdir(), "nf-memory-unit-"));
 const previousHome = process.env.NARRAFORK_HOME;
 process.env.NARRAFORK_HOME = home;
 const { memoryMetrics } = await import("../memory");
+const { logger } = await import("../../logger");
 const { cancelMemoryJob, runMemoryJob, waitForMemory } = await import("../memory-job");
 const { MEMORY_CLEANUP_TIMEOUT_MS } = await import("../memory-constants");
 // Puppeteer's public rolled-up d.ts strips this internal, real runtime symbol.
@@ -117,6 +118,46 @@ describe("memoryMetrics with fake page/CDP", () => {
 		]);
 		expect(client.detaches).toBe(1);
 		cleaned(page, session);
+	});
+
+	test("throwing warning sink preserves sanitized failure and still detaches listeners", async () => {
+		const { page, client, session } = fixture();
+		client.hook = async () => {
+			throw new Error("ws://private-canary");
+		};
+		const sink = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("sink failed");
+		});
+		try {
+			await expect(memoryMetrics(session)).rejects.toThrow(
+				"Browser memory diagnostic failed during metrics",
+			);
+			expect(client.detaches).toBe(1);
+			cleaned(page, session);
+		} finally {
+			sink.mockRestore();
+		}
+	});
+
+	test("throwing slow-operation sink cannot replace successful metrics or skip cleanup", async () => {
+		const { page, client, session } = fixture();
+		const now = Date.now();
+		const clock = spyOn(Date, "now");
+		client.hook = async (method) => {
+			if (method === "Performance.getMetrics") clock.mockReturnValue(now + 6000);
+		};
+		const sink = spyOn(logger, "info").mockImplementation(() => {
+			throw new Error("sink failed");
+		});
+		try {
+			expect((await memoryMetrics(session)).JSHeapUsedSize).toBe(100);
+			expect(sink).toHaveBeenCalledTimes(1);
+			expect(client.detaches).toBe(1);
+			cleaned(page, session);
+		} finally {
+			sink.mockRestore();
+			clock.mockRestore();
+		}
 	});
 
 	test("missing, negative and nonfinite values are null, genuine zero stays zero", async () => {

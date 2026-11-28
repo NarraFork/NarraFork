@@ -207,6 +207,7 @@ describe("programmatic host service with a fake isolation driver", () => {
 		const service = createProgrammaticService({ driver: f.driver });
 		const running = service.execute(f.input);
 		try {
+			await eventually(() => f.checks() === 1);
 			expect(f.checks()).toBe(1);
 			expect(f.launches()).toBe(0);
 			available.resolve();
@@ -229,6 +230,45 @@ describe("programmatic host service with a fake isolation driver", () => {
 			f.controller.abort();
 			await bounded(running);
 		}
+	});
+
+	test("shared queue preserves total/user quotas alongside the independent team quota", async () => {
+		const f = fixture();
+		const other = fixture();
+		let launches = 0;
+		const service = createProgrammaticService({
+			driver: {
+				...f.driver,
+				launch(options) {
+					launches++;
+					return (launches === 1 ? f.driver : other.driver).launch(options);
+				},
+			},
+		});
+		const first = service.execute(f.input);
+		await eventually(() => launches === 1);
+		const candidate = (runId: string, actorUserId: string, teamId: string) => ({
+			...f.input,
+			identity: { ...f.input.identity, runId, actorUserId, teamId },
+		});
+		await expect(service.execute(candidate("same-user", "user-1", "team-2"))).rejects.toMatchObject(
+			{ code: "CAPACITY" },
+		);
+		await expect(service.execute(candidate("same-team", "user-2", "team-1"))).rejects.toMatchObject(
+			{ code: "CAPACITY" },
+		);
+		const second = service.execute(candidate("second", "user-2", "team-2"));
+		await eventually(() => launches === 2);
+		await expect(
+			service.execute(candidate("total-full", "user-3", "team-3")),
+		).rejects.toMatchObject({ code: "CAPACITY" });
+		expect(service.activeRuns()).toBe(2);
+		await service.close();
+		for (const result of await Promise.all([first, second]))
+			expect(result.resourcesReleased).toBe(true);
+		expect(launches).toBe(2);
+		expect(f.sent).toHaveLength(0);
+		expect(other.sent).toHaveLength(0);
 	});
 
 	for (const [name, frame] of [
@@ -500,6 +540,90 @@ describe("programmatic host service with a fake isolation driver", () => {
 		expect(result.ok).toBe(false);
 		expect(result.error?.code).toBe("ISOLATION_REQUIRED");
 		expect(f.checks()).toBe(1);
+		expect(f.launches()).toBe(0);
+	});
+
+	test("close waits for pending launch, actual exit and business drain, without sending source", async () => {
+		const f = fixture();
+		const launch = f.driver.launch.bind(f.driver);
+		const admit = deferred<void>();
+		const exit = deferred<number>();
+		f.driver.launch = async (options) => {
+			const session = await launch(options);
+			await admit.promise;
+			return { ...session, exited: exit.promise };
+		};
+		const service = createProgrammaticService({ driver: f.driver });
+		const running = service.execute(f.input);
+		await eventually(() => f.launches() === 1);
+		let closed = false;
+		const closing = service.close().then(() => {
+			closed = true;
+		});
+		await expect(service.execute(f.input)).rejects.toMatchObject({ code: "CLOSED" });
+		expect(closed).toBe(false);
+		expect(f.sent).toHaveLength(0);
+		admit.resolve();
+		await Bun.sleep(0);
+		expect(service.activeRuns()).toBe(1);
+		expect(closed).toBe(false);
+		exit.resolve(0);
+		const result = await bounded(running);
+		await bounded(closing);
+		expect(result.ok).toBe(false);
+		expect(result.error?.code).toBe("CLOSED");
+		expect(result.resourcesReleased).toBe(true);
+		expect(f.sent).toHaveLength(0);
+		expect(f.invokes()).toBe(0);
+		expect(closed).toBe(true);
+	});
+
+	for (const synchronous of [true, false])
+		test(`unknown ${synchronous ? "sync" : "async"} launch cleanup retains its queue reservation instead of claiming an empty success`, async () => {
+			const f = fixture();
+			const fail = () => {
+				throw new Error("uncertain startup");
+			};
+			f.driver.launch = synchronous ? fail : async () => fail();
+			const service = createProgrammaticService({ driver: f.driver, maxConcurrent: 1 });
+			const result = await bounded(service.execute(f.input));
+			expect(result.ok).toBe(false);
+			expect(result.cleanup.confirmed).toBe(false);
+			expect(result.resourcesReleased).toBe(false);
+			expect(service.activeRuns()).toBe(1);
+			await expect(
+				service.execute({
+					...f.input,
+					identity: {
+						...f.input.identity,
+						runId: "other",
+						actorUserId: "other",
+						teamId: undefined,
+					},
+				}),
+			).rejects.toMatchObject({ code: "CAPACITY" });
+			expect(f.sent).toHaveLength(0);
+			expect(f.invokes()).toBe(0);
+		});
+
+	test("pending availability is drained by close before any launcher can start", async () => {
+		const f = fixture();
+		const gate = deferred<void>();
+		f.hooks.available = () => gate.promise;
+		const service = createProgrammaticService({ driver: f.driver });
+		const running = service.execute(f.input);
+		await eventually(() => f.checks() === 1);
+		let closed = false;
+		const closing = service.close().then(() => {
+			closed = true;
+		});
+		const result = await bounded(running);
+		expect(result.resourcesReleased).toBe(false);
+		expect(closed).toBe(false);
+		expect(f.launches()).toBe(0);
+		gate.resolve();
+		await bounded(closing);
+		expect(service.activeRuns()).toBe(0);
 		expect(f.launches()).toBe(0);
 	});
 

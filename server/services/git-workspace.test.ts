@@ -887,7 +887,7 @@ describe("authenticated Git management", () => {
 		await symlink(root, join(repo, "outside"));
 		for (const file of [
 			"../outside",
-			"C:escape",
+			...(process.platform === "win32" ? ["C:escape"] : []),
 			"C:\\escape",
 			"\\\\host\\share",
 			"/etc/passwd",
@@ -903,6 +903,19 @@ describe("authenticated Git management", () => {
 			(await request("stage", { files: [":(glob)*"], workspaceKey: ws.workspaceKey })).status,
 		).toBe(200);
 		expect(await git(repo, "diff", "--cached", "--name-only")).toBe(":(glob)*");
+		if (process.platform !== "win32") {
+			for (const file of ["a:b.txt", "C:escape"]) {
+				await writeFile(join(repo, file), "colon filename\n");
+				expect(
+					(await request("stage", { files: [file], workspaceKey: ws.workspaceKey })).status,
+				).toBe(200);
+			}
+			expect((await git(repo, "diff", "--cached", "--name-only")).split("\n")).toEqual([
+				":(glob)*",
+				"C:escape",
+				"a:b.txt",
+			]);
+		}
 	});
 	test("remote default uses device cwd, remains device-separated, never falls back locally", async () => {
 		const deviceId = generateId();

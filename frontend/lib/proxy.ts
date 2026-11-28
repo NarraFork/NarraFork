@@ -1,6 +1,15 @@
-import { normalizeProxyUrl } from "@shared/proxy-settings";
+import {
+	type NoProxyRule,
+	normalizeProxyUrl,
+	validateNoProxyPattern,
+} from "@shared/proxy-settings";
 
-export { normalizeProxyUrl } from "@shared/proxy-settings";
+export {
+	MAX_NO_PROXY_RULES,
+	type NoProxyRule,
+	normalizeProxyUrl,
+	validateNoProxyPattern,
+} from "@shared/proxy-settings";
 
 export type OutboundProxyMode = "system" | "direct" | "custom";
 
@@ -40,6 +49,71 @@ export interface ProxyOverride {
 /** Update and helper downloads share one override; never patch source/identity fields. */
 export function buildUpdateProxyPatch(next?: ProxyOverride) {
 	return { update: { proxy: next ?? { mode: "default" as const } } };
+}
+
+// ---------------------------------------------------------------------------
+// no_proxy rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the stored no_proxy rule list into editor shape.
+ * Unknown/blank entries are dropped rather than shown as broken rows.
+ */
+export function summarizeNoProxyRules(policy: unknown): NoProxyRule[] {
+	if (!isRecord(policy) || !Array.isArray(policy.noProxyRules)) return [];
+	const rules: NoProxyRule[] = [];
+	for (const entry of policy.noProxyRules) {
+		if (!isRecord(entry)) continue;
+		const pattern = typeof entry.pattern === "string" ? entry.pattern.trim() : "";
+		if (!pattern) continue;
+		rules.push({
+			...(typeof entry.id === "string" && entry.id ? { id: entry.id } : {}),
+			match: entry.match === "regex" ? "regex" : "wildcard",
+			pattern,
+			enabled: entry.enabled !== false,
+		});
+	}
+	return rules;
+}
+
+/**
+ * Build a complete `settings.proxy` patch.
+ *
+ * The server replaces the whole object (so switching mode drops a stale custom
+ * URL), which also means the shared no_proxy list must always travel with it —
+ * omitting it would be read as "keep the stored list", and that is only true
+ * for API clients that deliberately leave it out.
+ */
+export function buildOutboundProxyPatch(input: {
+	mode: OutboundProxyMode;
+	url?: string;
+	noProxyRules?: NoProxyRule[];
+}) {
+	const proxy: { mode: OutboundProxyMode; url?: string; noProxyRules: NoProxyRule[] } = {
+		mode: input.mode,
+		noProxyRules: input.noProxyRules ?? [],
+	};
+	if (input.mode === "custom") {
+		const normalized = normalizeProxyUrl(input.url);
+		if (normalized) proxy.url = normalized;
+	}
+	return { proxy };
+}
+
+/**
+ * Validate the editor's rule rows, returning `{ index, message }` for the first
+ * problem. Blank rows are ignored: an empty new row is "not filled in yet".
+ */
+export function findNoProxyRuleError(
+	rules: readonly NoProxyRule[],
+): { index: number; message: string } | undefined {
+	for (const [index, rule] of rules.entries()) {
+		const pattern = rule.pattern.trim();
+		if (!pattern) continue;
+		const message = validateNoProxyPattern(rule.match, pattern);
+		if (message) return { index, message };
+	}
+	return undefined;
 }
 
 /** Minimal settings patch; explicit default survives JSON and clears old overrides. */

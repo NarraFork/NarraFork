@@ -3,6 +3,7 @@ import { IconCheck } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { isAutoModelOptionValue, type ModelOption } from "../../../lib/constants";
+import { createModelQueryMatcher, createModelSearchIndex } from "../../../lib/model-search";
 import { familyLabel } from "./model-menu-selection";
 
 /**
@@ -28,6 +29,7 @@ export interface ModelSourceBrowserProps {
 
 /** Columns share the viewport instead of a fixed five rows; they still scroll past it. */
 const COLUMN_MAX_HEIGHT = "45vh";
+const EMPTY_PROVIDER_LABELS: Record<string, string> = {};
 
 function familyOf(option: ModelOption): string {
 	return option.family ?? "";
@@ -50,7 +52,7 @@ function sourcesOf(option: ModelOption) {
 export function ModelSourceBrowser({
 	allModels,
 	currentModel,
-	providerLabels = {},
+	providerLabels = EMPTY_PROVIDER_LABELS,
 	onSelect,
 	filter = "",
 }: ModelSourceBrowserProps) {
@@ -74,24 +76,22 @@ export function ModelSourceBrowser({
 		: (autoRowOfSource.get(currentValue) ?? autoModels[0]?.value);
 	const [focused, setFocused] = useState<string | undefined>(initialFocus);
 
-	const needle = filter.trim().toLowerCase();
+	const searchIndex = useMemo(
+		() =>
+			createModelSearchIndex(
+				autoModels.map((option) => ({
+					...option,
+					group: familyOf(option) ? familyLabel(familyOf(option)) : t("modelGroupFamilyOther"),
+				})),
+				{ providerLabels },
+			),
+		[autoModels, providerLabels, t],
+	);
 	const visible = useMemo(() => {
-		if (!needle) return autoModels;
-		return autoModels.filter((option) => {
-			const haystack = [
-				option.label,
-				option.value,
-				familyOf(option),
-				...(option.autoSources ?? []).flatMap((s) => [
-					s.value,
-					providerLabels[s.provider] ?? s.provider,
-				]),
-			]
-				.join(" ")
-				.toLowerCase();
-			return haystack.includes(needle);
-		});
-	}, [autoModels, needle, providerLabels]);
+		if (!filter.trim()) return autoModels;
+		const matchesQuery = createModelQueryMatcher(filter);
+		return autoModels.filter((option) => matchesQuery(searchIndex.get(option.value) ?? ""));
+	}, [autoModels, filter, searchIndex]);
 	const focusedOption =
 		visible.find((o) => o.value === focused) ??
 		autoModels.find((o) => o.value === focused) ??

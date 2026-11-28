@@ -8,7 +8,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { historyStrings } from "../../../tests/fixtures/model-input";
 import { wavBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
@@ -33,8 +33,14 @@ import {
 	freezeModelHistorySource,
 	loadModelHistorySource,
 } from "../agent-runtime/model-history-source";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb as getTestDb,
+} from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
@@ -93,7 +99,7 @@ afterEach(() => {
 	settings.openaiProviders = originalOpenAIProviders;
 	settings.geminiProviders = originalGeminiProviders;
 });
-afterAll(() => sqlite.close());
+afterAll(async () => await closeRuntimeTestDb(sqlite, { sessionTails: true }));
 /**
  * "subagent" names the session shape whose run delivers to the "origin" call: its own
  * turns are placed under that call. The rule is the same for every session.
@@ -1277,14 +1283,14 @@ test("real loader plus currentRevision adoption retain exact history identity", 
 	expect(first.currentText).toBe("");
 	expect(first.currentInputText).toBe('<sender kind="human" />\nedited current');
 	expect(historyStrings(first.history)).toContain('<sender kind="human" />\nedited current');
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeNull();
 	// A copy is not the built history's identity and adopts nothing.
-	consumeAgentMessageHistory([...first.history]);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
-	consumeAgentMessageHistory(first.history);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	await consumeAgentMessageHistory([...first.history]);
+	await drainRuntimeTestWork();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeNull();
+	await consumeAgentMessageHistory(first.history);
+	await drainRuntimeTestWork();
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentAdoptedRevision: 2,
 		adoptedAt: null,
 	});
@@ -1340,10 +1346,10 @@ test("grouped sys receipts are adopted with the history that carries their packe
 	const packet = historyStrings(prepared.history);
 	expect(packet).toContain('<sender kind="agent" id="agent-a" name="A" />\none');
 	expect(packet).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
-	consumeAgentMessageHistory(prepared.history);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).not.toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
+	await consumeAgentMessageHistory(prepared.history);
+	await drainRuntimeTestWork();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).not.toBeNull();
 });
 
 test("an already prepared initial packet is not attributed or extracted twice", async () => {

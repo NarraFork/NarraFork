@@ -18,7 +18,7 @@ BUILDFLAGS := -trimpath -buildvcs=false -ldflags "$(LDFLAGS)"
 BUILDENV := GOTOOLCHAIN=go$(GO_VERSION) CGO_ENABLED=0 GOAMD64=v1 GOARM64=v8.0
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
-.PHONY: build dist test vet check-toolchain
+.PHONY: build dist test vet licenses check-toolchain
 check-toolchain:
 	@test "$$(GOTOOLCHAIN=go$(GO_VERSION) $(GO) env GOVERSION)" = "go$(GO_VERSION)" || \
 		{ printf '%s\n' 'remote-peer requires Go $(GO_VERSION)'; exit 1; }
@@ -44,3 +44,9 @@ test: check-toolchain
 
 vet: check-toolchain
 	$(BUILDENV) $(GO) vet ./...
+
+# After a dependency bump: regenerate the license attachment and sync entries.json versions.
+# A new or removed module still needs a reviewed manual edit; the sync script refuses it.
+licenses: check-toolchain
+	$(BUILDENV) $(GO) run ./internal/licensebundle
+	./scripts/sync-license-entries.sh

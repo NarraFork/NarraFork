@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "../db/worker-read";
 /**
  * Passkey (WebAuthn) service — all database-backed credential operations and
  * the four WebAuthn ceremony steps (registration options/verify,
@@ -50,18 +51,25 @@ function toSummary(row: typeof userPasskeys.$inferSelect): PasskeySummary {
 export const passkeyService = {
 	/** List a user's registered passkeys (newest first). */
 	async list(userId: string): Promise<PasskeySummary[]> {
-		const rows = await db.query.userPasskeys.findMany({
-			where: eq(userPasskeys.userId, userId),
-			orderBy: [desc(userPasskeys.createdAt)],
-		});
+		const rows = await readQuery(
+			db.query.userPasskeys.findMany({
+				where: eq(userPasskeys.userId, userId),
+				orderBy: [desc(userPasskeys.createdAt)],
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		return rows.map(toSummary);
 	},
 
 	async hasAny(userId: string): Promise<boolean> {
-		const row = await db.query.userPasskeys.findFirst({
-			where: eq(userPasskeys.userId, userId),
-			columns: { id: true },
-		});
+		const row = await readQueryFirst(
+			db.query.userPasskeys.findMany({
+				limit: 1,
+				where: eq(userPasskeys.userId, userId),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		return !!row;
 	},
 
@@ -93,10 +101,13 @@ export const passkeyService = {
 		originHeader: string | null | undefined;
 	}) {
 		const rp = resolveRp(params.originHeader);
-		const existing = await db.query.userPasskeys.findMany({
-			where: eq(userPasskeys.userId, params.userId),
-			columns: { credentialId: true, transports: true },
-		});
+		const existing = await readQuery(
+			db.query.userPasskeys.findMany({
+				where: eq(userPasskeys.userId, params.userId),
+				columns: { credentialId: true, transports: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const options = await generateRegistrationOptions({
 			rpName: rp.rpName,
 			rpID: rp.rpID,
@@ -179,10 +190,13 @@ export const passkeyService = {
 		const rp = resolveRp(params.originHeader);
 		let allowCredentials: { id: string; transports?: never }[] | undefined;
 		if (params.userId) {
-			const creds = await db.query.userPasskeys.findMany({
-				where: eq(userPasskeys.userId, params.userId),
-				columns: { credentialId: true, transports: true },
-			});
+			const creds = await readQuery(
+				db.query.userPasskeys.findMany({
+					where: eq(userPasskeys.userId, params.userId),
+					columns: { credentialId: true, transports: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			allowCredentials = creds.map((c) => ({
 				id: c.credentialId,
 				transports: c.transports as never,
@@ -218,9 +232,13 @@ export const passkeyService = {
 		}
 
 		const credentialId = params.response.id;
-		const stored = await db.query.userPasskeys.findFirst({
-			where: eq(userPasskeys.credentialId, credentialId),
-		});
+		const stored = await readQueryFirst(
+			db.query.userPasskeys.findMany({
+				limit: 1,
+				where: eq(userPasskeys.credentialId, credentialId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!stored) return { ok: false, userId: null };
 		// Enforce ownership for the 2FA flow.
 		if (params.expectedUserId && stored.userId !== params.expectedUserId) {

@@ -231,8 +231,6 @@ test("outbound panel publication preserves bridge and plugin-host identities", a
 	for (const key of [
 		"registerAppendChatInput",
 		"appendChatInput",
-		"registerWriteTerminalStdin",
-		"writeTerminalStdin",
 		"registerScrollToMessage",
 		"scrollToMessage",
 		"registerSubmitToNarrator",

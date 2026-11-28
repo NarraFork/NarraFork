@@ -1,10 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { scheduledTaskRuns, scheduledTasks, userPreferences, users } from "../../db/schema";
 import { logger } from "../../lib/logger";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { notifyScheduledRunChanged, notifyScheduledTaskTransferred } = await import(
@@ -108,9 +111,9 @@ afterEach(() => {
 	globalThis.fetch = originalFetch;
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDb);
-	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("owner-directed scheduled task notifications", () => {
@@ -290,11 +293,12 @@ describe("owner-directed scheduled task notifications", () => {
 	test("a failed durable claim never delivers and never logs SQL secrets", async () => {
 		task();
 		run();
-		spyOn(db, "run").mockImplementation(() => {
+		const insert = spyOn(db, "get").mockImplementation(() => {
 			throw new Error(privateValues.join(" "));
 		});
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		await notifyScheduledRunChanged("run", "failed");
+		expect(insert).toHaveBeenCalledTimes(1);
 		expect(requests).toHaveLength(0);
 		expect(stored()).toHaveLength(0);
 		for (const secret of privateValues)

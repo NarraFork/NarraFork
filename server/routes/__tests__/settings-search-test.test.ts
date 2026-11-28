@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -9,7 +9,7 @@ import { authMfaStore, authSessionStore, setAuthStores } from "../../services/au
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "nf-search-route-"));
 process.env.NARRAFORK_HOME = testHome;
-const { settings } = await import("../../lib/settings");
+const { narraforkDir, reloadSettings, saveSettings, settings } = await import("../../lib/settings");
 const { settingsRoutes } = await import("../settings");
 const probe = await import("../../lib/search/subagent-probe");
 const { AppError } = await import("../../lib/errors");
@@ -103,6 +103,69 @@ afterAll(() => {
 });
 
 describe("settings search test route", () => {
+	test("GET masks and PATCH restores NUG OAuth and search header secrets, while explicit clearing persists", async () => {
+		const saved = structuredClone(settings);
+		try {
+			saveSettings({
+				...settings,
+				nugProviders: [
+					{
+						id: "route-oauth",
+						name: "OAuth",
+						prefix: "routeoauth",
+						apiKey: "nug-route-key",
+						baseUrl: "https://nug.example",
+						defaultModel: "",
+						oauthClientSecret: "oauth-route-secret",
+					},
+				],
+				search: {
+					channels: [],
+					...settings.search,
+					customProviders: [
+						{
+							id: "route-headers",
+							name: "Headers",
+							protocol: "tavily",
+							baseUrl: "https://search.example",
+							headers: { Authorization: "  Bearer route-secret  ", "X-Ordinary": "  ordinary  " },
+						},
+					],
+				},
+			});
+			const response = await app().request("/settings");
+			expect(response.status).toBe(200);
+			const draft = await response.json();
+			expect(draft.nugProviders[0].oauthClientSecret).toStartWith("*");
+			expect(draft.search.customProviders[0].headers.Authorization).toStartWith("*");
+			expect(draft.search.customProviders[0].headers["X-Ordinary"]).toBe("  ordinary  ");
+			const patch = (value: unknown) =>
+				app().request("/settings", {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(value),
+				});
+			const echoed = await patch({ nugProviders: draft.nugProviders, search: draft.search });
+			expect(echoed.status).toBe(200);
+			expect(settings.nugProviders?.[0].oauthClientSecret).toBe("oauth-route-secret");
+			expect(settings.search?.customProviders[0].headers?.Authorization).toBe(
+				"  Bearer route-secret  ",
+			);
+			const disk = readFileSync(join(narraforkDir, "settings.json"), "utf8");
+			expect(disk).not.toContain("oauth-route-secret");
+			expect(disk).not.toContain("Bearer route-secret");
+			draft.nugProviders[0].oauthClientSecret = "";
+			draft.search.customProviders[0].headers.Authorization = "";
+			expect((await patch({ nugProviders: draft.nugProviders, search: draft.search })).status).toBe(
+				200,
+			);
+			expect(reloadSettings().nugProviders?.[0]).not.toHaveProperty("oauthClientSecret");
+			expect(settings.search?.customProviders[0].headers?.Authorization).toBe("");
+		} finally {
+			saveSettings(saved);
+		}
+	});
+
 	test("uses a validated draft and authenticated user, without mutating saved configuration", async () => {
 		const saved = JSON.stringify(settings.search);
 		const run = spyOn(probe, "runSearchProbe").mockResolvedValue("Verified results");

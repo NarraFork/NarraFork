@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,11 +13,14 @@ import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import {
+	blobCatalogInternals,
 	FILE_CHANGE_BLOB_BUDGET_ID,
 	FileChangeBlobCatalog,
+	FileChangeBlobCatalogError,
 	type FileChangeBlobCatalogErrorCode,
 } from "./file-change-blob-catalog";
 import { type FileChangeBlobRelease, FileChangeBlobStore } from "./file-change-blob-store";
+import { fileHistoryCatalogDiagnostic } from "./file-change-history-diagnostics";
 
 const DDL = `
 CREATE TABLE file_change_blobs (
@@ -56,7 +59,7 @@ beforeEach(async () => {
 	catalog = new FileChangeBlobCatalog({ db, namespaceKey: root });
 });
 afterEach(async () => {
-	sqlite.close();
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
 function refFor(text = "abc"): FileChangeBlobRef {
@@ -74,8 +77,15 @@ function reserve(size = 3, source = catalog) {
 		signal: new AbortController().signal,
 	});
 }
-function expectCode(run: () => unknown, code: FileChangeBlobCatalogErrorCode) {
-	expect(run).toThrow(expect.objectContaining({ name: "FileChangeBlobCatalogError", code }));
+async function expectCode(run: () => unknown, code: FileChangeBlobCatalogErrorCode) {
+	let error: unknown;
+	try {
+		await run();
+	} catch (caught) {
+		error = caught;
+	}
+	expect(error).toMatchObject({ name: "FileChangeBlobCatalogError", code });
+	return error;
 }
 function store() {
 	return new FileChangeBlobStore({
@@ -89,21 +99,21 @@ function blobPath(ref: FileChangeBlobRef) {
 }
 
 describe("independent retryable blob history", () => {
-	test("initialization is idempotent and needs no ready-state transition", () => {
-		expect(catalog.getBudget()).toBeNull();
+	test("initialization is idempotent and needs no ready-state transition", async () => {
+		expect(await catalog.getBudget()).toBeNull();
 		const initialized = catalog.initializeNamespace({ quotaBytes: 100 });
 		expect(catalog.initializeNamespace({ expectedGeneration: 999 })).toEqual(initialized);
-		const lease = reserve();
+		const lease = await reserve();
 		lease.release({ ref: refFor(), published: true });
-		expect(catalog.getMetadata({ ref: refFor() })?.status).toBe("ready");
-		expect(catalog.getBudget()?.usedBytes).toBe(3);
+		expect((await catalog.getMetadata({ ref: refFor() }))?.status).toBe("ready");
+		expect((await catalog.getBudget())?.usedBytes).toBe(3);
 		expect(db.select().from(reservations).all()).toEqual([]);
 	});
 	test.each([
 		"unverified",
 		"reconciling",
 		"ready",
-	] as const)("old %s status and abandoned reservations remain archival", (status) => {
+	] as const)("old %s status and abandoned reservations remain archival", async (status) => {
 		catalog.initializeNamespace({ quotaBytes: 100 });
 		db.update(budgets)
 			.set({ status, reservedBytes: Number.MAX_SAFE_INTEGER, generation: 91 })
@@ -121,11 +131,11 @@ describe("independent retryable blob history", () => {
 			})
 			.run();
 		const before = db.select().from(reservations).all();
-		const budget = catalog.getBudget();
+		const budget = await catalog.getBudget();
 		if (!budget) throw new Error("Missing budget fixture");
 		expect(catalog.initializeNamespace()).toEqual(budget);
-		reserve().release({ ref: refFor(), published: true });
-		expect(catalog.getBudget()).toMatchObject({
+		(await reserve()).release({ ref: refFor(), published: true });
+		expect(await catalog.getBudget()).toMatchObject({
 			status,
 			generation: 91,
 			reservedBytes: Number.MAX_SAFE_INTEGER,
@@ -133,32 +143,32 @@ describe("independent retryable blob history", () => {
 		});
 		expect(db.select().from(reservations).all()).toEqual(before);
 	});
-	test("live byte quota is shared across handles without serializing file IO", () => {
+	test("live byte quota is shared across handles without serializing file IO", async () => {
 		catalog.initializeNamespace({ quotaBytes: 5 });
 		const other = new FileChangeBlobCatalog({ db, namespaceKey: root });
-		const first = reserve(3);
-		const second = reserve(2, other);
-		expectCode(() => reserve(1, other), "quota_exceeded");
+		const first = await reserve(3);
+		const second = await reserve(2, other);
+		await expectCode(() => reserve(1, other), "quota_exceeded");
 		first.release(empty);
-		const third = reserve(3, other);
+		const third = await reserve(3, other);
 		second.release(empty);
 		third.release(empty);
-		reserve(5).release(empty);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 0 });
+		(await reserve(5)).release(empty);
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 0 });
 		expect(queries.some((query) => /SUM\s*\(|COUNT\s*\(/i.test(query))).toBe(false);
 	});
-	test("verified publication is atomic, deduplicated, and enforces stored byte quota", () => {
+	test("verified publication is atomic, deduplicated, and enforces stored byte quota", async () => {
 		catalog.initializeNamespace({ quotaBytes: 6 });
-		const first = reserve();
+		const first = await reserve();
 		const result = { ref: refFor(), published: true };
 		first.release(result);
 		first.release(result);
-		reserve().release({ ref: refFor(), published: false });
-		expect(catalog.getBudget()?.usedBytes).toBe(3);
-		reserve().release({ ref: refFor("def"), published: true });
-		expect(catalog.getBudget()?.usedBytes).toBe(6);
-		expectCode(() => reserve(1), "quota_exceeded");
-		expectCode(() => first.release(empty), "release_conflict");
+		(await reserve()).release({ ref: refFor(), published: false });
+		expect((await catalog.getBudget())?.usedBytes).toBe(3);
+		(await reserve()).release({ ref: refFor("def"), published: true });
+		expect((await catalog.getBudget())?.usedBytes).toBe(6);
+		await expectCode(() => reserve(1), "quota_exceeded");
+		await expectCode(() => first.release(empty), "release_conflict");
 	});
 	test("accounting failure releases in-memory quota and never damages published bytes", async () => {
 		catalog.initializeNamespace({ quotaBytes: 8 });
@@ -170,28 +180,28 @@ describe("independent retryable blob history", () => {
 			"admission release failed",
 		);
 		expect(await readFile(blobPath(refFor()), "utf8")).toBe("abc");
-		expect(catalog.getMetadata({ ref: refFor() })).toBeNull();
+		expect(await catalog.getMetadata({ ref: refFor() })).toBeNull();
 		sqlite.exec("DROP TRIGGER fail_accounting;");
 		const second = await objects.putBytes(Buffer.from("def"), { expectedSize: 3 });
 		expect(await objects.readBytes(second)).toEqual(Buffer.from("def"));
 		const retry = await objects.putBytes(Buffer.from("abc"), { expectedSize: 3 });
 		expect(await objects.readBytes(retry)).toEqual(Buffer.from("abc"));
-		expect(catalog.getBudget()?.usedBytes).toBe(6);
+		expect((await catalog.getBudget())?.usedBytes).toBe(6);
 		expect(await readFile(blobPath(refFor()), "utf8")).toBe("abc");
 	});
-	test("original publication callback is retryable after a transient DB failure", () => {
+	test("original publication callback is retryable after a transient DB failure", async () => {
 		catalog.initializeNamespace({ quotaBytes: 3 });
-		const lease = reserve();
+		const lease = await reserve();
 		const result = { ref: refFor(), published: true };
 		sqlite.exec(
 			"CREATE TRIGGER fail_blob BEFORE INSERT ON file_change_blobs BEGIN SELECT RAISE(ABORT, 'blob-fault'); END;",
 		);
 		expect(() => lease.release(result)).toThrow("blob-fault");
-		reserve().release(empty);
+		(await reserve()).release(empty);
 		sqlite.exec("DROP TRIGGER fail_blob;");
 		lease.release(result);
 		lease.release(result);
-		expect(catalog.getBudget()?.usedBytes).toBe(3);
+		expect((await catalog.getBudget())?.usedBytes).toBe(3);
 	});
 	test("a corrupt object only fails that digest and remains intact", async () => {
 		catalog.initializeNamespace({ quotaBytes: 100 });
@@ -203,7 +213,7 @@ describe("independent retryable blob history", () => {
 		const second = await objects.putBytes(Buffer.from("xyz"), { expectedSize: 3 });
 		expect(await objects.readBytes(second)).toEqual(Buffer.from("xyz"));
 		expect(await readFile(blobPath(original), "utf8")).toBe("bad");
-		expect(catalog.getMetadata({ ref: original })?.digest).toBe(original.digest);
+		expect((await catalog.getMetadata({ ref: original }))?.digest).toBe(original.digest);
 	});
 	test("stream failure returns only active quota and preserves older history", async () => {
 		catalog.initializeNamespace({ quotaBytes: 6 });
@@ -220,40 +230,217 @@ describe("independent retryable blob history", () => {
 		expect(await objects.readBytes(prior)).toEqual(Buffer.from("abc"));
 		expect(await objects.readBytes(later)).toEqual(Buffer.from("def"));
 	});
-	test("cancellation and invalid publication metadata release only their own quota", () => {
+	test("cancellation and invalid publication metadata release only their own quota", async () => {
 		catalog.initializeNamespace({ quotaBytes: 3 });
 		const signal = AbortSignal.abort();
-		expectCode(() => catalog.reserve({ ownerEpoch: "writer", expectedSize: 3, signal }), "aborted");
-		const lease = reserve();
-		expectCode(
+		await expectCode(
+			() => catalog.reserve({ ownerEpoch: "writer", expectedSize: 3, signal }),
+			"aborted",
+		);
+		const lease = await reserve();
+		await expectCode(
 			() => lease.release({ ref: refFor("wrong-size"), published: true }),
 			"size_mismatch",
 		);
-		reserve().release(empty);
-		expect(catalog.getBudget()?.usedBytes).toBe(0);
+		(await reserve()).release(empty);
+		expect((await catalog.getBudget())?.usedBytes).toBe(0);
 	});
-	test("a reservation snapshots its declared size before the caller can mutate it", () => {
+	test("a reservation snapshots its declared size before the caller can mutate it", async () => {
 		catalog.initializeNamespace({ quotaBytes: 10 });
 		const request = { ownerEpoch: "writer", expectedSize: 3, signal: new AbortController().signal };
-		const lease = catalog.reserve(request);
+		const pending = catalog.reserve(request);
 		request.expectedSize = 6;
-		expectCode(() => lease.release({ ref: refFor("abcdef"), published: true }), "size_mismatch");
-		expect(catalog.getBudget()?.usedBytes).toBe(0);
-		reserve(10).release(empty);
+		const lease = await pending;
+		await expectCode(
+			() => lease.release({ ref: refFor("abcdef"), published: true }),
+			"size_mismatch",
+		);
+		expect((await catalog.getBudget())?.usedBytes).toBe(0);
+		(await reserve(10)).release(empty);
 	});
 
-	test("namespace identity, catalog metadata and unsafe SQLite settings stay enforced", () => {
+	test("namespace identity, catalog metadata and unsafe SQLite settings stay enforced", async () => {
 		catalog.initializeNamespace({ quotaBytes: 100 });
 		const other = new FileChangeBlobCatalog({ db, namespaceKey: "different" });
-		expectCode(() => other.initializeNamespace(), "namespace_mismatch");
-		expectCode(() => other.getMetadata({ ref: refFor() }), "namespace_mismatch");
-		reserve().release({ ref: refFor(), published: true });
+		await expectCode(() => other.initializeNamespace(), "namespace_mismatch");
+		await expectCode(() => other.getMetadata({ ref: refFor() }), "namespace_mismatch");
+		(await reserve()).release({ ref: refFor(), published: true });
 		db.update(blobs).set({ sizeBytes: 99 }).where(eq(blobs.digest, refFor().digest)).run();
-		expectCode(() => reserve().release({ ref: refFor(), published: false }), "catalog_mismatch");
+		await expectCode(
+			async () => (await reserve()).release({ ref: refFor(), published: false }),
+			"catalog_mismatch",
+		);
 		sqlite.exec("PRAGMA busy_timeout = 5000;");
-		expectCode(() => new FileChangeBlobCatalog({ db, namespaceKey: root }), "invalid_input");
+		await expectCode(() => new FileChangeBlobCatalog({ db, namespaceKey: root }), "invalid_input");
 	});
-	test("legacy reservation inventory remains bounded and read-only", () => {
+	test("shared two-argument budget validation preserves its original behavior", async () => {
+		const error = await expectCode(
+			() =>
+				blobCatalogInternals.checkBudget(
+					{ namespaceKey: "other", usedBytes: 0, quotaBytes: 100 },
+					root,
+				),
+			"namespace_mismatch",
+		);
+		expect((error as Error).message).toBe(
+			"Database is bound to a different physical blob namespace",
+		);
+		expect(fileHistoryCatalogDiagnostic(error)).toBeUndefined();
+	});
+
+	test("namespace mismatch retains precise initialization metadata with no extra SQL", async () => {
+		const currentKey = "b".repeat(64);
+		const storedKey = "a".repeat(64);
+		catalog = new FileChangeBlobCatalog({ db, namespaceKey: currentKey });
+		catalog.initializeNamespace();
+		db.update(budgets)
+			.set({
+				namespaceKey: storedKey,
+				status: "ready",
+				generation: 2,
+				updatedAt: "2026-10-31 03:54:39",
+			})
+			.run();
+		queries.length = 0;
+		const error = await expectCode(() => catalog.initializeNamespace(), "namespace_mismatch");
+		expect(error).toBeInstanceOf(FileChangeBlobCatalogError);
+		expect((error as Error).message).toBe(
+			"Database is bound to a different physical blob namespace",
+		);
+		expect(fileHistoryCatalogDiagnostic(error)).toEqual({
+			errorCode: "namespace_mismatch",
+			errorName: "FileChangeBlobCatalogError",
+			catalogStage: "initialize",
+			reason: "key_mismatch",
+			keysEqual: false,
+			storedKeyFingerprint: createHash("sha256").update(storedKey).digest("hex"),
+			currentKeyFingerprint: createHash("sha256").update(currentKey).digest("hex"),
+			status: "ready",
+			generation: 2,
+			updatedAt: "2026-10-31 03:54:39",
+		});
+		// Bun's native transaction wrapper is not part of Drizzle's query logger.
+		expect(queries).toHaveLength(1);
+		expect(queries[0]).toContain("limit ?");
+	});
+
+	test("multiple budget rows preserve the guard without evaluating a throwing row ID getter", async () => {
+		let idReads = 0;
+		const rows = [
+			{
+				get id() {
+					idReads++;
+					throw new Error("unexpected diagnostic ID read");
+				},
+				namespaceKey: root,
+			},
+			{},
+		];
+		const transaction = spyOn(db, "transaction").mockImplementation((work) => {
+			const tx = { select: () => ({ from: () => ({ limit: () => ({ all: () => rows }) }) }) };
+			return work(tx as unknown as Parameters<typeof work>[0]);
+		});
+		try {
+			const error = await expectCode(() => catalog.initializeNamespace(), "namespace_mismatch");
+			expect(error).toBeInstanceOf(FileChangeBlobCatalogError);
+			expect((error as Error).message).toBe(
+				"A database must bind exactly one physical blob namespace",
+			);
+			expect(idReads).toBe(0);
+			expect(fileHistoryCatalogDiagnostic(error)).toMatchObject({
+				errorCode: "namespace_mismatch",
+				catalogStage: "initialize",
+				reason: "cardinality",
+				observedRows: 2,
+			});
+			expect(fileHistoryCatalogDiagnostic(error)?.rowIdMatches).toBeUndefined();
+		} finally {
+			transaction.mockRestore();
+		}
+	});
+
+	test.each([
+		"cardinality",
+		"budget_id",
+	] as const)("initialization distinguishes %s without disclosing row IDs or changing its guard", async (reason) => {
+		catalog.initializeNamespace();
+		if (reason === "cardinality")
+			db.insert(budgets)
+				.values({
+					id: "private-second-budget",
+					namespaceKey: "a".repeat(64),
+					quotaBytes: 100,
+					updatedAt: "2026-10-31T00:00:00.000Z",
+				})
+				.run();
+		else db.update(budgets).set({ id: "private-invalid-budget" }).run();
+		queries.length = 0;
+		const error = await expectCode(() => catalog.initializeNamespace(), "namespace_mismatch");
+		expect((error as Error).message).toBe(
+			"A database must bind exactly one physical blob namespace",
+		);
+		expect(fileHistoryCatalogDiagnostic(error)).toMatchObject({
+			catalogStage: "initialize",
+			reason,
+			observedRows: reason === "cardinality" ? 2 : 1,
+		});
+		expect(fileHistoryCatalogDiagnostic(error)?.rowIdMatches).toBe(
+			reason === "cardinality" ? undefined : false,
+		);
+		expect(JSON.stringify(fileHistoryCatalogDiagnostic(error))).not.toContain("private-");
+		expect(queries).toHaveLength(1);
+	});
+
+	test.each([
+		"budget",
+		"metadata",
+		"reservations",
+	] as const)("%s mismatch uses only the existing bounded budget read and reports budget_read", async (kind) => {
+		catalog.initializeNamespace();
+		db.update(budgets)
+			.set({ namespaceKey: "a".repeat(64) })
+			.run();
+		{
+			queries.length = 0;
+			const error = await expectCode(
+				() =>
+					kind === "budget"
+						? catalog.getBudget()
+						: kind === "metadata"
+							? catalog.getMetadata({ ref: refFor() })
+							: catalog.listReservations({ status: "reserved" }),
+				"namespace_mismatch",
+			);
+			expect(fileHistoryCatalogDiagnostic(error)).toMatchObject({
+				catalogStage: "budget_read",
+				reason: "key_mismatch",
+			});
+			expect(queries).toHaveLength(1);
+			expect(queries[0]).toContain('where "file_change_storage_budgets"."id" = ?');
+			expect(queries[0]).toContain("limit ?");
+		}
+	});
+
+	test("publication accounting reports its own stage with only the existing budget read", async () => {
+		catalog.initializeNamespace();
+		const lease = await reserve();
+		db.update(budgets)
+			.set({ namespaceKey: "a".repeat(64) })
+			.run();
+		queries.length = 0;
+		const error = await expectCode(
+			() => lease.release({ ref: refFor(), published: true }),
+			"namespace_mismatch",
+		);
+		expect(fileHistoryCatalogDiagnostic(error)).toMatchObject({
+			catalogStage: "publication_accounting",
+			reason: "key_mismatch",
+		});
+		expect(queries).toHaveLength(1);
+		expect(queries[0]).toContain('where "file_change_storage_budgets"."id" = ?');
+	});
+
+	test("legacy reservation inventory remains bounded and read-only", async () => {
 		catalog.initializeNamespace();
 		for (let index = 0; index < 5; index++)
 			db.insert(reservations)
@@ -265,13 +452,13 @@ describe("independent retryable blob history", () => {
 					createdAt: "2026-01-01T00:00:00.000Z",
 				})
 				.run();
-		const first = catalog.listReservations({ status: "reserved", limit: 2 });
-		const second = catalog.listReservations({
+		const first = await catalog.listReservations({ status: "reserved", limit: 2 });
+		const second = await catalog.listReservations({
 			status: "reserved",
 			limit: 2,
 			after: first.nextCursor ?? undefined,
 		});
-		const last = catalog.listReservations({
+		const last = await catalog.listReservations({
 			status: "reserved",
 			limit: 2,
 			after: second.nextCursor ?? undefined,

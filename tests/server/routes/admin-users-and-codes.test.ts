@@ -6,14 +6,20 @@
  * account creation never returns a session token for the created user, and that
  * the code plaintext appears in the creation response and nowhere else.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { registrationCodes, userPreferences, users } from "../../../server/db/schema";
+import * as pool from "../../../server/lib/db-worker/pool";
 import { AppError } from "../../../server/lib/errors";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -70,7 +76,8 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
@@ -207,6 +214,50 @@ describe("PATCH /users/:id role changes", () => {
 		const selfRes = await patch(`/users/${ADMIN_ID}`, { role: "user" });
 		expect(selfRes.status).toBe(400);
 		expect(((await selfRes.json()) as { code: string }).code).toBe("SELF_DEMOTE");
+	});
+
+	/** The admin count is read on a Worker; the other admin goes away before the write. */
+	function demoteOtherAdminAfterCount() {
+		const run = pool.runReadTask;
+		let fired = false;
+		spyOn(pool, "runReadTask").mockImplementation((async (path, params, options) => {
+			const result = await run(path, params, options);
+			if (!fired && "sql" in params && /count\(/i.test(params.sql)) {
+				fired = true;
+				sqlite.run("UPDATE users SET role = 'user' WHERE id = ?", [ADMIN_ID]);
+			}
+			return result;
+		}) as typeof pool.runReadTask);
+	}
+
+	test("the last-administrator guard is re-checked inside the demotion write", async () => {
+		await seedUser("second-admin", "admin");
+		demoteOtherAdminAfterCount();
+		try {
+			const res = await patch("/users/second-admin", { role: "user" });
+			expect(res.status).toBe(400);
+			expect(((await res.json()) as { code: string }).code).toBe("LAST_ADMIN");
+		} finally {
+			mock.restore();
+		}
+		expect(sqlite.query("SELECT role FROM users WHERE id = 'second-admin'").get()).toEqual({
+			role: "admin",
+		});
+	});
+
+	test("the last-administrator guard is re-checked inside the deletion write", async () => {
+		await seedUser("second-admin", "admin");
+		demoteOtherAdminAfterCount();
+		try {
+			const res = await appForRole("admin").request("/users/second-admin", { method: "DELETE" });
+			expect(res.status).toBe(400);
+			expect(((await res.json()) as { code: string }).code).toBe("LAST_ADMIN");
+		} finally {
+			mock.restore();
+		}
+		expect(sqlite.query("SELECT role FROM users WHERE id = 'second-admin'").get()).toEqual({
+			role: "admin",
+		});
 	});
 });
 

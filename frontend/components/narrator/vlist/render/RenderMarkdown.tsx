@@ -34,6 +34,7 @@ import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
 import { Fragment, lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { MarkdownImage } from "../../markdown/MarkdownImage";
 import { MarkdownLink } from "../../markdown/MarkdownLink";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { pretextLineMetrics } from "../measure/pretext-metrics";
@@ -44,6 +45,7 @@ import type {
 	MeasuredElement,
 	PreparedBlock,
 	PreparedCodeBlock,
+	PreparedFixedBlock,
 	PreparedInlineBlock,
 	PreparedTableBlock,
 	PreparedTableCell,
@@ -55,12 +57,18 @@ import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-conte
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
 import "../vlist-markdown.css";
+import { inlineFlowForWidth } from "@shared/pretext-layout/agent-reference-flow";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import { TokenText } from "../../content/TokenLines";
 import { VListCodeCopyButton } from "../VListCodeCopyButton";
 import { CaretFiller } from "./caret-filler";
-import { FragmentGap, LINE_FRAGMENTS_STYLE, LineFragments } from "./line-fragments";
+import {
+	FragmentGap,
+	LINE_FRAGMENTS_STYLE,
+	LineFragments,
+	lineChipAttribute,
+} from "./line-fragments";
 import { MarkdownLineFragments } from "./MarkdownLineFragments";
 import { staticInlineMarkupCache } from "./static-inline-markup";
 import {
@@ -155,6 +163,7 @@ export interface RenderMarkdownProps {
 	showSource?: boolean;
 	/** The raw markdown, needed only while `showSource` holds. */
 	sourceText?: string;
+	observeSourceRanges?: boolean;
 	/**
 	 * Fired once the unknown-block subtree settles at a real pixel height.
 	 * Only used for PreparedUnknownBlock; ordinary blocks never call this.
@@ -216,6 +225,7 @@ function RenderMarkdownBody({
 	measured,
 	showSource,
 	sourceText,
+	observeSourceRanges,
 	onUnknownHeight,
 	animateStreaming,
 	sealOnMount,
@@ -312,9 +322,15 @@ function RenderMarkdownBody({
 				height={frame.contentHeight}
 				limited={limited}
 				direction={measured.textPreview?.direction}
+				observeSourceRanges={observeSourceRanges}
 			/>
 		);
 	}
+	const sourceAttrs = (block: PreparedBlock) => {
+		const range = block.sourceRange;
+		const offset = measured.textPreview?.sourceStart ?? 0;
+		return range ? sourceRangeAttributes(range.start + offset, range.end + offset) : undefined;
+	};
 
 	// When any unpredictable block is present, switch the whole host to a
 	// simple stacked flow. Absolute frame tops cannot reflow subsequent siblings
@@ -340,6 +356,7 @@ function RenderMarkdownBody({
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
 							key={index}
 							data-vlist-flow-block={block.kind}
+							{...sourceAttrs(block)}
 							style={{
 								position: "relative",
 								width: "100%",
@@ -379,6 +396,18 @@ function RenderMarkdownBody({
 				const blockFrame = frame.blocks[index];
 				if (!blockFrame) return null;
 				const marginTop = block.marginTop;
+				const rendered = (
+					<BlockView
+						block={block}
+						frame={blockFrame}
+						contentWidth={contentWidth}
+						flowing={false}
+						animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
+						animScope={animScope}
+						sealAnimation={sealAnimation}
+						codeCopyPlacement={copyPlacements.get(index)}
+					/>
+				);
 				return (
 					// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
 					<Fragment key={index}>
@@ -386,16 +415,13 @@ function RenderMarkdownBody({
 						    marginTop before frame.top) belongs to no text box; fill it so a
 						    drag-selection can resolve a caret there. */}
 						<CaretFiller top={blockFrame.top - marginTop} height={marginTop} width={contentWidth} />
-						<BlockView
-							block={block}
-							frame={blockFrame}
-							contentWidth={contentWidth}
-							flowing={false}
-							animKey={animateStreaming && animKeyBase ? `${animKeyBase}:${index}` : undefined}
-							animScope={animScope}
-							sealAnimation={sealAnimation}
-							codeCopyPlacement={copyPlacements.get(index)}
-						/>
+						{block.sourceRange ? (
+							<div {...sourceAttrs(block)} style={{ display: "contents" }}>
+								{rendered}
+							</div>
+						) : (
+							rendered
+						)}
 					</Fragment>
 				);
 			})}
@@ -426,6 +452,10 @@ export function RenderMarkdown(props: RenderMarkdownProps) {
  * the reader asks for a height change), so the source scrolls inside the reserved
  * box instead. Exactly what a tool card's capped markdown body already does.
  */
+function sourceRangeAttributes(start: number, end: number) {
+	return { "data-vlist-source-start": start, "data-vlist-source-end": end };
+}
+
 function MarkdownSourceBody({
 	text,
 	width,
@@ -433,6 +463,7 @@ function MarkdownSourceBody({
 	limited = false,
 	direction = "head",
 	plainText = false,
+	observeSourceRanges = false,
 }: {
 	plainText?: boolean;
 	text: string;
@@ -440,6 +471,7 @@ function MarkdownSourceBody({
 	height: number;
 	limited?: boolean;
 	direction?: "head" | "tail";
+	observeSourceRanges?: boolean;
 }) {
 	const metrics = typographyMetrics();
 	const font = plainText ? metrics.font.body : metrics.font.markdownCode;
@@ -457,6 +489,23 @@ function MarkdownSourceBody({
 		});
 		return ranges.map((range) => materializeLineRange(prepared, range).text);
 	}, [limited, text, width, height, direction, font, lineHeight]);
+	let cursor = 0;
+	const rawLineAttrs = (line: string, exact: boolean) => {
+		if (!observeSourceRanges || cursor < 0) return;
+		const start = exact ? cursor : text.indexOf(line, cursor);
+		if (start < 0 || (!exact && text.slice(cursor, start).trim().length)) {
+			cursor = -1;
+			return;
+		}
+		const end = start + line.length;
+		cursor = exact ? end + 1 : end;
+		const nonblank = line.trim();
+		if (nonblank)
+			return sourceRangeAttributes(
+				start + line.indexOf(nonblank),
+				start + line.indexOf(nonblank) + nonblank.length,
+			);
+	};
 	return (
 		<div
 			data-vlist-markdown-source={plainText ? undefined : true}
@@ -492,13 +541,24 @@ function MarkdownSourceBody({
 							// biome-ignore lint/suspicious/noArrayIndexKey: bounded visual source lines
 							key={index}
 							data-vlist-source-line
+							{...(direction === "head" ? rawLineAttrs(line, false) : undefined)}
 							data-vlist-line={plainText ? true : undefined}
 							style={{ height: lineHeight, whiteSpace: "pre" }}
 						>
 							{line}
 						</div>
 					))
-				: text}
+				: observeSourceRanges
+					? text.split("\n").map((line, index) => (
+							// biome-ignore lint/suspicious/noArrayIndexKey: raw source lines are positional
+							<Fragment key={index}>
+								{index ? "\n" : null}
+								<span data-vlist-source-line {...rawLineAttrs(line, true)}>
+									{line}
+								</span>
+							</Fragment>
+						))
+					: text}
 		</div>
 	);
 }
@@ -586,10 +646,86 @@ function BlockView({
 		case "rule":
 			return <RuleBlockView frame={frame} block={block} />;
 		case "fixed":
-			return null; // rendered by the owning element's renderer via block.tag
+			return block.tag === "markdown-image" ? (
+				<MarkdownImageBlockView block={block} frame={frame} contentWidth={contentWidth} />
+			) : null; // Other fixed tags are rendered by the owning element.
 		case "unknown":
 			return <UnknownBlockView block={block} frame={frame} flowing={flowing} />;
 	}
+}
+
+/** Fixed geometry, including while the scoped image read is pending or has failed. */
+function MarkdownImageBlockView({
+	block,
+	frame,
+	contentWidth,
+}: {
+	block: PreparedFixedBlock;
+	frame: BlockFrame;
+	contentWidth: number;
+}) {
+	const src = typeof block.data?.src === "string" ? block.data.src : undefined;
+	const alt = typeof block.data?.alt === "string" ? block.data.alt : "";
+	const title = typeof block.data?.title === "string" ? block.data.title : undefined;
+	return (
+		<div
+			data-vlist-markdown-image
+			style={{
+				position: "absolute",
+				top: frame.top,
+				left: 0,
+				width: contentWidth,
+				height: frame.height,
+				overflow: "hidden",
+			}}
+		>
+			{block.quoteRailLefts.length > 0 ? (
+				<div
+					style={{
+						position: "absolute",
+						left: block.quoteRailLefts[0] ?? 0,
+						top: 0,
+						right: 0,
+						bottom: 0,
+						background: "var(--vlist-quote-bg)",
+					}}
+				/>
+			) : null}
+			<MarkdownListMarker block={block} top={0} />
+			{block.quoteRailLefts.map((left, index) => (
+				<div
+					// biome-ignore lint/suspicious/noArrayIndexKey: rails are a stable ordered list
+					key={index}
+					style={{
+						position: "absolute",
+						left,
+						top: 0,
+						bottom: 0,
+						width: 3,
+						background: "var(--mantine-primary-color-filled)",
+					}}
+				/>
+			))}
+			<div
+				style={{
+					position: "absolute",
+					left: block.contentLeft,
+					top: 0,
+					width: Math.max(1, contentWidth - block.contentLeft),
+					height: frame.height,
+					display: "flex",
+					alignItems: "center",
+					justifyContent: "center",
+					overflow: "hidden",
+					borderRadius: "var(--mantine-radius-sm)",
+					background: "var(--vlist-media-bg)",
+					font: typographyMetrics().font.body,
+				}}
+			>
+				<MarkdownImage key={src} src={src} alt={alt} title={title} previewHeight={frame.height} />
+			</div>
+		</div>
+	);
 }
 
 // ── Table block: solved columns, absolutely positioned cells ─────────────────
@@ -743,9 +879,10 @@ function TableCellView({
 }) {
 	const lines = useMemo(() => {
 		const out: InlineLine[] = [];
-		walkRichInlineLineRanges(cell.flow, width, (range) => {
+		const flow = inlineFlowForWidth(cell, width);
+		walkRichInlineLineRanges(flow, width, (range) => {
 			if (maxHeight !== undefined && out.length * lineHeight >= maxHeight) return;
-			const line = materializeRichInlineLineRange(cell.flow, range);
+			const line = materializeRichInlineLineRange(flow, range);
 			out.push({
 				fragments: line.fragments.map((f) => ({
 					text: f.text,
@@ -753,6 +890,7 @@ function TableCellView({
 					className: cell.classNames[f.itemIndex] ?? "",
 					href: cell.hrefs[f.itemIndex] ?? null,
 					gapBefore: f.gapBefore,
+					occupiedWidth: f.occupiedWidth,
 					globalStart: 0,
 					// A cell formula reaches here the same way a paragraph's does; leaving
 					// this null painted the atom placeholder (an NBSP) instead of the KaTeX
@@ -785,7 +923,7 @@ function TableCellView({
 						justifyContent,
 					}}
 				>
-					<LineFragments>
+					<LineFragments chip={lineChipAttribute(line.fragments)}>
 						{line.fragments.map((frag, fi) => (
 							<Fragment
 								// biome-ignore lint/suspicious/noArrayIndexKey: fragments are a stable ordered list
@@ -808,6 +946,8 @@ function TableCellView({
 										<MarkdownLink
 											lineNumbersInChildren
 											href={frag.href}
+											labelText={frag.text}
+											occupiedWidth={frag.occupiedWidth}
 											className={frag.className}
 											style={fragmentTextStyle({
 												font: frag.font,
@@ -842,6 +982,7 @@ function TableCellView({
 // ── Inline block: materialize line ranges and lay out fragments ──────────────
 
 interface InlineFragment {
+	occupiedWidth: number;
 	text: string;
 	font: string;
 	className: string;
@@ -898,10 +1039,11 @@ function InlineBlockView({
 		const maxLines = frame.renderLimited
 			? Math.ceil(Math.max(0, frame.height - contentTop) / block.lineHeight)
 			: Number.POSITIVE_INFINITY;
-		walkRichInlineLineRanges(block.flow, lineWidth, (range) => {
+		const flow = inlineFlowForWidth(block, lineWidth);
+		walkRichInlineLineRanges(flow, lineWidth, (range) => {
 			const index = lineIndex++;
 			if (index < skip || out.length >= maxLines) return;
-			const line = materializeRichInlineLineRange(block.flow, range);
+			const line = materializeRichInlineLineRange(flow, range);
 			out.push({
 				fragments: line.fragments.map((f) => {
 					const globalStart = offset;
@@ -913,7 +1055,9 @@ function InlineBlockView({
 						className: block.classNames[f.itemIndex] ?? "",
 						href: block.hrefs[f.itemIndex] ?? null,
 						gapBefore: f.gapBefore,
+						occupiedWidth: f.occupiedWidth,
 						globalStart,
+
 						math: block.mathHtmls?.[f.itemIndex] ?? null,
 					};
 				}),
@@ -1074,7 +1218,11 @@ function InlineBlockView({
 									dangerouslySetInnerHTML={{ __html: markup }}
 								/>
 							) : (
-								<span data-vlist-line-frags style={LINE_FRAGMENTS_STYLE}>
+								<span
+									data-vlist-line-frags
+									data-vlist-line-chip={lineChipAttribute(line.fragments)}
+									style={LINE_FRAGMENTS_STYLE}
+								>
 									{line.fragments.map((frag, fi) => {
 										// An inline formula replaces its placeholder glyph with real KaTeX
 										// output, pinned to the width the measure layer reserved.
@@ -1104,6 +1252,8 @@ function InlineBlockView({
 													<MarkdownLink
 														lineNumbersInChildren
 														href={frag.href}
+														labelText={frag.text}
+														occupiedWidth={frag.occupiedWidth}
 														className={frag.className}
 														style={fragmentTextStyle({
 															font: frag.font,

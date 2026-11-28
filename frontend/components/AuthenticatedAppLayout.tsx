@@ -3,7 +3,6 @@ import type { AppShellProps } from "@mantine/core";
 import { AppShell, Box, Button, Center, Group, Loader, Modal, Text, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowLeft } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { Navigate, Outlet, useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -11,14 +10,17 @@ import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
 import { useChatUnreadLive } from "../hooks/useChat";
+import { useFastModeUpdates } from "../hooks/useFastModeUpdates";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
+import { useRuntimeProjectionSync } from "../hooks/useRuntimeProjectionSync";
+import { useRuntimeSettings } from "../hooks/useRuntimeSettings";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
-import { api, clearToken } from "../lib/api";
+import { clearToken } from "../lib/api";
 import {
 	useAppShellHistoryEntryKey,
 	useAppShellMainScrollRestoration,
@@ -63,6 +65,7 @@ import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
 import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
+import { UnattendedModeBanner } from "./UnattendedModeBanner";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
@@ -141,6 +144,8 @@ export function AuthenticatedLayout() {
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, fetchStatus, hasToken, sessionLost } = useAuthenticatedSession();
+	useFastModeUpdates(!!user);
+	useRuntimeProjectionSync(!!user);
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
@@ -149,11 +154,7 @@ export function AuthenticatedLayout() {
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
 
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		enabled: hasToken,
-	});
+	const { data: settings } = useRuntimeSettings(hasToken);
 	const requestEvidenceAutoPin = settings?.requestEvidence?.autoPin;
 	const requestEvidencePinning =
 		requestEvidenceAutoPin === "all" || requestEvidenceAutoPin === "errors";
@@ -538,6 +539,12 @@ export function AuthenticatedLayout() {
 				 */}
 				<WSConnectionAlert />
 				<VersionUpdateBanner />
+				{/*
+				 * Last sibling on purpose: this is the kill switch for unattended mode, so it
+				 * must win both paint order and the WCO no-drag rect collection (see the note
+				 * above) when another banner happens to be visible at the same time.
+				 */}
+				<UnattendedModeBanner />
 			</AppShellWithNavWidth>
 		</MobileNavContext.Provider>
 	);

@@ -372,5 +372,6 @@ describe("shared grant table isolation", () => {
 		});
 
 		expect(await canReadProject(await rowOf(projectId), asUser(outsider))).toBe(true);
+		expect((await readableIdsViaSql(asUser(outsider), [projectId])).has(projectId)).toBe(true);
 	});
 });

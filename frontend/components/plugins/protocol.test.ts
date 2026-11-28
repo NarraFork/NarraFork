@@ -148,6 +148,14 @@ describe("plugin UI method inventory", () => {
 		expect(isPluginUiBackendMethod("context.get")).toBe(false);
 	});
 
+	test("keeps overlay.setBounds host-local so an overlay never needs its backend to be interactive", () => {
+		// It only moves a DOM hit region inside the host; routing it to the backend would
+		// make dragging stop working whenever the plugin process is down.
+		expect(isPluginUiHostLocalMethod("overlay.setBounds")).toBe(true);
+		expect(isPluginUiBackendMethod("overlay.setBounds")).toBe(false);
+		expect(isKnownPluginUiMethod("overlay.setBounds")).toBe(true);
+	});
+
 	test("flags unknown methods as not part of the protocol surface", () => {
 		expect(isKnownPluginUiMethod("snapshot_live")).toBe(false);
 		expect(isKnownPluginUiMethod("backend.call")).toBe(false);

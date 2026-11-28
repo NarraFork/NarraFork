@@ -11,6 +11,7 @@
  * fallback after the coordinator's retry budget.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../../logger";
 import { ParcelRecursiveWatcher } from "../parcel-watcher";
 import {
 	asWorkerStdinSink,
@@ -32,6 +33,13 @@ let clearTimeoutSpy: ReturnType<typeof spyOn<typeof globalThis, "clearTimeout">>
 // A real event-loop boundary drains stream/Promise continuations and lets Bun
 // report unhandled rejections; it does not wait for an arbitrary elapsed delay.
 const drainEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+async function shutdownClient(client: ParcelWorkerClient): Promise<void> {
+	const closing = client.shutdown();
+	await drainEventLoop();
+	if ([...timers.values()].some((timer) => timer.delay === 500)) await fireTimeout(500);
+	await closing;
+}
 
 async function fireTimeout(delay: number) {
 	const matches = Array.from(timers).filter(([, timer]) => timer.delay === delay);
@@ -97,7 +105,7 @@ interface FakeProc {
 	pid: number;
 	stdin: WorkerStdinSink | { getWriter(): never };
 	stdout: ReadableStream<Uint8Array>;
-	stderr: null;
+	stderr: ReadableStream<Uint8Array> | null;
 	exited: Promise<number>;
 	killed: boolean;
 	emitLine(line: string): void;
@@ -264,6 +272,99 @@ afterEach(async () => {
 	}
 });
 
+describe("watcher health diagnostics", () => {
+	test("coordinator cannot report successful shutdown when client exit cleanup failed", async () => {
+		const watcher = new ParcelRecursiveWatcher(
+			() => {},
+			() => {},
+		);
+		const client = (watcher as unknown as { workerClient: ParcelWorkerClient }).workerClient;
+		const failure = new Error("worker exit remains unconfirmed");
+		client.shutdown = async () => {
+			throw failure;
+		};
+		await expect(watcher.shutdown()).rejects.toBe(failure);
+	});
+	test("worker/coordinator canaries never enter health logs and throwing sinks cannot skip exit", async () => {
+		process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = "1";
+		const canary = "watcher-secret-/private/root-raw-error-body";
+		const records: unknown[] = [];
+		let throwSink = false;
+		const logs = (["debug", "info", "warn", "error"] as const).map((level) =>
+			spyOn(logger, level).mockImplementation((message, data) => {
+				records.push({ message, data });
+				if (throwSink) throw new Error(canary);
+			}),
+		);
+		const { proc, spawn } = spawnAndInstall({ autoAck: true });
+		proc.stderr = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(`${canary}\n`));
+				controller.close();
+			},
+		});
+		const unavailable: string[] = [];
+		const client = new ParcelWorkerClient(
+			() => {},
+			(reason) => {
+				unavailable.push(reason);
+				throw new Error(canary);
+			},
+		);
+		const coordinator = new ParcelRecursiveWatcher(
+			() => {},
+			() => {},
+		);
+		const internal = coordinator as unknown as {
+			onError(path: string, ignores: string[], error: unknown, attempts: number): void;
+		};
+		try {
+			await client.watch(canary, []);
+			proc.emitLine(
+				JSON.stringify({
+					type: "log",
+					level: "warn",
+					message: canary,
+					data: { path: canary, error: canary },
+				}),
+			);
+			proc.emitLine(`invalid-${canary}`);
+			await drainEventLoop();
+			internal.onError(canary, [], new Error(canary), 3);
+			throwSink = true;
+			proc.emitLine(JSON.stringify({ type: "error", id: canary, error: canary, fatal: true }));
+			await drainEventLoop();
+			expect(proc.killed).toBe(true);
+			expect(unavailable).toContain(canary); // Domain failure context is retained, not logged.
+			await shutdownClient(client);
+			expect(records.length).toBeGreaterThan(0);
+			expect(JSON.stringify(records)).not.toContain(canary);
+			for (const record of records as { message: string; data?: Record<string, unknown> }[]) {
+				expect(record.message).toBe("Parcel watcher health");
+				for (const [key, value] of Object.entries(record.data ?? {})) {
+					expect([
+						"code",
+						"bytes",
+						"active",
+						"restartAttempts",
+						"restart",
+						"pending",
+						"count",
+						"pid",
+						"fatal",
+					]).toContain(key);
+					expect(["string", "number", "boolean"]).toContain(typeof value);
+				}
+			}
+		} finally {
+			await shutdownClient(client).catch(() => {});
+			await coordinator.shutdown().catch(() => {});
+			spawn.mockRestore();
+			for (const log of logs) log.mockRestore();
+		}
+	});
+});
+
 describe("FileSink write protocol", () => {
 	test("asWorkerStdinSink accepts FileSink and rejects WritableStream shape", () => {
 		const good = createFakeFileSink();
@@ -370,15 +471,14 @@ describe("FileSink write protocol", () => {
 			expect(parsed.type).toBe("watch");
 			expect(parsed.path).toBe("/tmp/nf-watcher-test");
 
-			await client.shutdown();
-			// shutdown command then end() on the sink
-			await fireTimeout(500);
+			await shutdownClient(client);
+			// shutdown command, end(), escalation, then the actual process exit.
 			expect(sink.endCount).toBeGreaterThan(0);
 			await sub.unsubscribe().catch(() => {});
 			expect(proc.killed || sink.endCount > 0).toBe(true);
 		} finally {
 			spawn.mockRestore();
-			await client.shutdown().catch(() => {});
+			await shutdownClient(client).catch(() => {});
 		}
 	});
 });
@@ -414,7 +514,7 @@ describe("pending ACK lifecycle", () => {
 			expect(timers.size).toBe(0);
 		} finally {
 			spawn.mockRestore();
-			await client.shutdown().catch(() => {});
+			await shutdownClient(client).catch(() => {});
 			await drainEventLoop();
 			expect(collector.rejections).toEqual([]);
 			expect(sink.getWriterCalls).toBe(0);
@@ -461,7 +561,7 @@ describe("pending ACK lifecycle", () => {
 			expect(sink.getWriterCalls).toBe(0);
 		} finally {
 			spawn.mockRestore();
-			await client.shutdown().catch(() => {});
+			await shutdownClient(client).catch(() => {});
 		}
 	});
 
@@ -487,17 +587,25 @@ describe("pending ACK lifecycle", () => {
 			expect(pendingMapOf(client).size).toBe(1);
 			expect(Array.from(timers.values(), (timer) => timer.delay)).toEqual([5000]);
 
-			await client.shutdown();
+			const closing = client.shutdown();
+			let settled = false;
+			void closing.then(() => {
+				settled = true;
+			});
+			await drainEventLoop();
+			expect(settled).toBe(false);
 			expect(pendingMapOf(client).size).toBe(0);
 			expect(sink.endCount).toBeGreaterThan(0);
 			await expect(inflight).rejects.toThrow(/shutting down|timed out|exited/);
 			await fireTimeout(500);
+			await closing;
+			expect(settled).toBe(true);
 			expect(timers.size).toBe(0);
 			expect(collector.rejections).toEqual([]);
 			expect(proc.killed || sink.endCount > 0).toBe(true);
 		} finally {
 			spawn.mockRestore();
-			await client.shutdown().catch(() => {});
+			await shutdownClient(client).catch(() => {});
 		}
 	});
 });
@@ -572,7 +680,7 @@ describe("coordinator fallback after retries", () => {
 			expect(collector.rejections).toEqual([]);
 		} finally {
 			spawn.mockRestore();
-			await client.shutdown().catch(() => {});
+			await shutdownClient(client).catch(() => {});
 		}
 	});
 });

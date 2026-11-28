@@ -10,10 +10,12 @@
 
 import {
 	hasDirectorySubtitle,
+	isCoordinatorSessionTab,
 	type RecentTab,
 	type RecentTabViewer,
 } from "@frontend/hooks/recent-tabs-utils";
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
+import { refreshProjectTabDetails } from "@frontend/hooks/useRecentTabs";
 import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import { ActionIcon, Avatar, Box, Group, Paper, Stack, Text, Tooltip } from "@mantine/core";
@@ -21,17 +23,24 @@ import {
 	IconArchive,
 	IconClock,
 	IconCopy,
+	IconFolder,
 	IconFolderPlus,
+	IconGitMerge,
+	IconHourglass,
+	IconMessages,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
 	IconServer,
+	IconShieldQuestion,
 	IconSubtask,
 	IconTerminal2,
+	IconUsersGroup,
 	IconWindowMaximize,
 	IconX,
 } from "@tabler/icons-react";
-import { useLayoutEffect, useState, useSyncExternalStore } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { UserAvatar } from "../UserAvatar";
 import type { RecentTabHoverStore } from "./recent-tab-hover";
@@ -95,17 +104,82 @@ function DetailLine({ icon, children }: { icon: React.ReactNode; children: React
 	);
 }
 
+/** A count as shown: `12`, or `12+` when the server's read hit its cap. */
+function countLabel(count: number, capped: boolean | undefined): string {
+	return capped ? `${count}+` : String(count);
+}
+
+/**
+ * A project tab's details (runtime state, `recent-tab-projects.ts`): its directory, the sessions
+ * running or waiting there that this user can read, and its teams. Nothing until the runtime
+ * patch arrives, and nothing for a project the user can no longer read.
+ */
+function ProjectTabDetails({ tab, t }: { tab: RecentTab; t: T }) {
+	const active = tab.activeSessionCount;
+	const waiting = tab.waitingSessionCount ?? 0;
+	const teams = tab.teamCount;
+	const capped = tab.projectCountsCapped;
+	return (
+		<>
+			{tab.projectPath && (
+				<Group gap={6} wrap="nowrap" align="flex-start" data-testid="recent-tab-project-path">
+					<Box style={{ display: "flex", flexShrink: 0, opacity: 0.6, paddingTop: 2 }}>
+						<IconFolder size={12} />
+					</Box>
+					<Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
+						{tab.projectPath}
+					</Text>
+				</Group>
+			)}
+			{typeof active === "number" && (
+				<DetailLine icon={<IconMessages size={12} />}>
+					{active > 0
+						? t("recentTabProjectActiveSessions", {
+								count: active,
+								countLabel: countLabel(active, capped),
+							})
+						: t("recentTabProjectNoActiveSessions")}
+				</DetailLine>
+			)}
+			{waiting > 0 && (
+				<DetailLine icon={<IconHourglass size={12} />}>
+					{t("recentTabProjectWaitingSessions", {
+						count: waiting,
+						countLabel: countLabel(waiting, capped),
+					})}
+				</DetailLine>
+			)}
+			{typeof teams === "number" && teams > 0 && (
+				<DetailLine icon={<IconUsersGroup size={12} />}>
+					{t("recentTabProjectTeams", { count: teams, countLabel: countLabel(teams, capped) })}
+				</DetailLine>
+			)}
+		</>
+	);
+}
+
 /**
  * The details block itself. `compact` drops the title for the menu header, where the
  * row the user swiped is right next to it.
  */
 export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; compact?: boolean }) {
 	const { t } = useTranslation("common");
+	const qc = useQueryClient();
+	// A project's details are read when its card or touch details open (bounded, see
+	// `refreshProjectTabDetails`), on top of the sidebar's runtime request.
+	useEffect(() => {
+		if (tab.type !== "project") return;
+		return refreshProjectTabDetails(qc, tab.id);
+	}, [qc, tab.type, tab.id]);
 	const tt = t as T;
 	const isSession = tab.type === "narrator" || tab.type === "subagent";
-	const display = isSession
-		? getEffectiveNarratorDisplay(tab.status ?? "idle", tab.substatus)
-		: null;
+	// A team tab shows its coordinator's state, as its icon does.
+	const display =
+		isSession || tab.type === "team"
+			? getEffectiveNarratorDisplay(tab.status ?? "idle", tab.substatus)
+			: null;
+	const pendingApprovals = tab.type === "team" ? (tab.pendingApprovalCount ?? 0) : 0;
+	const readyItems = tab.type === "team" ? (tab.readyItemCount ?? 0) : 0;
 	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
 	const terminals = tab.activeTerminalCount ?? 0;
 	const work = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
@@ -142,6 +216,22 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 				>
 					{tab.subtitle}
 				</Text>
+			)}
+			{tab.type === "project" && <ProjectTabDetails tab={tab} t={tt} />}
+			{isCoordinatorSessionTab(tab) && (
+				<DetailLine icon={<IconUsersGroup size={12} />}>
+					{tt("recentTabCoordinatorSession")}
+				</DetailLine>
+			)}
+			{pendingApprovals > 0 && (
+				<DetailLine icon={<IconShieldQuestion size={12} />}>
+					{tt("recentTabTeamPendingApprovals", { count: pendingApprovals })}
+				</DetailLine>
+			)}
+			{readyItems > 0 && (
+				<DetailLine icon={<IconGitMerge size={12} />}>
+					{tt("recentTabTeamReadyItems", { count: readyItems })}
+				</DetailLine>
 			)}
 			{terminals > 0 && (
 				<DetailLine icon={<IconTerminal2 size={12} />}>

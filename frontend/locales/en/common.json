@@ -448,7 +448,7 @@
 	"updateDeltaFallback": "Switched to a full download.",
 	"updateSourceChanged": "Update settings changed. Check for updates again.",
 	"updateMirrorPromptTitle": "Switch to the official update server?",
-	"updateMirrorPromptDescription": "On the first update check, the NarraFork server could not connect to GitHub, timed out, or was rate limited. Switch to the official update server to improve update checks and incremental patch downloads? Full update packages may still require GitHub. Settings change only after confirmation; no update will be installed and no restart will occur automatically.",
+	"updateMirrorPromptDescription": "On the first update check, the NarraFork server could not connect to GitHub, timed out, or was rate limited. Switch to the official update server? Update checks, incremental patches and full packages will then use only the selected server, with no GitHub access or fallback. Settings change only after confirmation; no update will be installed and no restart will occur automatically.",
 	"updateMirrorKeepGithub": "Keep GitHub",
 	"updateMirrorSwitch": "Switch to official update server",
 	"updateMirrorSwitchFailed": "Could not switch update servers. Retry or switch manually in server settings.",
@@ -810,5 +810,12 @@
 	"imageViewer_copyFailed": "Failed to copy image",
 	"imageViewer_downloadFailed": "Failed to download image",
 	"botBadge": "Bot",
-	"swipeMenu": "Menu"
+	"swipeMenu": "Menu",
+	"recentTabTeamPendingApprovals": "{{count}} pending approval(s)",
+	"recentTabTeamReadyItems": "{{count}} item(s) ready to merge",
+	"recentTabProjectActiveSessions": "{{countLabel}} session(s) running",
+	"recentTabProjectNoActiveSessions": "No sessions running",
+	"recentTabProjectWaitingSessions": "{{countLabel}} waiting for input or approval",
+	"recentTabProjectTeams": "{{countLabel}} team(s)",
+	"recentTabCoordinatorSession": "The coordinator session of a team. The team's own tab opens its board."
 }

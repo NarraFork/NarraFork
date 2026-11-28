@@ -53,7 +53,7 @@ interface CommandsEditorProps {
 
 export function CommandsEditor({ commands, onChange, ns = "settings" }: CommandsEditorProps) {
 	const { t } = useTranslation(ns);
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const [editIndex, setEditIndex] = useState<number | null>(null);
 	const [draft, setDraft] = useState<CommandDef>({ name: "", prompt: "" });
 	const [error, setError] = useState("");
@@ -335,6 +335,7 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 										}));
 									}}
 									searchable
+									filter={modelOptionsFilter}
 									limit={MODEL_SELECT_OPTION_LIMIT}
 									size="xs"
 								/>

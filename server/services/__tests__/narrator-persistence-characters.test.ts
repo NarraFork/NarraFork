@@ -1,13 +1,16 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ContextCharStats } from "@shared/context-composition";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	hasPendingContextCharacterRefresh,
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../../lib/context-characters";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 // Schema changes intentionally precede generated migrations in this worktree.
 for (const [table, column, definition] of [
 	["narrator_messages", "context_chars_json", "text"],
@@ -91,6 +94,7 @@ afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("character statistics at actual persistence boundaries", () => {

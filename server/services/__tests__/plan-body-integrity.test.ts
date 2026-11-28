@@ -21,10 +21,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { getFileTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { resetDbWorkerPoolForTest } from "../../lib/db-worker/pool";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDbModule = { ...(await import("../../db")) };
 
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
@@ -49,7 +50,9 @@ afterEach(() => {
 	sqlite.run("DELETE FROM narrators");
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await resetDbWorkerPoolForTest();
+	dispose();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });

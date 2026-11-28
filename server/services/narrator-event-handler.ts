@@ -8,23 +8,38 @@ import {
 } from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
+import {
+	getValidReasoningTranslationParts,
+	isReasoningTranslationId,
+	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
+	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
+	type ReasoningTranslationFields,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import { and, eq } from "drizzle-orm";
-import { db } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { activeDatabaseBackend, db } from "../db";
+import {
+	apiRequests,
+	narratorBlocks,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+} from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
 	cleanupPartialImageGenerationResults,
 	saveImageGenerationResult,
 } from "../lib/agent/image-generation";
-import { listRunningAgentAwaitsForSubagent } from "../lib/agent/tools/await";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -33,7 +48,7 @@ import {
 import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
-import { sqliteErrorCode, withDbRetry } from "../lib/db-resilience";
+import { sqliteErrorCode } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -49,7 +64,9 @@ import { saveUploadedImage } from "../lib/uploads";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
+import { getRunControl } from "./agent-runtime/ownership";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { knownBlockIdForElement } from "./narrator-block-ids";
 import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { completeAssistantOutput } from "./narrator-output-recovery";
@@ -64,6 +81,7 @@ import {
 import { narratorStore } from "./narrator-store";
 import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
+import { reasoningTranslationActivity } from "./reasoning-translation-activity";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
 /** Maps are scoped to this consumer/session, not globally to provider tool ids. */
@@ -244,23 +262,19 @@ export async function persistDetachedToolResult(
 		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
 	}
 	const output = await toolResultLedgerOutput(narratorId, event);
-	// The generator is already gone, so a transient lock cannot rely on its normal
-	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
-	const affected = await withDbRetry(
-		() =>
-			narratorStore.settleTool(event.toolUseId, {
-				expectedBinding: { ...binding, narratorId },
-				output,
-				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
-				status: event.isError ? "fail" : "success",
-				errorMessage: event.isError ? event.output : undefined,
-				durationMs: event.durationMs,
-				permissionStartedAt: event.permissionStartedAt,
-				executionStartedAt: event.executionStartedAt,
-				completedAt: event.completedAt,
-			}),
-		{ label: "persistDetachedToolResult", maxRetries: 3 },
-	);
+	// Persistence retries only the atomic transaction, retaining this receipt's CAS authority;
+	// committed notifications must never replay through a second settle.
+	const affected = await narratorStore.settleTool(event.toolUseId, {
+		expectedBinding: { ...binding, narratorId },
+		output,
+		input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
+		status: event.isError ? "fail" : "success",
+		errorMessage: event.isError ? event.output : undefined,
+		durationMs: event.durationMs,
+		permissionStartedAt: event.permissionStartedAt,
+		executionStartedAt: event.executionStartedAt,
+		completedAt: event.completedAt,
+	});
 	if (!affected) return;
 
 	// Refresh persisted history, not tool_completed (which mutates live streaming
@@ -385,6 +399,8 @@ export interface EventHandlerContext {
 	// --- Subagent-specific ---
 	/** Parent tool_use ID that spawned this subagent */
 	parentToolUseId?: string;
+	/** Frozen logical run and exact destination attempt, checked against the live owner. */
+	subagentOutputIdentity?: Omit<SubagentOutputCount, "count" | "active">;
 	/** Subagent's resolved model name (attached to broadcast messages) */
 	subagentModel?: string;
 
@@ -605,6 +621,7 @@ export interface EventHooks {
 
 export interface ToolChunkSnapshot {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
@@ -827,186 +844,235 @@ export function clearStreamingSnapshot(narratorId: string): void {
 }
 
 // === Subagent live output char count ===
-//
-// A running subagent's reply text is invisible on the parent's page beyond the
-// "recent calls" rows: the Agent card shows nothing growing while the child
-// writes. This counter folds every `stream_text` delta into a cumulative total
-// and republishes it to the parent's tool card over the existing `tool_output`
-// channel, reusing ContextAsk's bare-count convention — a numeric
-// `_streamingOutput` renders as "N chars", never as a markdown body of digits.
-//
-// Semantics: the count is the child's reply text across its WHOLE run (every
-// agentic iteration, not just the current one), reasoning excluded — the badge
-// answers "how much has it written", not "how much is on screen".
-//
-// Lifecycle: the counter accumulates across a run's iterations (each
-// `assistant_message` resets only the streaming SNAPSHOT, never this total),
-// resets on a discarded attempt / dead-turn reset (the streamed text is
-// retracted and replayed, so the count starts over with it), and retires at
-// the run's end — `retireSubagentOutputCharCount` is called from the
-// orchestrator's loop finalizer and the narrator-disposal paths, NOT from
-// `clearStreamingSnapshot` (which also fires per iteration via
-// `clearAuthorStreamingSnapshot`).
-//
-// Delivery is gated on the parent's snapshot still tracking the target tool:
-// once the Agent/Await call completes and its turn persists, the chunk is gone
-// and there is no card left to tick, so the broadcast is skipped while the
-// count itself keeps accumulating — a card that (re)appears later (a fresh
-// Await on the same child) resumes from the true total rather than zero.
-
-/** Minimum interval between subagent output-count broadcasts (ms). */
+// The logical run owns this state, independently of parent/child message streams.
+// Only reply-body spans are retained: no reply text, tool input or durable history.
 const SUBAGENT_OUTPUT_COUNT_EMIT_MS = 250;
 
 interface SubagentOutputCharCounter {
-	/** Where the Agent card lives — the subagent's direct parent. */
 	parentNarratorId: string;
-	/** The parent's Agent tool_use this subagent belongs to. */
-	parentToolUseId: string;
-	/**
-	 * Per-block accumulated span (start offset + length), never the text itself:
-	 * a run-long copy of every reply would grow unboundedly for a verbose child.
-	 * The overlap math mirrors appendRawStreamText on lengths alone.
-	 */
-	blocks: Map<string, { start: number; length: number }>;
+	identity: Omit<SubagentOutputCount, "count" | "active">;
+	/** Provider request identity, distinct from the parent's persisted tool execution attempt. */
+	blocks: Map<string, { start: number; length: number; requestId?: string }>;
 	totalChars: number;
 	lastEmitAt: number;
 	timer?: ReturnType<typeof setTimeout>;
 }
 
 const subagentOutputCharCounters = hotSafe<Map<string, SubagentOutputCharCounter>>(
-	"narrafork.subagentOutputCharCounters",
+	"narrafork.subagentOutputCharCounters.v2",
+	() => new Map(),
+);
+// An index into the authoritative counters, not a second store of their totals.
+const subagentOutputTargets = hotSafe<Map<string, Set<string>>>(
+	"narrafork.subagentOutputTargets",
 	() => new Map(),
 );
 
-/** Push the current count to every card still showing it. */
-function emitSubagentOutputCharCount(
-	subagentNarratorId: string,
+function isCurrentSubagentOutputCounter(counter: SubagentOutputCharCounter): boolean {
+	const { identity } = counter;
+	const run = getRunControl(identity.childNarratorId);
+	return (
+		subagentOutputCharCounters.get(identity.childNarratorId) === counter &&
+		run?.logicalRunId === identity.logicalRunId &&
+		!run.cancel.signal.aborted &&
+		run.deliverTo?.narratorId === counter.parentNarratorId &&
+		run.deliverTo.toolUseId === identity.toolUseId &&
+		run.deliverTo.toolCallId === identity.toolCallId &&
+		run.deliverTo.attempt === identity.attempt
+	);
+}
+
+function projectSubagentOutputCount(
 	counter: SubagentOutputCharCounter,
-): void {
+	active: boolean,
+): SubagentOutputCount {
+	return { ...counter.identity, count: counter.totalChars, active };
+}
+
+/** Push Agent counts without requiring a transient parent tool chunk. */
+function emitSubagentOutputCharCount(counter: SubagentOutputCharCounter, active = true): void {
+	if (active && !isCurrentSubagentOutputCounter(counter)) return;
 	counter.lastEmitAt = Date.now();
-	const payload = String(counter.totalChars);
-	// The spawning Agent card plus any in-flight Await watching this subagent.
-	const targets: Array<{ narratorId: string; toolUseId: string }> = [
-		{ narratorId: counter.parentNarratorId, toolUseId: counter.parentToolUseId },
-		...listRunningAgentAwaitsForSubagent(subagentNarratorId),
-	];
-	for (const target of targets) {
-		const chunk = streamingSnapshots.get(target.narratorId)?.toolChunks.get(target.toolUseId);
-		// No chunk → the call completed and its turn persisted; nobody is showing
-		// this card, so skip the broadcast but keep counting (see the header note).
-		if (!chunk) continue;
-		// Keep the snapshot current so a reconnecting client restores the count.
-		chunk.streamingOutput = payload;
-		broadcastToNarrator(target.narratorId, {
-			type: "tool_output",
-			narratorId: target.narratorId,
-			toolUseId: target.toolUseId,
-			output: payload,
-		});
-	}
+	const output = String(counter.totalChars);
+	broadcastToNarrator(counter.parentNarratorId, {
+		type: "tool_output",
+		narratorId: counter.parentNarratorId,
+		toolUseId: counter.identity.toolUseId,
+		output,
+		subagentOutputCount: projectSubagentOutputCount(counter, active),
+	});
+	// Watch registrations return immediately; live output belongs to the spawning Agent card.
 }
 
-/**
- * Retire a subagent's output counter at the END of its run: flush the final
- * total so the parent card lands on it, then drop the entry.
- *
- * Called from the orchestrator's loop finalizer and the narrator-disposal
- * paths — deliberately NOT from `clearStreamingSnapshot`, which also fires per
- * agentic iteration (via `clearAuthorStreamingSnapshot`) and would make the
- * badge restart from zero between a child's turns.
- */
-export function retireSubagentOutputCharCount(narratorId: string): void {
+/** Register the live owner's exact Agent destination before its first text (zero included). */
+export function startSubagentOutputCharCount(narratorId: string, logicalRunId: string): void {
+	const run = getRunControl(narratorId);
+	if (run?.logicalRunId !== logicalRunId || run.cancel.signal.aborted) return;
+	const deliverTo = run.deliverTo;
+	if (!deliverTo) return;
+	const parsed = parseSubagentOutputCount({
+		childNarratorId: narratorId,
+		logicalRunId,
+		toolUseId: deliverTo.toolUseId,
+		toolCallId: deliverTo.toolCallId,
+		attempt: deliverTo.attempt,
+		count: 0,
+		active: true,
+	});
+	if (!parsed) return;
+	const previous = subagentOutputCharCounters.get(narratorId);
+	if (previous) {
+		if (isCurrentSubagentOutputCounter(previous)) return;
+		retireSubagentOutputCharCount(narratorId, previous.identity.logicalRunId);
+	}
+	const { count: _count, active: _active, ...identity } = parsed;
+	const counter: SubagentOutputCharCounter = {
+		parentNarratorId: deliverTo.narratorId,
+		identity,
+		blocks: new Map(),
+		totalChars: 0,
+		lastEmitAt: 0,
+	};
+	subagentOutputCharCounters.set(narratorId, counter);
+	let targets = subagentOutputTargets.get(deliverTo.narratorId);
+	if (!targets) {
+		targets = new Set();
+		subagentOutputTargets.set(deliverTo.narratorId, targets);
+	}
+	targets.add(narratorId);
+	emitSubagentOutputCharCount(counter);
+	// Let the first body delta be immediate, independently of the initial zero.
+	counter.lastEmitAt = 0;
+}
+
+/** Only the matching logical run's terminal finalizer (or explicit close) may retire it. */
+export function retireSubagentOutputCharCount(narratorId: string, logicalRunId: string): void {
 	const counter = subagentOutputCharCounters.get(narratorId);
-	if (!counter) return;
+	if (!counter || counter.identity.logicalRunId !== logicalRunId) return;
 	if (counter.timer) clearTimeout(counter.timer);
-	emitSubagentOutputCharCount(narratorId, counter);
+	counter.timer = undefined;
 	subagentOutputCharCounters.delete(narratorId);
+	const targets = subagentOutputTargets.get(counter.parentNarratorId);
+	targets?.delete(narratorId);
+	if (targets?.size === 0) subagentOutputTargets.delete(counter.parentNarratorId);
+	emitSubagentOutputCharCount(counter, false);
 }
 
-/**
- * Reset the running total when the child's in-flight text is retracted (a
- * discarded attempt / dead-turn reset): the replayed stream restarts the count
- * with it. The counter itself survives — the run continues.
- */
-function resetSubagentOutputCharCount(narratorId: string): void {
-	const counter = subagentOutputCharCounters.get(narratorId);
-	if (!counter) return;
-	if (counter.timer) {
-		clearTimeout(counter.timer);
-		counter.timer = undefined;
+/** Bounded by this destination's live runs; never reads transcript bodies or the database. */
+export function getSubagentOutputCounts(narratorId: string): SubagentOutputCount[] {
+	const counts: SubagentOutputCount[] = [];
+	for (const childId of subagentOutputTargets.get(narratorId) ?? []) {
+		const counter = subagentOutputCharCounters.get(childId);
+		if (!counter) continue;
+		if (!isCurrentSubagentOutputCounter(counter)) {
+			retireSubagentOutputCharCount(childId, counter.identity.logicalRunId);
+			continue;
+		}
+		counts.push(projectSubagentOutputCount(counter, true));
 	}
-	counter.blocks.clear();
-	counter.totalChars = 0;
+	return counts;
 }
 
-/**
- * Fold one subagent text delta into the running count (throttled broadcast).
- *
- * Keyed by the subagent's narrator id, which a nested subagent correctly maps
- * to its own direct parent: each level's Agent card counts only its own child's
- * reply text.
- */
+function subagentOutputCounterForContext(
+	ctx: EventHandlerContext,
+): SubagentOutputCharCounter | undefined {
+	const identity = ctx.subagentOutputIdentity;
+	const counter = subagentOutputCharCounters.get(ctx.narratorId);
+	if (
+		!identity ||
+		!counter ||
+		!isCurrentSubagentOutputCounter(counter) ||
+		ctx.broadcastTargetId !== counter.parentNarratorId ||
+		ctx.parentToolUseId !== identity.toolUseId ||
+		identity.childNarratorId !== ctx.narratorId ||
+		identity.logicalRunId !== counter.identity.logicalRunId ||
+		identity.toolUseId !== counter.identity.toolUseId ||
+		identity.toolCallId !== counter.identity.toolCallId ||
+		identity.attempt !== counter.identity.attempt
+	)
+		return undefined;
+	return counter;
+}
+
+/** A persisted response makes this request's contribution irreversible; retain only its total. */
+function sealSubagentOutputAttempt(ctx: EventHandlerContext): void {
+	const counter = subagentOutputCounterForContext(ctx);
+	if (!counter) return;
+	for (const [key, span] of counter.blocks) {
+		if (span.requestId === ctx.currentAttemptId) counter.blocks.delete(key);
+	}
+}
+
+/** A closed model pass cannot replay its provider requests; keep its accumulated number only. */
+export function sealSubagentOutputPass(narratorId: string, logicalRunId: string): void {
+	const counter = subagentOutputCharCounters.get(narratorId);
+	if (counter?.identity.logicalRunId !== logicalRunId || !isCurrentSubagentOutputCounter(counter))
+		return;
+	counter.blocks.clear();
+}
+
+/** Retract only body spans owned by the discarded provider request, preserving prior passes. */
+function retractSubagentOutputAttempt(ctx: EventHandlerContext, requestId?: string): void {
+	const counter = subagentOutputCounterForContext(ctx);
+	// Display-only adapters without a provider request cannot identify retractable text.
+	if (!counter || !requestId) return;
+	let removed = 0;
+	for (const [key, span] of counter.blocks) {
+		if (span.requestId !== requestId) continue;
+		removed += span.length;
+		counter.blocks.delete(key);
+	}
+	if (removed === 0) return;
+	if (counter.timer) clearTimeout(counter.timer);
+	counter.timer = undefined;
+	counter.totalChars -= removed;
+	emitSubagentOutputCharCount(counter);
+}
+
+/** Reply body length across every pass of this run, with span-only replay deduplication. */
 function noteSubagentOutputText(
 	ctx: EventHandlerContext,
 	blockKey: string,
 	text: string,
 	textOffset: number,
 ): void {
-	if (!ctx.parentToolUseId || !text) return;
-	const key = ctx.narratorId;
-	let counter = subagentOutputCharCounters.get(key);
-	if (!counter) {
-		counter = {
-			parentNarratorId: ctx.broadcastTargetId,
-			parentToolUseId: ctx.parentToolUseId,
-			blocks: new Map(),
-			totalChars: 0,
-			lastEmitAt: 0,
-		};
-		subagentOutputCharCounters.set(key, counter);
-	}
-	// The snapshot's append rule, on spans alone so no text is retained: a
-	// replayed/overlapping prefix (a resume) must not double-count.
-	const previous = counter.blocks.get(blockKey);
-	let span: { start: number; length: number };
+	if (!text) return;
+	const counter = subagentOutputCounterForContext(ctx);
+	if (!counter) return;
+	const requestId = ctx.currentAttemptId;
+	const countBlockKey = JSON.stringify([requestId ?? null, blockKey]);
+	const previous = counter.blocks.get(countBlockKey);
 	const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
-	if (!previous || textOffset > previousEnd || textOffset < previous.start) {
-		// A gap/missing prefix cannot be invented — the delta becomes the span.
-		span = { start: textOffset, length: text.length };
-	} else {
-		// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
-		// max keeps the old end), one extending past it grows by exactly the
-		// non-overlapping tail — the length-only form of appendRawStreamText.
-		span = {
-			start: previous.start,
-			length: Math.max(previousEnd, textOffset + text.length) - previous.start,
-		};
-	}
-	counter.blocks.set(blockKey, span);
-	let total = 0;
-	for (const block of counter.blocks.values()) total += block.length;
-	if (total === counter.totalChars) return;
-	counter.totalChars = total;
+	const span =
+		!previous || textOffset > previousEnd || textOffset < previous.start
+			? { start: textOffset, length: text.length }
+			: {
+					start: previous.start,
+					length: Math.max(previousEnd, textOffset + text.length) - previous.start,
+				};
+	counter.blocks.set(countBlockKey, { ...span, requestId });
+	const delta = span.length - (previous?.length ?? 0);
+	if (delta === 0) return;
+	counter.totalChars += delta;
 
 	const elapsed = Date.now() - counter.lastEmitAt;
 	if (elapsed >= SUBAGENT_OUTPUT_COUNT_EMIT_MS) {
-		if (counter.timer) {
-			clearTimeout(counter.timer);
-			counter.timer = undefined;
-		}
-		emitSubagentOutputCharCount(key, counter);
+		if (counter.timer) clearTimeout(counter.timer);
+		counter.timer = undefined;
+		emitSubagentOutputCharCount(counter);
 	} else if (!counter.timer) {
 		counter.timer = setTimeout(() => {
 			counter.timer = undefined;
-			// The entry may have retired while this timer was pending.
-			const live = subagentOutputCharCounters.get(key);
-			if (live) emitSubagentOutputCharCount(key, live);
+			// Both the exact counter object and live owner binding must still match.
+			// An old timer never emits the replacement counter's total.
+			emitSubagentOutputCharCount(counter);
 		}, SUBAGENT_OUTPUT_COUNT_EMIT_MS - elapsed);
 	}
 }
 
 /** Reset one author's stream without deleting concurrently running relatives. */
 function clearAuthorStreamingSnapshot(ctx: EventHandlerContext): void {
+	reasoningTranslationActivity.clear(ctx.narratorId);
 	const ownerId = ctx.parentToolUseId ? ctx.narratorId : ctx.broadcastTargetId;
 	const owner = streamingSnapshots.get(ownerId);
 	// A narrator's snapshot also holds its children's tool summaries. Those children
@@ -1119,8 +1185,10 @@ function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): bool
 }
 
 function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
+	const receipt = ctx.toolExecutionReceipts?.get(toolUseId)?.binding;
 	return {
-		toolCallId: ctx.toolCallIdsMap?.get(toolUseId) ?? null,
+		toolCallId: receipt?.toolCallId ?? ctx.toolCallIdsMap?.get(toolUseId) ?? null,
+		...(receipt ? { executionAttempt: receipt.attempt } : {}),
 		...(ctx.parentToolUseId
 			? {
 					parentToolUseId: ctx.parentToolUseId,
@@ -1171,6 +1239,7 @@ function broadcastToolCompleted(
 		type: "tool_completed",
 		narratorId: ctx.broadcastTargetId,
 		toolCallId: message.toolCallId,
+		...(message.executionAttempt != null ? { executionAttempt: message.executionAttempt } : {}),
 		toolUseId: message.toolUseId,
 		toolName: message.toolName,
 		status: message.status,
@@ -1306,9 +1375,8 @@ async function discardAttemptPersistedBlocks(
 	// retire them. Done regardless of whether a partial row exists: the streaming
 	// blocks are client state and are not conditional on persistence.
 	clearAuthorStreamingSnapshot(ctx);
-	// The retracted text no longer counts toward the child's live output total;
-	// the replay restarts it.
-	resetSubagentOutputCharCount(narratorId);
+	// Retract this provider request only; successful earlier passes still count.
+	retractSubagentOutputAttempt(ctx, requestId);
 	ctx.fileReferenceContexts?.clear();
 	ctx.committedContentSnapshots?.clear();
 	ctx.unpublishedContentBlockIds?.clear();
@@ -1406,7 +1474,7 @@ const LOCALE_NAMES: Record<string, string> = {
 	ko: "한국어",
 };
 
-type PersistedReasoningBlock = {
+type PersistedReasoningBlock = ReasoningTranslationFields & {
 	type?: string;
 	id?: string;
 	text?: string;
@@ -1545,8 +1613,20 @@ function translateReasoningBlock(
 			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
 			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
 			if (!isSameReasoningBlock(beforeBlock, reasoningText) || beforeBlock?.translatedText) return;
-			const result = await summaryGenerate(
+			let start = 0;
+			const generation = beforeBlock?.translationGeneration ?? randomUUID();
+			for (const part of getValidReasoningTranslationParts(
 				reasoningText,
+				generation,
+				beforeBlock?.translationParts,
+			)) {
+				if (part.start !== start) break;
+				start = part.end;
+			}
+			if (start === reasoningText.length) return;
+			const sourceText = reasoningText.slice(start);
+			const result = await summaryGenerate(
+				sourceText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
 				{ narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
 				undefined,
@@ -1580,18 +1660,69 @@ function translateReasoningBlock(
 			// See isSameReasoningBlock.
 			if (!isSameReasoningBlock(blocks[targetIdx], reasoningText)) return;
 
-			const patched = await narratorService.patchReasoningTranslation(
-				messageId,
-				targetIdx,
-				translated,
-				{
-					id: locator?.id,
-					text: reasoningText,
-				},
-			);
+			const elementId = locator?.id;
+			const part: ReasoningTranslationPart = {
+				id: randomUUID(),
+				generation,
+				start,
+				end: reasoningText.length,
+				sourceText,
+				translatedText: translated,
+			};
+			const useRange =
+				activeDatabaseBackend === "sqlite" &&
+				isReasoningTranslationId(elementId) &&
+				Buffer.byteLength(sourceText) <= MAX_REASONING_TRANSLATION_SOURCE_BYTES &&
+				Buffer.byteLength(translated) <= MAX_REASONING_TRANSLATION_OUTPUT_BYTES;
+			const patched = useRange
+				? narratorService.patchReasoningTranslationRange(messageId, elementId, reasoningText, part)
+				: start === 0 &&
+					(await narratorService.patchReasoningTranslation(messageId, targetIdx, translated, {
+						id: elementId,
+						text: reasoningText,
+					}));
 			if (!patched) return;
 
-			// Broadcast updated message so frontend picks up the translation
+			if (useRange) {
+				const blockId = knownBlockIdForElement(narratorId, elementId);
+				const receipt = blockId
+					? (
+							await db
+								.select({
+									blockRevision: narratorBlocks.revision,
+									stateRevision: narratorMessages.stateRevision,
+								})
+								.from(narratorBlocks)
+								.innerJoin(narratorMessages, eq(narratorBlocks.messageId, narratorMessages.id))
+								.where(
+									and(
+										eq(narratorBlocks.id, blockId),
+										eq(narratorBlocks.messageId, messageId),
+										eq(narratorMessages.narratorId, narratorId),
+										eq(narratorBlocks.kind, "reasoning"),
+										eq(narratorMessages.bodyFormat, 2),
+									),
+								)
+								.limit(1)
+						)[0]
+					: null;
+				if (receipt && blockId) {
+					dualBroadcast(ctx, {
+						type: "reasoning_translation_patch",
+						narratorId: broadcastTargetId,
+						ownerNarratorId: narratorId,
+						messageId,
+						blockId,
+						elementId,
+						...receipt,
+						translationGeneration: generation,
+						part,
+					});
+					return;
+				}
+			}
+
+			// Legacy/unnamed blocks do not have a persistent identity for a compact frame.
 			const fullMessage = fillBody(
 				await db.query.narratorMessages.findFirst({
 					...bodyColumns(),
@@ -2108,6 +2239,25 @@ export async function processEvent(
 				});
 				retireCompletedSnapshot();
 			} else if (block.type === "reasoning") {
+				let sealedReasoningLength = 0;
+				if (
+					settings.agent.translateReasoning &&
+					block.completed === false &&
+					block.id &&
+					block.revision !== undefined &&
+					event.sealedReasoningLength &&
+					event.sealedReasoningLength <= block.text.length &&
+					block.text.length === block.rawTextLength
+				) {
+					sealedReasoningLength = event.sealedReasoningLength;
+					reasoningTranslationActivity.seal(
+						narratorId,
+						partialId,
+						block.id,
+						block.revision,
+						event.sealedReasoningLength,
+					);
+				}
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
 					text: block.text,
@@ -2115,6 +2265,7 @@ export async function processEvent(
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
 					...(block.completed != null ? { completed: block.completed } : {}),
+					...(block.completed === false ? { sealedReasoningLength } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
 				});
@@ -2547,6 +2698,7 @@ export async function processEvent(
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
 			clearAuthorStreamingSnapshot(ctx);
+			if (event.outputCompleted !== false) sealSubagentOutputAttempt(ctx);
 			ctx.attemptBlockBaselines?.clear();
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
@@ -2762,16 +2914,18 @@ export async function processEvent(
 							executionStartedAt: event.executionStartedAt,
 							completedAt: event.completedAt,
 							input: settledInput,
+							...(binding && {
+								expectedBinding: { ...binding, narratorId },
+								includeLegacyParentVersions: true,
+							}),
 						},
 						undefined,
 						resultToolCallId,
 					);
 				try {
-					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
-					// 事务本身是 immediate，单次尝试会先忙等一次 busy_timeout；再撞锁就退避
-					// 200+400+800+1600ms 重试，5 次合计约 4.5 秒。只「立即重试一次」会在同一
-					// 个锁窗口里再失败，把瞬时争用升级成 CriticalEventPersistenceError、终止 loop。
-					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 5 });
+					// The persistence transaction owns bounded SQLITE_BUSY retries; committed
+					// notifications and other postcommit effects must never replay from here.
+					await settle();
 					toolResultPersisted = true;
 				} catch (err) {
 					logger.error("CRITICAL: tool_result persist failed", {
@@ -2828,6 +2982,7 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				...subagentToolRouting(ctx, event.toolUseId),
 				...(resultToolCallId ? { toolCallId: resultToolCallId } : {}),
+				...(binding ? { executionAttempt: binding.attempt } : {}),
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
@@ -2973,6 +3128,9 @@ export async function processEvent(
 				providerPrefix: event.providerPrefix,
 				resumeAction: event.resumeAction,
 			});
+			// A subagent running out of balance must not open the parent's recharge
+			// dialog: tag the parent copy so the parent page ignores it.
+			const routedToAnotherNarrator = ctx.narratorId !== broadcastTargetId;
 			dualBroadcast(ctx, {
 				type: "payment_required",
 				narratorId: broadcastTargetId,
@@ -2980,7 +3138,11 @@ export async function processEvent(
 				providerPrefix: event.providerPrefix,
 				balance: event.balance,
 				required: event.required,
+				...(isNugPaymentContext(event.paymentContext)
+					? { paymentContext: event.paymentContext }
+					: {}),
 				resumeAction: event.resumeAction,
+				...(routedToAnotherNarrator && { isSubagent: true }),
 			});
 			return null;
 		}
@@ -3014,7 +3176,7 @@ export async function processEvent(
 			// tell the frontend to drop the streaming blocks it is currently showing.
 			clearAuthorStreamingSnapshot(ctx);
 			// The discarded turn's text stops counting toward the child's output total.
-			resetSubagentOutputCharCount(narratorId);
+			retractSubagentOutputAttempt(ctx, ctx.currentAttemptId);
 			ctx.fileReferenceContexts?.clear();
 			ctx.committedContentSnapshots?.clear();
 			ctx.unpublishedContentBlockIds?.clear();
@@ -3045,7 +3207,10 @@ export async function processEvent(
 				type: "tool_use_discarded",
 				narratorId: broadcastTargetId,
 				toolUseIds: event.toolUseIds,
-				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				...(ctx.parentToolUseId && {
+					parentToolUseId: ctx.parentToolUseId,
+					subagentNarratorId: narratorId,
+				}),
 			});
 			return null;
 		}
@@ -3239,17 +3404,26 @@ export async function processEvent(
 		}
 
 		case "quota_balance": {
+			// Same rule as context_usage / metering: the parent page's quota slot
+			// belongs to the parent's own model, so the parent copy is tagged and
+			// ignored there — otherwise a running subagent's balance overwrites the
+			// parent's display and its provider cache. Keyed on the broadcast route
+			// rather than `parentToolUseId`, so a frame addressed to another narrator
+			// is always tagged even when the placement carries no tool_use link.
+			const routedToAnotherNarrator = ctx.narratorId !== broadcastTargetId;
 			dualBroadcast(ctx, {
 				type: "quota_balance",
 				narratorId: broadcastTargetId,
 				quotaBalance: event.quotaBalance,
 				detailedQuotaBalance: event.detailedQuotaBalance,
+				...(routedToAnotherNarrator && { isSubagent: true }),
 			});
 			if (ctx.providerPrefix) {
 				updateCustomApiQuotaByPrefix(
 					ctx.providerPrefix,
 					event.quotaBalance,
 					event.detailedQuotaBalance,
+					event.providerIdentity,
 				);
 				try {
 					const { updateNugQuotaByPrefix } = await import("../routes/nug");
@@ -3260,6 +3434,8 @@ export async function processEvent(
 								ctx.providerPrefix,
 								numericBalance,
 								event.detailedQuotaBalance ?? null,
+								undefined,
+								event.providerIdentity,
 							);
 						}
 					}

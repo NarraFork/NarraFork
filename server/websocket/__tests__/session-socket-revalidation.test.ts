@@ -3,16 +3,24 @@
  * role change reaches sockets that are already open, and a session that slid forward
  * keeps its socket instead of being dropped at the expiry captured on upgrade.
  *
- * ISOLATION: the session store runs on `tests/setup`'s in-memory database, mocked over
- * `server/db`.
+ * ISOLATION: the session store runs on an isolated file/WAL database, mocked over
+ * `server/db`, so its live reads execute in the production worker path.
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
-import { authSessions, users } from "../../db/schema";
+import { cleanDb } from "../../../tests/setup";
+import { authSessions, narrators, terminals, users } from "../../db/schema";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
+import { getNarratorWorkerTestDb } from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const previousWorker = process.env.NARRAFORK_DB_WORKER;
+const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+process.env.NARRAFORK_DB_WORKER = "on";
+process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -20,15 +28,22 @@ const { createToken, revokeSessionToken, revokeUserSessions, verifyToken } = awa
 	"../../lib/auth"
 );
 const { authSessionStore } = await import("../../services/auth/store");
-const { revalidateSessionSockets } = await import("../ws-handler");
+const { revalidateSessionSockets, startHeartbeat, stopHeartbeat } = await import("../ws-handler");
 
-afterAll(() => {
+afterAll(async () => {
+	stopHeartbeat();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
+	if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+	else process.env.NARRAFORK_DB_WORKER = previousWorker;
+	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
+	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 });
 
 beforeEach(() => {
 	cleanDb(sqlite);
+	startHeartbeat();
 });
 
 type Socket = Parameters<typeof revalidateSessionSockets>[0][number];
@@ -130,6 +145,48 @@ describe("revalidateSessionSockets", () => {
 		expect((socket.ws.data as { userRole: string }).userRole).toBe("user");
 	});
 
+	test("refreshes the live role on terminal sockets and drops what it no longer opens", async () => {
+		const adminId = await makeUser("admin");
+		const ownerId = await makeUser("user");
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "private-session",
+			ownerUserId: ownerId,
+			visibility: "private",
+			writeAudience: "owner",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db.insert(terminals).values({
+			id: "owner-shell",
+			narratorId: "private-session",
+			name: "shell",
+			status: "running",
+			createdAt: now,
+		});
+		const session = await verifyToken(await createToken(adminId));
+		const sent: Array<{ type: string; code?: string }> = [];
+		const socket = terminalSocket(adminId, session.sid as string, session.exp);
+		Object.assign(socket.ws, { send: (payload: string) => sent.push(JSON.parse(payload)) });
+		const data = socket.ws.data as { userRole?: string; subscribedTerminals: Set<string> };
+		data.userRole = "admin";
+		data.subscribedTerminals.add("owner-shell");
+
+		// Still an admin: the subscription stays.
+		await revalidateSessionSockets([socket.ws]);
+		expect(data.subscribedTerminals.has("owner-shell")).toBe(true);
+
+		await db.update(users).set({ role: "user" }).where(eq(users.id, adminId));
+		await revalidateSessionSockets([socket.ws]);
+
+		expect(socket.close).not.toHaveBeenCalled();
+		expect(data.userRole).toBe("user");
+		expect(data.subscribedTerminals.has("owner-shell")).toBe(false);
+		expect(sent).toContainEqual(
+			expect.objectContaining({ type: "error", code: "TERMINAL_NOT_FOUND" }),
+		);
+	});
+
 	test("an expired session closes the socket", async () => {
 		const userId = await makeUser("user");
 		const session = await verifyToken(await createToken(userId));
@@ -142,6 +199,100 @@ describe("revalidateSessionSockets", () => {
 		await revalidateSessionSockets([socket.ws]);
 
 		expect(socket.close).toHaveBeenCalled();
+	});
+
+	test("multiple explicit sockets and overlapping heartbeats perform one session read", async () => {
+		const userId = await makeUser("admin");
+		const session = await verifyToken(await createToken(userId));
+		const a = terminalSocket(userId, session.sid, session.exp);
+		const b = narratorSocket(userId, session.sid as string, "admin");
+		const original = authSessionStore.findSessionById;
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const find = spyOn(authSessionStore, "findSessionById").mockImplementation(
+			async (id, options) => {
+				await held;
+				return original(id, options);
+			},
+		);
+		const first = revalidateSessionSockets([a.ws, b.ws]);
+		const overlap = revalidateSessionSockets([a.ws, b.ws]);
+		try {
+			expect(overlap).toBe(first);
+			expect(find).toHaveBeenCalledTimes(1);
+			release();
+			await first;
+			expect(a.close).not.toHaveBeenCalled();
+			expect(b.close).not.toHaveBeenCalled();
+		} finally {
+			release();
+			await first;
+			find.mockRestore();
+		}
+	});
+
+	test("auth changed rejects an in-flight admin snapshot and tail reads the live downgrade", async () => {
+		const userId = await makeUser("admin");
+		const session = await verifyToken(await createToken(userId));
+		const socket = narratorSocket(userId, session.sid as string, "user");
+		const original = authSessionStore.findSessionById;
+		const stale = await original(session.sid as string);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let calls = 0;
+		const find = spyOn(authSessionStore, "findSessionById").mockImplementation(
+			async (id, options) => {
+				if (++calls === 1) {
+					await held;
+					return stale;
+				}
+				return original(id, options);
+			},
+		);
+		const run = revalidateSessionSockets([socket.ws]);
+		try {
+			await db.update(users).set({ role: "user" }).where(eq(users.id, userId));
+			for (let index = 0; index < 5; index++) eventBus.emit({ type: "auth:changed", userId });
+			release();
+			await run;
+			expect(find).toHaveBeenCalledTimes(2);
+			expect(socket.close).not.toHaveBeenCalled();
+			expect((socket.ws.data as { userRole: string }).userRole).toBe("user");
+		} finally {
+			release();
+			await run;
+			find.mockRestore();
+		}
+	});
+
+	test("identity changes during the session lookup do not close or update the replacement", async () => {
+		const userId = await makeUser("admin");
+		const session = await verifyToken(await createToken(userId));
+		const socket = narratorSocket(userId, session.sid as string, "user");
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const find = spyOn(authSessionStore, "findSessionById").mockImplementation(async () => {
+			await held;
+			return null;
+		});
+		const run = revalidateSessionSockets([socket.ws]);
+		socket.ws.data.sessionId = "replacement";
+		try {
+			release();
+			await run;
+			expect(socket.close).not.toHaveBeenCalled();
+			expect(socket.ws.data.sessionExp).toBe(0);
+		} finally {
+			release();
+			await run;
+			find.mockRestore();
+		}
 	});
 
 	test("a storage failure keeps the socket", async () => {

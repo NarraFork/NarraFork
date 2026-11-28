@@ -5,9 +5,21 @@ import {
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	type ReasoningTranslationPatch,
+	type ReasoningTranslationStatusFrame,
+	readReasoningTranslationPatch,
+	readReasoningTranslationStatus,
+} from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import {
+	normalizeSubagentNestedSummary,
+	type SubagentNestedSummary,
+} from "@shared/subagent-nested";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -74,6 +86,11 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.executionAttempt === "number" &&
+		Number.isSafeInteger(data.executionAttempt) &&
+		data.executionAttempt >= 0
+			? { executionAttempt: data.executionAttempt }
+			: {}),
 		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
@@ -86,7 +103,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		model: nonEmptyString(data.model),
 		// Re-normalized rather than trusted: the same cap and key whitelist the server
 		// applied, so a hand-crafted frame cannot widen the payload the row renders.
-		inputSummary: normalizeSubagentToolInputSummary(data.inputSummary),
+		...(data.inputSummary !== undefined
+			? { inputSummary: normalizeSubagentToolInputSummary(data.inputSummary) }
+			: {}),
 	};
 }
 
@@ -97,6 +116,7 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	const eventMeta = subagentToolEventMeta(record);
 	return {
 		toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+		...(eventMeta.executionAttempt != null ? { executionAttempt: eventMeta.executionAttempt } : {}),
 		toolUseId: record.toolUseId,
 		toolName: record.toolName,
 		status: typeof record.status === "string" ? record.status : "initializing",
@@ -108,7 +128,9 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
 		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
 		// moment a reconnect snapshot replaced the fetched activity.
-		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
+		...(eventMeta.inputSummary != null || record.inputSummary === null
+			? { inputSummary: eventMeta.inputSummary }
+			: {}),
 	};
 }
 
@@ -217,6 +239,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		: [];
 	const reasoningEffort = nonEmptyString(record.reasoningEffort);
 	const fileChanges = normalizeSubagentFileChanges(record.fileChanges);
+	const nested = normalizeSubagentNestedSummary(record.nested);
 	return {
 		subagentNarratorId:
 			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
@@ -224,6 +247,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		...(reasoningEffort ? { reasoningEffort } : {}),
 		...(fileChanges ? { fileChanges } : {}),
 		...(record.takenOver === true ? { takenOver: true } : {}),
+		...(nested && nested.total > 0 ? { nested } : {}),
 		latestToolCalls,
 	};
 }
@@ -353,6 +377,7 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
 	blockId?: string | null;
 	toolName?: string | null;
@@ -393,6 +418,73 @@ export interface NarratorWarningInfo {
 	maxRetries?: number;
 	delayMs?: number;
 	diagnostics?: Record<string, unknown>;
+}
+
+export interface NarratorStatusPatch {
+	status: string;
+	statusEpoch?: string;
+	statusRevision?: number;
+	substatus?: string[];
+	turnStartedAt?: string | null;
+	updatedAt?: string;
+	messageCount?: number;
+	errorMessage?: string | null;
+	errorRetryable?: boolean | null;
+	archivedWithNarratorId?: string | null;
+	backgroundWorkActive?: boolean;
+}
+
+/** Whitelist status fields without turning omitted legacy fields into clears. */
+export function coerceNarratorStatusPatch(
+	data: Record<string, unknown>,
+): NarratorStatusPatch | null {
+	if (!Object.hasOwn(data, "status") || typeof data.status !== "string") return null;
+	const patch: NarratorStatusPatch = { status: data.status };
+	if (Object.hasOwn(data, "statusEpoch") && typeof data.statusEpoch === "string") {
+		patch.statusEpoch = data.statusEpoch;
+	}
+	if (
+		Object.hasOwn(data, "statusRevision") &&
+		typeof data.statusRevision === "number" &&
+		Number.isSafeInteger(data.statusRevision) &&
+		data.statusRevision >= 0
+	) {
+		patch.statusRevision = data.statusRevision;
+	}
+	if (
+		Object.hasOwn(data, "substatus") &&
+		Array.isArray(data.substatus) &&
+		data.substatus.every((item) => typeof item === "string")
+	) {
+		patch.substatus = data.substatus;
+	}
+	if (Object.hasOwn(data, "updatedAt") && typeof data.updatedAt === "string") {
+		patch.updatedAt = data.updatedAt;
+	}
+	if (
+		Object.hasOwn(data, "messageCount") &&
+		typeof data.messageCount === "number" &&
+		Number.isSafeInteger(data.messageCount) &&
+		data.messageCount >= 0
+	) {
+		patch.messageCount = data.messageCount;
+	}
+	for (const field of ["turnStartedAt", "errorMessage", "archivedWithNarratorId"] as const) {
+		if (Object.hasOwn(data, field) && isNullableString(data[field])) patch[field] = data[field];
+	}
+	if (
+		Object.hasOwn(data, "errorRetryable") &&
+		(typeof data.errorRetryable === "boolean" || data.errorRetryable === null)
+	) {
+		patch.errorRetryable = data.errorRetryable;
+	}
+	if (
+		Object.hasOwn(data, "backgroundWorkActive") &&
+		typeof data.backgroundWorkActive === "boolean"
+	) {
+		patch.backgroundWorkActive = data.backgroundWorkActive;
+	}
+	return patch;
 }
 
 export interface NarratorWSCallbacks {
@@ -531,7 +623,12 @@ export interface NarratorWSCallbacks {
 	 * rebuild would re-layout the list several times per second.
 	 */
 	onReflectionProgress?: (data: ReflectionProgressEvent) => void;
-	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
+	onStatusChange?: (
+		status: string,
+		turnStartedAt?: string,
+		substatus?: string[],
+		patch?: NarratorStatusPatch,
+	) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
 		toolUseId: string,
@@ -587,7 +684,12 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
-	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
+	onToolOutput?: (
+		toolUseId: string,
+		output: string,
+		parentToolUseId?: string,
+		meta?: { subagentOutputCount?: SubagentOutputCount },
+	) => void;
 	/**
 	 * A determinate "N of M done" measurement from a running tool (TransferFile),
 	 * rendered as an actual progress bar rather than parsed out of its text output.
@@ -688,6 +790,7 @@ export interface NarratorWSCallbacks {
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onPaymentRequired?: (info: {
+		paymentContext?: string;
 		providerId?: string;
 		providerPrefix?: string;
 		balance?: number;
@@ -811,6 +914,15 @@ export interface NarratorWSCallbacks {
 		toolUseId?: string;
 		takenOver: boolean;
 	}) => void;
+	/**
+	 * The helpers a first-level subagent launched changed (ACL root's page only). Replaces
+	 * the card's nested rows; `toolUseId` names the card, best-effort.
+	 */
+	onSubagentNestedChanged?: (info: {
+		subagentNarratorId: string;
+		toolUseId?: string;
+		nested: SubagentNestedSummary;
+	}) => void;
 	onSubagentWarning?: (subagentNarratorId: string, info: NarratorWarningInfo) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
@@ -840,6 +952,8 @@ export interface NarratorWSCallbacks {
 		replacement?: MessageReplacementAliases,
 	) => void;
 	onMessageUpdated?: (message: TreeMessage, replacement?: MessageReplacementAliases) => void;
+	onReasoningTranslationPatch?: (patch: ReasoningTranslationPatch) => void;
+	onReasoningTranslationStatus?: (frame: ReasoningTranslationStatusFrame) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -854,6 +968,7 @@ export interface NarratorWSCallbacks {
 		parentToolUseId?: string;
 	}) => void;
 	onStreamingSnapshot?: (snapshot: {
+		subagentOutputCounts?: SubagentOutputCount[];
 		model?: string;
 		provider?: string;
 		streamingBlocks: Array<
@@ -885,6 +1000,7 @@ export interface NarratorWSCallbacks {
 		>;
 		toolChunks: Array<{
 			toolUseId: string;
+			executionAttempt?: number;
 			toolName: string;
 			inputCharsTotal: number;
 			parentToolUseId?: string;
@@ -921,7 +1037,11 @@ export interface NarratorWSCallbacks {
 	 * persisted, so nothing else will retire them — drop them or they stay
 	 * "running" forever with a live elapsed timer.
 	 */
-	onToolUseDiscarded?: (toolUseIds: string[], parentToolUseId?: string) => void;
+	onToolUseDiscarded?: (
+		toolUseIds: string[],
+		parentToolUseId?: string,
+		subagentNarratorId?: string,
+	) => void;
 }
 
 export function useNarratorWS(
@@ -931,12 +1051,19 @@ export function useNarratorWS(
 	options?: {
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
+		/** Retire old listeners when a session/provider changes within the same narrator. */
+		callbackScope?: string;
 	},
 ) {
-	const callbacksOwnerRef = useRef({ narratorId, generation: 0, callbacks });
-	if (callbacksOwnerRef.current.narratorId !== narratorId) {
+	const callbackScope = options?.callbackScope;
+	const callbacksOwnerRef = useRef({ narratorId, callbackScope, generation: 0, callbacks });
+	if (
+		callbacksOwnerRef.current.narratorId !== narratorId ||
+		callbacksOwnerRef.current.callbackScope !== callbackScope
+	) {
 		callbacksOwnerRef.current = {
 			narratorId,
+			callbackScope,
 			generation: callbacksOwnerRef.current.generation + 1,
 			callbacks,
 		};
@@ -993,16 +1120,27 @@ export function useNarratorWS(
 				...(options?.excludeTypes ? { excludeTypes: options.excludeTypes } : {}),
 			},
 			(data) => {
-				// A narrator can change during render before React runs the previous effect cleanup.
+				// A narrator/session/provider can change before the previous effect cleanup.
 				// Drop that old listener immediately instead of letting it read the new callbacks.
 				if (
 					callbacksOwnerRef.current.narratorId !== subscribedId ||
+					callbacksOwnerRef.current.callbackScope !== callbackScope ||
 					callbacksOwnerRef.current.generation !== callbackOwner.generation
 				)
 					return;
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
+					case "reasoning_translation_status": {
+						const frame = readReasoningTranslationStatus(data);
+						if (frame) callbackOwner.callbacks.onReasoningTranslationStatus?.(frame);
+						break;
+					}
+					case "reasoning_translation_patch": {
+						const patch = readReasoningTranslationPatch(data);
+						if (patch) callbackOwner.callbacks.onReasoningTranslationPatch?.(patch);
+						break;
+					}
 					case "message":
 						callbackOwner.callbacks.onMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },
@@ -1186,15 +1324,22 @@ export function useNarratorWS(
 						break;
 					}
 					case "status_change":
-						callbackOwner.callbacks.onStatusChange?.(
-							data.status as string,
-							data.turnStartedAt as string | undefined,
-							data.substatus as string[] | undefined,
-						);
+					case "substatus_change": {
+						const patch = coerceNarratorStatusPatch(data);
+						if (patch) {
+							callbackOwner.callbacks.onStatusChange?.(
+								patch.status,
+								patch.turnStartedAt ?? undefined,
+								patch.substatus,
+								patch,
+							);
+						} else if (data.type === "substatus_change") {
+							// Older producers send only the label array. Versioned frames
+							// carry the complete committed patch and use the status path.
+							callbackOwner.callbacks.onSubstatusChange?.(data.substatus as string[]);
+						}
 						break;
-					case "substatus_change":
-						callbackOwner.callbacks.onSubstatusChange?.(data.substatus as string[]);
-						break;
+					}
 					case "tool_started":
 						callbackOwner.callbacks.onToolStarted?.(
 							data.toolUseId as string,
@@ -1263,13 +1408,21 @@ export function useNarratorWS(
 							data.timeoutMs as number,
 						);
 						break;
-					case "tool_output":
+					case "tool_output": {
+						const count = parseSubagentOutputCount(data.subagentOutputCount);
+						if (
+							data.subagentOutputCount !== undefined &&
+							(!count || count.toolUseId !== data.toolUseId)
+						)
+							break;
 						callbackOwner.callbacks.onToolOutput?.(
 							data.toolUseId as string,
 							data.output as string,
 							data.parentToolUseId as string | undefined,
+							count ? { subagentOutputCount: count } : undefined,
 						);
 						break;
+					}
 					case "tool_structured_progress": {
 						// Validated rather than cast: a malformed frame must degrade to a
 						// barless card, not to a bar reading `NaN%`.
@@ -1459,6 +1612,9 @@ export function useNarratorWS(
 						}
 						break;
 					case "quota_balance": {
+						// A subagent's balance is not this conversation's balance; applying it
+						// would overwrite THIS panel's display and its provider cache.
+						if (data.isSubagent) break;
 						const quotaBalance = data.quotaBalance;
 						const detailedQuotaBalance = data.detailedQuotaBalance;
 						const detailedText = detailedQuotaBalance == null ? null : String(detailedQuotaBalance);
@@ -1469,7 +1625,13 @@ export function useNarratorWS(
 						break;
 					}
 					case "payment_required":
+						// Same isolation: a child running out of balance must not make the
+						// parent page open its own recharge dialog.
+						if (data.isSubagent) break;
 						callbackOwner.callbacks.onPaymentRequired?.({
+							...(isNugPaymentContext(data.paymentContext)
+								? { paymentContext: data.paymentContext }
+								: {}),
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							balance: data.balance as number | undefined,
@@ -1705,6 +1867,16 @@ export function useNarratorWS(
 							takenOver: data.takenOver === true,
 						});
 						break;
+					case "subagent_nested_changed": {
+						const nested = normalizeSubagentNestedSummary(data.nested);
+						if (nested && typeof data.subagentNarratorId === "string")
+							callbackOwner.callbacks.onSubagentNestedChanged?.({
+								subagentNarratorId: data.subagentNarratorId,
+								toolUseId: nonEmptyString(data.toolUseId) ?? undefined,
+								nested,
+							});
+						break;
+					}
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
@@ -1785,6 +1957,14 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
+							...(Array.isArray(data.subagentOutputCounts)
+								? {
+										subagentOutputCounts: data.subagentOutputCounts.flatMap((value) => {
+											const count = parseSubagentOutputCount(value);
+											return count ? [count] : [];
+										}),
+									}
+								: {}),
 							model: nonEmptyString(data.model) ?? undefined,
 							provider: nonEmptyString(data.provider) ?? undefined,
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
@@ -1871,6 +2051,7 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onToolUseDiscarded?.(
 							(data.toolUseIds ?? []) as string[],
 							data.parentToolUseId as string | undefined,
+							nonEmptyString(data.subagentNarratorId) ?? undefined,
 						);
 						break;
 				}
@@ -1889,7 +2070,7 @@ export function useNarratorWS(
 			narratorWSManager.leavePresence(subscribedId, subHandle._id);
 			narratorWSManager.unsubscribe(subHandle);
 		};
-	}, [narratorId, options?.excludeTypes, subscriptionKind]);
+	}, [narratorId, options?.excludeTypes, subscriptionKind, callbackScope]);
 
 	const sendPermissionDecision = useCallback(
 		(
@@ -1973,6 +2154,10 @@ export interface NarratorListWSEvent {
 		| "awaitedQuestion";
 	status?: string;
 	substatus?: string[];
+	/** Authoritative state reconciliation, not a new completion notification intent. */
+	stateOnly?: boolean;
+	/** A late completion intent; never apply it to cached state or the favicon. */
+	notificationOnly?: boolean;
 	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
 	turnStartedAt?: string;
 	/**
@@ -2061,12 +2246,18 @@ export function useNarratorsListWS(
 			},
 			(data) => {
 				const nId = data.narratorId as string | undefined;
-				if (data.type === "status_change") {
+				if (
+					data.type === "status_change" ||
+					(data.type === "substatus_change" && typeof data.status === "string")
+				) {
 					if (nId)
 						onUpdateRef.current(nId, {
 							type: "status",
 							status: data.status as string,
 							substatus: data.substatus as string[] | undefined,
+							...(data.type === "substatus_change" ? { stateOnly: true } : {}),
+							turnStartedAt:
+								typeof data.turnStartedAt === "string" ? data.turnStartedAt : undefined,
 							...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 						});
 				} else if (data.type === "substatus_change") {

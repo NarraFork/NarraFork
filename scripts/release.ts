@@ -41,6 +41,8 @@ if (deprecatedOverwriteArg) {
 const version = args.find((a) => !a.startsWith("--"));
 const dryRun = args.includes("--dry-run");
 const preview = args.includes("--preview");
+const includeFull = args.includes("--include-full");
+const patchOnly = args.includes("--patch-only");
 const skipBuild = args.includes("--skip-build");
 const indexOnly = args.includes("--index-only");
 const publishIndex = args.includes("--publish-index");
@@ -55,6 +57,10 @@ const target =
 	args.find((a) => a.startsWith("--target="))?.slice("--target=".length) ?? "update-server";
 if (target !== "github" && target !== "update-server") {
 	console.error("Invalid release target; expected github or update-server");
+	process.exit(1);
+}
+if ((includeFull || patchOnly) && (target !== "update-server" || (includeFull && patchOnly))) {
+	console.error("Select at most one of --include-full or --patch-only, only for update-server");
 	process.exit(1);
 }
 if (indexOnly && target !== "github") {
@@ -85,6 +91,8 @@ for (const argument of args.filter((arg) => arg.startsWith("--"))) {
 		![
 			"--dry-run",
 			"--preview",
+			"--include-full",
+			"--patch-only",
 			"--skip-build",
 			"--upload-only",
 			"--index-only",
@@ -108,6 +116,7 @@ if (!version) {
 	console.error("  --dry-run             Offline mirror intent; GitHub build/local validation");
 	console.error("  --preview             Online read-only mirror preview; no token needed");
 	console.error("  --upload-only         Mirror compatibility alias (no dist); GitHub uses dist");
+	console.error("  --include-full        Include full binaries in the mirror (default: patches only)");
 	console.error("  --index-only          GitHub read-only online repair; no dist/build required");
 	console.error("  --publish-index       With --index-only, explicitly write the metadata branch");
 	console.error("  --skip-build          GitHub local preview/legacy only: use existing dist");
@@ -160,7 +169,7 @@ function loadUpdateServerConfig(): { serverUrl: string; token: string } {
 if (target === "update-server") {
 	if (dryRun) {
 		console.log(
-			`Offline mirror intent: main ${githubRepository} v${version}; no network, build, mutation, dist or token access. Use --preview for online public Release verification.`,
+			`Offline mirror intent: main ${githubRepository} v${version}; ${includeFull ? "include full binaries" : "patches and metadata only"}; no network, build, mutation, dist or token access. Use --preview for online public Release verification.`,
 		);
 		process.exit(0);
 	}
@@ -176,6 +185,7 @@ if (target === "update-server") {
 			repository: githubRepository,
 			tag: `v${version}`,
 			...(platformArg ? { platforms: [...platformSuffixes.keys()] } : {}),
+			patchOnly: !includeFull,
 			dryRun: preview,
 			signal,
 			...(preview ? {} : { config: loadUpdateServerConfig() }),
@@ -391,7 +401,11 @@ if (!skipBuild && !uploadOnly) {
 	try {
 		execFileSync("bun", buildArgs, {
 			cwd: ROOT,
-			env: { ...process.env, NF_BUILD_GITHUB_REPOSITORY: githubRepository },
+			env: {
+				...process.env,
+				NF_BUILD_GITHUB_REPOSITORY: githubRepository,
+				NF_BUILD_RELEASE_CONTEXT: "1",
+			},
 			stdio: "inherit",
 			timeout: 600_000,
 		});

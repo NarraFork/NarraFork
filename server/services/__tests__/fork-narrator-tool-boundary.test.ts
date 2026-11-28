@@ -1,15 +1,17 @@
 /**
  * ForkNarrator runs as soon as its input is complete — possibly while the response that
- * calls it is still streaming. That response's row is shared by full forks and appended
- * in place, so a child that inherited it would see a step that keeps changing under it.
- * The tool therefore forks at the step before the calling response.
+ * calls it is still streaming. Full forks now snapshot that response, but the tool
+ * deliberately forks at the previous step rather than inherit its own calling card.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -80,10 +82,11 @@ async function inheritedMessageIds(narratorId: string) {
 
 beforeEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("ForkNarrator fork point", () => {
@@ -130,6 +133,19 @@ describe("ForkNarrator fork point", () => {
 			callingToolCallId: "missing-call",
 		});
 
-		expect((await inheritedMessageIds(child.id)).at(-1)).toBe("parent-calling-step");
+		const lastId = (await inheritedMessageIds(child.id)).at(-1);
+		expect(lastId).toBeTruthy();
+		// The fallback still includes the latest message, but its unsettled tool
+		// makes it a private historical snapshot rather than a shared live row.
+		expect(lastId).not.toBe("parent-calling-step");
+		const snapshot = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, lastId as string),
+		});
+		expect(snapshot?.contentText).toBe("parent-calling-step");
+		expect(snapshot?.authorNarratorId).toBe("parent");
+		const call = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.messageId, lastId as string),
+		});
+		expect(call?.executionOriginToolCallId).toBe("parent-fork-call");
 	});
 });

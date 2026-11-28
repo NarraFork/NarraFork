@@ -14,15 +14,18 @@
 
 import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 
 const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
-const sqlite = new Database(":memory:");
+const databaseDirectory = mkdtempSync(join(tmpdir(), "nf-edit-revert-db-"));
+const sqlite = new Database(join(databaseDirectory, "test.sqlite"));
+sqlite.run("PRAGMA journal_mode = WAL");
 sqlite.run("PRAGMA foreign_keys = OFF");
 for (const file of readdirSync(DRIZZLE_DIR)
 	.filter((f) => f.endsWith(".sql"))
@@ -83,6 +86,8 @@ const scopedRevert = await import("../narrator-scoped-revert");
 const { emptyRevertResult } = await import("../snapshot-revert");
 
 afterAll(() => {
+	sqlite.close();
+	rmSync(databaseDirectory, { recursive: true, force: true });
 	mock.module("../../db", () => realDbModule);
 	mock.module("../narrator-service", () => ({ narratorService: realNarratorService }));
 	mock.module("../../lib/uploads", () => realUploads);
@@ -107,6 +112,7 @@ function seed(cwd: string) {
 			inheritMode: "fresh",
 			cwd,
 			status: "idle",
+			defaultDeviceId: "remote-test",
 			createdAt: now,
 			updatedAt: now,
 		})
@@ -146,6 +152,35 @@ describe("edit-and-regenerate file rollback", () => {
 			deferContinuation: true,
 			...opts,
 		});
+
+	test("local default edits only messages without consulting file recovery", async () => {
+		db.update(narrators).set({ defaultDeviceId: null }).where(eq(narrators.id, "n1")).run();
+		const restore = spyOn(scopedRevert, "revertNarratorScopedForEdit").mockRejectedValue(
+			new Error("history unavailable"),
+		);
+		try {
+			await edit();
+			expect(deleteCalls).toEqual([
+				{ messageId: "m1", opts: { preserveConversationId: true, skipRevert: true } },
+			]);
+			expect(restore).not.toHaveBeenCalled();
+		} finally {
+			restore.mockRestore();
+		}
+	});
+
+	test("local explicit file recovery refuses before truncation or attachments", async () => {
+		db.update(narrators).set({ defaultDeviceId: "local" }).where(eq(narrators.id, "n1")).run();
+		await expect(
+			edit({ revertFiles: true, newTextFiles: [new File(["new"], "new.txt")] }),
+		).rejects.toMatchObject({ code: "FILE_HISTORY_DISABLED" });
+		expect(deleteCalls).toHaveLength(0);
+		expect(eventLog).toHaveLength(0);
+		expect(
+			db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "m1") }).sync()
+				?.contentText,
+		).toBe("old");
+	});
 
 	test("file recovery requires a reviewed plan instead of silently replanning", async () => {
 		await expect(edit()).rejects.toThrow("Review a fresh edit preview");
@@ -295,7 +330,7 @@ describe("right-click rollback uses one fixed block-boundary plan", () => {
 		const principal = { userId: "u1", isAdmin: false };
 		try {
 			await rollbackToBlock("n1", "m1", 0, { principal });
-			expect(restore).toHaveBeenCalledWith("n1", "m1", 0, { principal });
+			expect(restore).toHaveBeenCalledWith("n1", "m1", 0, { principal, skipRevert: false });
 			expect(deleteCalls).toHaveLength(0);
 		} finally {
 			restore.mockRestore();

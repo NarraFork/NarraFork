@@ -12,8 +12,9 @@ import {
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { scheduledTaskRuns, scheduledTasks } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AsyncMutex } from "../lib/async-mutex";
-import { ValidationError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -84,7 +85,10 @@ export async function lookupScheduledRun(
 				: undefined;
 		const row: { parentNarratorId: string | null } | null = await narratorService
 			.getById(id)
-			.catch(() => null);
+			.catch((error: unknown) => {
+				if (error instanceof NotFoundError) return null;
+				throw error;
+			});
 		id = row?.parentNarratorId ?? null;
 	}
 	return undefined;
@@ -118,7 +122,10 @@ export async function attachScheduledRuntimeRun(input: {
 		throw new ValidationError("Scheduled run registration expired before dispatch");
 	if (!root) {
 		const { narratorService } = await import("./narrator-service");
-		const row = await narratorService.getById(narratorId).catch(() => null);
+		const row = await narratorService.getById(narratorId).catch((error: unknown) => {
+			if (error instanceof NotFoundError) return null;
+			throw error;
+		});
 		parentNarratorId = row?.parentNarratorId ?? undefined;
 		if (!parentNarratorId) return;
 		const parent = getScheduledRunMember(parentNarratorId);
@@ -273,10 +280,13 @@ export async function recordScheduledAutoHandled(
 	note: string,
 ): Promise<void> {
 	await locks.acquire(runId, async () => {
-		const row = await db.query.scheduledTaskRuns.findFirst({
-			where: eq(scheduledTaskRuns.id, runId),
-			columns: { autoHandled: true },
-		});
+		const row = await readQuery(
+			db.query.scheduledTaskRuns.findFirst({
+				where: eq(scheduledTaskRuns.id, runId),
+				columns: { autoHandled: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!row) return;
 		const value: RunAutoHandled = row.autoHandled ?? {
 			question: 0,
@@ -305,12 +315,25 @@ export async function markScheduledRunBlocked(
 	runId: string,
 	reason: RunBlockReason | null,
 ): Promise<void> {
+	const registration = getScheduledRunById(runId);
+	const logicalRunId = registration?.logicalRunId;
+	const executionEpoch = registration?.executionEpoch;
 	const changed = await locks.acquire(runId, async () => {
-		const row = await db.query.scheduledTaskRuns.findFirst({
-			where: eq(scheduledTaskRuns.id, runId),
-			columns: { taskId: true, status: true, blockReason: true, blockedAt: true },
-		});
+		const row = await readQuery(
+			db.query.scheduledTaskRuns.findFirst({
+				where: eq(scheduledTaskRuns.id, runId),
+				columns: { taskId: true, status: true, blockReason: true, blockedAt: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!row || !ACTIVE_RUN_STATUSES.some((status) => status === row.status)) return false;
+		// A Worker read may finish after a continuation replaced this execution.
+		if (
+			getScheduledRunById(runId) !== registration ||
+			registration?.logicalRunId !== logicalRunId ||
+			registration?.executionEpoch !== executionEpoch
+		)
+			return false;
 		const status = reason ? "blocked" : "running";
 		if (row.status === status && row.blockReason === reason) return false;
 		await db
@@ -367,11 +390,14 @@ export async function cancelScheduledTaskWaitingRuns(
 	taskId: string,
 	reason: string,
 ): Promise<number> {
-	const [run] = await db
-		.select({ id: scheduledTaskRuns.id })
-		.from(scheduledTaskRuns)
-		.where(and(eq(scheduledTaskRuns.taskId, taskId), eq(scheduledTaskRuns.status, "waiting")))
-		.limit(1);
+	const [run] = await readQuery(
+		db
+			.select({ id: scheduledTaskRuns.id })
+			.from(scheduledTaskRuns)
+			.where(and(eq(scheduledTaskRuns.taskId, taskId), eq(scheduledTaskRuns.status, "waiting")))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!run) return 0;
 	return (await finalizeScheduledRun(run.id, "skipped", {
 		error: reason,

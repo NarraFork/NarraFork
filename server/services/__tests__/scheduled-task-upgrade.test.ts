@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import {
 	afterAll,
 	afterEach,
@@ -22,6 +21,8 @@ import { applyPendingMigrationsByHash, runMigrations } from "../../db/run-migrat
 import * as schema from "../../db/schema";
 import { nextCronRun } from "../../lib/cron";
 import { nextOccurrence } from "../../lib/schedule-engine";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 // Released baseline dd11a53e7d84ef706d002304845404298ae73d2a, the parent of 56e1f6e.
 // Replay its historical SQL, insert its old columns, then use the production upgrader.
@@ -44,7 +45,7 @@ const UPGRADE_AT = "2026-11-27T09:00:20.000Z";
 const NEXT_DAILY = "2026-11-28T09:00:00.000Z";
 const OWNER = "upgrade-owner";
 const PRINCIPAL = { userId: OWNER, isAdmin: false };
-const sqlite = new Database(":memory:");
+const sqlite = openFileWorkerDatabase();
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 const dispatched = mock(async () => {
 	throw new Error("An upgrade must not dispatch or replay a task");
@@ -123,7 +124,11 @@ function baselineMigrations(): string {
 	const boundary = journal.entries.findIndex((entry) => entry.tag === BASELINE_TAG);
 	expect(boundary).toBeGreaterThan(0);
 	expect(journal.entries[boundary]?.idx).toBe(256);
-	expect(journal.entries[boundary + 1]?.tag).toBe("0257_scheduled_tasks_redesign");
+	const redesign = journal.entries.findLastIndex((entry) =>
+		entry.tag.endsWith("_scheduled_tasks_redesign"),
+	);
+	expect(redesign).toBeGreaterThan(boundary);
+	expect(journal.entries[redesign]?.idx).toBeGreaterThan(256);
 	const entries = journal.entries.slice(0, boundary + 1);
 	const folder = mkdtempSync(join(tmpdir(), "nf-scheduled-upgrade-"));
 	oldMigrations = folder;
@@ -325,9 +330,9 @@ beforeEach(() => {
 
 afterEach(() => setSystemTime());
 
-afterAll(() => {
+afterAll(async () => {
 	for (const run of listRegisteredScheduledRuns()) unregisterScheduledRun(run.runId);
-	sqlite.close();
+	await closeFileWorkerDatabase(sqlite);
 	if (oldMigrations) rmSync(oldMigrations, { recursive: true, force: true });
 	mock.restore();
 });
@@ -531,19 +536,23 @@ describe("scheduled tasks: direct upgrade from the released 0256 baseline", () =
 			scheduleRevision: 0,
 			firedCount: 0,
 		});
-		await expect(
-			scheduledTaskService.update(taskId, { cronExpr: "*/15 * * * * *" }, PRINCIPAL),
-		).rejects.toMatchObject({ statusCode: 400 });
-		expect(await scheduledTaskService.get(taskId)).toEqual(edited);
-		await expect(
-			scheduledTaskService.update(
-				taskId,
-				{
-					schedule: { kind: "cron", expr: "*/20 * * * * *", end: { type: "never" } },
-				},
-				PRINCIPAL,
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.update(taskId, { cronExpr: "*/15 * * * * *" }, PRINCIPAL),
 			),
-		).rejects.toMatchObject({ statusCode: 400 });
+		).toMatchObject({ statusCode: 400 });
+		expect(await scheduledTaskService.get(taskId)).toEqual(edited);
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.update(
+					taskId,
+					{
+						schedule: { kind: "cron", expr: "*/20 * * * * *", end: { type: "never" } },
+					},
+					PRINCIPAL,
+				),
+			),
+		).toMatchObject({ statusCode: 400 });
 		expect(await scheduledTaskService.get(taskId)).toEqual(edited);
 		expect(snapshot().scheduled_task_runs).toEqual(upgraded.scheduled_task_runs);
 		expect(dispatched).not.toHaveBeenCalled();

@@ -30,7 +30,8 @@ const context: WorkspaceContext = {
 	git: { workspaceKey: "wk", repositoryKey: "rk", rootPath: "/repo" },
 	capabilities: { switchDirectory: true },
 };
-let activeContext: WorkspaceContext = context;
+let activeContext: WorkspaceContext | undefined = context;
+let transitioning = false;
 let activeUser: { id: string } | undefined = { id: "u1" };
 const storage = new Map<string, string>();
 let quotaFailure = false;
@@ -45,6 +46,12 @@ Object.defineProperty(window, "localStorage", {
 	configurable: true,
 });
 mock.module("@frontend/hooks/useAuth", () => ({ useCurrentUser: () => ({ data: activeUser }) }));
+mock.module("@frontend/lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		onCredentialChange: () => () => {},
+		getCredentialIdentity: () => 1,
+	},
+}));
 const switched = mock(async (_input: unknown) => ({
 	current: context,
 	previous: context,
@@ -76,8 +83,9 @@ const reconcile = mock(
 		created((input as WorktreeCreateRequest).destinationPath),
 );
 mock.module("@frontend/hooks/useWorkspaceContext", () => ({
-	useWorkspaceContext: () => ({ data: activeContext }),
+	useWorkspaceContext: () => ({ data: activeContext, transitioning }),
 	useSwitchWorkspaceContext: () => ({ mutateAsync: switched, isPending: false }),
+	workspaceContextKey: (id: string) => ["workspaceContext", id],
 }));
 class FakeApiError extends Error {
 	constructor(
@@ -104,8 +112,15 @@ let extraPages: WorktreeEntry[][] = [];
 let nextPageError: Error | null = null;
 let hasNextPage = false;
 let observedQuery: { search: string; sort: string; order: string };
+const listClient = {
+	resetQueries,
+	cancelQueries: async () => {},
+	invalidateQueries: async () => {},
+	getQueryState: () => undefined,
+	getQueryCache: () => ({ find: () => undefined }),
+};
 mock.module("@tanstack/react-query", () => ({
-	useQueryClient: () => ({ resetQueries }),
+	useQueryClient: () => listClient,
 	useInfiniteQuery: (options: { queryKey: unknown[] }) => {
 		observedQuery = options.queryKey[3] as typeof observedQuery;
 		return {
@@ -152,6 +167,44 @@ mock.module("@mantine/core", () => {
 		Tooltip: Wrapper,
 		Menu,
 		Badge: Wrapper,
+		Divider: () => <hr />,
+		UnstyledButton: ({
+			children,
+			onClick,
+			disabled,
+			"data-worktree-path": path,
+		}: Children & {
+			onClick?: () => void;
+			disabled?: boolean;
+			"data-worktree-path"?: string;
+		}) => (
+			<button type="button" disabled={disabled} onClick={onClick} data-worktree-path={path}>
+				{children}
+			</button>
+		),
+		Checkbox: ({
+			label,
+			checked,
+			onChange,
+			disabled,
+		}: {
+			label: string;
+			checked: boolean;
+			onChange: (event: { currentTarget: { checked: boolean } }) => void;
+			disabled?: boolean;
+		}) => (
+			<label>
+				<input
+					type="checkbox"
+					checked={checked}
+					disabled={disabled}
+					onChange={(event) =>
+						onChange({ currentTarget: { checked: event.currentTarget.checked } })
+					}
+				/>
+				{label}
+			</label>
+		),
 		ScrollArea: {
 			Autosize: ({
 				children,
@@ -290,6 +343,7 @@ async function submit() {
 }
 beforeEach(async () => {
 	activeContext = context;
+	transitioning = false;
 	listEntries = [];
 	extraPages = [];
 	nextPageError = null;
@@ -519,6 +573,41 @@ test("a successful switch retains the requirement as a composer prompt exactly o
 	await submit();
 	expect(retained).toHaveBeenCalledTimes(1);
 	expect(retained.mock.calls[0]?.[0]).toBe("fix login");
+});
+test("a context transition preserves the creating owner until receipt cleanup and prompt delivery", async () => {
+	const retained = mock((_text: string) => {});
+	const render = () =>
+		root.render(<NarratorWorktreeControls narratorId="n" onRequirement={retained} />);
+	let finishSwitch!: () => void;
+	switched.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				finishSwitch = () => resolve({ current: context, previous: context, changed: true });
+			}),
+	);
+	await act(async () => render());
+	await openForm();
+	await input("worktree.requirement", "fix login after switching");
+	await submit();
+	expect(switched).toHaveBeenCalledTimes(1);
+	expect(JSON.parse([...storage.values()][0] ?? "[]")).toHaveLength(1);
+	await act(async () => {
+		activeContext = undefined;
+		transitioning = true;
+		render();
+		await flush();
+	});
+	await act(async () => {
+		activeContext = { ...context, cwd: "/wt/named", revision: 3, contextKey: "new" };
+		transitioning = false;
+		render();
+		await flush();
+		finishSwitch();
+		await flush();
+	});
+	expect(JSON.parse([...storage.values()][0] ?? "[]")).toEqual([]);
+	expect(retained.mock.calls).toEqual([["fix login after switching"]]);
+	expect(container.querySelector("[data-modal]")).toBeNull();
 });
 test("return to original directory freezes the original device and sends the latest revision", async () => {
 	activeContext = { ...context, cwd: "/wt/named", revision: 3, contextKey: "new" };

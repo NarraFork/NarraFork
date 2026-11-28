@@ -23,6 +23,7 @@ import {
 import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
 import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
+import { pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import {
 	fallbackPluginUiContext,
 	RuntimeContext,
@@ -33,7 +34,7 @@ import {
 } from "./plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
-import { PluginUiSession } from "./runtime";
+import { PluginUiHostError, PluginUiSession } from "./runtime";
 import {
 	createPluginUiBackendSession,
 	type MaterializedPluginUiSession,
@@ -161,6 +162,7 @@ export function PluginUiRuntimeProvider({
 
 	const disposeRecord = useCallback(
 		(record: SessionRecord) => {
+			pluginOverlayBoundsStore.clear(record.params.panelInstanceId);
 			record.abortController.abort();
 			record.controller?.dispose();
 			if (record.materialized && !record.revoked) {
@@ -187,6 +189,20 @@ export function PluginUiRuntimeProvider({
 				openExternal: hostLocalRef.current?.openExternal,
 				modelsChanged: hostLocalRef.current?.modelsChanged,
 				testModel: hostLocalRef.current?.testModel,
+				// Overlay bounds are clamped here rather than in the router: only the
+				// browser knows the viewport, and the router is deliberately kept
+				// DOM-free so it stays unit-testable.
+				overlaySetBounds: (panelInstanceId, bounds) => {
+					const viewportWidth = Math.max(0, window.innerWidth);
+					const viewportHeight = Math.max(0, window.innerHeight);
+					const applied = pluginOverlayBoundsStore.set(
+						panelInstanceId,
+						bounds,
+						viewportWidth,
+						viewportHeight,
+					);
+					return { ...applied, viewportWidth, viewportHeight };
+				},
 				navigate:
 					// App.tsx's createAppPluginHostLocal only wires modelsChanged/testModel,
 					// so today every navigate call lands on this fallback. Kept as an explicit
@@ -303,6 +319,15 @@ export function PluginUiRuntimeProvider({
 							getContext: () =>
 								resolveContext(record.params, record.sessionContext, record.contribution),
 							onRequest: (context) => {
+								// A queued request from a retired generation must not recreate its hit region.
+								if (
+									sessionsRef.current.get(params.panelInstanceId) !== record ||
+									record.abortController.signal.aborted
+								) {
+									throw new PluginUiHostError("SESSION_CLOSED", "Plugin session is closed", {
+										retryable: false,
+									});
+								}
 								const local = handleHostLocal(context);
 								if (local !== null) return local;
 								const backend = handleBackendRequest(record, materialized);
@@ -327,6 +352,9 @@ export function PluginUiRuntimeProvider({
 								const latest = sessionsRef.current.get(params.panelInstanceId);
 								if (latest?.controller !== controller) return;
 								latest.snapshot = snapshot;
+								if (snapshot.status !== "ready") {
+									pluginOverlayBoundsStore.clear(params.panelInstanceId);
+								}
 								rerender();
 							},
 						});

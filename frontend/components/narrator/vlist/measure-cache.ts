@@ -31,7 +31,9 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { type PlanTreeView, planTreeViewSignature } from "@shared/outline-plan-tree";
+import { prepareModelTraceResult } from "./measure/measure-modeltrace-result";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +265,13 @@ export function buildCacheKey(
 export function extractDataRevision(data: unknown): string | undefined {
 	if (data == null || typeof data !== "object") return undefined;
 	const d = data as Record<string, unknown>;
+	if (d.type === "modeltrace_result") {
+		// A streamed slot update may change the card without changing its key or height.
+		const { sampleProgress, ...result } = prepareModelTraceResult(data as ModelTraceResultBlock);
+		return `mt:${textSignature(JSON.stringify(result))}:${
+			sampleProgress?.map((slot) => textSignature(JSON.stringify(slot))).join(":") ?? ""
+		}`;
+	}
 	// Collect height-affecting primitives that can change for the same spec.key.
 	let rev = "";
 	if ("status" in d && d.status != null) rev += `s:${d.status}`;
@@ -381,6 +390,7 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	if (typeof d.translatedText === "string") rev += `|rt:${textSignature(d.translatedText)}`;
 	// Chat regrouping can add/remove the fixed header without editing the message.
 	// Body format also changes geometry while text/id/document version stay equal.
 	// Normalize the narrator defaults so omitted and explicit defaults share a key.
@@ -612,6 +622,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
+		if (r.sourceRanges === true) rev += "|tsr:1";
 		if (r.shimmer === true) rev += "|tw:1";
 		// A DRILLED-IN row nests a whole tool card, so the trace's height now depends
 		// on that card's own height-bearing fields. `opts.expandedIndices` only tells
@@ -686,9 +697,9 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// Recent calls: the ROW COUNT is what drives the block height (capped at 3).
 	if (typeof d.recentCallCount === "number") rev += `|gn:${d.recentCallCount}`;
 	if (Array.isArray(d.recentCallNames)) {
-		rev += `|gk:${d.recentCallNames.length}`;
-		for (const name of d.recentCallNames) {
-			if (typeof name === "string") rev += `|gm:${name}`;
+		rev += `|gk:${Math.min(3, d.recentCallNames.length)}`;
+		for (const [index, name] of d.recentCallNames.slice(0, 3).entries()) {
+			rev += `|gm:${index}:${typeof name === "string" ? textSignature(name) : "-"}`;
 		}
 	}
 	// Row label detail + category chip. Height-neutral, but PAINTED from the cached
@@ -698,13 +709,22 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// names and status all stay put — without this the row keeps its bare tool name
 	// until the next full rebuild. Bounded: at most 3 short strings each.
 	if (Array.isArray(d.recentCallSummaries)) {
-		for (const summary of d.recentCallSummaries) {
-			if (typeof summary === "string") rev += `|gs:${textSignature(summary)}`;
+		for (const [index, summary] of d.recentCallSummaries.slice(0, 3).entries()) {
+			rev += `|gs:${index}:${typeof summary === "string" ? textSignature(summary) : "-"}`;
 		}
 	}
 	if (Array.isArray(d.recentCallCategories)) {
-		for (const category of d.recentCallCategories) {
-			if (typeof category === "string") rev += `|gc:${category}`;
+		for (const [index, category] of d.recentCallCategories.slice(0, 3).entries()) {
+			rev += `|gc:${index}:${typeof category === "string" ? textSignature(category) : "-"}`;
+		}
+	}
+	if (Array.isArray(d.recentCallTimings)) {
+		for (const [index, timing] of d.recentCallTimings.slice(0, 3).entries()) {
+			rev += `|gr:${index}`;
+			if (!timing || typeof timing !== "object") continue;
+			const row = timing as Record<string, unknown>;
+			if (typeof row.status === "string") rev += `:${row.status}`;
+			rev += toolTimingRevision(row);
 		}
 	}
 	if (d.hasRecentCallsButton === true) rev += "|gb:1";
@@ -719,6 +739,7 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// from the cached payload and advanced by the streaming channel alone, so it
 	// must re-key or the number freezes at whatever the first measure saw.
 	if (typeof d.liveOutputChars === "number") rev += `|gl:${d.liveOutputChars}`;
+	if (d.toolCallId) rev += `|gid:${d.toolCallId}:${d.executionAttempt}`;
 	if (d.isBackground === true) rev += "|gg:1";
 	// Takeover badge — same fixed badge row as `isBackground`, so height-neutral,
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),
@@ -756,6 +777,16 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// otherwise keep drawing the previous numbers.
 	rev += subagentFileChangesRevision(d.fileChanges);
 	if (d.fileChangesExpanded === true) rev += "|gfx:1";
+	// Nested helpers: the row COUNT (and the overflow row) decide height; each row's
+	// status, awaiting mark and title are painted from the cached payload, and the live
+	// `subagent_nested_changed` patch writes them alone. Bounded: at most 5 short rows.
+	if (Array.isArray(d.nestedAgents)) {
+		rev += `|gnr:${d.nestedAgents.length}:${typeof d.nestedTotal === "number" ? d.nestedTotal : 0}`;
+		for (const agent of d.nestedAgents as Array<Record<string, unknown>>) {
+			rev += `|gna:${String(agent.subagentNarratorId)}:${String(agent.status)}:${agent.awaitingPermission === true ? 1 : 0}:${String(agent.ended ?? "")}`;
+			if (typeof agent.title === "string") rev += `:${textSignature(agent.title)}`;
+		}
+	}
 	// Permission blocks force expansion and add their own bodies; presence + count
 	// is enough because the bodies themselves are keyed by the permission measure.
 	if (d.selfPermission != null) rev += "|gf:1";
@@ -1004,9 +1035,22 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				if (!row) return "-";
 				const text = typeof row.text === "string" ? textSignature(row.text) : "";
 				const identity = typeof row.identity === "string" ? textSignature(row.identity) : "";
+				// A live bar row is height-fixed but PAINTED from the cached payload: a
+				// progress patch on a committed card moves only these figures.
+				const progress = row.progress as
+					| { ratio?: unknown; percent?: unknown; figures?: unknown }
+					| null
+					| undefined;
+				const bar = progress
+					? `:p${String(progress.ratio)}/${String(progress.percent)}/${
+							Array.isArray(progress.figures)
+								? textSignature(progress.figures.map(String).join("|"))
+								: ""
+						}`
+					: "";
 				return `${text}:${identity}:${Array.isArray(row.badges) ? row.badges.length : 0}:${
 					Array.isArray(row.actions) ? row.actions.length : 0
-				}`;
+				}${bar}`;
 			})
 			.join(";")}`;
 	}

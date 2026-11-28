@@ -1,3 +1,4 @@
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { useCallback, useMemo } from "react";
 import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
@@ -26,6 +27,8 @@ export interface CommandCodeState {
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	/** Chat Completions：工具返回的图片放哪，缺省 `"off"`。 */
+	toolResultImages?: ToolResultImagesMode;
 }
 
 /**
@@ -52,6 +55,7 @@ export interface ProvidersState {
 	commandCode: CommandCodeState;
 	/** TokenDance 的连接开关草稿（它存在自己的连接记录里，保存时单独提交）。 */
 	tokenDanceDisabled: boolean;
+	tokenDanceToolResultImages?: ToolResultImagesMode;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
 	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
@@ -64,6 +68,7 @@ export interface ProvidersState {
 }
 
 export interface SavedSnapshot {
+	tokenDanceToolResultImages?: ToolResultImagesMode;
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
@@ -81,14 +86,23 @@ export interface SavedSnapshot {
 // Functional updater types
 type Updater<T> = T | ((prev: T) => T);
 
+export type ProviderKeyTarget = { kind: "command-code" } | { kind: "custom" | "nug"; id: string };
+
 export type ProvidersAction =
 	| { type: "INIT_FROM_SETTINGS"; settings: Record<string, unknown> }
 	| { type: "SYNC_FROM_SETTINGS"; settings: Record<string, unknown> }
+	| {
+			type: "SYNC_PERSISTED_PROVIDER_KEY";
+			target: ProviderKeyTarget;
+			apiKey: string;
+			previousApiKey: string | undefined;
+	  }
 	| { type: "SET_CUSTOM_API_PROVIDERS"; providers: Updater<CustomApiProviderState[]> }
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
 	| { type: "SET_COMMAND_CODE"; config: CommandCodeState }
+	| { type: "SET_TOKENDANCE_TOOL_IMAGES"; value: ToolResultImagesMode }
 	| { type: "SET_PLATFORM_DISABLED"; prefix: PlatformProviderPrefix; disabled: boolean }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
@@ -210,6 +224,12 @@ function normalizeCustomApiProvider(
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		toolResultImages:
+			provider.toolResultImages === "off" ||
+			provider.toolResultImages === "inline" ||
+			provider.toolResultImages === "separate"
+				? provider.toolResultImages
+				: undefined,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -310,6 +330,30 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 		case "SYNC_FROM_SETTINGS":
 			return providersStateFromSettings(action.settings);
 
+		case "SYNC_PERSISTED_PROVIDER_KEY": {
+			const { target, apiKey, previousApiKey } = action;
+			// Pool writes are already saved. Follow them only if this particular field
+			// still matches its old baseline; a typed replacement/clear remains a draft.
+			if (target.kind === "command-code") {
+				if (state.commandCode.apiKey !== previousApiKey) return state;
+				return { ...state, commandCode: { ...state.commandCode, apiKey } };
+			}
+			if (target.kind === "nug") {
+				return {
+					...state,
+					nugProviders: state.nugProviders.map((p) =>
+						p.id === target.id && p.apiKey === previousApiKey ? { ...p, apiKey } : p,
+					),
+				};
+			}
+			return withDerivedCustomApiProviders(
+				state,
+				state.customApiProviders.map((p) =>
+					p.id === target.id && p.apiKey === previousApiKey ? { ...p, apiKey } : p,
+				),
+			);
+		}
+
 		case "INIT_FROM_SETTINGS": {
 			if (state.initialized) return state;
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
@@ -377,6 +421,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const nug = (s.nugProviders ?? []).map((p: any) => ({
+				toolResultImages:
+					p.toolResultImages === "off" ||
+					p.toolResultImages === "inline" ||
+					p.toolResultImages === "separate"
+						? p.toolResultImages
+						: undefined,
 				id: p.id ?? "",
 				name: p.name ?? "",
 				prefix: p.prefix ?? "nug",
@@ -446,8 +496,15 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					userAgentMode: s.commandCode?.userAgentMode,
 					customUserAgent: s.commandCode?.customUserAgent,
 					extraHeaders: s.commandCode?.extraHeaders,
+					toolResultImages: s.commandCode?.toolResultImages,
 				},
 				tokenDanceDisabled: s.tokendance?.disabled === true,
+				tokenDanceToolResultImages:
+					s.tokendance?.toolResultImages === "off" ||
+					s.tokendance?.toolResultImages === "inline" ||
+					s.tokendance?.toolResultImages === "separate"
+						? s.tokendance.toolResultImages
+						: undefined,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
 				modelProtocols,
@@ -484,6 +541,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 		case "SET_COMMAND_CODE":
 			return { ...state, commandCode: action.config };
+		case "SET_TOKENDANCE_TOOL_IMAGES":
+			return { ...state, tokenDanceToolResultImages: action.value };
 
 		case "SET_PLATFORM_DISABLED": {
 			// 平台 provider 的启用开关只有这一个写入点：它只改草稿，绝不碰后端接口。
@@ -602,6 +661,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
 				commandCode: { ...snap.commandCode },
 				tokenDanceDisabled: snap.tokenDanceDisabled,
+				tokenDanceToolResultImages: snap.tokenDanceToolResultImages,
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
 				modelProtocols: { ...snap.modelProtocols },
@@ -636,6 +696,7 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
 			return true;
 		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
+		if (state.tokenDanceToolResultImages !== savedSnapshot.tokenDanceToolResultImages) return true;
 		// Key order is not meaningful here, so compare sorted entries rather than the raw objects.
 		if (
 			JSON.stringify(Object.entries(state.modelProtocols).sort()) !==
@@ -681,6 +742,37 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 	}, [state, savedSnapshot]);
 }
 
+/** Advance only an immediately persisted key in the discard/dirty baseline. */
+export function rebasePersistedProviderKeySnapshot(
+	snapshot: SavedSnapshot,
+	target: ProviderKeyTarget,
+	apiKey: string,
+): { snapshot: SavedSnapshot; previousApiKey: string | undefined } {
+	if (target.kind === "command-code") {
+		return {
+			previousApiKey: snapshot.commandCode.apiKey,
+			snapshot: { ...snapshot, commandCode: { ...snapshot.commandCode, apiKey } },
+		};
+	}
+	const update = <T extends { id: string; apiKey: string }>(providers: T[]) =>
+		providers.map((p) => (p.id === target.id ? { ...p, apiKey } : p));
+	if (target.kind === "nug") {
+		return {
+			previousApiKey: snapshot.nugProviders.find((p) => p.id === target.id)?.apiKey,
+			snapshot: { ...snapshot, nugProviders: update(snapshot.nugProviders) },
+		};
+	}
+	return {
+		previousApiKey: snapshot.customApiProviders.find((p) => p.id === target.id)?.apiKey,
+		snapshot: {
+			...snapshot,
+			customApiProviders: update(snapshot.customApiProviders),
+			openaiProviders: update(snapshot.openaiProviders),
+			anthropicProviders: update(snapshot.anthropicProviders),
+		},
+	};
+}
+
 /** Create a snapshot of the current state for dirty detection. */
 export function createSnapshot(state: ProvidersState): SavedSnapshot {
 	return {
@@ -690,6 +782,7 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
 		commandCode: { ...state.commandCode },
 		tokenDanceDisabled: state.tokenDanceDisabled,
+		tokenDanceToolResultImages: state.tokenDanceToolResultImages,
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
 		modelProtocols: { ...state.modelProtocols },

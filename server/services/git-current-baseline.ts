@@ -1,7 +1,14 @@
-import type { Worker } from "node:worker_threads";
 import type { FileChangeBlobRef } from "../../shared/file-change-protocol";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
-import type { CurrentBaselineRequest, CurrentGitBaseline } from "./git-current-baseline-worker";
+import { hotSafe } from "../lib/hot-safe";
+import { WorkerPool } from "../lib/worker-runtime/pool";
+import { TaskQueueError } from "../lib/worker-runtime/queue";
+import { GitReaderSession } from "./git-current-baseline-session";
+import type {
+	CurrentBaselineRequest,
+	CurrentBaselineResponse,
+	CurrentGitBaseline,
+} from "./git-current-baseline-worker";
 
 export type {
 	CurrentFileBaseline,
@@ -9,56 +16,55 @@ export type {
 	GitObjectVersion,
 } from "./git-current-baseline-worker";
 
-let workers = 0;
-let resolvedWorkerSpecifier: string | undefined;
-/** No unbounded queue of expensive per-panel scans. Callers disclose busy as unknown. */
-async function worker<T>(request: CurrentBaselineRequest, signal: AbortSignal): Promise<T> {
-	signal.throwIfAborted();
-	if (workers >= 2) throw new Error("reader_busy");
-	workers++;
-	let thread: Worker | undefined;
-	let abort = () => {};
-	let forcedTermination: ReturnType<typeof setTimeout> | undefined;
+function createPool() {
+	return new WorkerPool<CurrentBaselineRequest, CurrentBaselineResponse>({
+		concurrency: 2,
+		maxQueued: 0,
+		reuse: false,
+		create: async ({ signal }) => {
+			const { worker, handle } = await connectCompiledWorker(
+				compiledWorkerSpecifiers(
+					"services/git-current-baseline-worker.ts",
+					"./git-current-baseline-worker.ts",
+					import.meta.url,
+				),
+				{ signal },
+			);
+			return new GitReaderSession(worker, handle, (message) => new Error(message));
+		},
+	});
+}
+
+// Real owners and the permanent production latch survive module re-evaluation together.
+const owner = hotSafe("narrafork.gitCurrentBaseline.workers.v1", () => ({
+	version: 1,
+	pool: createPool(),
+}));
+if (owner.version !== 1)
+	throw new Error(
+		"Git current baseline ownership predates this runtime; manually restart NarraFork",
+	);
+
+export function closeGitCurrentBaselineWorkers(): Promise<void> {
+	return owner.pool.close(new Error("Git current baseline workers are closed"));
+}
+
+export async function resetGitCurrentBaselineWorkersForTests(): Promise<void> {
+	await closeGitCurrentBaselineWorkers();
+	owner.pool = createPool();
+}
+
+/** No queue of expensive per-panel scans. Domain budgets stay inside the worker. */
+async function read<T extends CurrentBaselineResponse>(
+	request: CurrentBaselineRequest,
+	signal: AbortSignal,
+): Promise<T> {
 	try {
-		const started = await connectCompiledWorker(
-			resolvedWorkerSpecifier
-				? [resolvedWorkerSpecifier]
-				: compiledWorkerSpecifiers(
-						"services/git-current-baseline-worker.ts",
-						"./git-current-baseline-worker.ts",
-						import.meta.url,
-					),
-			{ signal },
-		);
-		resolvedWorkerSpecifier = started.specifier;
-		const active = started.worker;
-		thread = active;
-		return await new Promise<T>((resolve, reject) => {
-			abort = () => {
-				// Let the worker abort its currently owned Git child and close file handles
-				// before termination. Never signal the server or an unrelated process.
-				active.postMessage({ action: "cancel" });
-				forcedTermination = setTimeout(() => reject(new Error("cancelled")), 1000);
-			};
-			signal.addEventListener("abort", abort, { once: true });
-			active.once("message", (message: { value: T; error?: string }) => {
-				if (signal.aborted) reject(new Error("cancelled"));
-				else if (message.error) reject(new Error(message.error));
-				else resolve(message.value);
-			});
-			active.once("error", reject);
-			active.once("exit", () => reject(new Error("reader_exited")));
-			active.postMessage(request);
-			if (signal.aborted) abort();
-		});
-	} finally {
-		if (forcedTermination) clearTimeout(forcedTermination);
-		signal.removeEventListener("abort", abort);
-		try {
-			await thread?.terminate();
-		} finally {
-			workers--;
-		}
+		return (await owner.pool.run(request, { signal, deadlineAt: Infinity })) as T;
+	} catch (error) {
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
+			throw new Error("reader_busy");
+		throw error;
 	}
 }
 
@@ -70,13 +76,13 @@ export const gitCurrentBaselineReader = {
 		privateRoot: string,
 		signal: AbortSignal,
 	): Promise<CurrentGitBaseline> {
-		return worker({ action: "snapshot", workspacePath, filePaths, privateRoot }, signal);
+		return read({ action: "snapshot", workspacePath, filePaths, privateRoot }, signal);
 	},
 	verifyBlobs(
 		refs: FileChangeBlobRef[],
 		privateRoot: string,
 		signal: AbortSignal,
 	): Promise<string[]> {
-		return worker({ action: "verify_blobs", refs, privateRoot }, signal);
+		return read({ action: "verify_blobs", refs, privateRoot }, signal);
 	},
 };

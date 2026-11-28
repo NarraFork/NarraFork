@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -10,8 +10,16 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const session = await import("../narrator-session");
@@ -114,7 +122,7 @@ afterEach(async () => {
 	for (const release of pendingReleases.splice(0)) release();
 	state.activeNarrators.clear();
 	for (const owner of runOwners.splice(0)) owner.release();
-	drainPendingInjections(ROOT);
+	await drainPendingInjections(ROOT);
 	mock.restore();
 });
 
@@ -229,12 +237,12 @@ describe("exclusive revert blocks every service entry before writes", () => {
 			const save = spyOn(uploads, "saveTextFileToWorktree").mockImplementation(async () => {
 				throw new Error("Unexpected attachment write");
 			});
-			await expect(run()).rejects.toMatchObject(rejection);
+			await expect(await captureWorkerRejection(run())).toMatchObject(rejection);
 			expect(save).not.toHaveBeenCalled();
 			expect(sqlite.query("SELECT * FROM narrators ORDER BY id").all()).toEqual(before);
 			expect(sqlite.query("SELECT * FROM narrator_messages").all()).toEqual(messages);
 			expect(sqlite.query("SELECT * FROM narrator_buffered_messages").all()).toEqual(queue);
-			expect(state.bufferedMessages.get(ROOT)?.map((entry) => entry.text)).toEqual([
+			expect((await state.bufferedMessages.get(ROOT))?.map((entry) => entry.text)).toEqual([
 				"preserved queued input",
 			]);
 		});
@@ -266,7 +274,7 @@ test("minimal admission reads preserve missing narrator errors", async () => {
 				interrupt: false,
 			}),
 	]) {
-		await expect(request()).rejects.toMatchObject({
+		await expect(await captureWorkerRejection(request())).toMatchObject({
 			statusCode: 404,
 			code: "NOT_FOUND",
 			message: "Narrator not found: missing-admission-narrator",
@@ -281,7 +289,9 @@ test("minimal root metadata still follows variant rather than type and detects c
 		.run();
 	expect(await state.resolveNarratorAdmissionRoot(CHILD)).toBe(ROOT);
 	db.update(narrators).set({ variant: "subagent:general" }).where(eq(narrators.id, ROOT)).run();
-	await expect(state.resolveNarratorAdmissionRoot(CHILD)).rejects.toMatchObject({
+	await expect(
+		await captureWorkerRejection(state.resolveNarratorAdmissionRoot(CHILD)),
+	).toMatchObject({
 		statusCode: 409,
 		code: "NARRATOR_ADMISSION_ROOT_INVALID",
 	});
@@ -305,7 +315,7 @@ test("release drains preserved buffered input exactly once", async () => {
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
 
-	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+	expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 	expectMaterializedUserInput();
 	expect(
 		(await db.select().from(narratorMessages)).filter(
@@ -382,6 +392,28 @@ async function seedAwaitReexecution(recovery: boolean, suffix = "") {
 
 for (const recovery of [false, true]) {
 	test(`${recovery ? "recovery" : "denied retry"} Await releases the start mutex for independent child Send(parent)`, async () => {
+		const { users } = await import("../../db/schema");
+		const { ensureCommunicationNodeTx, grantFixtureNarratorWrite } = await import(
+			"./runtime-communication-fixtures"
+		);
+		const userId = "revert-send-principal";
+		db.transaction((tx) => {
+			tx.insert(users)
+				.values({
+					id: userId,
+					username: userId,
+					passwordHash: "test",
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			tx.update(narrators)
+				.set({ ownerUserId: userId, aclRootNarratorId: ROOT })
+				.where(eq(narrators.id, CHILD))
+				.run();
+			grantFixtureNarratorWrite(tx, ROOT, userId);
+			ensureCommunicationNodeTx(tx, ROOT, null);
+			ensureCommunicationNodeTx(tx, CHILD, ROOT);
+		});
 		const row = await seedAwaitReexecution(recovery);
 		const childSendBinding = { toolCallId: "child-send-row", attempt: 1 };
 		await db.insert(narratorMessages).values({
@@ -461,7 +493,9 @@ for (const recovery of [false, true]) {
 			});
 			sendNow.resolve();
 			await child;
-			await expect(acquire()).rejects.toMatchObject({ code: "NARRATOR_REVERT_BUSY" });
+			await expect(await captureWorkerRejection(acquire())).toMatchObject({
+				code: "NARRATOR_REVERT_BUSY",
+			});
 			outerClaim();
 			const active = state.activeNarrators.get(ROOT);
 			if (!active) throw new Error("Reexecution lost its active session");
@@ -690,7 +724,7 @@ test("cancellation retries the real loop finalizer's consumed waiting-gate wakeu
 	cleanup.resolve();
 	await running;
 	expect(active._resumeBufferedAfterLoop).toBe(false);
-	expect(state.bufferedMessages.get(ROOT)).toHaveLength(1);
+	expect(await state.bufferedMessages.get(ROOT)).toHaveLength(1);
 	const committed = deferred();
 	const persist = narratorService.persistUserMessage;
 	spyOn(narratorService, "persistUserMessage").mockImplementation(async (...args) => {
@@ -703,7 +737,7 @@ test("cancellation retries the real loop finalizer's consumed waiting-gate wakeu
 	expect(await requested).toBeInstanceOf(Error);
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
-	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+	expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 	expect(
 		(await db.select().from(narratorMessages)).filter((message) => message.role === "user"),
 	).toHaveLength(1);
@@ -750,7 +784,9 @@ for (const timeout of [false, true]) {
 				finish.resolve();
 				await work;
 				// Reproduce the loop finalizer's already-consumed, gate-refused wakeup.
-				await expect(session.resumeBufferedMessagesIfIdle(ROOT)).rejects.toMatchObject(rejection);
+				await expect(
+					await captureWorkerRejection(session.resumeBufferedMessagesIfIdle(ROOT)),
+				).toMatchObject(rejection);
 			}
 			state.activeNarrators.set(ROOT, makeActive());
 			if (!timeout) controller.abort(new Error("cancel waiting revert"));
@@ -758,13 +794,13 @@ for (const timeout of [false, true]) {
 			expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(false);
 			if (settlesLate) {
 				expect(await session.resumeBufferedMessagesIfIdle(ROOT)).toEqual({ resumed: false });
-				expect(state.bufferedMessages.get(ROOT)).toHaveLength(1);
+				expect(await state.bufferedMessages.get(ROOT)).toHaveLength(1);
 				finish.resolve();
 				await work;
 			}
 			await committed.promise;
 			await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
-			expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
+			expect(await state.bufferedMessages.get(ROOT)).toBeUndefined();
 			expectMaterializedUserInput();
 			expect(
 				(await db.select().from(narratorMessages)).filter(
@@ -788,15 +824,19 @@ test("a primary fork is independent; ownership follows child parent links, not c
 	await deliverInjection(OTHER, { content: "other narrator", source: "test" });
 	expect(await db.select().from(narratorMessages)).toHaveLength(1);
 	await expect(
-		deliverInjection(CHILD, { content: "child narrator", source: "test" }),
-	).rejects.toMatchObject(rejection);
+		await captureWorkerRejection(
+			deliverInjection(CHILD, { content: "child narrator", source: "test" }),
+		),
+	).toMatchObject(rejection);
 	// A root revert already reserves the whole team, so the child cannot start its own.
 	await expect(
-		session.acquireNarratorRevertAdmission(CHILD, {
-			signal: new AbortController().signal,
-			interrupt: false,
-		}),
-	).rejects.toMatchObject(rejection);
+		await captureWorkerRejection(
+			session.acquireNarratorRevertAdmission(CHILD, {
+				signal: new AbortController().signal,
+				interrupt: false,
+			}),
+		),
+	).toMatchObject(rejection);
 });
 
 test("a subagent revert reserves only the subagent, never its parent", async () => {
@@ -806,13 +846,15 @@ test("a subagent revert reserves only the subagent, never its parent", async () 
 	});
 	pendingReleases.push(release);
 	await expect(
-		deliverInjection(CHILD, { content: "child narrator", source: "test" }),
-	).rejects.toMatchObject(rejection);
+		await captureWorkerRejection(
+			deliverInjection(CHILD, { content: "child narrator", source: "test" }),
+		),
+	).toMatchObject(rejection);
 	// The parent keeps working while one of its subagents is being reverted.
 	await deliverInjection(ROOT, { content: "parent narrator", source: "test" });
 	expect(await db.select().from(narratorMessages)).toHaveLength(1);
 	// But the team root cannot revert concurrently: its selection reaches the child.
-	await expect(acquire()).rejects.toMatchObject(rejection);
+	await expect(await captureWorkerRejection(acquire())).toMatchObject(rejection);
 	release();
 	await acquire();
 });
@@ -834,11 +876,13 @@ test("a subagent revert waits for the subagent's own work, not its parent's", as
 	const child = state.withNarratorWorkAdmission(CHILD, () => childWork.promise);
 	try {
 		await expect(
-			session.acquireNarratorRevertAdmission(CHILD, {
-				signal: new AbortController().signal,
-				interrupt: false,
-			}),
-		).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_BUSY" });
+			await captureWorkerRejection(
+				session.acquireNarratorRevertAdmission(CHILD, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			),
+		).toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_BUSY" });
 	} finally {
 		childWork.resolve();
 		await child;
@@ -858,7 +902,7 @@ test("continuation admission wins before its first write: non-interrupting rever
 	const continuation = session.continueNarrator(ROOT).catch((error) => error);
 	await entered.promise;
 	try {
-		await expect(acquire()).rejects.toMatchObject({
+		await expect(await captureWorkerRejection(acquire())).toMatchObject({
 			statusCode: 409,
 			code: "NARRATOR_REVERT_BUSY",
 		});
@@ -890,7 +934,9 @@ test("complete finally remains busy after _loopRunning and alive clear", async (
 		expect(active._loopRunning).toBe(false);
 		expect(active.alive).toBe(false);
 		expect(session.isLoopRunning(ROOT)).toBe(true);
-		await expect(acquire()).rejects.toMatchObject({ code: "NARRATOR_REVERT_BUSY" });
+		await expect(await captureWorkerRejection(acquire())).toMatchObject({
+			code: "NARRATOR_REVERT_BUSY",
+		});
 		exclusive = acquire(true, controller.signal).then((release) => {
 			granted = true;
 			return release;
@@ -928,7 +974,9 @@ test("interrupt waits for background child publication without changing parent n
 	});
 	await entered.promise;
 	expect(state.isNarratorRuntimeBusy(ROOT)).toBe(false);
-	await expect(acquire()).rejects.toMatchObject({ code: "NARRATOR_REVERT_BUSY" });
+	await expect(await captureWorkerRejection(acquire())).toMatchObject({
+		code: "NARRATOR_REVERT_BUSY",
+	});
 	const aborted = new Promise<void>((resolve) =>
 		controller.signal.addEventListener("abort", () => resolve(), { once: true }),
 	);
@@ -942,6 +990,122 @@ test("interrupt waits for background child publication without changing parent n
 	// This fixture installs a control without a run finalizer; its publication work
 	// has finished, so end the fixture owner before afterEach waits for real runs.
 	owner.release();
+});
+
+test("reverting the primary leaves a background subagent running", async () => {
+	db.update(narrators)
+		.set({ isBackground: true, backgroundStatus: "running" })
+		.where(eq(narrators.id, CHILD))
+		.run();
+	const owner = ownership.tryClaimExecution(CHILD, "run");
+	if (!owner) throw new Error("Missing child run owner");
+	runOwners.push(owner);
+	const runCancel = new AbortController();
+	ownership.setRunControl(owner, {
+		startedAt: Date.now(),
+		cancel: runCancel,
+		timedOut: false,
+		terminal: new Promise(() => {}),
+	});
+	const childActive = makeActive();
+	childActive.narratorId = CHILD;
+	childActive._loopRunning = true;
+	state.activeNarrators.set(CHILD, childActive);
+	const primary = makeActive();
+	primary._loopRunning = true;
+	state.activeNarrators.set(ROOT, primary);
+	primary.abortController.signal.addEventListener(
+		"abort",
+		() => {
+			primary._loopRunning = false;
+			primary.alive = false;
+		},
+		{ once: true },
+	);
+	const entered = deferred();
+	const finish = deferred();
+	const child = state.withNarratorWorkAdmission(CHILD, async () => {
+		entered.resolve();
+		await finish.promise;
+	});
+	await entered.promise;
+	const signal = new AbortController();
+	const exclusive = acquire(true, signal.signal);
+	try {
+		const granted = await Promise.race([
+			exclusive.then((release) => ({ release, timedOut: false as const })),
+			Bun.sleep(1_500).then(() => ({ release: undefined, timedOut: true as const })),
+		]);
+		// The primary turn still stops. The background subagent's run does not, and the
+		// revert does not wait for that run to finish.
+		expect(primary.abortController.signal.aborted).toBe(true);
+		expect(runCancel.signal.aborted).toBe(false);
+		expect(childActive.abortController.signal.aborted).toBe(false);
+		expect(granted.timedOut).toBe(false);
+		if (!granted.release) throw new Error("Revert admission was not granted");
+		expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(true);
+		let continued = false;
+		await state.withNarratorWorkAdmission(CHILD, async () => {
+			continued = true;
+			expect(state.isNarratorRevertAdmissionBlocked(CHILD)).toBe(false);
+		});
+		expect(continued).toBe(true);
+		granted.release();
+	} finally {
+		signal.abort(new Error("test cleanup"));
+		finish.resolve();
+		await Promise.allSettled([child, exclusive]);
+		owner.release();
+	}
+});
+
+test("reverting a background subagent still interrupts that subagent", async () => {
+	db.update(narrators)
+		.set({ isBackground: true, backgroundStatus: "running" })
+		.where(eq(narrators.id, CHILD))
+		.run();
+	const active = makeActive();
+	active.narratorId = CHILD;
+	active._loopRunning = true;
+	state.activeNarrators.set(CHILD, active);
+	const aborted = deferred();
+	active.abortController.signal.addEventListener(
+		"abort",
+		() => {
+			active._loopRunning = false;
+			active.alive = false;
+			aborted.resolve();
+		},
+		{ once: true },
+	);
+	const entered = deferred();
+	const finish = deferred();
+	const work = state.withNarratorWorkAdmission(CHILD, async () => {
+		entered.resolve();
+		await finish.promise;
+	});
+	await entered.promise;
+	const signal = new AbortController();
+	const exclusive = session
+		.acquireNarratorRevertAdmission(CHILD, { interrupt: true, signal: signal.signal })
+		.then((release) => {
+			pendingReleases.push(release);
+			return release;
+		});
+	try {
+		const outcome = await Promise.race([
+			aborted.promise.then(() => "aborted" as const),
+			Bun.sleep(1_500).then(() => "timeout" as const),
+		]);
+		expect(outcome).toBe("aborted");
+		finish.resolve();
+		await work;
+		(await exclusive)();
+	} finally {
+		signal.abort(new Error("test cleanup"));
+		finish.resolve();
+		await Promise.allSettled([work, exclusive]);
+	}
 });
 
 test("cancellation before acquisition releases only the waiting reservation", async () => {
@@ -964,7 +1128,9 @@ test("cancellation before acquisition releases only the waiting reservation", as
 	expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(true);
 	controller.abort(new Error("cancel pending acquisition"));
 	// Capture the reason after abort; no ownership can have been granted while work is live.
-	await expect(requested).rejects.toThrow("cancel pending acquisition");
+	await expect(await captureWorkerRejectionThrower(requested)).toThrow(
+		"cancel pending acquisition",
+	);
 	expect(state.isNarratorRevertAdmissionBlocked(ROOT)).toBe(false);
 	leave.resolve();
 	await work;
@@ -972,21 +1138,23 @@ test("cancellation before acquisition releases only the waiting reservation", as
 });
 
 test("already aborted requests leak no reservation; acquired lease ignores abort and release is idempotent", async () => {
-	await expect(acquire(false, AbortSignal.abort(new Error("already cancelled")))).rejects.toThrow(
-		"already cancelled",
-	);
+	await expect(
+		await captureWorkerRejectionThrower(
+			acquire(false, AbortSignal.abort(new Error("already cancelled"))),
+		),
+	).toThrow("already cancelled");
 	const controller = new AbortController();
 	const release = await acquire(false, controller.signal);
 	controller.abort();
 	await expect(
-		deliverInjection(ROOT, { source: "test", content: "not yet" }),
-	).rejects.toMatchObject(rejection);
+		await captureWorkerRejection(deliverInjection(ROOT, { source: "test", content: "not yet" })),
+	).toMatchObject(rejection);
 	release();
 	const nextRelease = await acquire();
 	release();
 	await expect(
-		deliverInjection(ROOT, { source: "test", content: "still held" }),
-	).rejects.toMatchObject(rejection);
+		await captureWorkerRejection(deliverInjection(ROOT, { source: "test", content: "still held" })),
+	).toMatchObject(rejection);
 	nextRelease();
 	await deliverInjection(ROOT, { source: "test", content: "released" });
 	expect((await db.select().from(narratorMessages))[0]?.contentText).toBe("released");
@@ -1020,5 +1188,5 @@ test("nested start transactions are reentrant but escaped async work cannot reus
 	});
 	await acquire();
 	later.resolve();
-	await expect(escaped).rejects.toMatchObject(rejection);
+	await expect(await captureWorkerRejection(escaped)).toMatchObject(rejection);
 });

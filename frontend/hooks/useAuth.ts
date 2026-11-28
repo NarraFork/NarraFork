@@ -1,20 +1,37 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ApiError, api, endSession, getToken, setToken } from "../lib/api";
+import { api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
+import { confirmAuthUser, getAuthSnapshot } from "../lib/api/client";
+import { appearanceStore } from "../lib/appearance-preference-store";
 import { assetUrl } from "../lib/base-path";
+import { writeCurrentUserCache } from "../lib/current-user-cache";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
+import { seedCurrentUser } from "./useCurrentUser";
+
+export { useCurrentUser } from "./useCurrentUser";
 
 /** Establish a session from a login/verify result: store token, seed cache, set language. */
 export async function applySession(qc: QueryClient, data: LoginSession): Promise<void> {
+	let generation: number | undefined;
+	const persist = (token: string) => {
+		generation = setToken(token);
+	};
 	if (REMOTE_BUILD) {
 		const { establishRemoteSession } = await import("@frontend/remote/session");
-		await establishRemoteSession(data, setToken);
+		await establishRemoteSession(data, persist);
 	} else {
-		setToken(data.token);
+		persist(data.token);
 	}
+	const auth = getAuthSnapshot();
+	if (!auth.hasToken || auth.generation !== generation) return;
+	// Never hydrate from the preceding session's preferences, including tab pages and pin states.
+	qc.removeQueries({ queryKey: ["user-preferences"] });
+	appearanceStore.activate(data.user.id);
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.
-	qc.setQueryData(["auth", "me"], data.user);
+	seedCurrentUser(qc, generation, data.user);
+	writeCurrentUserCache(data.user);
+	confirmAuthUser(generation, data.user.id);
 	try {
 		await changeAppLanguage(data.language, getNamespacesForPath("/"));
 	} catch (error) {
@@ -28,22 +45,6 @@ export function useAuthStatus() {
 		queryFn: api.authStatus,
 		retry: false,
 		staleTime: 60_000,
-	});
-}
-
-export function useCurrentUser() {
-	return useQuery({
-		queryKey: ["auth", "me"],
-		queryFn: api.me,
-		enabled: !!getToken(),
-		retry: (failureCount, error) => {
-			// Don't retry auth failures or missing user, but retry transient server errors.
-			// 401 = token invalid/expired; 404 = user deleted (DB wipe) while token still valid.
-			const status = (error as ApiError)?.status;
-			if (status === 401 || status === 404) return false;
-			return failureCount < 3;
-		},
-		staleTime: 30_000,
 	});
 }
 

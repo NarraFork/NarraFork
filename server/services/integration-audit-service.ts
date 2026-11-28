@@ -9,6 +9,7 @@ import type { ResourceRef, ResourceScope } from "@shared/integrations/resources"
 import { and, desc, eq, lt, or } from "drizzle-orm";
 import { db } from "../db";
 import { integrationAuditEvents } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 
@@ -153,22 +154,25 @@ export class IntegrationAuditService {
 			Math.max(1, Math.trunc(input.limit ?? 50)),
 		);
 		const cursor = decodeCursor(input.cursor);
-		const rows = await db.query.integrationAuditEvents.findMany({
-			where: and(
-				eq(integrationAuditEvents.authorityId, authorityId),
-				cursor
-					? or(
-							lt(integrationAuditEvents.createdAt, cursor.createdAt),
-							and(
-								eq(integrationAuditEvents.createdAt, cursor.createdAt),
-								lt(integrationAuditEvents.id, cursor.id),
-							),
-						)
-					: undefined,
-			),
-			orderBy: [desc(integrationAuditEvents.createdAt), desc(integrationAuditEvents.id)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.integrationAuditEvents.findMany({
+				where: and(
+					eq(integrationAuditEvents.authorityId, authorityId),
+					cursor
+						? or(
+								lt(integrationAuditEvents.createdAt, cursor.createdAt),
+								and(
+									eq(integrationAuditEvents.createdAt, cursor.createdAt),
+									lt(integrationAuditEvents.id, cursor.id),
+								),
+							)
+						: undefined,
+				),
+				orderBy: [desc(integrationAuditEvents.createdAt), desc(integrationAuditEvents.id)],
+				limit: limit + 1,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const hasMore = rows.length > limit;
 		const items = hasMore ? rows.slice(0, limit) : rows;
 		const last = items.at(-1);

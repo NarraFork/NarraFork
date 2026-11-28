@@ -1,6 +1,7 @@
 import { and, eq, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { projects, scheduledTasks, users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { ForbiddenError, NotFoundError } from "../lib/errors";
 import {
 	canManageProject,
@@ -29,10 +30,13 @@ export async function resolveTaskPrincipal(
 	userId: string | null | undefined,
 ): Promise<ScheduledTaskPrincipal> {
 	if (!userId) throw new ForbiddenError();
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { id: true, role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { id: true, role: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!user) throw new ForbiddenError();
 	return { userId: user.id, isAdmin: user.role === "admin" };
 }
@@ -62,10 +66,13 @@ export function taskReadableWhere(principal: ScheduledTaskPrincipal) {
 
 async function taskProject(task: TaskAclRow) {
 	if (task.runContext === "standalone" || !task.projectId) return undefined;
-	return db.query.projects.findFirst({
-		where: eq(projects.id, task.projectId),
-		columns: { id: true, ownerUserId: true, visibility: true },
-	});
+	return readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, task.projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 export function canEditTask(task: TaskAclRow, principal: ScheduledTaskPrincipal): boolean {
@@ -109,10 +116,13 @@ export async function assertTaskProjectWrite(
 	principal: ScheduledTaskPrincipal,
 ) {
 	if (!projectId) throw new NotFoundError("Project", "unknown");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, ownerUserId: true, visibility: true, gitPath: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true, gitPath: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!project || !(await canWriteProject(project, principal)))
 		throw new NotFoundError("Project", projectId);
 	return project;

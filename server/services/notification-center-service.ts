@@ -1,3 +1,4 @@
+import { readDbAll, readQuery } from "../db/worker-read";
 /** Bounded event history. Source ACL and read watermarks are authoritative, not the projection. */
 
 import { isConversationRoomKind } from "@shared/chat-room-kinds";
@@ -170,12 +171,16 @@ interface NotificationRow {
 
 /** Always select the event window BEFORE kind/status filters. No request catches up old backlog. */
 async function loadWindow(userId: string, now: number): Promise<NotificationRow[]> {
-	return db.all<NotificationRow>(sql`
+	return readDbAll<NotificationRow>(
+		db,
+		sql`
 		SELECT id, kind, title, preview, link_json, source_key, status, created_at, read_at
 		FROM notifications WHERE user_id = ${userId}
 		AND created_at >= ${now - NOTIFICATION_RETENTION_MAX_AGE_MS}
 		ORDER BY created_at DESC, id DESC LIMIT ${NOTIFICATION_RETENTION_MAX_ROWS}
-	`);
+	`,
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 function rowBase(row: NotificationRow): NotificationListItem {
@@ -229,7 +234,7 @@ export async function recordNotifications(
 				Number.isSafeInteger(input.createdAt) && (input.createdAt as number) >= 0
 					? (input.createdAt as number)
 					: Date.now();
-			db.run(sql`
+			const inserted = db.get<{ id: string }>(sql`
 				INSERT INTO notifications (
 					id, user_id, kind, project_id, narrator_id,
 					title, preview, link_json, source_key, status, created_at, read_at
@@ -241,8 +246,9 @@ export async function recordNotifications(
 					${clampNotificationText(input.preview, NOTIFICATION_PREVIEW_MAX_LENGTH)},
 					${JSON.stringify(link)}, ${input.sourceKey}, 'unread', ${createdAt}, NULL
 				) ON CONFLICT (user_id, kind, source_key) DO NOTHING
+				RETURNING id
 			`);
-			if ((db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count ?? 0) > 0) {
+			if (inserted) {
 				onInserted?.(input);
 				const kinds = touched.get(input.userId) ?? new Set<NotificationKind>();
 				kinds.add(input.kind);
@@ -283,14 +289,18 @@ async function loadMessageSources(rows: NotificationRow[], userId: string) {
 	const result = new Map<string, MessageSource>();
 	const ids = rows.filter((row) => row.kind === "chat_message").map((row) => row.source_key);
 	for (const batch of chunks([...new Set(ids)])) {
-		const found = db.all<MessageSource>(sql`
+		const found = await readDbAll<MessageSource>(
+			db,
+			sql`
 			SELECT m.id, m.room_id AS roomId, m.seq, m.deleted_at AS deletedAt,
 			       r.kind AS roomKind, member.last_read_seq AS lastReadSeq,
 			       member.last_read_at AS lastReadAt
 			FROM chat_messages m INNER JOIN chat_rooms r ON r.id = m.room_id
 			LEFT JOIN chat_room_members member ON member.room_id = r.id AND member.user_id = ${userId}
 			WHERE m.id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
-		`);
+		`,
+			{ executionPolicy: "worker-required" },
+		);
 		for (const row of found) result.set(row.id, row);
 	}
 	return result;
@@ -320,11 +330,14 @@ async function loadScheduledTaskSources(
 	}
 	const visibleTasks = new Set<string>();
 	for (const batch of chunks([...new Set([...links.values()].map((link) => link.taskId))])) {
-		const tasks = await db
-			.select({ id: scheduledTasks.id })
-			.from(scheduledTasks)
-			.where(and(inArray(scheduledTasks.id, batch), taskReadableWhere(principal)))
-			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		const tasks = await readQuery(
+			db
+				.select({ id: scheduledTasks.id })
+				.from(scheduledTasks)
+				.where(and(inArray(scheduledTasks.id, batch), taskReadableWhere(principal)))
+				.limit(NOTIFICATION_SQL_BATCH_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const task of tasks) visibleTasks.add(task.id);
 	}
 	const runs = new Map<string, { taskId: string; status: string }>();
@@ -332,15 +345,18 @@ async function loadScheduledTaskSources(
 		link.runId && visibleTasks.has(link.taskId) ? [link.runId] : [],
 	);
 	for (const batch of chunks([...new Set(runIds)])) {
-		const found = await db
-			.select({
-				id: scheduledTaskRuns.id,
-				taskId: scheduledTaskRuns.taskId,
-				status: scheduledTaskRuns.status,
-			})
-			.from(scheduledTaskRuns)
-			.where(inArray(scheduledTaskRuns.id, batch))
-			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		const found = await readQuery(
+			db
+				.select({
+					id: scheduledTaskRuns.id,
+					taskId: scheduledTaskRuns.taskId,
+					status: scheduledTaskRuns.status,
+				})
+				.from(scheduledTaskRuns)
+				.where(inArray(scheduledTaskRuns.id, batch))
+				.limit(NOTIFICATION_SQL_BATCH_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const run of found) runs.set(run.id, run);
 	}
 	const sources = new Map<string, { link: NotificationLink; sourceState: "active" | "resolved" }>();
@@ -365,18 +381,25 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		.filter((row) => row.kind === "permission_request")
 		.map((row) => row.source_key);
 	for (const batch of chunks([...new Set(toolIds)])) {
-		const found = db.all<PermissionSource>(sql`
+		const found = await readDbAll<PermissionSource>(
+			db,
+			sql`
 			SELECT id, narrator_id AS narratorId, status,
 			permission_decided_by AS decidedBy, permission_decided_at AS decidedAt
 			FROM narrator_tool_calls WHERE id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
-		`);
+		`,
+			{ executionPolicy: "worker-required" },
+		);
 		for (const tool of found) tools.set(tool.id, tool);
 	}
 
-	const principal = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const principal = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const scheduledSources = principal
 		? await loadScheduledTaskSources(rows, { userId, isAdmin: principal.role === "admin" })
 		: new Map();
@@ -389,23 +412,26 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		}
 	>();
 	for (const batch of chunks([...new Set([...tools.values()].map((tool) => tool.narratorId))])) {
-		const found = await db
-			.select({
-				narratorId: narrators.id,
-				projectId: projects.id,
-				projectTitle: sql<
-					string | null
-				>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
-			})
-			.from(narrators)
-			.leftJoin(projects, eq(projects.id, narratorProjectIdColumn))
-			.where(
-				and(
-					inArray(narrators.id, batch),
-					narratorReadableWhere({ userId, isAdmin: principal?.role === "admin" }),
-				),
-			)
-			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		const found = await readQuery(
+			db
+				.select({
+					narratorId: narrators.id,
+					projectId: projects.id,
+					projectTitle: sql<
+						string | null
+					>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
+				})
+				.from(narrators)
+				.leftJoin(projects, eq(projects.id, narratorProjectIdColumn))
+				.where(
+					and(
+						inArray(narrators.id, batch),
+						narratorReadableWhere({ userId, isAdmin: principal?.role === "admin" }),
+					),
+				)
+				.limit(NOTIFICATION_SQL_BATCH_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const context of found) contexts.set(context.narratorId, context);
 	}
 
@@ -574,11 +600,11 @@ async function updateReadIds(userId: string, ids: string[]): Promise<{ updated: 
 	let updated = 0;
 	const now = Date.now();
 	for (const batch of chunks([...new Set(ids)])) {
-		db.run(sql`
+		updated += db.all<{ id: string }>(sql`
 			UPDATE notifications SET status = 'read', read_at = coalesce(read_at, ${now})
 			WHERE user_id = ${userId} AND status = 'unread' AND id IN (${boundIds(batch)})
-		`);
-		updated += db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count ?? 0;
+			RETURNING id
+		`).length;
 	}
 	if (updated > 0) notifyNotificationCenterChanged(userId);
 	return { updated };
@@ -628,9 +654,10 @@ export async function syncChatNotificationReads(
 
 export async function deleteNotification(userId: string, id: string): Promise<void> {
 	if (!isId(userId) || !isId(id)) throw new ValidationError("Notification id is required");
-	db.run(sql`DELETE FROM notifications WHERE id = ${id} AND user_id = ${userId}`);
-	if (!db.all<{ count: number }>(sql`SELECT changes() AS count`)[0]?.count)
-		throw new NotFoundError("Notification", id);
+	const deleted = db.get<{ id: string }>(sql`
+		DELETE FROM notifications WHERE id = ${id} AND user_id = ${userId} RETURNING id
+	`);
+	if (!deleted) throw new NotFoundError("Notification", id);
 	notifyNotificationCenterChanged(userId);
 }
 

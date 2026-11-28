@@ -35,9 +35,11 @@ import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-rout
 import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
+import type { ModelHistoryPreparation } from "../lib/model-history-preparation";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
+import { freezePrefixValue } from "./narrator-prefix-snapshot-values";
 import {
 	getPrefixToolDefinitions,
 	putPrefixJson,
@@ -242,6 +244,7 @@ export interface ReconcileEpochInput {
 	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
+	preparation?: ModelHistoryPreparation;
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	/** Compatibility for callers/tests; cache age never opens an epoch. */
 	now?: number;
@@ -323,9 +326,10 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 		? await (await import("./narrator-service")).narratorService.getModelHistorySinceLastCompact(
 				narratorId,
 				undefined,
-				{ signal },
+				{ signal, preparation: input.preparation },
 			)
 		: undefined;
+	input.preparation?.recordPhase("epoch");
 	const messages = sourceMessages ?? input.messages;
 	const compactMessageId = await currentCompactMessageId(narratorId);
 	if (
@@ -515,7 +519,9 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 	const changes = contextChanges(reduced.parts, parts);
 	if (changes.length) {
 		const modelText = renderContextUpdate(changes);
-		const snapshotRef = await putPrefixJson({ changes, modelText }, signal);
+		const snapshot = { changes, modelText };
+		await freezePrefixValue(snapshot, () => signal?.throwIfAborted());
+		const snapshotRef = await putPrefixJson(snapshot, signal);
 		// The reader's summaries: each changed part's own, refined against the row this session was
 		// last shown (the current-tasks view then names what was finished or started in between).
 		// Rendered after, and never read by, the model's text above.

@@ -199,7 +199,11 @@ export interface PluginDetail extends PluginSummary {
 	generatedAt?: string;
 	/** Declared host capabilities (names only), used by the grants panel to show
 	 * which declared capabilities still lack a grant. */
-	manifest?: { permissions?: { host?: string[] } };
+	manifest?: {
+		permissions?: { host?: string[] };
+		/** True when the plugin contributes an `overlay` view (painted over the whole app). */
+		overlay?: true;
+	};
 }
 
 export interface PluginStatusEnvelope extends PluginDetail {

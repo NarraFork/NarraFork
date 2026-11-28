@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessages,
 	narratorQuestions,
@@ -9,8 +9,11 @@ import {
 	users,
 } from "../../db/schema";
 import type { NarraForkEvent } from "../../lib/event-bus";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { eventBus } = await import("../../lib/event-bus");
@@ -119,7 +122,7 @@ beforeEach(async () => {
 	});
 });
 
-afterAll(() => {
+afterAll(async () => {
 	for (const controller of controllers) controller.abort();
 	pendingPermissions.clear();
 	pendingDangerReflections.clear();
@@ -128,6 +131,7 @@ afterAll(() => {
 	setQuestionServiceSeam(null);
 	mock.restore();
 	mock.module("../../db", () => realDb);
+	await fixture.close();
 });
 
 async function startPermission() {
@@ -189,13 +193,22 @@ describe("data-free authoritative human attention invalidation", () => {
 		expect(events.at(-1)?.questionCount).toBe(1);
 		const controller = new AbortController();
 		controllers.push(controller);
+		const registered = Promise.withResolvers<void>();
+		setQuestionServiceSeam({
+			isLoopRunning: () => false,
+			broadcastToNarrator: () => {
+				localBroadcasts++;
+			},
+			emitAttention: () => registered.resolve(),
+			emitAttentionResolved: () => {},
+		});
 		const waiting = awaitAsyncQuestion({
 			questionId,
 			narratorId: "n",
 			timeoutMs: 0,
 			signal: controller.signal,
 		});
-		for (let i = 0; i < 30 && !isAsyncQuestionAwaited(questionId); i++) await Promise.resolve();
+		await registered.promise;
 		expect(events.some((event) => event.awaited)).toBe(true);
 		controller.abort();
 		await waiting;

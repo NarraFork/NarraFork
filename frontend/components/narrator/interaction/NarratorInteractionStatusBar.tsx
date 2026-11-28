@@ -7,28 +7,27 @@ import {
 	Loader,
 	Menu,
 	NativeSelect,
-	Popover,
-	Stack,
 	Text,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type { QuotaSnapshotEntry } from "@shared/quota-snapshot";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
-import type { OpencodeUsageCache } from "../../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
+	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 	statusRegistry,
 } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import { TruncatedText } from "../../common/TruncatedText";
 import {
 	AwaitingConfirmationBadge,
@@ -46,18 +45,17 @@ import type {
 	planNarratorWorkIndicator,
 } from "../header/narrator-status-bar";
 import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
-import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
-import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
-import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
-import type { QuotaPanelView } from "../model/quota-panel-view";
-import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
+import { PaginatedModelMenuItems as ModelMenuItems } from "../model/PaginatedModelMenuItems";
+import { QuotaSnapshotIndicator } from "../model/QuotaSnapshotIndicator";
 import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
+import type { ProviderHeaderActions } from "../model/use-model-menu-refresh-props";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
+import type { Mutate, PendingMutate } from "./mutate";
 import { PermissionMenuContent } from "./PermissionMenuContent";
 import { createPlanReflectionStatusAction } from "./PlanReflectionStatusControl";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
@@ -152,18 +150,19 @@ export interface NarratorInteractionStatusBarProps {
 	};
 
 	model: {
+		summary?: import("@shared/model-runtime").RuntimeModelSummary;
 		allModels: ModelOption[];
-		// biome-ignore lint/suspicious/noExplicitAny: aggregation/provider-label shapes come straight from NarratorPanel.
-		aggregations: any;
-		// biome-ignore lint/suspicious/noExplicitAny: provider label map passthrough.
-		providerLabels: any;
+		aggregations: ModelAggregation[];
+		providerLabels: Record<string, string>;
 		/** Settings projection, for the allowance/balance badges on provider groups. */
 		settingsData?: Parameters<typeof useModelMenuProviderBadges>[0];
 		defaultModelValue: string;
-		// biome-ignore lint/suspicious/noExplicitAny: refresh props are spread verbatim onto ModelMenuItems.
-		refreshProps: any;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateModel.
-		mutation: any;
+		refreshProps: {
+			providerActions?: Record<string, ProviderHeaderActions>;
+			onOpenProviderSettings?: (prefix: string) => void;
+			onPickerOpened?: () => void;
+		};
+		mutation: Mutate<{ id: string; model: string }>;
 		onEditDefaultModel: () => void;
 		onEditSummaryModel: () => void;
 		/** Promote a concrete model from the menu into the instance default/summary slots. */
@@ -178,8 +177,7 @@ export interface NarratorInteractionStatusBarProps {
 		displayed: string;
 		options: readonly ReasoningEffortValue[];
 		followsDefault: boolean;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: PendingMutate<{ id: string; reasoningEffort: string | null }>;
 		onFollowDefault: () => void;
 		onSetAsDefault: () => void;
 	};
@@ -187,8 +185,7 @@ export interface NarratorInteractionStatusBarProps {
 	permission: {
 		availableModes: string[];
 		unavailableReason?: string;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: Mutate<{ id: string; permissionMode: string }>;
 		hasPlanTrait: boolean;
 		togglePlanMode: () => void;
 		planModePending: boolean;
@@ -231,29 +228,9 @@ export interface NarratorInteractionStatusBarProps {
 	};
 
 	quota: {
-		balance: string | null;
-		detailsText: string | null;
-		hasDetailsPopover: boolean;
-		/**
-		 * OpenCode Go plan allowance for the current model's provider. Rendered by its
-		 * own structured indicator; `undefined` when the model is not on a Go endpoint.
-		 */
-		opencode?: {
-			usage: OpencodeUsageCache | null | undefined;
-			waitingForQuota: boolean;
-			waitingText: string | null;
-		};
-		/** The active sub2api subscription, already isolated by the balance query. */
-		sub2api?: { snapshot: ProviderBalanceSnapshot; queryFailed: boolean };
-		/**
-		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
-		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
-		 */
-		panel?: {
-			view: QuotaPanelView | null;
-			waitingForQuota: boolean;
-			waitingText: string | null;
-		};
+		entries: QuotaSnapshotEntry[];
+		waitingForQuota: boolean;
+		waitingText: string | null;
 		shouldShowNugRechargeButton: boolean;
 		shouldShowNugRechargeInQuotaDetails: boolean;
 		onOpenNugRecharge: () => void;
@@ -268,8 +245,7 @@ export interface NarratorInteractionStatusBarProps {
 	relaxedPlan: {
 		enabled: boolean;
 		forced: boolean;
-		// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough.
-		mutation: any;
+		mutation: PendingMutate<{ id: string; relaxedPlan: boolean }>;
 	};
 
 	terminal: {
@@ -351,22 +327,6 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	// the status bar since nothing else drives it; hovering the balance opens it and
 	// leaving schedules a short (150ms) close so a small gap between trigger and
 	// dropdown does not snap it shut.
-	const [quotaDetailsOpened, setQuotaDetailsOpened] = useState(false);
-	const quotaDetailsCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const cancelQuotaDetailsClose = useCallback(() => {
-		if (quotaDetailsCloseTimer.current) {
-			clearTimeout(quotaDetailsCloseTimer.current);
-			quotaDetailsCloseTimer.current = null;
-		}
-	}, []);
-	const scheduleQuotaDetailsClose = useCallback(() => {
-		cancelQuotaDetailsClose();
-		quotaDetailsCloseTimer.current = setTimeout(() => {
-			setQuotaDetailsOpened(false);
-			quotaDetailsCloseTimer.current = null;
-		}, 150);
-	}, [cancelQuotaDetailsClose]);
-	useEffect(() => () => cancelQuotaDetailsClose(), [cancelQuotaDetailsClose]);
 
 	// Retry countdown ticker. Only the work-indicator text below reads it, so it
 	// lives here rather than in NarratorPanel. Recomputes every second while a
@@ -457,6 +417,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	const canFollowParent = !!narrator.variant?.startsWith("subagent:");
 	const inheritance = followsParent ? modelInheritanceLabel(narrator.modelInheritance, t) : null;
 	const followLabel = inheritance?.label ?? t("followParent");
+	const summaryDisplayLabel =
+		model.summary?.selection.value === FOLLOW_DEFAULT_MODEL
+			? followDefaultLabel(t, model.defaultModelValue)
+			: model.summary?.selection.value === FOLLOW_PARENT_MODEL
+				? followLabel
+				: model.summary?.selection.value === "__summary__"
+					? t("modelGroupSummary")
+					: model.summary?.selection.label;
 	const followTooltip = inheritance
 		? (inheritance.reason ?? t("inheritance.followTooltip"))
 		: t("followParent");
@@ -577,119 +545,27 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							)}
 							{contextIndicator}
 							<CodexQuotaIndicator
+								detailsOnly
 								enabled={codexControls.isBuiltInCodexModel && !isWorkspacePreview}
 								isAdmin={currentUser?.role === "admin"}
 								compact={isMobileViewport}
 							/>
-							{quota.opencode && !isWorkspacePreview && (
-								<OpencodeQuotaIndicator
-									usage={quota.opencode.usage}
-									waitingForQuota={quota.opencode.waitingForQuota}
-									waitingText={quota.opencode.waitingText}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{quota.sub2api && !isWorkspacePreview && (
-								<Sub2ApiSubscriptionQuotaIndicator
-									snapshot={quota.sub2api.snapshot}
-									queryFailed={quota.sub2api.queryFailed}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{quota.panel && !isWorkspacePreview && (
-								<QuotaPanelIndicator
-									view={quota.panel.view}
-									waitingForQuota={quota.panel.waitingForQuota}
-									waitingText={quota.panel.waitingText}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{/* Generic gateway/API quota balance */}
-							{!quota.sub2api &&
-								quota.balance != null &&
-								(quota.hasDetailsPopover ? (
-									<Popover
-										opened={quotaDetailsOpened}
-										onChange={setQuotaDetailsOpened}
-										position="top"
-										withArrow
-										withinPortal
-										shadow="md"
-									>
-										<Popover.Target>
-											<UnstyledButton
-												onClick={(event) => {
-													event.stopPropagation();
-													cancelQuotaDetailsClose();
-													setQuotaDetailsOpened((opened) => !opened);
-												}}
-												onPointerEnter={() => {
-													if (!isMobileViewport) {
-														cancelQuotaDetailsClose();
-														setQuotaDetailsOpened(true);
-													}
-												}}
-												onPointerLeave={() => {
-													if (!isMobileViewport) scheduleQuotaDetailsClose();
-												}}
-												style={{ flexShrink: 0, maxWidth: 120 }}
-											>
-												<Text
-													size="xs"
-													c="dimmed"
-													style={{
-														cursor: "pointer",
-														maxWidth: 120,
-														overflow: "hidden",
-														textOverflow: "ellipsis",
-														whiteSpace: "nowrap",
-													}}
-												>
-													{quota.balance}
-												</Text>
-											</UnstyledButton>
-										</Popover.Target>
-										<Popover.Dropdown
-											maw={360}
-											onPointerEnter={() => {
-												if (!isMobileViewport) cancelQuotaDetailsClose();
-											}}
-											onPointerLeave={() => {
-												if (!isMobileViewport) scheduleQuotaDetailsClose();
-											}}
-										>
-											<Stack gap={6}>
-												{quota.detailsText && (
-													<Text
-														size="xs"
-														style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-													>
-														{quota.detailsText}
-													</Text>
-												)}
-												{recharge.showInDetails && (
-													<Button
-														size="compact-xs"
-														variant="light"
-														onClick={() => {
-															setQuotaDetailsOpened(false);
-															recharge.onOpen();
-														}}
-													>
-														{t("recharge.open")}
-													</Button>
-												)}
-											</Stack>
-										</Popover.Dropdown>
-									</Popover>
-								) : (
-									// No details popover here, so the clipped balance needs its own
-									// hover/tap reveal.
-									<TruncatedText
-										size="xs"
-										c="dimmed"
-										text={quota.balance}
-										style={{ flexShrink: 0, maxWidth: 120 }}
+							{!isWorkspacePreview &&
+								quota.entries.map((entry, index) => (
+									<QuotaSnapshotIndicator
+										key={`${entry.groupId}:${entry.credentialId ?? ""}`}
+										snapshot={entry.snapshot}
+										title={entry.prefix}
+										waitingForQuota={quota.waitingForQuota}
+										waitingText={quota.waitingText}
+										isMobile={isMobileViewport}
+										detailsFooter={
+											index === 0 && recharge.showInDetails ? (
+												<Button size="compact-xs" variant="light" onClick={recharge.onOpen}>
+													{t("recharge.open")}
+												</Button>
+											) : undefined
+										}
 									/>
 								))}
 							{recharge.showButton && (
@@ -722,32 +598,40 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
 																data={
-																	followsParent
-																		? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
-																		: model.allModels
-																				.filter((m) => {
-																					const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																					const agg = parseAggModelValue(raw);
-																					return (
-																						m.value ===
-																						(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
-																					);
-																				})
-																				.map((m) => ({
-																					value: m.value,
+																	model.summary
+																		? [
+																				{
+																					value: parseAggModelValue(model.summary.selection.value)
+																						? `${AGG_MODEL_PREFIX}${parseAggModelValue(model.summary.selection.value)?.aggId}`
+																						: model.summary.selection.value,
 																					label:
-																						m.value === FOLLOW_DEFAULT_MODEL
-																							? t("followDefault", {
-																									model: model.defaultModelValue,
-																								})
-																							: m.provider === "__agg__"
-																								? `⚡ ${m.label}`
-																								: m.provider === "__auto__"
-																									? m.label
-																									: m.provider
-																										? `${m.provider}:${m.label}`
-																										: m.label,
-																				}))
+																						summaryDisplayLabel ?? model.summary.selection.value,
+																				},
+																			]
+																		: followsParent
+																			? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
+																			: model.allModels
+																					.filter((m) => {
+																						const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																						const agg = parseAggModelValue(raw);
+																						return (
+																							m.value ===
+																							(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																						);
+																					})
+																					.map((m) => ({
+																						value: m.value,
+																						label:
+																							m.value === FOLLOW_DEFAULT_MODEL
+																								? followDefaultLabel(t, model.defaultModelValue)
+																								: m.provider === "__agg__"
+																									? `⚡ ${m.label}`
+																									: m.provider === "__auto__"
+																										? m.label
+																										: m.provider
+																											? `${m.provider}:${m.label}`
+																											: m.label,
+																					}))
 																}
 																value={(() => {
 																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
@@ -1052,8 +936,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																	// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
 																	// so an empty label never produces `undefined.toUpperCase()`.
 																	return (
-																		(m?.label || narrator.model || "?").charAt(0).toUpperCase() ||
-																		"?"
+																		(summaryDisplayLabel || m?.label || narrator.model || "?")
+																			.charAt(0)
+																			.toUpperCase() || "?"
 																	);
 																})()}
 															</Text>

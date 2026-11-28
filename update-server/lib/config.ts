@@ -8,6 +8,8 @@ import type { ServerConfig, TokenRecord } from "../types";
 import { nanoid } from "./id";
 import { logger } from "./logger";
 
+export const MAX_MIRROR_STORAGE_BYTES = 32 * 1024 ** 3;
+
 const DEFAULT_CONFIG: ServerConfig = {
 	port: 7780,
 	host: "localhost",
@@ -16,7 +18,7 @@ const DEFAULT_CONFIG: ServerConfig = {
 	mirrorRepositories: {},
 	mirrorRelay: { enabled: false },
 	mirrorLimits: {
-		quotaBytes: 8 * 1024 * 1024 * 1024,
+		quotaBytes: MAX_MIRROR_STORAGE_BYTES,
 		minFreeBytes: 256 * 1024 * 1024,
 		// Delivery-specific defaults live in ingestAsset; an explicit timeout here is an operator cap.
 	},

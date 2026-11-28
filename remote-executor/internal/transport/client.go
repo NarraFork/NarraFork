@@ -35,6 +35,10 @@ type Client struct {
 	dispatcher *rpc.Dispatcher
 	platform   rpc.Platform
 	caps       rpc.Capabilities
+	// resetReconnectBackoff is set when a connection reaches authentication.
+	// A session that was usable should reconnect promptly; backoff only grows
+	// across dials and handshakes that never authenticated.
+	resetReconnectBackoff bool
 }
 
 // connectionState owns every mutable resource associated with exactly one
@@ -135,8 +139,9 @@ func (s *connectionState) SendBinary(frame []byte) error {
 // expose a send-buffer size, so Write itself provides natural backpressure.
 func (s *connectionState) BufferedAmount() int { return 0 }
 
-// Run connects and serves until ctx is cancelled, reconnecting with exponential
-// backoff on any disconnect.
+// Run connects and serves until ctx is cancelled. A connection that reached
+// authentication reconnects after one second; dials that never authenticate
+// back off exponentially.
 func (c *Client) Run(ctx context.Context) error {
 	// Load trust once, before reconnecting. Invalid local configuration must
 	// return to the caller rather than being retried forever as a dial error.
@@ -151,9 +156,13 @@ func (c *Client) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		c.resetReconnectBackoff = false
 		err := c.connectAndServe(ctx, httpClient)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if c.resetReconnectBackoff {
+			backoff = time.Second
 		}
 		log.Printf("connection closed: %v; reconnecting in %s", err, backoff)
 		select {
@@ -161,9 +170,11 @@ func (c *Client) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(backoff):
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		if !c.resetReconnectBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }
@@ -304,6 +315,7 @@ func (c *Client) connectAndServe(ctx context.Context, httpClient *http.Client) e
 		return err
 	}
 	state.authenticated.Store(true)
+	c.resetReconnectBackoff = true
 	log.Printf("connected to %s as device %q (session %s)", c.cfg.ServerURL, c.cfg.DeviceRef, ack.SessionID)
 	return state.serveAuthenticated()
 }

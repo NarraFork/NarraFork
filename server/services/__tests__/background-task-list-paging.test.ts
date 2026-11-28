@@ -11,10 +11,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -155,11 +159,12 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	await backgroundOccupancyStore.drain();
 	if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
 	await flushDeltas();
 	cleanDb(sqlite);
 	// An emptied case cannot leave an outbox page cursor positioned in the next case.
-	runtimePublication.flushPage();
+	await runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
@@ -183,6 +188,7 @@ async function seedLegacyTask(opts: {
 	createdAt: string;
 	result?: string;
 	backgroundStatus?: "running" | "completed" | "failed" | "cancelled";
+	status?: "idle" | "archived";
 }): Promise<void> {
 	await seedNarrators({
 		id: opts.id,
@@ -193,7 +199,7 @@ async function seedLegacyTask(opts: {
 		backgroundStatus: opts.backgroundStatus ?? "completed",
 		backgroundResult: opts.result ?? "legacy result",
 		backgroundCompletedAt: opts.createdAt,
-		status: "idle",
+		status: opts.status ?? "idle",
 		title: `legacy ${opts.id}`,
 		createdAt: opts.createdAt,
 		updatedAt: opts.createdAt,
@@ -238,9 +244,137 @@ function transitions(values: unknown[]): unknown[] {
 async function flushDeltas(): Promise<void> {
 	do {
 		if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		await Promise.all([...pendingBroadcasts]);
 	} while (pendingBroadcasts.size > 0);
 }
+
+describe("maintained background task list invalidation semantics", () => {
+	test("ordinary primary/child reasoning and reflecting publish no list deltas", async () => {
+		const { eq } = await import("drizzle-orm");
+		await seedParent();
+		const now = new Date().toISOString();
+		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, PARENT));
+		backgroundOccupancyStore.refreshNarrator(PARENT);
+		await seedNarrators({
+			id: "semantic-child",
+			parentNarratorId: PARENT,
+			type: "subagent",
+			variant: "subagent:general",
+			status: "working",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-agent",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "completed",
+			subagentNarratorId: "semantic-child",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-child-work",
+			parentNarratorId: "semantic-child",
+			type: "bash",
+			status: "running",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await flushDeltas();
+		const version = backgroundTaskService.getListVersion(PARENT);
+		for (const substatus of [["reasoning"], ["reflecting"], ["reasoning"]]) {
+			broadcasts.length = 0;
+			for (const id of [PARENT, "semantic-child"]) {
+				await db
+					.update(narrators)
+					.set({ substatus: JSON.stringify(substatus) })
+					.where(eq(narrators.id, id));
+				backgroundOccupancyStore.refreshNarrator(id);
+			}
+			await flushDeltas();
+			expect(listDeltas()).toEqual([]);
+			expect(backgroundTaskService.getListVersion(PARENT)).toBe(version);
+		}
+		// The owner's own lifecycle is not a change to its list of tasks.
+		await db.update(narrators).set({ status: "waiting" }).where(eq(narrators.id, PARENT));
+		backgroundOccupancyStore.refreshNarrator(PARENT);
+		await flushDeltas();
+		expect(listDeltas()).toEqual([]);
+		// continued -> child_running keeps counts equal but must update the parent.
+		await db
+			.update(narrators)
+			.set({ status: "idle", substatus: "[]" })
+			.where(eq(narrators.id, "semantic-child"));
+		backgroundOccupancyStore.refreshNarrator("semantic-child");
+		await flushDeltas();
+		expect(listDeltas()).toEqual([
+			expect.objectContaining({ narratorId: PARENT, invalidate: true, activeCount: 1 }),
+		]);
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]).toMatchObject({
+			id: "semantic-agent",
+			effectiveStatus: "child_running",
+			activeChildTaskCount: 1,
+		});
+	});
+
+	test("worker display flags cover terminal status derivation without full substatus/error columns", async () => {
+		const { eq } = await import("drizzle-orm");
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedNarrators({
+			id: "semantic-terminal",
+			parentNarratorId: PARENT,
+			type: "subagent",
+			variant: "subagent:general",
+			status: "idle",
+			isBackground: false,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-terminal-task",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "timeout",
+			subagentNarratorId: "semantic-terminal",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await flushDeltas();
+		for (const [substatus, errorMessage, expected] of [
+			[["error"], "ordinary failure", "failed"],
+			[["error"], "execution timeout while waiting", "timeout"],
+			[["unread"], null, "completed"],
+			[["interrupted"], null, "cancelled"],
+			[["timeout"], null, "timeout"],
+			[["taken_over"], null, "taken_over"],
+		] as const) {
+			broadcasts.length = 0;
+			await db
+				.update(narrators)
+				.set({ substatus: JSON.stringify(substatus), errorMessage })
+				.where(eq(narrators.id, "semantic-terminal"));
+			backgroundOccupancyStore.refreshNarrator("semantic-terminal");
+			await flushDeltas();
+			expect(listDeltas()).toEqual([
+				expect.objectContaining({ narratorId: PARENT, invalidate: true }),
+			]);
+			expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+				expected,
+			);
+			const [row] = await databaseBackgroundOccupancySource.getNarrators(["semantic-terminal"]);
+			expect(row?.hasError).toBe(!!errorMessage);
+			expect(row?.errorTimeout).toBe(errorMessage?.includes("timeout") ?? false);
+			expect(row).not.toHaveProperty("substatus");
+			expect(row).not.toHaveProperty("errorMessage");
+		}
+	});
+});
 
 describe("background task list cursor paging", () => {
 	test("merges unified and legacy rows into one createdAt-descending stream with no gaps or repeats", async () => {
@@ -615,6 +749,91 @@ describe("background task active count", () => {
 	// is invisible to the DB. It has to be applied where the count is computed, not
 	// only in the route: while it lived in the route, a row rendered as `continued`
 	// while the badge beside it said 0, and delta upserts disagreed with the page.
+	test("archived legacy rows agree across active, full, history and upsert projections", async () => {
+		await seedParent();
+		const { eq } = await import("drizzle-orm");
+		for (const status of ["running", "completed", "failed", "cancelled"] as const) {
+			const id = `archived-${status}`;
+			await seedLegacyTask({ id, createdAt: "2026-05-01T00:00:00.000Z", backgroundStatus: status });
+			await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, id));
+			backgroundOccupancyStore.refreshNarrator(id);
+		}
+		const checkRows = (rows: BackgroundTaskListItem[]) => {
+			for (const row of rows) {
+				const expected =
+					row.id === "archived-running" ? "cancelled" : row.id.slice("archived-".length);
+				expect(row.status).toBe(expected);
+				expect(row.effectiveStatus).toBe(expected);
+				expect(row.canCancelActiveWork).toBe(false);
+				expect(row.activeChildTaskCount).toBe(0);
+			}
+		};
+		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
+		checkRows(page.tasks);
+		expect(page.tasks).toHaveLength(4);
+		expect(page.activeTasks).toEqual([]);
+		expect(page.activeCount).toBe(0);
+		checkRows((await backgroundTaskService.listLegacySnapshotByParent(PARENT)).tasks);
+		const first = await backgroundTaskService.listPageByParent(PARENT, { limit: 1 });
+		expect(first.nextCursor).not.toBeNull();
+		const history = await backgroundTaskService.listPageByParent(PARENT, {
+			limit: 10,
+			cursor: first.nextCursor ?? undefined,
+		});
+		checkRows(history.tasks);
+		expect(history.tasks).toHaveLength(3);
+		await flushDeltas();
+		broadcasts.length = 0;
+		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "archived-running");
+		await flushDeltas();
+		expect(listRowDeltas().at(-1)?.upsert).toMatchObject({
+			id: "archived-running",
+			status: "cancelled",
+			effectiveStatus: "cancelled",
+			canCancelActiveWork: false,
+		});
+		expect(listRowDeltas().at(-1)?.activeCount).toBe(0);
+	});
+
+	test("archived legacy projection retains real descendants and runtime liveness", async () => {
+		await seedParent();
+		const { eq } = await import("drizzle-orm");
+		for (const id of ["archived-descendants", "archived-live"]) {
+			await seedLegacyTask({
+				id,
+				createdAt: "2026-05-01T00:00:00.000Z",
+				backgroundStatus: "running",
+			});
+			await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, id));
+			backgroundOccupancyStore.refreshNarrator(id);
+		}
+		setRuntimeLive("archived-live", true);
+		await backgroundTaskService.createBashTask({
+			id: "descendant-work",
+			parentNarratorId: "archived-descendants",
+			command: "work",
+		});
+		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
+		expect(page.activeCount).toBe(2);
+		for (const rows of [
+			page.tasks,
+			page.activeTasks ?? [],
+			(await backgroundTaskService.listLegacySnapshotByParent(PARENT)).tasks,
+		]) {
+			expect(rows.find((row) => row.id === "archived-descendants")).toMatchObject({
+				status: "cancelled",
+				effectiveStatus: "child_running",
+				activeChildTaskCount: 1,
+				canCancelActiveWork: true,
+			});
+			expect(rows.find((row) => row.id === "archived-live")).toMatchObject({
+				status: "cancelled",
+				effectiveStatus: "continued",
+				canCancelActiveWork: true,
+			});
+		}
+	});
+
 	test("a live agent loop makes the row, the active set and the count all agree", async () => {
 		await seedParent();
 		const subagentId = "live-loop";
@@ -651,6 +870,27 @@ describe("background task active count", () => {
 		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
 	});
 
+	test("keeps archived legacy tasks in history without treating stale running as active", async () => {
+		await seedParent();
+		await seedLegacyTask({
+			id: "archived-legacy",
+			createdAt: "2026-05-01T00:00:00.000Z",
+			backgroundStatus: "running",
+			status: "archived",
+		});
+
+		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
+		expect(page.tasks).toHaveLength(1);
+		expect(page.tasks[0]).toMatchObject({
+			id: "archived-legacy",
+			status: "cancelled",
+			effectiveStatus: "cancelled",
+			canCancelActiveWork: false,
+		});
+		expect(page.activeTasks).toEqual([]);
+		expect(page.activeCount).toBe(0);
+	});
+
 	test("counts a legacy row still marked running", async () => {
 		await seedParent();
 		await seedLegacyTask({
@@ -672,9 +912,11 @@ describe("background task batch active count", () => {
 			spyOn(databaseBackgroundOccupancySource, "getProjections"),
 		];
 		try {
-			await expect(backgroundTaskService.countActiveKindsByParentBatch([PARENT])).rejects.toThrow(
-				"not initialized",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(
+					backgroundTaskService.countActiveKindsByParentBatch([PARENT]),
+				),
+			).toThrow("not initialized");
 			for (const read of reads) expect(read).not.toHaveBeenCalled();
 		} finally {
 			for (const read of reads) read.mockRestore();
@@ -869,11 +1111,17 @@ describe("derived status notification identity", () => {
 		const narratorId = "derived-narrator";
 		const taskId = "derived-projection";
 		await seedLegacyTask({ id: narratorId, createdAt: new Date().toISOString() });
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: taskId,
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: narratorId,
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			toolUseId: "test-tool-use",
+			createdAt: new Date().toISOString(),
+			startedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
 		});
 		const { eq } = await import("drizzle-orm");
 		await db
@@ -914,11 +1162,17 @@ describe("derived status notification identity", () => {
 			updatedAt: now,
 		});
 		await seedLegacyTask({ id: "scoped-narrator", createdAt: now });
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: "scoped-projection",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: "scoped-narrator",
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			toolUseId: "test-tool-use",
+			createdAt: new Date().toISOString(),
+			startedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
 		});
 		await seedBashTaskAt("scoped-bash", now);
 		await flushDeltas();
@@ -940,11 +1194,17 @@ describe("derived status notification identity", () => {
 		await seedParent();
 		const now = new Date().toISOString();
 		await seedLegacyTask({ id: "direct-id", createdAt: now });
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: "indirect-id",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: "direct-id",
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			toolUseId: "test-tool-use",
+			createdAt: new Date().toISOString(),
+			startedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
 		});
 		await seedBashTaskAt("direct-id", now);
 		await seedLegacyTask({ id: "plain-legacy", createdAt: now });
@@ -1687,11 +1947,17 @@ describe("background task list deltas", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		await backgroundTaskService.createAgentTask({
+		await seedTasks({
 			id: subagentId,
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "running",
 			subagentNarratorId: subagentId,
 			subagentType: "general",
-			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+			toolUseId: "test-tool-use",
+			createdAt: new Date().toISOString(),
+			startedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
 		});
 		await backgroundTaskService.markTakenOver(subagentId);
 		await flushDeltas();
@@ -1713,7 +1979,7 @@ describe("background task list deltas", () => {
 		expect(upsert.status).toBe("cancelled");
 		expect(upsert.effectiveStatus).toBe("continued");
 		expect(deltas[0]?.activeCount).toBe(1);
-		await expect(backgroundTaskService.getById(subagentId)).resolves.toMatchObject({
+		await expect(await backgroundTaskService.getById(subagentId)).toMatchObject({
 			status: "cancelled",
 			completedAt: stored?.completedAt ?? null,
 		});

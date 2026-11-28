@@ -13,6 +13,9 @@ import {
 	type PluginToHostFeature,
 	pluginHelloParamsSchema,
 } from "@server/lib/plugins/protocol";
+import { spawnWindowsPluginProcess } from "@server/lib/plugins/windows-plugin-process";
+import { WorkerCleanupError, WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
+import { TaskQueue } from "@server/lib/worker-runtime/queue";
 import {
 	type PluginHealthRegistry,
 	type PluginHealthSample,
@@ -24,6 +27,52 @@ import {
 	type PluginRpcRequestHandler,
 	RPC_REQUEST_NOT_HANDLED,
 } from "./plugin-rpc-connection";
+
+type PluginRuntimeHealthCode =
+	| "resource_limits_disabled"
+	| "restart_failed"
+	| "uninstall_stop_failed"
+	| "secret_purge_failed"
+	| "authorization_reset_stop_failed"
+	| "staging_cleanup_failed"
+	| "pointer_recovery_failed"
+	| "authority_reconciliation_failed"
+	| "approval_requests_failed"
+	| "provider_catalog_refresh_failed"
+	| "activation_revoke_failed"
+	| "state_persist_failed"
+	| "contribution_sync_failed"
+	| "journal_persist_failed"
+	| "authority_retirement_failed"
+	| "runtime_revoke_failed"
+	| "revoke_state_persist_failed"
+	| "approval_request_failed";
+
+/** Health only: user plugin logs and persisted business failure details use their own channels. */
+export function reportPluginRuntimeHealth(
+	code: PluginRuntimeHealthCode,
+	level: "warn" | "error" = "warn",
+	counts: {
+		generation?: number;
+		failures?: number;
+		attempt?: number;
+		quarantined?: boolean;
+		sourceError?: boolean;
+	} = {},
+): void {
+	const data: Record<string, string | number | boolean> = { code };
+	for (const key of ["generation", "failures", "attempt"] as const) {
+		const value = counts[key];
+		if (typeof value === "number" && Number.isFinite(value)) data[key] = value;
+	}
+	for (const key of ["quarantined", "sourceError"] as const)
+		if (typeof counts[key] === "boolean") data[key] = counts[key];
+	try {
+		logger[level]("Plugin runtime health", data);
+	} catch {
+		/* Advisory only; never skip cleanup. */
+	}
+}
 
 const textEncoder = new TextEncoder();
 const DEFAULT_MAX_HEADER_BYTES = 8 * 1024;
@@ -489,12 +538,49 @@ export interface LocalProcessRunnerOptions extends ContentLengthFrameParserOptio
  */
 export class LocalProcessRunner {
 	private readonly options: LocalProcessRunnerOptions;
+	private readonly launches = new TaskQueue({ concurrency: 1, maxQueued: 0, maxQueuedBytes: 0 });
+	private readonly handles = new Set<PluginProcessHandle>();
+	private readonly pending = new Set<Promise<PluginProcessHandle>>();
+	private readonly uncertain = new Set<WorkerHandle<unknown>>();
+	private closing: Promise<void> | undefined;
 
 	constructor(options: LocalProcessRunnerOptions = {}) {
 		this.options = options;
 	}
 
-	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
+	start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
+		if (this.closing) return Promise.reject(new Error("Plugin runner closed"));
+		const pending = this.startOwned(options);
+		this.pending.add(pending);
+		void pending.then(
+			() => this.pending.delete(pending),
+			() => this.pending.delete(pending),
+		);
+		return pending;
+	}
+
+	/** Final owner close, unlike a reversible plugin disable. Includes late asynchronous creates. */
+	close(): Promise<void> {
+		if (this.closing) return this.closing;
+		const drained = this.launches.close();
+		this.closing = (async () => {
+			await Promise.allSettled([...this.pending]);
+			const results = await Promise.allSettled([
+				...[...this.handles].map((handle) => handle.terminate?.("runner closed")),
+				...[...this.uncertain].map((handle) => handle.close()),
+			]);
+			const errors = results.filter((result) => result.status === "rejected");
+			if (errors.length)
+				throw new AggregateError(
+					errors.map((result) => result.reason),
+					"Plugin resources did not exit",
+				);
+			await drained;
+		})();
+		return this.closing;
+	}
+
+	private async startOwned(options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		validateCommand(options.command);
 		const maxInboundBodyBytes = Math.min(
 			options.maxInboundBodyBytes ?? this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES,
@@ -528,7 +614,7 @@ export class LocalProcessRunner {
 		};
 		const allowUnboundedResourceUsage = this.options.allowUnboundedResourceUsage ?? false;
 		if (allowUnboundedResourceUsage) {
-			logger.warn("local plugin runtime is running without host resource limits", { platform });
+			reportPluginRuntimeHealth("resource_limits_disabled");
 		}
 		const command = buildLocalProcessCommand(
 			options.command,
@@ -537,29 +623,65 @@ export class LocalProcessRunner {
 			allowUnboundedResourceUsage,
 		);
 		const spawn = this.options.spawn ?? defaultSpawner;
-		const process = await spawnWithTimeout(
-			() => spawn(command, spawnOptions),
-			options.spawnTimeoutMs ?? this.options.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS,
-		);
-		return new LocalProcessHandleImpl(process, {
-			...this.options,
-			...options,
-			idleTimeoutMs: options.idleTimeoutMs ?? this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
-			...((options.totalTimeoutMs ?? this.options.totalTimeoutMs)
-				? { totalTimeoutMs: options.totalTimeoutMs ?? this.options.totalTimeoutMs }
-				: {}),
-			maxBodyBytes: maxInboundBodyBytes,
-			maxOutboundBodyBytes,
-			maxStdoutBytes: this.options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES,
-			stderrRingBytes: this.options.stderrRingBytes ?? DEFAULT_STDERR_RING_BYTES,
-			maxStderrBytes:
-				options.maxStderrBytes ?? this.options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES,
-			maxStderrBytesPerSecond:
-				options.maxStderrBytesPerSecond ??
-				this.options.maxStderrBytesPerSecond ??
-				DEFAULT_MAX_STDERR_BYTES_PER_SECOND,
-			killProcessTree: this.options.killProcessTree ?? true,
-		});
+		const permit = await this.launches.acquire({ signal: options.signal, deadlineAt: Infinity });
+		let process: RunnerProcess | undefined;
+		try {
+			permit.signal.throwIfAborted();
+			if (this.closing) throw new Error("Plugin runner closed");
+			process = await spawnWithTimeout(
+				() => spawn(command, spawnOptions),
+				options.spawnTimeoutMs ?? this.options.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS,
+			);
+			const handle = new LocalProcessHandleImpl(process, {
+				...this.options,
+				...options,
+				idleTimeoutMs:
+					options.idleTimeoutMs ?? this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+				...((options.totalTimeoutMs ?? this.options.totalTimeoutMs)
+					? { totalTimeoutMs: options.totalTimeoutMs ?? this.options.totalTimeoutMs }
+					: {}),
+				maxBodyBytes: maxInboundBodyBytes,
+				maxOutboundBodyBytes,
+				maxStdoutBytes: this.options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES,
+				stderrRingBytes: this.options.stderrRingBytes ?? DEFAULT_STDERR_RING_BYTES,
+				maxStderrBytes:
+					options.maxStderrBytes ?? this.options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES,
+				maxStderrBytesPerSecond:
+					options.maxStderrBytesPerSecond ??
+					this.options.maxStderrBytesPerSecond ??
+					DEFAULT_MAX_STDERR_BYTES_PER_SECOND,
+				killProcessTree: this.options.killProcessTree ?? true,
+			});
+			this.handles.add(handle);
+			void handle.exited.then(
+				() => {
+					this.handles.delete(handle);
+					permit.release();
+				},
+				() => {},
+			); // Unconfirmed tree cleanup retains its permit and handle.
+			if (this.closing || options.signal?.aborted) {
+				await handle.terminate("runner closed during create");
+				throw createAbortError(options.signal?.reason);
+			}
+			return handle;
+		} catch (error) {
+			if (error instanceof WorkerCleanupError) {
+				this.uncertain.add(error.handle);
+				throw error;
+			}
+			if (process) {
+				const cleanup = ownRunnerProcess(process, this.options.killProcessTree ?? true);
+				try {
+					await cleanup.close();
+				} catch (cause) {
+					this.uncertain.add(cleanup);
+					throw new WorkerCleanupError(cleanup, cause);
+				}
+			}
+			permit.release();
+			throw error;
+		}
 	}
 }
 
@@ -578,6 +700,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	readonly pid?: number;
 	readonly exited: Promise<number>;
 	private readonly process: RunnerProcess;
+	private readonly worker: WorkerHandle<RunnerProcess>;
 	private readonly options: LocalProcessHandleOptions;
 	private readonly parser: ContentLengthFrameParser;
 	private readonly stderrRing: ByteRingBuffer;
@@ -587,9 +710,15 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private readonly queuedMessages: JsonRpcEnvelope[] = [];
 	private readonly queuedErrors: Error[] = [];
 	private readonly stdoutDrained: Promise<void>;
+	private readonly stderrDrained: Promise<void>;
 	private resolveStdoutDrained!: () => void;
 	private exitCode: number | undefined;
-	private writeQueue: Promise<void> = Promise.resolve();
+	private readonly writes = new TaskQueue({
+		concurrency: 1,
+		maxQueued: 64,
+		maxQueuedBytes: 8 * 1024 * 1024,
+	});
+	private writeFailure: unknown;
 	private stdoutBytes = 0;
 	private stderrBytes = 0;
 	private stderrWindowStartedAt = Date.now();
@@ -618,16 +747,19 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 		)
 			throw new RangeError("maxStderrBytesPerSecond must be a positive safe integer");
 		this.stderrRing = new ByteRingBuffer(options.stderrRingBytes);
-		this.exited = process.exited.then((exitCode) => {
-			void this.finalizeExit(exitCode);
+		// Parent PID exit alone is not a process-tree ACK: descendants can retain stdio/leases.
+		this.worker = ownRunnerProcess(process, options.killProcessTree);
+		this.exited = this.worker.exited.then(async (exitCode) => {
+			await this.finalizeExit(exitCode);
 			return exitCode;
 		});
+		void this.exited.catch((error) => this.emitError(asError(error)));
 
 		void this.readStdout().then(
 			() => this.resolveStdoutDrained(),
 			() => this.resolveStdoutDrained(),
 		);
-		void this.readStderr();
+		this.stderrDrained = this.readStderr();
 		if (options.idleTimeoutMs && options.idleTimeoutMs > 0) this.resetIdleTimer();
 		if (options.totalTimeoutMs && options.totalTimeoutMs > 0) {
 			this.totalTimer = setTimeout(() => this.timeout("total"), options.totalTimeoutMs);
@@ -636,7 +768,8 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			const abort = () => this.kill("aborted");
 			if (options.signal.aborted) abort();
 			else options.signal.addEventListener("abort", abort, { once: true });
-			void this.exited.finally(() => options.signal?.removeEventListener("abort", abort));
+			const cleanup = () => options.signal?.removeEventListener("abort", abort);
+			void this.exited.then(cleanup, cleanup);
 		}
 	}
 
@@ -668,17 +801,34 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			);
 		}
 		const frame = frameEncodedBody(bodyBytes);
-		this.writeQueue = this.writeQueue.then(async () => {
-			const writer = this.process.stdin as {
-				write?: (data: Uint8Array) => number | Promise<number> | undefined;
-				flush?: () => void | Promise<void>;
-			};
-			if (typeof writer.write !== "function")
-				throw new Error("Plugin process stdin is not writable");
-			await writer.write(frame);
-			if (typeof writer.flush === "function") await writer.flush();
-		});
-		return this.writeQueue;
+		return this.writes.run(
+			async () => {
+				if (this.closed || this.killed) throw new Error("Plugin process is not writable");
+				if (this.writeFailure) throw this.writeFailure;
+				const write = async () => {
+					const writer = this.process.stdin as {
+						write?: (data: Uint8Array) => number | Promise<number> | undefined;
+						flush?: () => void | Promise<void>;
+					};
+					if (typeof writer.write !== "function")
+						throw new Error("Plugin process stdin is not writable");
+					await writer.write(frame);
+					if (typeof writer.flush === "function") await writer.flush();
+				};
+				try {
+					await Promise.race([
+						write(),
+						this.worker.exited.then(() => {
+							throw new Error("Plugin process exited during write");
+						}),
+					]);
+				} catch (error) {
+					this.writeFailure = error;
+					throw error;
+				}
+			},
+			{ bytes: frame.byteLength, deadlineAt: Infinity },
+		);
 	}
 
 	onMessage(handler: (message: JsonRpcEnvelope) => void): () => void {
@@ -707,16 +857,20 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	}
 
 	kill(reason = "killed"): void {
-		void this.terminate(reason);
+		void this.terminate(reason).catch((error) => this.emitError(asError(error)));
 	}
 
-	terminate(reason = "killed"): Promise<void> {
+	terminate(_reason = "killed"): Promise<void> {
 		if (this.termination) return this.termination;
 		this.killed = true;
 		this.clearTimers();
-		this.termination = terminateProcessTree(this.process, this.options.killProcessTree).finally(
-			() => {
-				logger.debug("plugin runtime process tree terminated", { pid: this.pid, reason });
+		this.termination = this.worker.close().then(
+			async () => {
+				await this.writes.close();
+				await this.exited;
+			},
+			(error) => {
+				throw new WorkerCleanupError(this.worker, error);
 			},
 		);
 		return this.termination;
@@ -724,9 +878,12 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 
 	async close(): Promise<void> {
 		if (this.closed) return;
+		this.closed = true;
 		this.clearTimers();
+		const drained = this.writes.close();
 		const writer = this.process.stdin as { end?: () => void | Promise<void> };
 		try {
+			await Promise.race([drained, this.worker.exited]);
 			if (typeof writer.end === "function") await writer.end();
 		} catch {
 			// A pipe can already be closed when a plugin exits.
@@ -734,12 +891,22 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	}
 
 	private async finalizeExit(exitCode: number): Promise<void> {
-		await this.stdoutDrained;
+		await Promise.all([this.stdoutDrained, this.stderrDrained]);
 		this.clearTimers();
 		this.closed = true;
 		this.exitCode = exitCode;
-		for (const handler of this.exitHandlers) handler(exitCode);
-		this.options.onExit?.(exitCode);
+		for (const handler of this.exitHandlers) {
+			try {
+				handler(exitCode);
+			} catch {
+				/* An observer is not process-exit evidence. */
+			}
+		}
+		try {
+			this.options.onExit?.(exitCode);
+		} catch {
+			/* Advisory sink only. */
+		}
 	}
 
 	private async readStdout(): Promise<void> {
@@ -823,8 +990,18 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			if (this.queuedErrors.length < 16) this.queuedErrors.push(error);
 			return;
 		}
-		for (const handler of this.errorHandlers) handler(error);
-		this.options.onError?.(error);
+		for (const handler of this.errorHandlers) {
+			try {
+				handler(error);
+			} catch {
+				/* Observers cannot skip termination/finally. */
+			}
+		}
+		try {
+			this.options.onError?.(error);
+		} catch {
+			/* Advisory sink only. */
+		}
 	}
 
 	private touchActivity(): void {
@@ -1028,17 +1205,27 @@ async function spawnWithTimeout(
 			});
 		}
 		return process;
+	} catch (error) {
+		if (timedOut) {
+			// A timeout requests stop, but does not release ownership of an unresolved create.
+			const process = await spawnPromise;
+			const cleanup = ownRunnerProcess(process, true);
+			try {
+				await cleanup.close();
+			} catch (cause) {
+				throw new WorkerCleanupError(cleanup, cause);
+			}
+		}
+		throw error;
 	} finally {
 		if (timer) clearTimeout(timer);
-		void spawnPromise.then(async (process) => {
-			if (!timedOut) return;
-			if (process.terminate) await process.terminate();
-			else process.kill?.();
-		});
 	}
 }
 
 function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerProcess {
+	if (globalThis.process.platform === "win32") {
+		return spawnWindowsPluginProcess(command, options, PROCESS_TREE_KILL_TIMEOUT_MS);
+	}
 	// windowsHide：插件进程从 GUI 后端派生，不隐藏会在 Windows 上闪出控制台窗口。
 	const process = Bun.spawn(command, { ...options, windowsHide: true });
 	let termination: Promise<void> | undefined;
@@ -1056,15 +1243,23 @@ function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerP
 	};
 }
 
+function ownRunnerProcess(process: RunnerProcess, tree: boolean): WorkerHandle<RunnerProcess> {
+	let termination: Promise<void> | undefined;
+	const stop = () => (termination ??= terminateProcessTree(process, tree));
+	const exited = process.exited.then(async (code) => {
+		if (tree && process.terminate) await stop();
+		return code;
+	});
+	return new WorkerHandle(process, exited, stop);
+}
+
 async function terminateProcessTree(childProcess: RunnerProcess, enabled: boolean): Promise<void> {
 	if (enabled && childProcess.terminate) {
 		await childProcess.terminate();
 		return;
 	}
 	childProcess.kill?.();
-	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
-		() => undefined,
-	);
+	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 }
 
 async function terminateSpawnedProcess(
@@ -1075,19 +1270,9 @@ async function terminateSpawnedProcess(
 	},
 	detachedProcessGroup: boolean,
 ): Promise<void> {
-	if (globalThis.process.platform === "win32") {
-		await runCleanupCommand(["taskkill", "/T", "/F", "/PID", String(childProcess.pid)]);
-		childProcess.kill();
-		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
-			() => undefined,
-		);
-		return;
-	}
 	if (!detachedProcessGroup) {
 		childProcess.kill();
-		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
-			() => undefined,
-		);
+		await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 		return;
 	}
 
@@ -1102,9 +1287,7 @@ async function terminateSpawnedProcess(
 			});
 		}
 	}
-	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(
-		() => undefined,
-	);
+	await promiseWithTimeout(childProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
@@ -1131,21 +1314,6 @@ async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	return !isProcessGroupAlive(pid);
-}
-
-async function runCleanupCommand(command: string[]): Promise<void> {
-	let cleanupProcess: ReturnType<typeof Bun.spawn> | undefined;
-	try {
-		cleanupProcess = Bun.spawn(command, {
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-			windowsHide: true,
-		});
-		await promiseWithTimeout(cleanupProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
-	} catch {
-		cleanupProcess?.kill();
-	}
 }
 
 export interface RuntimeTimeouts {
@@ -1202,6 +1370,8 @@ export interface PluginRuntimeOptions {
 
 export interface PluginRunner {
 	start(options: RunnerStartOptions): Promise<PluginProcessHandle>;
+	/** Permanent host shutdown, including pending creates. Normal plugin disable does not call it. */
+	close?(): Promise<void>;
 }
 
 export interface RuntimeDiagnostics {
@@ -1238,6 +1408,8 @@ export class PluginRuntime {
 	private _generation: number;
 	private _state: RuntimeState = "stopped";
 	private handle?: PluginProcessHandle;
+	private starting?: Promise<void>;
+	private shuttingDown?: Promise<void>;
 	private connection?: PluginRpcConnection;
 	private readonly notificationHandlers = new Set<
 		(notification: JsonRpcNotification, bodyBytes: number) => void
@@ -1311,7 +1483,22 @@ export class PluginRuntime {
 		};
 	}
 
-	async start(signal?: AbortSignal): Promise<void> {
+	start(signal?: AbortSignal): Promise<void> {
+		if (this.shuttingDown) return Promise.reject(new Error("Plugin runtime shutting down"));
+		const pending = this.startOwned(signal);
+		this.starting = pending;
+		void pending.then(
+			() => {
+				if (this.starting === pending) this.starting = undefined;
+			},
+			() => {
+				if (this.starting === pending) this.starting = undefined;
+			},
+		);
+		return pending;
+	}
+
+	private async startOwned(signal?: AbortSignal): Promise<void> {
 		if (this._state === "active") return;
 		if (this._state === "starting" || this._state === "handshaking") {
 			throw new PluginRuntimeError("Plugin runtime is already starting", {
@@ -1324,6 +1511,14 @@ export class PluginRuntime {
 				code: "QUARANTINED",
 				kind: "handshake",
 			});
+		}
+		if (this.handle) {
+			if (this.handle.terminate) await this.handle.terminate("previous generation cleanup");
+			else {
+				this.handle.kill("previous generation cleanup");
+				await this.handle.exited;
+			}
+			this.handle = undefined;
 		}
 		this._generation += 1;
 		const generation = this._generation;
@@ -1605,8 +1800,31 @@ export class PluginRuntime {
 		}
 	}
 
-	async shutdown(): Promise<void> {
-		if (this._state === "stopped") return;
+	shutdown(): Promise<void> {
+		if (this.shuttingDown) return this.shuttingDown;
+		const pending = this.shutdownOwned();
+		this.shuttingDown = pending;
+		void pending.then(
+			() => {
+				if (this.shuttingDown === pending) this.shuttingDown = undefined;
+			},
+			() => {},
+		);
+		return pending;
+	}
+
+	/** Final owner close must not lose a late spawn or an unconfirmed process tree. */
+	async closeResources(): Promise<void> {
+		try {
+			await this.shutdown();
+		} finally {
+			await this.runner.close?.();
+		}
+	}
+
+	private async shutdownOwned(): Promise<void> {
+		await this.starting?.catch(() => {});
+		if (this._state === "stopped" && !this.handle) return;
 		await this.drain();
 		const handle = this.handle;
 		if (!handle) {
@@ -1638,7 +1856,7 @@ export class PluginRuntime {
 		} catch {
 			// The process may have already crashed or not implement a response.
 		}
-		await handle.close();
+		await promiseWithTimeout(handle.close(), this.timeouts.shutdownMs).catch(() => undefined);
 		const exited = await promiseWithTimeout(handle.exited, this.timeouts.shutdownMs).catch(
 			() => undefined,
 		);
@@ -1646,13 +1864,14 @@ export class PluginRuntime {
 		if (handle.terminate) {
 			await handle.terminate("shutdown process-tree cleanup");
 		} else if (exited === undefined) {
-			await promiseWithTimeout(handle.exited, PROCESS_TREE_KILL_TIMEOUT_MS).catch(() => undefined);
+			await promiseWithTimeout(handle.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 		}
 		this.rejectAll(
 			new PluginRuntimeError("Plugin runtime shut down", { code: "SHUTDOWN", kind: "shutdown" }),
 		);
 		this.clearSubscriptions();
 		this.setState("stopped");
+		this.handle = undefined;
 		this.stoppedAt = new Date().toISOString();
 	}
 
@@ -1904,6 +2123,10 @@ export class RuntimeSupervisor {
 	private readonly options: Required<RuntimeSupervisorOptions>;
 	private readonly records = new Map<string, RuntimeRecord>();
 	private readonly mutex = new AsyncMutex();
+	private readonly retired = new Map<PluginRuntime, Promise<void>>();
+	private readonly replacements = new Map<string, Promise<void>>();
+	private closing: Promise<void> | undefined;
+	private admissionClosed = false;
 
 	constructor(options: RuntimeSupervisorOptions = {}) {
 		this.options = {
@@ -1921,6 +2144,7 @@ export class RuntimeSupervisor {
 	}
 
 	register(options: PluginRuntimeOptions): PluginRuntime {
+		if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
 		const existing = this.records.get(options.pluginId);
 		if (existing) {
 			// Same package (command) → reuse the live runtime so idle restarts and
@@ -1933,7 +2157,14 @@ export class RuntimeSupervisor {
 			}
 			if (existing.restartTimer) clearTimeout(existing.restartTimer);
 			existing.restartTimer = undefined;
-			void existing.runtime.shutdown().catch(() => undefined);
+			const previous = this.replacements.get(options.pluginId);
+			const cleanup = Promise.resolve(previous).then(() => existing.runtime.closeResources());
+			this.retired.set(existing.runtime, cleanup);
+			this.replacements.set(options.pluginId, cleanup);
+			void cleanup.then(
+				() => this.retired.delete(existing.runtime),
+				() => {},
+			);
 			this.records.delete(options.pluginId);
 		}
 		const runtime = this.createRuntime(options);
@@ -1965,6 +2196,9 @@ export class RuntimeSupervisor {
 		if (!record) throw new Error(`Runtime is not registered: ${pluginId}`);
 		const runtimeRecord = record;
 		return this.mutex.acquire(pluginId, async () => {
+			if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
+			await this.replacements.get(pluginId);
+			if (this.admissionClosed) throw new Error("Plugin runtime supervisor closed");
 			if (runtimeRecord.quarantineReason) {
 				throw new PluginRuntimeError(runtimeRecord.quarantineReason, {
 					code: "QUARANTINED",
@@ -2004,8 +2238,34 @@ export class RuntimeSupervisor {
 		await this.records.get(pluginId)?.runtime.drain();
 	}
 
-	async shutdown(): Promise<void> {
-		await Promise.all([...this.records.keys()].map((pluginId) => this.disable(pluginId)));
+	/** Latch final admission and restart producers before manager drains/updates StateStore. */
+	stopProducers(): void {
+		this.admissionClosed = true;
+		for (const record of this.records.values()) {
+			record.desiredEnabled = false;
+			clearTimeout(record.restartTimer);
+			record.restartTimer = undefined;
+		}
+	}
+
+	shutdown(): Promise<void> {
+		if (this.closing) return this.closing;
+		this.stopProducers();
+		this.closing = (async () => {
+			const results = await Promise.allSettled([
+				...[...this.records].map(([id, record]) =>
+					this.mutex.acquire(id, () => record.runtime.closeResources()),
+				),
+				...this.retired.values(),
+			]);
+			const errors = results.filter((result) => result.status === "rejected");
+			if (errors.length)
+				throw new AggregateError(
+					errors.map((result) => result.reason),
+					"Plugin runtimes did not exit",
+				);
+		})();
+		return this.closing;
 	}
 
 	get(pluginId: string): PluginRuntime | undefined {
@@ -2050,7 +2310,13 @@ export class RuntimeSupervisor {
 		state: "crashed" | "failed",
 	): void {
 		const record = this.records.get(pluginId);
-		if (!record?.desiredEnabled || record.quarantineReason || record.runtime !== runtime) return;
+		if (
+			this.admissionClosed ||
+			!record?.desiredEnabled ||
+			record.quarantineReason ||
+			record.runtime !== runtime
+		)
+			return;
 		const diagnostics = runtime.getDiagnostics();
 		if (
 			state === "failed" &&
@@ -2108,11 +2374,11 @@ export class RuntimeSupervisor {
 				record.restartTimer = undefined;
 				try {
 					await runtime.restart();
-				} catch (error) {
+				} catch {
 					runtime.getDiagnostics();
-					logger.warn("plugin runtime restart failed", {
-						pluginId,
-						error: asError(error).message,
+					reportPluginRuntimeHealth("restart_failed", "warn", {
+						generation: runtime.generation,
+						attempt,
 					});
 				}
 			});

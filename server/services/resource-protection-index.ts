@@ -1,4 +1,4 @@
-import type { Database, SQLQueryBindings } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import type { Dir, Dirent } from "node:fs";
 import { constants } from "node:fs";
 import { type FileHandle, lstat, open, opendir, readlink, realpath } from "node:fs/promises";
@@ -7,16 +7,36 @@ import {
 	type ProtectionSource,
 	protectionSources,
 	protectionTables,
+	type ReceiptProjectionProgress,
+	receiptProjectionPrefix,
 } from "../db/resource-protection-index";
+import { readNativeRows } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
+import type { ReadBind } from "../lib/db-worker/protocol";
 import { hotSafe } from "../lib/hot-safe";
-import { normalizePathForComparison } from "../lib/platform-path";
+import { normalizeRealpathResult } from "../lib/platform-path";
 import { worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
 
 const PAGE = 64;
 const MAX_ROW_BYTES = 64 * 1024;
+// 16 × (64KiB JSON + bounded scalars) stays well below the 4MiB Worker transport cap.
+const FACT_BATCH = 16;
+type NarratorRawRow = {
+	id: string;
+	cwd: string | null;
+	default_device_id: string | null;
+	workspace_revision: number;
+	context: string | null;
+	context_bytes: number | null;
+};
+type RawRow = NarratorRawRow | Omit<ResourceClaim, "kind">;
+type CandidateFact = PathRow & {
+	claim_json: string | null;
+	dirty: number | null;
+	saved_slot: number | null;
+};
 const MAX_RECEIPT_BYTES = 32 * 1024;
 const PENDING_RECEIPT =
 	/^([a-f0-9]{64}\.json)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.pending$/;
@@ -61,7 +81,7 @@ export async function canonicalProtectionAdmissionPath(path: string): Promise<st
 	const suffix: string[] = [];
 	for (let depth = 0; depth < 64; depth++) {
 		try {
-			return resolve(await realpath(current), ...suffix);
+			return resolve(normalizeRealpathResult(await realpath(current)), ...suffix);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			const node = await lstat(current).catch((cause) => {
@@ -83,7 +103,7 @@ export async function canonicalProtectionAdmissionPath(path: string): Promise<st
 	throw new Error("Resource path ancestry exceeded budget");
 }
 export async function canonicalProtectionPath(path: string): Promise<string> {
-	return normalizePathForComparison(await canonicalProtectionAdmissionPath(path));
+	return localPathSemantics.identityKey(await canonicalProtectionAdmissionPath(path));
 }
 
 type SourceState = {
@@ -99,6 +119,8 @@ type PathRow = {
 };
 type IndexedClaim = {
 	claim: ResourceClaim;
+	/** Immutable receipt upgrades retain the original serialized source evidence. */
+	claimJson?: string;
 	/** Canonical logical reference; claim.shadowKey retains the persisted physical hash input. */
 	shadowKey?: string;
 	canonicalPath: string | null;
@@ -119,24 +141,75 @@ function receiptClaim(record: unknown, id: string): ResourceClaim {
 		Object.hasOwn(row, "__proto__") ||
 		Object.hasOwn(row, "version") ||
 		!validText(row.destination) ||
-		!isAbsolute(row.destination) ||
 		!validText(row.repositoryKey) ||
 		!row.repositoryKey.trim() ||
 		(Object.hasOwn(row, "deviceId") &&
 			(typeof row.deviceId !== "string" || !/^[-A-Za-z0-9_]{1,128}$/.test(row.deviceId)))
 	)
 		throw new Error("Invalid receipt");
+	const deviceId = (row.deviceId as string | undefined) ?? "local";
+	if (deviceId === "local" && !isAbsolute(row.destination)) throw new Error("Invalid receipt");
+	treeSnapshotKey(deviceId, row.destination);
 	return {
 		kind: "receipt",
 		id,
-		deviceId: (row.deviceId as string | undefined) ?? "local",
+		deviceId,
 		path: row.destination,
 		repositoryKey: row.repositoryKey,
 	};
 }
 
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+class ProtectionIndexStoppedError extends Error {
+	constructor() {
+		super("Protection index stopped");
+	}
+}
+function track<T>(pending: Set<Promise<unknown>>, work: Promise<T>): Promise<T> {
+	pending.add(work);
+	void work.then(
+		() => pending.delete(work),
+		() => pending.delete(work),
+	);
+	return work;
+}
+async function waitForShutdown(work: Promise<unknown>, deadlineAt: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			work,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("Resource protection shutdown deadline exceeded")),
+					Math.max(0, deadlineAt - Date.now()),
+				);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /** Injectable handles keep custom fixtures entirely out of the production database. */
 export function createResourceProtectionIndex(database: Database, receiptDirectory: string) {
+	const controller = new AbortController();
+	const pending = new Set<Promise<unknown>>();
+	let stopped = false;
+	let draining: Promise<void> | undefined;
+	const assertOpen = () => {
+		if (stopped) throw new ProtectionIndexStoppedError();
+	};
+	function owned<T>(run: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		try {
+			assertOpen();
+			return track(
+				pending,
+				run(signal ? AbortSignal.any([controller.signal, signal]) : controller.signal),
+			);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
 	let dirtyCursor: [string, string] = ["", ""];
 	let receiptEntries: Dir | undefined;
 	let receiptEntry: Dirent | null | undefined;
@@ -146,6 +219,25 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	 * Chapters were removed. Their rows in the index would otherwise stay as permanent,
 	 * unmaintained claims; retire them one bounded page per maintenance pass.
 	 */
+	async function readRows<T>(
+		query: string,
+		values: readonly ReadBind[],
+		deadline: number,
+		signal?: AbortSignal,
+		maxRows = PAGE + 1,
+	): Promise<T[]> {
+		assertOpen();
+		check(deadline, signal);
+		const rows = await readNativeRows<T>(database, query, values, {
+			executionPolicy: "worker-required",
+			signal,
+			timeoutMs: Math.max(1, deadline - performance.now()),
+			maxRows,
+		});
+		assertOpen();
+		check(deadline, signal);
+		return rows;
+	}
 	let chapterSourcePurged = false;
 	function purgeRemovedChapterSource() {
 		if (chapterSourcePurged) return;
@@ -171,33 +263,61 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (row && Object.values(row).some((value) => value === "\0"))
 			throw new Error("Protection source scalar exceeds row budget");
 	}
-	function readRaw(source: ProtectionSource, id: string): ResourceClaim[] {
-		if (!validText(id)) throw new Error("Invalid protection source key");
-		if (source === "receipt") return [];
-		if (source === "registry") {
-			const row = database
-				.query(`SELECT ${smallText("id")} AS id, ${smallText("device_id", 256)} AS deviceId,
+	async function rawPage(
+		source: Exclude<ProtectionSource, "receipt">,
+		ids: readonly string[],
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<Map<string, RawRow>> {
+		if (ids.length > PAGE || ids.some((id) => !validText(id)))
+			throw new Error("Invalid protection source page");
+		const rows = new Map<string, RawRow>();
+		for (let offset = 0; offset < ids.length; offset += FACT_BATCH) {
+			check(deadline, signal);
+			const batch = ids.slice(offset, offset + FACT_BATCH);
+			const placeholders = batch.map(() => "?").join(",");
+			const projection =
+				source === "registry"
+					? `SELECT id, ${smallText("device_id", 256)} AS deviceId,
 				${smallText("worktree_path")} AS path, ${smallText("repository_key")} AS repositoryKey,
 				${smallText("scope_project_id")} AS scopeProjectId, ${smallText("state", 256)} AS state
-				FROM narrator_worktree_resources WHERE id = ?`)
-				.get(id) as Omit<ResourceClaim, "kind"> | null;
-			requireSmall(row);
-			return row ? [{ kind: "registry", ...row }] : [];
+				FROM narrator_worktree_resources`
+					: `SELECT id, ${smallText("cwd")} AS cwd,
+				${smallText("default_device_id", 256)} AS default_device_id, workspace_revision,
+				CASE WHEN length(cast(workspace_context AS blob)) <= ${MAX_ROW_BYTES} THEN workspace_context END AS context,
+				length(cast(workspace_context AS blob)) AS context_bytes FROM narrators`;
+			for (const row of await readRows<RawRow>(
+				`${projection} WHERE id IN (${placeholders}) LIMIT ${FACT_BATCH}`,
+				batch,
+				deadline,
+				signal,
+				FACT_BATCH,
+			))
+				rows.set(row.id, row);
+			if (offset + FACT_BATCH < ids.length) await tick();
 		}
-		const row = database
-			.query(`SELECT ${smallText("id")} AS id,
-			${smallText("cwd")} AS cwd, ${smallText("default_device_id", 256)} AS default_device_id, workspace_revision,
-			CASE WHEN length(cast(workspace_context AS blob)) <= ${MAX_ROW_BYTES} THEN workspace_context END AS context,
-			length(cast(workspace_context AS blob)) AS context_bytes FROM narrators WHERE id = ?`)
-			.get(id) as {
-			id: string;
-			cwd: string | null;
-			default_device_id: string | null;
-			workspace_revision: number;
-			context: string | null;
-			context_bytes: number | null;
-		} | null;
-		if (!row) return [];
+		return rows;
+	}
+	async function rawFacts(
+		states: readonly { source: ProtectionSource; id: string }[],
+		deadline: number,
+		signal?: AbortSignal,
+	) {
+		const facts = new Map<string, RawRow>();
+		for (const source of ["narrator", "registry"] as const) {
+			const ids = states.filter((state) => state.source === source).map((state) => state.id);
+			for (const [id, row] of await rawPage(source, ids, deadline, signal))
+				facts.set(`${source}\0${id}`, row);
+		}
+		return facts;
+	}
+	function rawClaims(source: ProtectionSource, raw: RawRow | undefined): ResourceClaim[] {
+		if (source === "receipt" || !raw) return [];
+		if (source === "registry") {
+			requireSmall(raw);
+			return [{ kind: "registry", ...(raw as Omit<ResourceClaim, "kind">) }];
+		}
+		const row = raw as NarratorRawRow;
 		requireSmall(row);
 		if ((row.context_bytes ?? 0) > MAX_ROW_BYTES)
 			throw new Error("Workspace context exceeds row budget");
@@ -209,14 +329,22 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				throw new Error("Legacy claim device is unverifiable");
 		for (const path of [row.cwd, contextCwd])
 			if (path !== null && !validText(path)) throw new Error("Legacy claim cwd is unverifiable");
-		const rawDevice =
-			row.cwd && isAbsolute(row.cwd)
-				? "local"
-				: (row.default_device_id ?? contextDevice ?? "local");
-		const effectiveDevice =
-			contextDevice ??
-			(row.default_device_id && row.default_device_id !== "local" ? null : "local");
-		if (contextCwd && !effectiveDevice) throw new Error("Legacy context device is unverifiable");
+		if (contextCwd && !contextDevice && row.default_device_id && row.default_device_id !== "local")
+			throw new Error("Legacy context device is unverifiable");
+		const deviceId = contextDevice ?? row.default_device_id ?? "local";
+		// Modern switches commit cwd/context together. The older SwitchDevice left
+		// an absolute host cwd untouched while committing a different remote context;
+		// require that inconsistent pair AND matching explicit remote devices before
+		// retaining its local owner. Absolute syntax alone never proves local ownership.
+		const legacyHostCwd =
+			row.cwd !== null &&
+			isAbsolute(row.cwd) &&
+			contextCwd !== null &&
+			row.cwd !== contextCwd &&
+			contextDevice !== null &&
+			contextDevice !== "local" &&
+			row.default_device_id === contextDevice;
+		const rawDevice = legacyHostCwd ? "local" : deviceId;
 		const base = {
 			kind: "narrator" as const,
 			id: row.id,
@@ -235,11 +363,9 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				throw new Error("Invalid repository key");
 			claims.push({
 				...base,
-				deviceId: effectiveDevice ?? "local",
+				deviceId,
 				path:
-					effectiveDevice === "local"
-						? localPathSemantics.resolve(process.cwd(), contextCwd)
-						: contextCwd,
+					deviceId === "local" ? localPathSemantics.resolve(process.cwd(), contextCwd) : contextCwd,
 				...(repositoryKey ? { repositoryKey } : {}),
 			});
 		}
@@ -257,12 +383,22 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (!path) return { claim, canonicalPath: null, deviceId, alias: 0 };
 		if (!validText(path)) throw new Error("Invalid resource path");
 		if (deviceId !== "local") return { claim, canonicalPath: path, deviceId, alias: 0 };
-		const canonicalPath = await bounded(canonicalProtectionPath(path), deadline, signal);
+		assertOpen();
+		const canonicalPath = await bounded(
+			track(pending, canonicalProtectionPath(path)),
+			deadline,
+			signal,
+		);
+		assertOpen();
+		check(deadline, signal);
 		const metadata = await bounded(
-			lstat(path).catch((error) => {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-				throw error;
-			}),
+			track(
+				pending,
+				lstat(path).catch((error) => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+					throw error;
+				}),
+			),
 			deadline,
 			signal,
 		);
@@ -271,7 +407,9 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			canonicalPath,
 			deviceId,
 			alias:
-				canonicalPath !== normalizePathForComparison(path) || metadata?.isSymbolicLink() ? 1 : 0,
+				canonicalPath !== localPathSemantics.identityKey(path) || metadata?.isSymbolicLink()
+					? 1
+					: 0,
 		};
 	}
 	async function indexed(
@@ -286,8 +424,15 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		if (shadowKey) {
 			const parts = shadowKey.split("\0");
 			const [deviceId, logicalPath] = parts;
-			if (parts.length !== 2 || !deviceId || !logicalPath || !isAbsolute(logicalPath))
+			if (
+				parts.length !== 2 ||
+				!deviceId ||
+				!logicalPath ||
+				(deviceId === "local" && !isAbsolute(logicalPath))
+			)
 				throw new Error("Invalid shadow reference");
+			// Snapshot identity validates remote absolute grammar without resolving it on the host.
+			treeSnapshotKey(deviceId, logicalPath);
 			const reference = { ...claim, path: undefined };
 			const logical = await indexedPath(reference, logicalPath, deviceId, deadline, signal);
 			const physical = await indexedPath(
@@ -321,6 +466,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		revision: number,
 		rows: IndexedClaim[],
 	): boolean {
+		assertOpen();
 		return database.transaction(() => {
 			const state = database
 				.query(
@@ -349,7 +495,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 						old[i]?.canonical_path === row.canonicalPath &&
 						old[i]?.shadow_key === (row.shadowKey ?? null) &&
 						old[i]?.alias_sensitive === row.alias &&
-						old[i]?.claim_json === JSON.stringify(row.claim),
+						old[i]?.claim_json === (row.claimJson ?? JSON.stringify(row.claim)),
 				);
 			if (!state.dirty && unchanged) return true;
 			database
@@ -377,7 +523,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 						row.shadowKey ?? null,
 						row.claim.scopeProjectId ?? null,
 						row.alias,
-						JSON.stringify(row.claim),
+						row.claimJson ?? JSON.stringify(row.claim),
 					);
 			return true;
 		})();
@@ -434,17 +580,19 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 
 	/** Register a durable retry before consuming the current directory entry. */
 	function registerReceipt(filePath: string): number | null {
-		const state = database
-			.query(
-				"SELECT revision, dirty FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ?",
-			)
-			.get(filePath) as { revision: number; dirty: number } | null;
-		if (state && !state.dirty) return null;
-		database
-			.query(`INSERT INTO resource_protection_sources (source, source_id)
+		return database.transaction(() => {
+			const state = database
+				.query(
+					"SELECT revision, dirty FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ?",
+				)
+				.get(filePath) as { revision: number; dirty: number } | null;
+			if (state && !state.dirty) return null;
+			database
+				.query(`INSERT INTO resource_protection_sources (source, source_id)
 			VALUES ('receipt', ?) ON CONFLICT DO NOTHING`)
-			.run(filePath);
-		return state?.revision ?? 1;
+				.run(filePath);
+			return state?.revision ?? 1;
+		})();
 	}
 	/** Legacy files are imported once. Existing pins never follow later journal rewrites/deletes. */
 	async function importReceipt(
@@ -466,13 +614,123 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			check(deadline, signal); // Retry bad finals after reaching EOF, without starving later files.
 		}
 	}
+	/** Rebuild derived identities from durable pins, never from mutable journal files. */
+	async function reprojectReceiptPins(
+		progress: ReceiptProjectionProgress,
+		initialCursor: string,
+		deadline: number,
+		signal?: AbortSignal,
+	) {
+		let expectedCursor = initialCursor;
+		const advance = (state: { source_id: string; revision: number; dirty: number }) => {
+			const cursor =
+				receiptProjectionPrefix + JSON.stringify({ ...progress, after: state.source_id });
+			const result = database
+				.query(`UPDATE resource_protection_sources
+				SET cursor = ?, revision = revision + 1
+				WHERE source = 'receipt' AND source_id = '' AND cursor = ? AND complete = 0
+				AND EXISTS (SELECT 1 FROM resource_protection_sources
+					WHERE source = 'receipt' AND source_id = ? AND revision = ? AND dirty = ?)`)
+				.run(cursor, expectedCursor, state.source_id, state.revision, state.dirty);
+			if (result.changes !== 1) throw new Error("Receipt projection cursor or pin changed");
+			expectedCursor = cursor;
+		};
+		const states = database
+			.query(`SELECT source_id, revision, dirty FROM resource_protection_sources
+			WHERE source = 'receipt' AND source_id > ? ORDER BY source_id LIMIT ?`)
+			.all(progress.after, PAGE) as { source_id: string; revision: number; dirty: number }[];
+		for (const state of states) {
+			check(deadline, signal);
+			if (state.dirty) {
+				// Keep the import retry pending, but commit this skipped prefix as well.
+				progress.complete = 0;
+				advance(state);
+				continue;
+			}
+			const saved = database
+				.query(`SELECT ${smallText("claim_json", MAX_ROW_BYTES)} AS claim_json,
+				${smallText("device_id", 256)} AS device_id, ${smallText("canonical_path")} AS canonical_path
+				FROM resource_protection_paths WHERE source = 'receipt' AND source_id = ?
+				ORDER BY slot LIMIT ?`)
+				.all(state.source_id, PAGE + 1) as {
+				claim_json: string;
+				device_id: string;
+				canonical_path: string | null;
+			}[];
+			if (saved.length > PAGE) throw new Error("Receipt projection exceeds row budget");
+			const rows: IndexedClaim[] = [];
+			const claims = new Map<string, ResourceClaim>();
+			for (const entry of saved) {
+				requireSmall(entry);
+				if (claims.has(entry.claim_json)) continue;
+				const claim = JSON.parse(entry.claim_json) as ResourceClaim;
+				if (claim?.kind !== "receipt" || claim.id !== state.source_id)
+					throw new Error("Invalid persisted receipt claim");
+				claims.set(entry.claim_json, claim);
+				rows.push(
+					...(await indexed(claim, deadline, signal)).map((row) => ({
+						...row,
+						claimJson: entry.claim_json,
+					})),
+				);
+			}
+			for (const entry of saved) {
+				const claim = claims.get(entry.claim_json);
+				if (
+					!claim?.shadowKey ||
+					entry.canonical_path === null ||
+					rows.some(
+						(row) => row.deviceId === entry.device_id && row.canonicalPath === entry.canonical_path,
+					)
+				)
+					continue;
+				// A receipt is immutable historical evidence. Its v1 physical hash may
+				// differ from the corrected logical key; retain that old footprint as a
+				// direct path alongside the original shadow claim, never a second shadow slot.
+				const footprint = {
+					...claim,
+					shadowKey: undefined,
+					deviceId: entry.device_id,
+					path: entry.canonical_path,
+				};
+				rows.push(...(await indexed(footprint, deadline, signal)));
+			}
+			if (!save("receipt", state.source_id, state.revision, rows))
+				throw new Error("Receipt pin changed during projection");
+			// Save/CAS stays per pin. A cursor failure may repeat this pin, never undo it;
+			// an interrupted page must not repeat its already-committed expensive prefix.
+			advance({ ...state, dirty: 0 });
+		}
+		check(deadline, signal);
+		if (states.length < PAGE) {
+			const result = database
+				.query(`UPDATE resource_protection_sources
+				SET cursor = ?, complete = ?, revision = revision + 1
+				WHERE source = 'receipt' AND source_id = '' AND cursor = ? AND complete = 0`)
+				.run(progress.cursor, progress.complete, expectedCursor);
+			if (result.changes !== 1) throw new Error("Receipt projection cursor changed");
+		}
+	}
 	async function runLegacyImport(deadline: number, signal?: AbortSignal) {
-		const progress = database
-			.query(
-				"SELECT cursor, complete FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ''",
-			)
-			.get() as { cursor: string | null; complete: number } | null;
+		const progress =
+			(
+				await readRows<{ cursor: string | null; complete: number }>(
+					"SELECT cursor, complete FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ''",
+					[],
+					deadline,
+					signal,
+				)
+			)[0] ?? null;
 		if (!progress) throw new Error("Protection triggers not installed");
+		if (progress.cursor?.startsWith(receiptProjectionPrefix)) {
+			await reprojectReceiptPins(
+				JSON.parse(progress.cursor.slice(receiptProjectionPrefix.length)),
+				progress.cursor,
+				deadline,
+				signal,
+			);
+			return;
+		}
 		if (progress.complete) return;
 		if (progress.cursor !== "eof") {
 			if (!receiptEntries) {
@@ -525,10 +783,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			// Keep the directory handle across bounded batches; restart safely skips imported rows.
 			return;
 		}
-		const failed = database
-			.query(`SELECT source_id FROM resource_protection_sources
-			WHERE dirty = 1 AND source = 'receipt' AND source_id > ? ORDER BY source_id LIMIT ?`)
-			.all(receiptRetryCursor, PAGE) as { source_id: string }[];
+		const failed = await readRows<{ source_id: string }>(
+			`SELECT source_id FROM resource_protection_sources
+			WHERE dirty = 1 AND source = 'receipt' AND source_id > ? ORDER BY source_id LIMIT ?`,
+			[receiptRetryCursor, PAGE],
+			deadline,
+			signal,
+		);
 		if (!failed.length) receiptRetryCursor = "";
 		for (const row of failed) {
 			check(deadline, signal);
@@ -539,25 +800,20 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				receiptRetryCursor = row.source_id;
 			}
 		}
-		if (
-			!database
-				.query(
-					"SELECT 1 FROM resource_protection_sources WHERE dirty = 1 AND source = 'receipt' AND source_id != '' LIMIT 1",
-				)
-				.get()
-		)
-			database
-				.query(
-					"UPDATE resource_protection_sources SET complete = 1, revision = revision + 1 WHERE source = 'receipt' AND source_id = '' AND complete = 0",
-				)
-				.run();
+		database
+			.query(`UPDATE resource_protection_sources SET complete = 1, revision = revision + 1
+			WHERE source = 'receipt' AND source_id = '' AND complete = 0
+			AND NOT EXISTS (SELECT 1 FROM resource_protection_sources
+				WHERE dirty = 1 AND source = 'receipt' AND source_id != '' LIMIT 1)`)
+			.run();
 	}
 
 	async function importLegacyReceipts(deadline: number, signal?: AbortSignal) {
 		// A timed-out filesystem operation (including close) still owns its handles until it settles.
 		// Pause only legacy import instead of reopening it or blocking the three business sources.
 		if (receiptImport) return;
-		const work = runLegacyImport(deadline, signal);
+		assertOpen();
+		const work = track(pending, runLegacyImport(deadline, signal));
 		receiptImport = work;
 		void work
 			.finally(() => {
@@ -573,23 +829,36 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	): Promise<void> {
 		check(deadline, signal);
 		purgeRemovedChapterSource();
-		for (const source of ["narrator", "registry"] as const) {
+		const progressRows = await readRows<{
+			source: ProtectionSource;
+			cursor: string | null;
+			complete: number;
+		}>(
+			`SELECT source, cursor, complete FROM resource_protection_sources
+			WHERE source IN ('narrator', 'registry', 'receipt') AND source_id = '' ORDER BY source`,
+			[],
+			deadline,
+			signal,
+			protectionSources.length,
+		);
+		if (protectionSources.some((source) => !progressRows.some((row) => row.source === source)))
+			throw new Error("Protection triggers not installed");
+		for (const progress of progressRows) {
 			check(deadline, signal);
-			const progress = database
-				.query(
-					"SELECT cursor, complete FROM resource_protection_sources WHERE source = ? AND source_id = ''",
-				)
-				.get(source) as { cursor: string | null; complete: number } | null;
-			if (!progress) throw new Error("Protection triggers not installed");
-			if (progress.complete) continue;
-			const ids = database
-				.query(`SELECT id FROM ${protectionTables[source].table} WHERE id > ? ORDER BY id LIMIT ?`)
-				.all(progress.cursor ?? "", PAGE) as { id: string }[];
+			const { source } = progress;
+			if (source === "receipt" || progress.complete) continue;
+			const ids = await readRows<{ id: string }>(
+				`SELECT id FROM ${protectionTables[source].table} WHERE id > ? ORDER BY id LIMIT ?`,
+				[progress.cursor ?? "", PAGE],
+				deadline,
+				signal,
+			);
 			database.transaction(() => {
 				for (const { id } of ids)
 					database
 						.query(`INSERT INTO resource_protection_sources (source, source_id)
-					VALUES (?, ?) ON CONFLICT DO NOTHING`)
+					VALUES (?, ?) ON CONFLICT(source, source_id) DO UPDATE
+					SET revision = revision + 1, dirty = 1`)
 						.run(source, id);
 				database
 					.query(
@@ -599,12 +868,21 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			})();
 			await tick();
 		}
-		const dirty = database
-			.query(`SELECT source, source_id, revision FROM resource_protection_sources
+		const dirty = await readRows<SourceState>(
+			`SELECT source, source_id, revision FROM resource_protection_sources
 			WHERE dirty = 1 AND source_id != '' AND source != 'receipt' AND (source, source_id) > (?, ?)
-			ORDER BY source, source_id LIMIT ?`)
-			.all(...dirtyCursor, PAGE) as SourceState[];
+			ORDER BY source, source_id LIMIT ?`,
+			[...dirtyCursor, PAGE],
+			deadline,
+			signal,
+		);
 		if (!dirty.length) dirtyCursor = ["", ""];
+		const facts = await rawFacts(
+			dirty.map((state) => ({ source: state.source, id: state.source_id })),
+			deadline,
+			signal,
+		);
+		let processed = 0;
 		for (const state of dirty) {
 			check(deadline, signal);
 			try {
@@ -614,8 +892,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					state.revision,
 					(
 						await Promise.all(
-							readRaw(state.source, state.source_id).map((claim) =>
-								indexed(claim, deadline, signal),
+							rawClaims(state.source, facts.get(`${state.source}\0${state.source_id}`)).map(
+								(claim) => indexed(claim, deadline, signal),
 							),
 						)
 					).flat(),
@@ -625,15 +903,20 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			} finally {
 				dirtyCursor = [state.source, state.source_id];
 			}
+			if (++processed % 4 === 0) await tick();
 		}
-		await importLegacyReceipts(deadline, signal);
+		assertOpen();
+		check(deadline, signal);
+		// Pending imports still read their latest cursor inside the receiptImport single flight.
+		if (!progressRows.some((row) => row.source === "receipt" && row.complete))
+			await importLegacyReceipts(deadline, signal);
 	}
 
 	function pathQueries(
 		target: LifecycleTarget,
-	): { clause: string; values: SQLQueryBindings[]; pathOrder?: boolean }[] {
+	): { clause: string; values: ReadBind[]; pathOrder?: boolean }[] {
 		const device = target.deviceId ?? "local";
-		const queries: { clause: string; values: SQLQueryBindings[]; pathOrder?: boolean }[] = [];
+		const queries: { clause: string; values: ReadBind[]; pathOrder?: boolean }[] = [];
 		if (target.scopeProjectId)
 			queries.push({ clause: "scope_project_id = ?", values: [target.scopeProjectId] });
 		if (target.shadowKey) queries.push({ clause: "shadow_key = ?", values: [target.shadowKey] });
@@ -643,18 +926,23 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				values: [device, target.repositoryKey],
 			});
 		if (target.path) {
+			const separator = device === "local" && process.platform === "win32" ? "\\" : "/";
 			let path = target.path;
 			for (let depth = 0; depth < 65; depth++) {
 				queries.push({ clause: "device_id = ? AND canonical_path = ?", values: [device, path] });
-				const parent = normalizePathForComparison(dirname(path));
+				const parent = localPathSemantics.identityKey(dirname(path));
 				if (parent === path) break;
 				if (depth === 64) throw new Error("Target ancestry exceeds budget");
 				path = parent;
 			}
-			const prefix = target.path.endsWith("/") ? target.path : `${target.path}/`;
+			const prefix = target.path.endsWith(separator) ? target.path : target.path + separator;
 			queries.push({
 				clause: "device_id = ? AND canonical_path >= ? AND canonical_path < ?",
-				values: [device, prefix, `${prefix.slice(0, -1)}0`],
+				values: [
+					device,
+					prefix,
+					prefix.slice(0, -1) + String.fromCharCode(separator.charCodeAt(0) + 1),
+				],
 				pathOrder: true,
 			});
 		}
@@ -671,9 +959,11 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			return !!(
 				a &&
 				b &&
-				(a === b ||
-					a.startsWith(b.endsWith("/") ? b : `${b}/`) ||
-					b.startsWith(a.endsWith("/") ? a : `${a}/`))
+				(row.deviceId === "local"
+					? localPathSemantics.contains(a, b) || localPathSemantics.contains(b, a)
+					: a === b ||
+						a.startsWith(b.endsWith("/") ? b : `${b}/`) ||
+						b.startsWith(a.endsWith("/") ? a : `${a}/`))
 			);
 		});
 	}
@@ -690,11 +980,12 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			? protectionSources
 			: protectionSources.filter((source) => source !== "receipt");
 		const sourceFilter = `source IN (${sources.map(() => "?").join(", ")})`;
-		const progress = database
-			.query(
-				`SELECT source, complete FROM resource_protection_sources WHERE ${sourceFilter} AND source_id = ''`,
-			)
-			.all(...sources) as { source: ProtectionSource; complete: number }[];
+		const progress = await readRows<{ source: ProtectionSource; complete: number }>(
+			`SELECT source, complete FROM resource_protection_sources WHERE ${sourceFilter} AND source_id = ''`,
+			sources,
+			deadline,
+			signal,
+		);
 		if (progress.length !== sources.length) return { complete: false, claims: empty() };
 		if (progress.some((state) => state.source === "receipt" && !state.complete))
 			return { complete: false, claims: empty() };
@@ -703,45 +994,90 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		// LIMIT n+1 is a completeness proof, never a truncated inventory interpreted as empty.
 		for (const state of progress) {
 			if (state.complete || state.source === "receipt") continue;
-			const ids = database
-				.query(`SELECT id FROM ${protectionTables[state.source].table} ORDER BY id LIMIT ?`)
-				.all(PAGE + 1) as { id: string }[];
+			const ids = await readRows<{ id: string }>(
+				`SELECT id FROM ${protectionTables[state.source].table} ORDER BY id LIMIT ?`,
+				[PAGE + 1],
+				deadline,
+				signal,
+			);
 			if (ids.length > PAGE) return { complete: false, claims: empty() };
 			for (const { id } of ids) bootstrapOverlay.push({ source: state.source, id });
 		}
-		const version = () =>
+		const version = async () =>
 			JSON.stringify(
-				database
-					.query(
-						`SELECT source, revision FROM resource_protection_sources WHERE ${sourceFilter} AND source_id = '' ORDER BY source`,
-					)
-					.all(...sources),
+				await readRows<{ source: string; revision: number }>(
+					`SELECT source, revision FROM resource_protection_sources WHERE ${sourceFilter} AND source_id = '' ORDER BY source`,
+					sources,
+					deadline,
+					signal,
+				),
 			);
-		const initialVersion = version();
+		const initialVersion = await version();
 		const bootstrapKeys = new Set(bootstrapOverlay.map(({ source, id }) => `${source}\0${id}`));
-		function candidateClaim(row: PathRow): ResourceClaim {
-			const saved = database
-				.query(`SELECT ${smallText("claim_json", MAX_ROW_BYTES)} AS claim_json FROM resource_protection_paths
-				WHERE source = ? AND source_id = ? AND slot = ?`)
-				.get(row.source, row.source_id, row.slot) as { claim_json: string } | null;
+		const rebuildingSources = new Set(
+			progress.filter((state) => !state.complete).map((state) => state.source),
+		);
+		// LIMIT is applied to raw indexed candidates, never after a dirty-row anti-join.
+		const candidateKey = (row: PathRow) => `${row.source}\0${row.source_id}\0${row.slot}`;
+		async function candidateFacts(rows: readonly PathRow[]) {
+			const facts = new Map<string, CandidateFact>();
+			if (rows.length > PAGE) throw new Error("Protection candidate page exceeds budget");
+			for (let offset = 0; offset < rows.length; offset += FACT_BATCH) {
+				const batch = rows.slice(offset, offset + FACT_BATCH);
+				if (
+					batch.some(
+						(row) =>
+							!validText(row.source_id) ||
+							!protectionSources.includes(row.source) ||
+							!Number.isSafeInteger(row.slot),
+					)
+				)
+					throw new Error("Invalid protection candidate key");
+				const saved = await readRows<CandidateFact>(
+					`WITH requested(source, source_id, slot) AS (VALUES ${batch.map(() => "(?, ?, ?)").join(",")})
+					SELECT r.source, r.source_id, r.slot, p.slot AS saved_slot,
+					${smallText("p.claim_json", MAX_ROW_BYTES)} AS claim_json, s.dirty
+					FROM requested r LEFT JOIN resource_protection_paths p
+					ON p.source = r.source AND p.source_id = r.source_id AND p.slot = r.slot
+					LEFT JOIN resource_protection_sources s ON s.source = r.source AND s.source_id = r.source_id
+					LIMIT ${FACT_BATCH}`,
+					batch.flatMap((row) => [row.source, row.source_id, row.slot]),
+					deadline,
+					signal,
+					FACT_BATCH,
+				);
+				if (saved.length !== batch.length) throw new Error("Protection candidate facts incomplete");
+				for (const fact of saved) facts.set(candidateKey(fact), fact);
+				if (offset + FACT_BATCH < rows.length) await tick();
+			}
+			return facts;
+		}
+		function candidateClaim(
+			row: PathRow,
+			facts: ReadonlyMap<string, CandidateFact>,
+		): ResourceClaim | null {
+			const saved = facts.get(candidateKey(row));
+			if (!saved) throw new Error("Protection candidate facts incomplete");
+			if (
+				row.source === "receipt"
+					? !includeLegacyReceipts
+					: rebuildingSources.has(row.source) || !!saved.dirty
+			)
+				return null;
+			if (saved.saved_slot === null || saved.claim_json === null)
+				throw new Error("Protection candidate disappeared");
 			requireSmall(saved);
-			if (!saved) throw new Error("Protection candidate disappeared");
 			return JSON.parse(saved.claim_json) as ResourceClaim;
 		}
-		// LIMIT is applied to raw indexed candidates, never after a dirty-row anti-join.
-		function skipCandidate(row: PathRow): boolean {
-			if (row.source === "receipt") return !includeLegacyReceipts;
-			return !!(
-				database
-					.query("SELECT dirty FROM resource_protection_sources WHERE source = ? AND source_id = ?")
-					.get(row.source, row.source_id) as { dirty: number } | null
-			)?.dirty;
-		}
 		async function* claims(): AsyncGenerator<ResourceClaim> {
+			const bootstrapFacts = await rawFacts(bootstrapOverlay, deadline, signal);
+			let processed = 0;
 			for (const { source, id } of bootstrapOverlay) {
-				for (const claim of readRaw(source, id))
+				check(deadline, signal);
+				for (const claim of rawClaims(source, bootstrapFacts.get(`${source}\0${id}`)))
 					for (const row of await indexed(claim, deadline, signal))
 						if (matches(targets, row)) yield row.claim;
+				if (++processed % 4 === 0) await tick();
 			}
 			const seen = new Set<string>();
 			for (const target of targets)
@@ -749,21 +1085,27 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 					const order = query.pathOrder
 						? "canonical_path, source, source_id, slot"
 						: "source, source_id, slot";
-					let cursor: SQLQueryBindings[] = query.pathOrder ? ["", "", "", -1] : ["", "", -1];
+					let cursor: ReadBind[] = query.pathOrder ? ["", "", "", -1] : ["", "", -1];
 					const cursorParameters = query.pathOrder ? "?, ?, ?, ?" : "?, ?, ?";
 					while (true) {
 						check(deadline, signal);
-						const rows = database
-							.query(`SELECT source, source_id, slot, canonical_path FROM resource_protection_paths
+						const rows = await readRows<PathRow>(
+							`SELECT source, source_id, slot, canonical_path FROM resource_protection_paths
 						WHERE ${query.clause}
-						AND (${order}) > (${cursorParameters}) ORDER BY ${order} LIMIT ?`)
-							.all(...query.values, ...cursor, PAGE) as PathRow[];
+						AND (${order}) > (${cursorParameters}) ORDER BY ${order} LIMIT ?`,
+							[...query.values, ...cursor, PAGE],
+							deadline,
+							signal,
+						);
+						const facts = await candidateFacts(rows);
 						for (const row of rows) {
-							if (skipCandidate(row)) continue;
-							const key = `${row.source}\0${row.source_id}\0${row.slot}`;
+							check(deadline, signal);
+							if (++processed % 4 === 0) await tick();
+							const key = candidateKey(row);
 							if (!seen.has(key)) {
+								const claim = candidateClaim(row, facts);
+								if (!claim) continue;
 								seen.add(key);
-								const claim = candidateClaim(row);
 								if (row.slot >= 0 && claim.shadowKey) {
 									for (const projection of await indexed(claim, deadline, signal))
 										if (matches(targets, projection)) yield projection.claim;
@@ -785,13 +1127,26 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			let cursor: [string, string] = ["", ""];
 			while (true) {
 				check(deadline, signal);
-				const states = database
-					.query(`SELECT source, source_id, revision FROM resource_protection_sources
-					WHERE dirty = 1 AND source IN ('narrator', 'registry') AND source_id != '' AND (source, source_id) > (?, ?) ORDER BY source, source_id LIMIT ?`)
-					.all(...cursor, PAGE) as SourceState[];
+				const states = await readRows<SourceState>(
+					`SELECT source, source_id, revision FROM resource_protection_sources
+					WHERE dirty = 1 AND source IN ('narrator', 'registry') AND source_id != '' AND (source, source_id) > (?, ?) ORDER BY source, source_id LIMIT ?`,
+					[...cursor, PAGE],
+					deadline,
+					signal,
+				);
+				const facts = await rawFacts(
+					states.map((state) => ({ source: state.source, id: state.source_id })),
+					deadline,
+					signal,
+				);
 				for (const state of states) {
+					check(deadline, signal);
+					if (++processed % 4 === 0) await tick();
 					if (bootstrapKeys.has(`${state.source}\0${state.source_id}`)) continue;
-					for (const claim of readRaw(state.source, state.source_id))
+					for (const claim of rawClaims(
+						state.source,
+						facts.get(`${state.source}\0${state.source_id}`),
+					))
 						for (const row of await indexed(claim, deadline, signal))
 							if (matches(targets, row)) yield row.claim;
 				}
@@ -804,14 +1159,20 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			let aliasCursor: [string, string, number] = ["", "", -1];
 			while (true) {
 				check(deadline, signal);
-				const rows = database
-					.query(`SELECT source, source_id, slot, canonical_path FROM resource_protection_paths
+				const rows = await readRows<PathRow>(
+					`SELECT source, source_id, slot, canonical_path FROM resource_protection_paths
 					WHERE alias_sensitive = 1
-					AND (source, source_id, slot) > (?, ?, ?) ORDER BY source, source_id, slot LIMIT ?`)
-					.all(...aliasCursor, PAGE) as PathRow[];
+					AND (source, source_id, slot) > (?, ?, ?) ORDER BY source, source_id, slot LIMIT ?`,
+					[...aliasCursor, PAGE],
+					deadline,
+					signal,
+				);
+				const facts = await candidateFacts(rows);
 				for (const row of rows) {
-					if (skipCandidate(row)) continue;
-					const claim = candidateClaim(row);
+					check(deadline, signal);
+					if (++processed % 4 === 0) await tick();
+					const claim = candidateClaim(row, facts);
+					if (!claim) continue;
 					for (const projection of await indexed(claim, deadline, signal))
 						if (matches(targets, projection)) yield projection.claim;
 				}
@@ -822,26 +1183,93 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				await tick();
 			}
 			check(deadline, signal);
-			if (version() !== initialVersion)
+			if ((await version()) !== initialVersion)
 				throw new Error("Protection facts changed during inspection");
 		}
 		return { complete: true, claims: claims() };
 	}
 
-	return { read, maintain };
+	function stop(options: { deadlineAt?: number } = {}): Promise<void> {
+		stopped = true;
+		controller.abort(new ProtectionIndexStoppedError());
+		draining ??= (async () => {
+			// Bounded callers may have returned while receipt FS and canonicalization still run.
+			while (pending.size) await Promise.allSettled([...pending]);
+			const entries = receiptEntries;
+			receiptEntries = undefined;
+			receiptEntry = undefined;
+			if (entries) await track(pending, entries.close());
+		})();
+		return waitForShutdown(
+			draining,
+			options.deadlineAt ?? Date.now() + DEFAULT_SHUTDOWN_TIMEOUT_MS,
+		);
+	}
+	return {
+		read: (
+			targets: readonly LifecycleTarget[],
+			deadline: number,
+			signal?: AbortSignal,
+			includeLegacyReceipts = true,
+		) =>
+			owned(async (ownedSignal) => {
+				const result = await read(targets, deadline, ownedSignal, includeLegacyReceipts);
+				return {
+					complete: result.complete,
+					claims: {
+						[Symbol.asyncIterator]() {
+							const iterator = result.claims[Symbol.asyncIterator]();
+							return {
+								next: () => owned(() => iterator.next(), ownedSignal),
+								return: () =>
+									iterator.return?.() ?? Promise.resolve({ done: true as const, value: undefined }),
+							};
+						},
+					},
+				};
+			}, signal),
+		maintain: (deadline = performance.now() + 1000, signal?: AbortSignal) =>
+			owned((ownedSignal) => maintain(deadline, ownedSignal), signal),
+		stop,
+		getShutdownSnapshot: () => ({
+			stopped,
+			pendingTasks: pending.size,
+			pendingReceiptImports: receiptImport ? 1 : 0,
+		}),
+	};
 }
 
-let singleton: ReturnType<typeof createResourceProtectionIndex> | undefined;
+const maintenance = hotSafe("resource-protection-index-maintenance", () => ({
+	timer: undefined as ReturnType<typeof setTimeout> | undefined,
+	stopped: false,
+	pending: new Set<Promise<unknown>>(),
+	index: undefined as ReturnType<typeof createResourceProtectionIndex> | undefined,
+}));
+// A hot reload can retain the previous timer-only state shape.
+maintenance.pending ??= new Set();
+maintenance.stopped ??= false;
 async function productionIndex() {
-	if (singleton) return singleton;
+	if (maintenance.stopped) throw new ProtectionIndexStoppedError();
+	if (maintenance.index) return maintenance.index;
 	const { sqlite } = await import("../db");
 	const { narraforkDir } = await import("../lib/settings");
-	singleton = createResourceProtectionIndex(sqlite, join(narraforkDir, "worktree-requests"));
-	return singleton;
+	if (maintenance.stopped) throw new ProtectionIndexStoppedError();
+	maintenance.index ??= createResourceProtectionIndex(
+		sqlite,
+		join(narraforkDir, "worktree-requests"),
+	);
+	return maintenance.index;
 }
 let lastWarning = -Infinity;
 let suppressedWarnings = 0;
 async function warnUnavailable(error: unknown): Promise<void> {
+	if (
+		maintenance.stopped &&
+		(error instanceof ProtectionIndexStoppedError ||
+			(error instanceof Error &&
+				/Protection index (cancelled|budget exceeded)|aborted/i.test(error.message)))
+	)
+		return;
 	if (performance.now() - lastWarning < 60_000) {
 		suppressedWarnings++;
 		return;
@@ -854,7 +1282,44 @@ async function warnUnavailable(error: unknown): Promise<void> {
 	});
 	suppressedWarnings = 0;
 }
-export async function readProtectionClaims(
+/**
+ * The create request a receipt file records, for matching a retirement against the
+ * receipt of the resource it retires. Bounded like the index's own receipt read: no
+ * symlinks, at most one receipt-sized read, and null for anything unreadable or malformed
+ * (which then keeps protecting the path).
+ */
+export async function readReceiptRequestIdentity(
+	filePath: string,
+	deadline: number,
+): Promise<{ requestId: string; destination: string } | null> {
+	if (!isAbsolute(filePath) || filePath.length > 4096 || filePath.includes("\0")) return null;
+	let file: FileHandle;
+	try {
+		file = await bounded(open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW), deadline);
+	} catch {
+		return null;
+	}
+	try {
+		const stat = await bounded(file.stat(), deadline);
+		if (!stat.isFile() || stat.size > MAX_RECEIPT_BYTES) return null;
+		const buffer = Buffer.alloc(MAX_RECEIPT_BYTES + 1);
+		const { bytesRead } = await bounded(file.read(buffer, 0, buffer.length, 0), deadline);
+		if (bytesRead > MAX_RECEIPT_BYTES) return null;
+		const record: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+		if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+		const { request, destination } = record as { request?: unknown; destination?: unknown };
+		const requestId =
+			request && typeof request === "object" && !Array.isArray(request)
+				? (request as { requestId?: unknown }).requestId
+				: undefined;
+		return validText(requestId, 256) && validText(destination) ? { requestId, destination } : null;
+	} catch {
+		return null;
+	} finally {
+		await file.close().catch(() => {});
+	}
+}
+async function readProductionProtectionClaims(
 	targets: readonly LifecycleTarget[],
 	deadline: number,
 	signal?: AbortSignal,
@@ -884,31 +1349,84 @@ export async function readProtectionClaims(
 		throw error;
 	}
 }
-export async function maintainProtectionIndex(
+export function readProtectionClaims(
+	targets: readonly LifecycleTarget[],
+	deadline: number,
+	signal?: AbortSignal,
+	includeLegacyReceipts = true,
+) {
+	if (maintenance.stopped) return Promise.reject(new ProtectionIndexStoppedError());
+	return track(
+		maintenance.pending,
+		readProductionProtectionClaims(targets, deadline, signal, includeLegacyReceipts),
+	);
+}
+export function maintainProtectionIndex(
 	deadline = performance.now() + 1000,
 	signal?: AbortSignal,
-) {
-	try {
-		await (await productionIndex()).maintain(deadline, signal);
-	} catch (error) {
-		await warnUnavailable(error);
-		throw error;
-	}
+): Promise<void> {
+	if (maintenance.stopped) return Promise.reject(new ProtectionIndexStoppedError());
+	return track(
+		maintenance.pending,
+		(async () => {
+			try {
+				await (await productionIndex()).maintain(deadline, signal);
+			} catch (error) {
+				await warnUnavailable(error);
+				throw error;
+			}
+		})(),
+	);
 }
-const maintenance = hotSafe("resource-protection-index-maintenance", () => ({
-	timer: undefined as ReturnType<typeof setTimeout> | undefined,
-}));
 export function startProtectionIndexMaintenance(): void {
-	if (maintenance.timer || process.env.NARRAFORK_TEST === "1") return;
+	if (maintenance.stopped || maintenance.timer || process.env.NARRAFORK_TEST === "1") return;
 	const run = async () => {
+		maintenance.timer = undefined;
+		if (maintenance.stopped) return;
 		try {
 			await maintainProtectionIndex();
 		} catch {
 			/* Backlog or invalid evidence stays dirty; destructive reads fail closed. */
 		}
+		if (maintenance.stopped) return;
 		maintenance.timer = setTimeout(run, 1000);
 		maintenance.timer.unref();
 	};
 	maintenance.timer = setTimeout(run, 0);
 	maintenance.timer.unref();
+}
+
+/** Permanently close production admission before waiting for its real work to settle. */
+export function stopResourceProtectionIndex(options: { deadlineAt?: number } = {}): Promise<void> {
+	maintenance.stopped = true;
+	clearTimeout(maintenance.timer);
+	maintenance.timer = undefined;
+	const deadlineAt = options.deadlineAt ?? Date.now() + DEFAULT_SHUTDOWN_TIMEOUT_MS;
+	const indexStop = maintenance.index?.stop({ deadlineAt });
+	return waitForShutdown(
+		(async () => {
+			await indexStop;
+			while (maintenance.pending.size) await Promise.allSettled([...maintenance.pending]);
+		})(),
+		deadlineAt,
+	);
+}
+export function getResourceProtectionShutdownSnapshot() {
+	const index = maintenance.index?.getShutdownSnapshot();
+	return {
+		stopped: maintenance.stopped,
+		pendingTasks: maintenance.pending.size + (index?.pendingTasks ?? 0),
+		pendingReceiptImports: index?.pendingReceiptImports ?? 0,
+		maintenanceScheduled: maintenance.timer !== undefined,
+	};
+}
+
+/** Test fixtures may reopen admission only after the previous owner really drained. */
+export async function resetResourceProtectionIndexForTests(
+	index?: ReturnType<typeof createResourceProtectionIndex>,
+): Promise<void> {
+	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Test-only protection index reset");
+	await stopResourceProtectionIndex();
+	maintenance.index = index;
+	maintenance.stopped = false;
 }

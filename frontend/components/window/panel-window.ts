@@ -11,7 +11,8 @@
  * Normalization drops surface bookkeeping (`panelRowId`), transient jump
  * requests (`highlightMessageId`/`highlightRequestId`) and anything unknown, so
  * a descriptor written by a newer/older build degrades to the fields both sides
- * understand. `mock` (the debug streaming harness) is deliberately not openable.
+ * understand. `mock` (the debug streaming harness) and `communication` (dock,
+ * mobile and team hosts only) are deliberately not openable.
  */
 
 import { assetUrl } from "@frontend/lib/base-path";
@@ -31,6 +32,7 @@ import {
 	resolveCanonicalPluginUiSessionContext,
 } from "../plugins/PluginUiSurfaceContext";
 import {
+	HOST_SURFACE_VALUES,
 	jsonByteLength,
 	type PluginDockPanelParams,
 	parsePluginDockPanelParams,
@@ -49,7 +51,10 @@ const contextIdSchema = z
 	.regex(/^[A-Za-z0-9._:-]+$/);
 const pluginWindowHostContextSchema = z
 	.object({
-		surface: z.enum(["focus", "workspace", "director", "settings", "provider-settings"]),
+		// Shared with the panel-binding schema so a surface added there cannot be
+		// rejected here. An `overlay` view is never openable in a window (it has no dock
+		// panel to detach), but parsing its descriptor must not be the thing that says so.
+		surface: z.enum(HOST_SURFACE_VALUES),
 		workspaceId: contextIdSchema.optional(),
 		narratorId: contextIdSchema.optional(),
 		projectId: contextIdSchema.optional(),
@@ -69,7 +74,7 @@ export type PanelWindowDescriptor =
 	| { panelType: "webview"; webviewConfig: WebviewLeafConfig }
 	| {
 			panelType: "narrator-tool";
-			toolType: NarratorToolPanelType;
+			toolType: Exclude<NarratorToolPanelType, "mock" | "communication">;
 			narratorId: string;
 	  }
 	| {
@@ -98,7 +103,7 @@ export type PanelWindowDescriptor =
 	/** An outline place; the window navigates it in place (and keeps it in its URL). */
 	| ({ panelType: "outline" } & OutlinePanelState)
 	| {
-			panelType: Exclude<NarratorToolPanelType, "terminal" | "mock">;
+			panelType: Exclude<NarratorToolPanelType, "terminal" | "mock" | "communication">;
 			narratorId: string;
 	  }
 	| PluginPanelWindowDescriptor;
@@ -119,7 +124,7 @@ function narratorBound(
 	value: Record<string, unknown>,
 ): PanelWindowDescriptor | null {
 	const narratorId = str(value.narratorId);
-	if (!narratorId || panelType === "mock") return null;
+	if (!narratorId || panelType === "mock" || panelType === "communication") return null;
 	// The split return is for TS narrowing: "terminal" and the rest are distinct
 	// union members even though their shapes are identical here.
 	if (panelType === "terminal") return { panelType, narratorId };
@@ -214,7 +219,12 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 		case "narrator-tool": {
 			const toolType = str(value.toolType);
 			const narratorId = str(value.narratorId);
-			if (!toolType || toolType === "mock" || !isNarratorToolPanelType(toolType) || !narratorId)
+			if (
+				!isNarratorToolPanelType(toolType) ||
+				toolType === "mock" ||
+				toolType === "communication" ||
+				!narratorId
+			)
 				return null;
 			return { panelType: "narrator-tool", toolType, narratorId };
 		}
@@ -360,6 +370,7 @@ export function recentTabWindowHref(tab: {
 	type: string;
 	id: string;
 	narratorId?: string;
+	projectId?: string;
 }): string | null {
 	switch (tab.type) {
 		case "narrator":
@@ -371,6 +382,12 @@ export function recentTabWindowHref(tab: {
 			return assetUrl(`/windows/workspaces/${encodeURIComponent(tab.id)}`);
 		case "project":
 			return assetUrl(`/projects/${encodeURIComponent(tab.id)}`);
+		case "team":
+			return tab.projectId
+				? assetUrl(
+						`/projects/${encodeURIComponent(tab.projectId)}/teams/${encodeURIComponent(tab.id)}`,
+					)
+				: null;
 		default:
 			return null;
 	}

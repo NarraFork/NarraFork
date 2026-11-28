@@ -126,6 +126,16 @@ describe("buildPanelWindowHref + parsePanelWindowDescriptor", () => {
 		).toEqual({ panelType: "terminal", terminalConfig: { narratorId: "n1" } });
 	});
 
+	test("communication is not offered as an independent window on either dock surface", () => {
+		for (const params of [
+			{ panelType: "communication", narratorId: "n1" },
+			{ panelType: "narrator-tool", toolType: "communication", narratorId: "n1" },
+		]) {
+			expect(normalizePanelWindowDescriptor(params)).toBeNull();
+			expect(parsePanelWindowDescriptor(JSON.stringify(params))).toBeNull();
+		}
+	});
+
 	test("rejects mock, unknown panel types, and missing identity", () => {
 		expect(normalizePanelWindowDescriptor({ panelType: "mock", narratorId: "n1" })).toBe(null);
 		expect(normalizePanelWindowDescriptor({ panelType: "nope", narratorId: "n1" })).toBe(null);

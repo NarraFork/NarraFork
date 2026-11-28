@@ -28,6 +28,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { allowRetainedFileHistoryForTests } from "./retained-file-history";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -78,6 +79,7 @@ const passes: string[] = [];
 let script: Array<() => Promise<{ finalText: string; hasError?: boolean }>> = [];
 
 beforeEach(async () => {
+	allowRetainedFileHistoryForTests();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	seq = 0;
@@ -170,6 +172,27 @@ function seed(shape: (typeof shapes)[number] = shapes[0]) {
 		.run();
 	message("task", "user", "the task", ORIGIN);
 	message("first-reply", "assistant", "first answer", ORIGIN);
+}
+
+async function seedSendContact(shape: (typeof shapes)[number] = shapes[0]) {
+	const { ensureCommunicationNodeTx, grantFixtureNarratorWrite, seedFixtureCommunicationPeer } =
+		await import("./runtime-communication-fixtures");
+	const userId = "resume-sender";
+	db.transaction((tx) => {
+		tx.insert(users)
+			.values({ id: userId, username: userId, passwordHash: "test", createdAt: NOW })
+			.run();
+		tx.update(narrators).set({ ownerUserId: userId }).where(eq(narrators.id, PARENT)).run();
+		const delegated = shape.row.type === "subagent";
+		ensureCommunicationNodeTx(tx, PARENT, null);
+		ensureCommunicationNodeTx(tx, CHILD, delegated ? PARENT : null);
+		if (delegated) {
+			tx.update(narrators).set({ aclRootNarratorId: PARENT }).where(eq(narrators.id, CHILD)).run();
+		} else {
+			grantFixtureNarratorWrite(tx, CHILD, userId);
+			seedFixtureCommunicationPeer(tx, PARENT, CHILD, userId);
+		}
+	});
 }
 
 function message(
@@ -281,6 +304,7 @@ for (const shape of shapes) {
 
 		test("a Send wake of the ended session runs as a background task Stop can reach", async () => {
 			seed(shape);
+			await seedSendContact(shape);
 			const gate = Promise.withResolvers<void>();
 			scriptPasses();
 			script = [
@@ -532,6 +556,7 @@ describe("a held run (user takeover) is continued in place", () => {
 
 	test("a parent Send wakes the parked held run itself: same run, one row, mailbox drained", async () => {
 		seed();
+		await seedSendContact();
 		scriptPasses();
 		script = [async () => ({ finalText: "turn one" }), async () => ({ finalText: "turn two" })];
 		await controlRun(CHILD, { kind: "hold" });

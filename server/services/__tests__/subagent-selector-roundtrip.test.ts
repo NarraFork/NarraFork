@@ -15,21 +15,29 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
 const { resolveSubagentTargets, awaitAgentResultDetailed } = await import("../agent-communication");
 const { agentLabelFromNarrator } = await import("../subagent-label");
 const { clearAgentLabelMemo } = await import("../subagent-label");
-const { clearAliasRegistry, registerTaskAlias, registerAndPersistSubagentAlias } = await import(
-	"../subagent-alias"
-);
+const {
+	SUBAGENT_ALIAS_TRAIT_PREFIX,
+	clearAliasRegistry,
+	registerTaskAlias,
+	registerAndPersistSubagentAlias,
+	storedTitleSlug,
+} = await import("../subagent-alias");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -58,6 +66,9 @@ async function seed(
 		.insert(narrators)
 		.values({ id: PARENT, type: "primary", variant: "primary", createdAt: now, updatedAt: now })
 		.onConflictDoNothing();
+	const persistedAlias = over.traits
+		?.find((trait) => trait.startsWith(SUBAGENT_ALIAS_TRAIT_PREFIX))
+		?.slice(SUBAGENT_ALIAS_TRAIT_PREFIX.length);
 	await db.insert(narrators).values({
 		id,
 		type: "subagent",
@@ -66,6 +77,10 @@ async function seed(
 		policySourceNarratorId: PARENT,
 		runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
 		title: over.title ?? null,
+		titleSlug: storedTitleSlug(over.title),
+		// Occupancy reads the stored selector, which persist and the startup
+		// backfill keep equal to the trait.
+		aliasSelector: persistedAlias ?? "",
 		...(over.traits ? { traits: over.traits } : {}),
 		createdAt: now,
 		updatedAt: now,
@@ -158,6 +173,8 @@ describe("recovered subagents retain their original selectors", () => {
 				},
 			});
 			expect(notifiedTitle).toBe("核实法线实际调用阶段");
+			expect(result.formatted).toContain(`[核实法线实际调用阶段](nf-agent://open?id=${NANOID})`);
+			expect(result.formatted).not.toContain("nf-agent://open?id=normal-stage-audit");
 			expect(result).toMatchObject({
 				id: NANOID,
 				label: "normal-stage-audit",
@@ -225,8 +242,10 @@ describe("recovered subagents retain their original selectors", () => {
 			updatedAt: now,
 		});
 		await expect(
-			resolveSubagentTargets({ callerNarratorId: "other-parent", id: "normal-stage-audit" }),
-		).rejects.toThrow(/No accessible subagent found/);
+			await captureWorkerRejectionThrower(
+				resolveSubagentTargets({ callerNarratorId: "other-parent", id: "normal-stage-audit" }),
+			),
+		).toThrow(/No accessible subagent found/);
 	});
 
 	test("alias persistence waits for concurrent trait edits without losing them", async () => {
@@ -259,8 +278,10 @@ describe("ambiguity is reported, not silently mis-resolved", () => {
 		await seed("SamePrefix0000000001", { title: null });
 		await seed("SamePrefix0000000002", { title: null });
 		await expect(
-			resolveSubagentTargets({ callerNarratorId: PARENT, id: "SamePref" }),
-		).rejects.toThrow(/Ambiguous subagent target/);
+			await captureWorkerRejectionThrower(
+				resolveSubagentTargets({ callerNarratorId: PARENT, id: "SamePref" }),
+			),
+		).toThrow(/Ambiguous subagent target/);
 	});
 
 	test("the ambiguity message leads with labels and shortened ids", async () => {

@@ -21,6 +21,7 @@ function SettingsModelsPage() {
 	const navigate = useNavigate();
 	const {
 		groupedModels,
+		modelOptionsFilter,
 		visibleModels,
 		providerLabels,
 		aggregations,
@@ -121,6 +122,7 @@ function SettingsModelsPage() {
 				reasoningEffortBlocklist={is.reasoningEffortBlocklist}
 				setReasoningEffortBlocklist={is.setReasoningEffortBlocklist}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
 			/>

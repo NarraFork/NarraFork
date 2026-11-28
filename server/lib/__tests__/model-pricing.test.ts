@@ -113,6 +113,22 @@ const estimateRaw = (raw: RawMetadata, data = usage(), provider = "openai") =>
 	calculateCostDetailed(data, provider, MODEL, discoveredSnapshot(raw));
 
 describe("reference costs use effective catalog metadata", () => {
+	test("time-of-use tariffs are not fallback prices for usage costing", () => {
+		const timeOfUse = {
+			...perToken({ input: "3", output: "9" }, "_peak"),
+			...perToken({ input: "0", output: "1" }, "_off_peak"),
+		};
+		expect(discoveredSnapshot(timeOfUse).referencePricing).toBeNull();
+		expect(estimateRaw(timeOfUse)).toMatchObject({
+			status: "unknown",
+			knownCost: 0,
+			missingFields: ["input", "output"],
+		});
+		expect(estimateRaw({ ...timeOfUse, ...perToken(allPrices) })).toMatchObject({
+			status: "complete",
+			knownCost: 10,
+		});
+	});
 	test("stream start price snapshots survive external consumers and preserve captured unknown", async () => {
 		const cases: Array<{
 			pricing?: Prices;

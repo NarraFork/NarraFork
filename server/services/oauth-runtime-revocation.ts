@@ -7,6 +7,7 @@ import {
 	oauthGrants,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { recordOAuthSecurityEvent } from "../lib/oauth-security-observability";
@@ -15,16 +16,16 @@ import { disconnectDevice } from "./device-connection-service";
 import { integrationAuthorizationService } from "./integration-authorization-service";
 import { integrationEventDispatcher } from "./integration-event-dispatcher";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import { clearBufferedMessages } from "./narrator-buffer";
+import { clearBufferedMessagesForAuthorizationLoss } from "./narrator-buffer";
 import { interruptManualBash, narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 
 const REVOCATION_PAGE_SIZE = 100;
 
 /**
- * Hard-stop all work owned by one OAuth narrator. Clearing the durable/in-memory
- * buffer happens synchronously before abort so the normal interrupt finalizer
- * cannot auto-resume the next queued message.
+ * Hard-stop all work owned by one OAuth narrator. Block input consumption before
+ * aborting activity, cancel/settle any in-flight editor, then clear the durable
+ * queue without a lease-release wake. UI edit holds can never block revocation.
  */
 export async function stopOAuthNarratorForAuthorizationLoss(
 	narratorId: string,
@@ -33,15 +34,21 @@ export async function stopOAuthNarratorForAuthorizationLoss(
 	const binding = await integrationResourceBindingService.get("narrator", narratorId);
 	const grant =
 		binding?.sourceType === "oauth_client" && binding.authorityType === "oauth_grant"
-			? await db.query.oauthGrants.findFirst({
-					where: eq(oauthGrants.id, binding.authorityId),
-					columns: { id: true, userId: true, oauthClientId: true },
-				})
+			? await readQueryFirst(
+					db.query.oauthGrants.findMany({
+						limit: 1,
+						where: eq(oauthGrants.id, binding.authorityId),
+						columns: { id: true, userId: true, oauthClientId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: null;
-	await clearBufferedMessages(narratorId);
-	interruptManualBash(narratorId);
-	const interrupted = interruptNarrator(narratorId);
-	await backgroundTaskService.cancelRunningByParent(narratorId);
+	let interrupted = false;
+	await clearBufferedMessagesForAuthorizationLoss(narratorId, async () => {
+		interruptManualBash(narratorId);
+		interrupted = interruptNarrator(narratorId);
+		await backgroundTaskService.cancelRunningByParent(narratorId);
+	});
 	if (!interrupted) {
 		const narrator = await narratorService.getById(narratorId).catch(() => null);
 		if (narrator && (narrator.status === "working" || narrator.status === "waiting")) {
@@ -69,23 +76,26 @@ async function stopNarratorsByGrantPage(
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					inArray(integrationResourceBindings.authorityId, [...grantIds]),
-					eq(integrationResourceBindings.state, "active"),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						inArray(integrationResourceBindings.authorityId, [...grantIds]),
+						eq(integrationResourceBindings.state, "active"),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, reason);
 			stopped++;
@@ -105,24 +115,27 @@ async function disconnectDevicesByGrantPage(
 	let cursor: string | null = null;
 	let disconnected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: remoteDevices.id })
-			.from(integrationResourceBindings)
-			.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					inArray(integrationResourceBindings.authorityId, [...grantIds]),
-					eq(integrationResourceBindings.state, "active"),
-					projectIds ? inArray(remoteDevices.projectId, [...projectIds]) : undefined,
-					cursor ? gt(remoteDevices.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(remoteDevices.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: remoteDevices.id })
+				.from(integrationResourceBindings)
+				.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						inArray(integrationResourceBindings.authorityId, [...grantIds]),
+						eq(integrationResourceBindings.state, "active"),
+						projectIds ? inArray(remoteDevices.projectId, [...projectIds]) : undefined,
+						cursor ? gt(remoteDevices.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(remoteDevices.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			disconnectDevice(row.id, reason);
 			disconnected++;
@@ -137,23 +150,26 @@ async function disconnectDevicesByProjectPage(projectId: string, reason: string)
 	let cursor: string | null = null;
 	let disconnected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: remoteDevices.id })
-			.from(integrationResourceBindings)
-			.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.state, "active"),
-					eq(remoteDevices.projectId, projectId),
-					cursor ? gt(remoteDevices.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(remoteDevices.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: remoteDevices.id })
+				.from(integrationResourceBindings)
+				.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.state, "active"),
+						eq(remoteDevices.projectId, projectId),
+						cursor ? gt(remoteDevices.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(remoteDevices.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			disconnectDevice(row.id, reason);
 			disconnected++;
@@ -207,13 +223,16 @@ export async function prepareOAuthUserHardDeletion(
 	let cursor: string | null = null;
 	let affected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: oauthGrants.id })
-			.from(oauthGrants)
-			.where(and(eq(oauthGrants.userId, userId), cursor ? gt(oauthGrants.id, cursor) : undefined))
-			.orderBy(asc(oauthGrants.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: oauthGrants.id })
+				.from(oauthGrants)
+				.where(and(eq(oauthGrants.userId, userId), cursor ? gt(oauthGrants.id, cursor) : undefined))
+				.orderBy(asc(oauthGrants.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		affected += await prepareOAuthGrantHardDeletion(
 			page.map((row) => row.id),
 			reason,
@@ -250,24 +269,27 @@ export async function propagateOAuthGrantRestriction(input: {
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.authorityId, input.grantId),
-					eq(integrationResourceBindings.state, "active"),
-					inArray(narrators.contextProjectId, projects),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.authorityId, input.grantId),
+						eq(integrationResourceBindings.state, "active"),
+						inArray(narrators.contextProjectId, projects),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, "OAuth narrator project access removed");
 			stopped++;
@@ -285,20 +307,23 @@ export async function propagateOAuthClientRestriction(
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: integrationAuthorities.id })
-			.from(integrationAuthorities)
-			.where(
-				and(
-					eq(integrationAuthorities.kind, "oauth_grant"),
-					eq(integrationAuthorities.integrationType, "oauth_client"),
-					eq(integrationAuthorities.integrationId, oauthClientId),
-					cursor ? gt(integrationAuthorities.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(integrationAuthorities.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: integrationAuthorities.id })
+				.from(integrationAuthorities)
+				.where(
+					and(
+						eq(integrationAuthorities.kind, "oauth_grant"),
+						eq(integrationAuthorities.integrationType, "oauth_client"),
+						eq(integrationAuthorities.integrationId, oauthClientId),
+						cursor ? gt(integrationAuthorities.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(integrationAuthorities.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		const grantIds = page.map((row) => row.id);
 		for (const grantId of grantIds) {
 			integrationAuthorizationService.invalidateAuthority(grantId);
@@ -316,23 +341,26 @@ export async function propagateOAuthProjectRemoval(projectId: string): Promise<n
 	let cursor: string | null = null;
 	let stopped = await disconnectDevicesByProjectPage(projectId, "OAuth device project deleted");
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.state, "active"),
-					eq(narrators.contextProjectId, projectId),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
-		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
+		const rows: Array<{ id: string }> = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.state, "active"),
+						eq(narrators.contextProjectId, projectId),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ executionPolicy: "worker-required" },
+		);
+		const page: Array<{ id: string }> = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, "OAuth narrator project deleted");
 			stopped++;

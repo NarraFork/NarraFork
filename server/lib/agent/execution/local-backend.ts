@@ -21,12 +21,15 @@ import {
 } from "node:fs/promises";
 import { isAbsolute, join as joinPath, posix as posixPath, resolve } from "node:path";
 import { guardDiskWrite } from "../../disk-safety";
+import { hotSafe } from "../../hot-safe";
 import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
-import { pathsEqualForOS } from "../../platform-path";
+import { normalizeRealpathResult, pathsEqualForOS } from "../../platform-path";
 import { resolveRgPath } from "../../ripgrep";
 import { loadSettings } from "../../settings";
 import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
+import { WorkerHandle } from "../../worker-runtime/lifecycle";
+import { type PoolWorker, WorkerPool, type WorkerTaskContext } from "../../worker-runtime/pool";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
 import type {
 	DevicePlatform,
@@ -75,6 +78,102 @@ self.onmessage = async ({ data }) => {
 	} catch (error) { self.postMessage({ error: String(error).slice(0, 4096) }); }
 };
 `;
+
+interface GlobRequest {
+	pattern: string;
+	cwd: string;
+	dot: boolean;
+	includeDirectories: boolean;
+	query: string;
+	maxResults: number;
+	maxBytes: number;
+	timeoutMs: number;
+}
+
+async function globWorker(
+	context: WorkerTaskContext,
+): Promise<PoolWorker<GlobRequest, GlobMatches>> {
+	context.signal.throwIfAborted();
+	const url = URL.createObjectURL(new Blob([BOUNDED_GLOB_WORKER], { type: "text/javascript" }));
+	let handle: WorkerHandle<Worker>;
+	try {
+		handle = WorkerHandle.bunThread(url);
+	} catch (error) {
+		URL.revokeObjectURL(url);
+		throw error;
+	}
+	const worker = handle.resource;
+	return {
+		get closed() {
+			return handle.closed;
+		},
+		async close() {
+			await handle.close();
+			URL.revokeObjectURL(url);
+		},
+		run(request, { signal }) {
+			return new Promise<GlobMatches>((resolveResult, reject) => {
+				const finish = (result?: GlobMatches, error?: unknown) => {
+					clearTimeout(timer);
+					signal.removeEventListener("abort", abort);
+					worker.onmessage = null;
+					worker.onerror = null;
+					worker.removeEventListener("close", exited);
+					if (result) resolveResult(result);
+					else reject(error);
+				};
+				const abort = () => finish(undefined, signal.reason ?? new Error("Glob scan aborted"));
+				const exited = () => finish(undefined, new Error("Glob worker exited"));
+				const timer = setTimeout(() => {
+					void handle.close().catch(() => {});
+					finish(undefined, new Error(`Glob scan timed out after ${request.timeoutMs}ms`));
+				}, request.timeoutMs);
+				worker.onmessage = (
+					event: MessageEvent<{ matches?: string[]; truncated?: boolean; error?: string }>,
+				) => {
+					const data = event.data;
+					if (typeof data?.error === "string") finish(undefined, new Error(data.error));
+					else if (
+						!Array.isArray(data?.matches) ||
+						!data.matches.every((entry) => typeof entry === "string") ||
+						typeof data.truncated !== "boolean" ||
+						data.matches.length > request.maxResults
+					)
+						finish(undefined, new Error("Invalid glob worker response"));
+					else finish(Object.assign(data.matches, { truncated: data.truncated }));
+				};
+				worker.onerror = (event) =>
+					finish(undefined, new Error(event.message || "Glob worker failed"));
+				worker.addEventListener("close", exited, { once: true });
+				signal.addEventListener("abort", abort, { once: true });
+				if (signal.aborted) abort();
+				else
+					try {
+						worker.postMessage(request);
+					} catch (error) {
+						finish(undefined, error);
+					}
+			});
+		},
+	};
+}
+
+const globOwner = hotSafe(
+	"narrafork.localBackend.globWorkers.v1",
+	() =>
+		new WorkerPool<GlobRequest, GlobMatches>({
+			concurrency: 4,
+			maxQueued: 32,
+			maxQueuedBytes: 1024 * 1024,
+			reuse: false,
+			create: globWorker,
+		}),
+);
+
+/** Stops admission synchronously and waits for pending startup and actual Worker exits. */
+export function closeLocalGlobWorkers(): Promise<void> {
+	return globOwner.close(new Error("Local glob workers are closed"));
+}
 
 const FILE_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_POSIX_SYMLINKS = 40;
@@ -131,7 +230,8 @@ async function resolvePosixCanonicalPath(inputPath: string): Promise<string> {
 }
 
 async function resolveCanonicalPath(inputPath: string): Promise<string> {
-	if (IS_WINDOWS || !inputPath.includes("\\")) return realpath(inputPath);
+	if (IS_WINDOWS || !inputPath.includes("\\"))
+		return normalizeRealpathResult(await realpath(inputPath));
 	try {
 		return await realpath(inputPath);
 	} catch {
@@ -567,53 +667,26 @@ export class LocalBackend implements ExecutionBackend {
 		if (![maxResults, maxBytes, timeoutMs].every((n) => Number.isSafeInteger(n) && n > 0)) {
 			throw new RangeError("Glob limits must be positive safe integers");
 		}
-		// Bun's glob can scan a huge tree without yielding a single matching entry. A
-		// loop-side deadline alone cannot stop it or protect the HTTP event loop.
-		const url = URL.createObjectURL(new Blob([BOUNDED_GLOB_WORKER], { type: "text/javascript" }));
-		const worker = new Worker(url);
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let onAbort = () => {};
-		try {
-			return await new Promise<GlobMatches>((resolveResult, reject) => {
-				onAbort = () => {
-					worker.terminate();
-					reject(opts.signal?.reason ?? new Error("Glob scan aborted"));
-				};
-				timer = setTimeout(() => {
-					worker.terminate();
-					reject(new Error(`Glob scan timed out after ${timeoutMs}ms`));
-				}, timeoutMs);
-				worker.onmessage = (
-					event: MessageEvent<{ matches?: string[]; truncated?: boolean; error?: string }>,
-				) => {
-					if (event.data.error) reject(new Error(event.data.error));
-					else
-						resolveResult(
-							Object.assign(event.data.matches ?? [], { truncated: event.data.truncated ?? false }),
-						);
-				};
-				worker.onerror = (event) => reject(new Error(event.message || "Glob worker failed"));
-				opts.signal?.addEventListener("abort", onAbort, { once: true });
-				if (opts.signal?.aborted) {
-					onAbort();
-					return;
-				}
-				worker.postMessage({
-					pattern,
-					cwd: opts.cwd,
-					dot: opts.dot ?? false,
-					maxResults,
-					maxBytes,
-					includeDirectories: opts.includeDirectories ?? false,
-					query: opts.query ?? "",
-				});
-			});
-		} finally {
-			if (timer) clearTimeout(timer);
-			opts.signal?.removeEventListener("abort", onAbort);
-			worker.terminate();
-			URL.revokeObjectURL(url);
-		}
+		// Bun's glob can scan without yielding: it remains one isolated, disposable Worker.
+		// Account only field lengths, never serialize a path/query merely for admission.
+		return globOwner.run(
+			{
+				pattern,
+				cwd: opts.cwd,
+				dot: opts.dot ?? false,
+				maxResults,
+				maxBytes,
+				timeoutMs,
+				includeDirectories: opts.includeDirectories ?? false,
+				query: opts.query ?? "",
+			},
+			{
+				signal: opts.signal,
+				bytes: (pattern.length + opts.cwd.length + (opts.query?.length ?? 0)) * 2 + 128,
+				// Keep the existing execution budget separate from bounded admission waiting.
+				deadlineAt: Infinity,
+			},
+		);
 	}
 
 	async grep(params: GrepParams): Promise<GrepResult> {

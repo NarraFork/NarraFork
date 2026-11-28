@@ -115,10 +115,11 @@ self.onmessage = async (event: MessageEvent<Request | { type: "ack" }>) => {
 	} catch (error) {
 		// PG driver errors may contain connection secrets. Only forward our fixed budget errors.
 		const message = error instanceof Error ? error.message : "";
+		const diagnostic = workerFailureDetails(error, false);
 		postMessage({
 			type: "error",
 			code: request.backend === "sqlite" ? safeSqliteCode(error) : undefined,
-			diagnostic: workerFailureDetails(error, false),
+			diagnostic: { errorType: diagnostic.errorType, code: diagnostic.code },
 			message: message.startsWith("Model history")
 				? message
 				: "Model history read-only worker failed",

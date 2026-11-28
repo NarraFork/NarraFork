@@ -32,6 +32,7 @@ const { narratorGitRoutes } = await import("../git");
 const { db } = await import("../../db");
 const { aclGrants, narrators, projects, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
+const { executionPolicyEngine } = await import("../../services/execution-policy/engine");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -232,6 +233,27 @@ describe("manage is not write", () => {
 });
 
 describe("project sessions inherit the project", () => {
+	test("removing a project rule refreshes an existing session's cached policy", async () => {
+		const pattern = "test-project-policy-cache";
+		const updateRule = (commandBlacklist: { pattern: string }[]) =>
+			request(OWNER, `/projects/${privateProject}`, {
+				method: "PATCH",
+				body: { chapterSettings: { commandBlacklist } },
+			});
+		const cachedPatterns = async () =>
+			(await executionPolicyEngine.compile(sessionInPrivate, null)).commandBlacklist.map(
+				(rule) => rule.pattern,
+			);
+		try {
+			expect((await updateRule([{ pattern }])).status).toBe(200);
+			expect(await cachedPatterns()).toContain(pattern);
+			expect((await updateRule([])).status).toBe(200);
+			expect(await cachedPatterns()).not.toContain(pattern);
+		} finally {
+			executionPolicyEngine.clear();
+		}
+	});
+
 	test("an outsider cannot read a session of a private project", async () => {
 		expect((await request(OUTSIDER, `/narrators/${sessionInPrivate}`)).status).toBe(404);
 	});

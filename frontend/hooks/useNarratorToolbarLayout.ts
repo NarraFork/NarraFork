@@ -22,9 +22,13 @@ import {
 	partitionToolbar,
 	toPersistedToolbarLayout,
 } from "./narrator-toolbar-layout";
-import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
+import {
+	isUserPreferencesScopeCurrent,
+	useUpdateUserPreferences,
+	useUserPreferences,
+} from "./useUserPreferences";
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 
 export function useNarratorToolbarLayout({
 	hostCapabilities,
@@ -46,7 +50,7 @@ export function useNarratorToolbarLayout({
 	 */
 	entryEnabled?: (id: NarratorToolbarId) => boolean;
 }) {
-	const { data: prefs } = useUserPreferences();
+	const { data: prefs, queryKey } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
 	const queryClient = useQueryClient();
 
@@ -74,12 +78,13 @@ export function useNarratorToolbarLayout({
 
 	const saveLayout = useCallback(
 		(nextEntries: readonly NarratorToolbarEntry[]) => {
+			if (!isUserPreferencesScopeCurrent(queryKey)) return;
 			const persisted = toPersistedToolbarLayout(nextEntries);
-			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
+			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic update: dragging a row must feel immediate, and the drag
 			// source is the same list this feeds.
 			if (previous) {
-				queryClient.setQueryData<Preferences>(["user-preferences"], {
+				queryClient.setQueryData<Preferences>(queryKey, {
 					...previous,
 					narratorToolbarLayout: persisted,
 				} as Preferences);
@@ -88,12 +93,13 @@ export function useNarratorToolbarLayout({
 				{ narratorToolbarLayout: persisted },
 				{
 					onError: () => {
-						if (previous) queryClient.setQueryData(["user-preferences"], previous);
+						if (previous && isUserPreferencesScopeCurrent(queryKey))
+							queryClient.setQueryData(queryKey, previous);
 					},
 				},
 			);
 		},
-		[queryClient, updatePrefs],
+		[queryClient, updatePrefs, queryKey],
 	);
 
 	// `overflow` excludes bottom controls; consumers needing combined badges can

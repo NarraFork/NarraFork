@@ -1,0 +1,446 @@
+{
+	"built_at": "2026-10-25T10:04:10.682171+00:00",
+	"models": [
+		{
+			"id": "claude-haiku-4.5",
+			"display_name": "claude-haiku-4.5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-sonnet-4.6",
+			"display_name": "claude-sonnet-4.6",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-sonnet-5",
+			"display_name": "claude-sonnet-5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-opus-4.6",
+			"display_name": "claude-opus-4.6",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-opus-4.7",
+			"display_name": "claude-opus-4.7",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-opus-4.8",
+			"display_name": "claude-opus-4.8",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "claude-opus-5",
+			"display_name": "claude-opus-5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 61
+		},
+		{
+			"id": "claude-fable-5.1",
+			"display_name": "claude-fable-5.1",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 49
+		},
+		{
+			"id": "claude-fable-5",
+			"display_name": "claude-fable-5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 38
+		},
+		{
+			"id": "gemini-2.5-pro",
+			"display_name": "gemini-2.5-pro",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.1-pro-preview",
+			"display_name": "gemini-3.1-pro-preview",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.5-flash",
+			"display_name": "gemini-3.5-flash",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.6-flash",
+			"display_name": "gemini-3.6-flash",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.7-flash",
+			"display_name": "gemini-3.7-flash",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.8-flash",
+			"display_name": "gemini-3.8-flash",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "grok-4.5",
+			"display_name": "grok-4.5",
+			"family": "grok",
+			"family_name": "Grok",
+			"response_count": 36
+		},
+		{
+			"id": "grok-4.6",
+			"display_name": "grok-4.6",
+			"family": "grok",
+			"family_name": "Grok",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-4o",
+			"display_name": "gpt-4o",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "glm-5.2",
+			"display_name": "glm-5.2",
+			"family": "glm",
+			"family_name": "GLM",
+			"response_count": 36
+		},
+		{
+			"id": "glm-5.3",
+			"display_name": "glm-5.3",
+			"family": "glm",
+			"family_name": "GLM",
+			"response_count": 36
+		},
+		{
+			"id": "qwen3.8-max-0902",
+			"display_name": "qwen3.8-max-0902",
+			"family": "qwen",
+			"family_name": "Qwen",
+			"response_count": 36
+		},
+		{
+			"id": "qwen3.8-27b",
+			"display_name": "qwen3.8-27b",
+			"family": "qwen",
+			"family_name": "Qwen",
+			"response_count": 36
+		},
+		{
+			"id": "kimi-k3",
+			"display_name": "kimi-k3",
+			"family": "kimi",
+			"family_name": "Kimi",
+			"response_count": 36
+		},
+		{
+			"id": "hy4-preview",
+			"display_name": "hy4-preview",
+			"family": "hunyuan",
+			"family_name": "Hunyuan",
+			"response_count": 36
+		},
+		{
+			"id": "muse-spark-1.2",
+			"display_name": "muse-spark-1.2",
+			"family": "muse",
+			"family_name": "Muse",
+			"response_count": 36
+		},
+		{
+			"id": "muse-spark-1.3",
+			"display_name": "muse-spark-1.3",
+			"family": "muse",
+			"family_name": "Muse",
+			"response_count": 36
+		},
+		{
+			"id": "kimi-k2.8-preview",
+			"display_name": "kimi-k2.8-preview",
+			"family": "kimi",
+			"family_name": "Kimi",
+			"response_count": 36
+		},
+		{
+			"id": "grok-4.7",
+			"display_name": "grok-4.7",
+			"family": "grok",
+			"family_name": "Grok",
+			"response_count": 36
+		},
+		{
+			"id": "mimo-v2.5",
+			"display_name": "mimo-v2.5",
+			"family": "mimo",
+			"family_name": "MiMo",
+			"response_count": 36
+		},
+		{
+			"id": "mimo-v2.5-pro",
+			"display_name": "mimo-v2.5-pro",
+			"family": "mimo",
+			"family_name": "MiMo",
+			"response_count": 36
+		},
+		{
+			"id": "mimo-v2.6-flash",
+			"display_name": "mimo-v2.6-flash",
+			"family": "mimo",
+			"family_name": "MiMo",
+			"response_count": 36
+		},
+		{
+			"id": "mimo-v2.6-pro",
+			"display_name": "mimo-v2.6-pro",
+			"family": "mimo",
+			"family_name": "MiMo",
+			"response_count": 36
+		},
+		{
+			"id": "step-5-preview",
+			"display_name": "step-5-preview",
+			"family": "step",
+			"family_name": "Step",
+			"response_count": 36
+		},
+		{
+			"id": "claude-opus-5.5",
+			"display_name": "claude-opus-5.5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-6-luna",
+			"display_name": "gpt-6-luna",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "glm-5.3-flashx",
+			"display_name": "glm-5.3-flashx",
+			"family": "glm",
+			"family_name": "GLM",
+			"response_count": 36
+		},
+		{
+			"id": "glm-5.3-flash",
+			"display_name": "glm-5.3-flash",
+			"family": "glm",
+			"family_name": "GLM",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4.1-flash",
+			"display_name": "deepseek-v4.1-flash",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4-flash",
+			"display_name": "deepseek-v4-flash",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4-pro-0813",
+			"display_name": "deepseek-v4-pro-0813",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4-pro",
+			"display_name": "deepseek-v4-pro",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4-flash-0731",
+			"display_name": "deepseek-v4-flash-0731",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v3.2",
+			"display_name": "deepseek-v3.2",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-6-sol",
+			"display_name": "gpt-6-sol",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "claude-sonnet-5.5",
+			"display_name": "claude-sonnet-5.5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-6-astra",
+			"display_name": "gpt-6-astra/6.1-sol",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 72
+		},
+		{
+			"id": "gpt-5.4",
+			"display_name": "gpt-5.4",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-5.5",
+			"display_name": "gpt-5.5",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-5.6-sol",
+			"display_name": "gpt-5.6-sol",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-5.6-terra",
+			"display_name": "gpt-5.6-terra",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "gpt-5.6-luna",
+			"display_name": "gpt-5.6-luna",
+			"family": "gpt",
+			"family_name": "GPT",
+			"response_count": 36
+		},
+		{
+			"id": "seed-2.0-mini",
+			"display_name": "seed-2.0-mini",
+			"family": "seed",
+			"family_name": "Seed",
+			"response_count": 36
+		},
+		{
+			"id": "seed-2.0-lite",
+			"display_name": "seed-2.0-lite",
+			"family": "seed",
+			"family_name": "Seed",
+			"response_count": 36
+		},
+		{
+			"id": "qwen3.8-omni-flash",
+			"display_name": "qwen3.8-omni-flash",
+			"family": "qwen",
+			"family_name": "Qwen",
+			"response_count": 36
+		},
+		{
+			"id": "seed-2.1-turbo",
+			"display_name": "seed-2.1-turbo",
+			"family": "seed",
+			"family_name": "Seed",
+			"response_count": 36
+		},
+		{
+			"id": "qwen3.8-flash",
+			"display_name": "qwen3.8-flash",
+			"family": "qwen",
+			"family_name": "Qwen",
+			"response_count": 36
+		},
+		{
+			"id": "claude-haiku-5.5",
+			"display_name": "claude-haiku-5.5",
+			"family": "claude",
+			"family_name": "Claude",
+			"response_count": 36
+		},
+		{
+			"id": "muse-wonder",
+			"display_name": "muse-wonder",
+			"family": "muse",
+			"family_name": "Muse",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-4-argon",
+			"display_name": "gemini-4-argon",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "deepseek-v4.1-flash-1017",
+			"display_name": "deepseek-v4.1-flash-1017",
+			"family": "deepseek",
+			"family_name": "DeepSeek",
+			"response_count": 36
+		},
+		{
+			"id": "kimi-k3.1-pro",
+			"display_name": "kimi-k3.1-pro",
+			"family": "kimi",
+			"family_name": "Kimi",
+			"response_count": 36
+		},
+		{
+			"id": "gemini-3.5-flash-lite",
+			"display_name": "gemini-3.5-flash-lite",
+			"family": "gemini",
+			"family_name": "Gemini",
+			"response_count": 36
+		},
+		{
+			"id": "minimax-m3.1-flash",
+			"display_name": "minimax-m3.1-flash",
+			"family": "minimax",
+			"family_name": "MiniMax",
+			"response_count": 36
+		}
+	]
+}

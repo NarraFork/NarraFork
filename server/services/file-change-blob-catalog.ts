@@ -9,11 +9,16 @@ import { FILE_CHANGE_LIMITS, type FileChangeBlobRef } from "@shared/file-change-
 import { and, asc, eq, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import type { SQLiteTransactionConfig } from "drizzle-orm/sqlite-core";
+import type { ReadQueryOptions } from "../db/worker-read";
 import type {
 	FileChangeBlobAdmission,
 	FileChangeBlobLease,
 	FileChangeBlobRelease,
 } from "./file-change-blob-store";
+import {
+	attachFileHistoryCatalogDiagnostic,
+	type FileHistoryCatalogStage,
+} from "./file-change-history-diagnostics";
 
 export const FILE_CHANGE_BLOB_BUDGET_ID = "file-change-blobs";
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
@@ -84,14 +89,45 @@ export class FileChangeBlobCatalog {
 			throw fail("invalid_input", "Catalog requires SQLite foreign_keys enabled");
 	}
 
+	async readBudget(
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	): Promise<FileChangeBlobBudgetMetadata | null> {
+		const { readQueryFirst } = await import("../db/worker-read");
+		const row = await readQueryFirst(
+			this.db.select().from(budgets).where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID)).limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
+		if (!row) return null;
+		checkBudget(row, this.namespaceKey, "budget_read");
+		return Object.freeze(row);
+	}
+	async readMetadata(
+		input: { expectedGeneration?: number; ref: FileChangeBlobRef } & Pick<
+			ReadQueryOptions,
+			"signal" | "timeoutMs" | "deadlineAt"
+		>,
+	): Promise<FileChangeBlobMetadata | null> {
+		const ref = validateRef(input.ref);
+		const budget = await this.readBudget(input);
+		if (!budget) throw fail("namespace_unverified", "Blob catalog has not been initialized");
+		const { readQueryFirst } = await import("../db/worker-read");
+		const row = await readQueryFirst(
+			this.db.select().from(blobs).where(eq(blobs.digest, ref.digest)).limit(1),
+			{ ...input, executionPolicy: "worker-required", maxRows: 1 },
+		);
+		if (!row) return null;
+		checkBlob(row, ref);
+		return Object.freeze(row);
+	}
 	getBudget(): FileChangeBlobBudgetMetadata | null {
 		const row = this.db
 			.select()
 			.from(budgets)
 			.where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
+			.limit(1)
 			.get();
 		if (!row) return null;
-		checkBudget(row, this.namespaceKey);
+		checkBudget(row, this.namespaceKey, "budget_read");
 		return Object.freeze(row);
 	}
 
@@ -103,13 +139,21 @@ export class FileChangeBlobCatalog {
 		return this.transaction((tx) => {
 			const rows = tx.select().from(budgets).limit(2).all();
 			if (rows.length > 1 || (rows[0] && rows[0].id !== FILE_CHANGE_BLOB_BUDGET_ID))
-				throw fail(
-					"namespace_mismatch",
-					"A database must bind exactly one physical blob namespace",
+				throw attachFileHistoryCatalogDiagnostic(
+					fail("namespace_mismatch", "A database must bind exactly one physical blob namespace"),
+					{
+						stage: "initialize",
+						reason: rows.length > 1 ? "cardinality" : "budget_id",
+						currentKey: this.namespaceKey,
+						row: rows[0],
+						observedRows: rows.length > 1 ? 2 : 1,
+						// The multi-row guard deliberately never reads either row's ID.
+						rowIdMatches: rows.length > 1 ? undefined : false,
+					},
 				);
 			const current = rows[0];
 			if (current) {
-				checkBudget(current, this.namespaceKey);
+				checkBudget(current, this.namespaceKey, "initialize");
 				if (input.quotaBytes === undefined || input.quotaBytes === current.quotaBytes)
 					return Object.freeze(current);
 				return Object.freeze(
@@ -185,8 +229,8 @@ export class FileChangeBlobCatalog {
 		if (!result.ref) return;
 		const ref = result.ref;
 		this.transaction((tx) => {
-			const current = this.requireBudget(tx);
-			const existing = tx.select().from(blobs).where(eq(blobs.digest, ref.digest)).get();
+			const current = this.requireBudget(tx, "publication_accounting");
+			const existing = tx.select().from(blobs).where(eq(blobs.digest, ref.digest)).limit(1).get();
 			if (existing) checkBlob(existing, ref);
 			if (existing?.status === "ready") return;
 			const usedBytes = publicationUsedBytes(current.usedBytes, ref.sizeBytes);
@@ -210,7 +254,7 @@ export class FileChangeBlobCatalog {
 	}): FileChangeBlobMetadata | null {
 		const ref = validateRef(input.ref);
 		this.requireBudget(this.db);
-		const row = this.db.select().from(blobs).where(eq(blobs.digest, ref.digest)).get();
+		const row = this.db.select().from(blobs).where(eq(blobs.digest, ref.digest)).limit(1).get();
 		if (!row) return null;
 		checkBlob(row, ref);
 		return Object.freeze(row);
@@ -242,10 +286,15 @@ export class FileChangeBlobCatalog {
 			.all();
 		return reservationPageResult(rows, limit);
 	}
-	private requireBudget(tx: QueryDb) {
-		const row = tx.select().from(budgets).where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID)).get();
+	private requireBudget(tx: QueryDb, stage: FileHistoryCatalogStage = "budget_read") {
+		const row = tx
+			.select()
+			.from(budgets)
+			.where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
+			.limit(1)
+			.get();
 		if (!row) throw fail("namespace_unverified", "Blob catalog has not been initialized");
-		checkBudget(row, this.namespaceKey);
+		checkBudget(row, this.namespaceKey, stage);
 		return row;
 	}
 	private transaction<T>(work: (tx: QueryDb) => T): T {
@@ -284,9 +333,23 @@ function publicationUsedBytes(usedBytes: number, sizeBytes: number): number {
 function checkBudget(
 	row: Pick<FileChangeBlobBudgetMetadata, "namespaceKey" | "usedBytes" | "quotaBytes">,
 	namespaceKey: string,
+	stage?: FileHistoryCatalogStage,
 ) {
-	if (row.namespaceKey !== namespaceKey)
-		throw fail("namespace_mismatch", "Database is bound to a different physical blob namespace");
+	if (row.namespaceKey !== namespaceKey) {
+		const error = fail(
+			"namespace_mismatch",
+			"Database is bound to a different physical blob namespace",
+		);
+		// Shared validation callers retain their existing two-argument behavior.
+		throw stage
+			? attachFileHistoryCatalogDiagnostic(error, {
+					stage,
+					reason: "key_mismatch",
+					currentKey: namespaceKey,
+					row,
+				})
+			: error;
+	}
 	for (const field of ["usedBytes", "quotaBytes"] as const) assertNumber(row[field], field);
 }
 function blobValues(ref: FileChangeBlobRef, generation: number): typeof blobs.$inferInsert {

@@ -28,8 +28,15 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
+import {
+	agentReferenceMarker,
+	isAgentReference,
+	normalizeAgentReferenceLabel,
+	parseAgentReference,
+} from "../agent-reference";
 import { prepareMarkdownEmphasis, stripEmphasisSentinel } from "../markdown-emphasis-compat";
 import { fileLinkLineSuffix, localFileHref, parseLocalFilePath } from "../markdown-file-path";
+import { agentReferenceMetrics, type PreparedAgentReferences } from "./agent-reference-flow";
 import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
 import { inlineTokensToPlainText, slugifyHeading } from "./markdown-anchor";
@@ -39,6 +46,7 @@ import type {
 	PreparedBlock,
 	PreparedBlockBase,
 	PreparedCodeBlock,
+	PreparedFixedBlock,
 	PreparedInlineBlock,
 	PreparedRuleBlock,
 	PreparedTableBlock,
@@ -78,6 +86,8 @@ const LIST_INDENT = emToPx(1.5, FONT_SIZE.sm); // padding-inline-start 1.5em @14
 const BLOCKQUOTE_PADDING = 10; // spacing xs
 const BLOCKQUOTE_BORDER = 3;
 const CODE_LANG_EXTRA_TOP = 12; // codeBlockWithLang: pad-top = xs + 12px (12px extra)
+// Preview geometry is independent of downloads, decoding and intrinsic dimensions.
+const IMAGE_PREVIEW_HEIGHT = 200;
 /**
  * Upper bound used to measure a cell's max-content width. Large enough that no
  * realistic cell wraps, small enough to stay far from float-precision trouble.
@@ -107,6 +117,7 @@ interface MarkState {
 }
 
 interface ParseContext {
+	listItemRanges?: ReadonlyMap<Tokens.ListItem, SourceRange>;
 	listDepth: number;
 	quoteDepth: number;
 	/** Present when KaTeX is available; absent means math stays literal text. */
@@ -115,6 +126,8 @@ interface ParseContext {
 	formulas?: readonly string[];
 }
 
+type SourceRange = NonNullable<PreparedBlock["sourceRange"]>;
+
 interface InlinePiece {
 	text: string;
 	font: string;
@@ -122,6 +135,8 @@ interface InlinePiece {
 	href: string | null;
 	breakMode: "normal" | "never";
 	extraWidth: number;
+	/** Width before content-column shrinking; the complete label stays in text. */
+	agentReferenceWidth?: number;
 	/** Set when this piece is an inline formula rendered as a fixed-width atom. */
 	math?: InlineMathFragment;
 }
@@ -260,7 +275,10 @@ function mathPiece(latex: string, font: string, math: MathSupport): InlinePiece 
 export function parseMarkdownToPreparedBlocks(
 	markdown: string,
 	math?: MathSupport,
+	sourceRanges = false,
 ): PreparedBlock[] {
+	if (sourceRanges)
+		return parseMarkdownUnits(markdown, math, { sourceRanges }).flatMap(({ blocks }) => blocks);
 	// `prepareMarkdownEmphasis` only rewrites pairs CommonMark would refuse
 	// (`**注意：**说明`); legal `**bold**` is byte-identical.
 	if (!math) {
@@ -290,11 +308,13 @@ function prepareSingleToken(
 	isFirst: boolean,
 	math: MathSupport | undefined,
 	formulas: readonly string[] | undefined,
+	listItemRanges?: ReadonlyMap<Tokens.ListItem, SourceRange>,
 ): PreparedBlock[] {
 	const ctx: ParseContext = {
 		listDepth: 0,
 		quoteDepth: 0,
 		...(math ? { math, formulas } : {}),
+		...(listItemRanges ? { listItemRanges } : {}),
 	};
 	if (isFirst) return parseBlockTokens([token], ctx);
 	// Any preceding block makes the next one "non-first"; a plain paragraph is the
@@ -388,6 +408,68 @@ export interface ParseMarkdownUnitsOptions {
 	continuation?: boolean;
 	/** Reuse hook, consulted per unit as `(raw, isFirst)`. */
 	reuse?: (raw: string, isFirst: boolean) => PreparedBlock[] | undefined;
+	sourceRanges?: boolean;
+}
+
+function trimmedSourceRange(text: string, start: number, end: number): SourceRange {
+	const raw = text.slice(start, end);
+	// A token can consume a newline separating two source owners.
+	return {
+		start: end - raw.trimStart().length,
+		end: start + raw.trimEnd().length,
+	};
+}
+
+function listItemSourceRanges(
+	token: Tokens.List,
+	start: number,
+	text: string,
+	originalOffset: (offset: number) => number,
+): ReadonlyMap<Tokens.ListItem, SourceRange> | undefined {
+	// Only use item offsets when their raw slices tile the unchanged lexer token.
+	if (token.items.map((item) => item.raw).join("") !== token.raw) return;
+	const ranges = new Map<Tokens.ListItem, SourceRange>();
+	for (const item of token.items) {
+		const end = start + item.raw.length;
+		ranges.set(item, trimmedSourceRange(text, originalOffset(start), originalOffset(end)));
+		start = end;
+	}
+	return ranges;
+}
+
+function lexWithSourceRanges(text: string, normalizedLength: number) {
+	const ranges = new Map<Token, SourceRange>();
+	let cursor = 0;
+	let previous: Token | undefined;
+	let previousRaw: string | undefined;
+	const record = (token: Token | undefined, end: number) => {
+		if (token && token !== previous) ranges.set(token, { start: cursor, end });
+		else if (token && token.raw !== previousRaw) {
+			const range = ranges.get(token);
+			if (range?.end === cursor) range.end = end;
+			else ranges.delete(token);
+		}
+		cursor = end;
+		previous = token;
+		previousRaw = token?.raw;
+	};
+	const tokens = marked.lexer(text, {
+		gfm: true,
+		extensions: {
+			renderers: {},
+			childTokens: {},
+			block: [
+				function (src, tokens) {
+					// Observe the top-level lexer cursor without consuming input. Marked
+					// can rewrite token.raw or consume definitions without emitting them.
+					if (tokens === this.lexer.tokens) record(tokens.at(-1), normalizedLength - src.length);
+					return undefined;
+				},
+			],
+		},
+	});
+	record(tokens.at(-1), normalizedLength);
+	return { tokens, ranges };
 }
 
 export function parseMarkdownUnits(
@@ -395,7 +477,7 @@ export function parseMarkdownUnits(
 	math?: MathSupport,
 	options: ParseMarkdownUnitsOptions = {},
 ): PreparedMarkdownUnit[] {
-	const { continuation = false, reuse } = options;
+	const { continuation = false, reuse, sourceRanges = false } = options;
 	// Lexer offsets belong to transformed text, but the streaming cache slices the
 	// ORIGINAL input. Carry boundaries through math lifting, inserted emphasis
 	// sentinels and marked's CRLF normalization. No second Markdown parse is needed.
@@ -424,12 +506,36 @@ export function parseMarkdownUnits(
 		return sourceOffsets?.[beforeEmphasis] ?? beforeEmphasis;
 	};
 	const formulas = source?.formulas;
-	const tokens = marked.lexer(text, { gfm: true });
+	const normalized = sourceRanges && lexerOffsets ? text.replace(/\r\n?/g, "\n") : text;
+	const lexed = sourceRanges ? lexWithSourceRanges(text, normalized.length) : undefined;
+	const tokens = lexed?.tokens ?? marked.lexer(text, { gfm: true });
 	const units: PreparedMarkdownUnit[] = [];
 	let isFirst = !continuation;
 	let consumed = 0;
+	const exactOriginalOffset = (offset: number) => {
+		const boundary = lexerOffsets?.[offset] ?? offset;
+		let lo = 0;
+		let hi = insertions.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			if (insertions[mid] < boundary) lo = mid + 1;
+			else hi = mid;
+		}
+		return sourceOffsets?.[boundary - lo] ?? boundary - lo;
+	};
 	for (const token of tokens) {
 		const start = originalOffset(consumed);
+		const range = lexed?.ranges.get(token);
+		const rangeStart =
+			range &&
+			range.end - range.start === token.raw.length &&
+			normalized.startsWith(token.raw, range.start)
+				? range.start
+				: undefined;
+		const itemRanges =
+			rangeStart !== undefined && token.type === "list"
+				? listItemSourceRanges(token as Tokens.List, rangeStart, markdown, exactOriginalOffset)
+				: undefined;
 		consumed += token.raw.length;
 		const end = originalOffset(consumed);
 		// `space` / `def` produce no blocks; skipping them here keeps unit identity
@@ -437,8 +543,19 @@ export function parseMarkdownUnits(
 		// above so `consumedLength` tracks the real source offset.
 		if (token.type === "space" || token.type === "def") continue;
 		const raw = markdown.slice(start, end);
-		const cached = reuse?.(raw, isFirst);
-		const blocks = cached ?? prepareSingleToken(token, isFirst, math, formulas);
+		const cached = sourceRanges ? undefined : reuse?.(raw, isFirst);
+		const prepared = cached ?? prepareSingleToken(token, isFirst, math, formulas, itemRanges);
+		const sourceRange =
+			rangeStart === undefined
+				? undefined
+				: trimmedSourceRange(
+						markdown,
+						exactOriginalOffset(rangeStart),
+						exactOriginalOffset(rangeStart + token.raw.length),
+					);
+		const blocks = sourceRange
+			? prepared.map((block) => (block.sourceRange ? block : { ...block, sourceRange }))
+			: prepared;
 		units.push({ raw, isFirst, blocks, consumedLength: end });
 		isFirst = false;
 	}
@@ -696,6 +813,8 @@ function buildListBlocks(token: Tokens.List, ctx: ParseContext): PreparedBlock[]
 				taskMarker: { checked: !!item.checked, label: item.text },
 			};
 		}
+		const range = ctx.listItemRanges?.get(item);
+		if (range) for (const block of itemBlocks) block.sourceRange = range;
 		appendGroup(blocks, itemBlocks, 0);
 	}
 	return blocks;
@@ -761,8 +880,38 @@ function buildInlineBlocks(
 	variant: InlineVariant,
 	ctx: ParseContext,
 ): PreparedBlock[] {
-	const lines = collectInlineLines(tokens, variant, ctx);
-	return buildPreparedInline(lines, variant, ctx);
+	if (variant !== "body") {
+		return buildPreparedInline(collectInlineLines(tokens, variant, ctx), variant, ctx);
+	}
+	const blocks: PreparedBlock[] = [];
+	const flush = (lines: InlinePiece[][], aroundImage: boolean) => {
+		// Whitespace between consecutive images is not a separate text row. Keep
+		// every nonempty run (and its original marks), including surrounding spaces.
+		const prose = aroundImage
+			? lines.filter((line) => line.some((piece) => piece.text.trim().length > 0 || piece.math))
+			: lines;
+		appendGroup(blocks, buildPreparedInline(prose, variant, ctx), 4);
+	};
+	const lines = collectInlineLines(tokens, variant, ctx, (image, pending) => {
+		const src = parseImageSource(image.href);
+		if (src === null) return false;
+		flush(pending.splice(0), true);
+		const block: PreparedFixedBlock = {
+			...blockBase(ctx),
+			kind: "fixed",
+			tag: "markdown-image",
+			height: IMAGE_PREVIEW_HEIGHT,
+			data: {
+				src,
+				alt: decodeCharacterReferences(image.text),
+				...(image.title != null ? { title: decodeCharacterReferences(image.title) } : {}),
+			},
+		};
+		appendGroup(blocks, [block], 4);
+		return true;
+	});
+	flush(lines, blocks.length > 0);
+	return blocks;
 }
 
 function buildPreparedInline(
@@ -779,6 +928,20 @@ function buildPreparedInline(
 		blocks.push({ ...block, marginTop: blocks.length === 0 ? 0 : 4 });
 	}
 	return blocks;
+}
+
+/** Preserve raw item inputs only when a content-column-dependent atom needs them. */
+function agentReferencesForPieces(
+	items: RichInlineItem[],
+	pieces: readonly InlinePiece[],
+): PreparedAgentReferences | undefined {
+	const atoms: PreparedAgentReferences["atoms"] = [];
+	for (const [itemIndex, piece] of pieces.entries()) {
+		if (piece.agentReferenceWidth !== undefined) {
+			atoms.push({ itemIndex, baseWidth: piece.agentReferenceWidth });
+		}
+	}
+	return atoms.length > 0 ? { items, atoms } : undefined;
 }
 
 function buildOneInline(
@@ -805,11 +968,15 @@ function buildOneInline(
 		};
 	});
 	const hasMath = pieces.some((p) => p.math != null);
+	const agentReferences = agentReferencesForPieces(items, pieces);
 	// A formula taller than the text line box must grow the line, or its glyphs
 	// would overlap the neighbouring lines. `PreparedInlineBlock` carries a single
 	// lineHeight, so the whole block adopts the tallest formula's height — the same
 	// thing the browser's own line-height calculation does.
-	let lineHeight = lineHeightForVariant(variant);
+	let lineHeight = Math.max(
+		lineHeightForVariant(variant),
+		agentReferences ? agentReferenceMetrics().height : 0,
+	);
 	if (hasMath) {
 		for (const piece of pieces) {
 			if (piece.math && piece.math.height > lineHeight) lineHeight = Math.ceil(piece.math.height);
@@ -819,6 +986,7 @@ function buildOneInline(
 		...blockBase(ctx),
 		kind: "inline",
 		flow: prepareRichInline(items),
+		...(agentReferences ? { agentReferences } : {}),
 		lineHeight,
 		classNames: pieces.map((p) => p.className),
 		hrefs: pieces.map((p) => p.href),
@@ -831,6 +999,9 @@ function collectInlineLines(
 	tokens: readonly Token[],
 	variant: InlineVariant,
 	ctx: ParseContext,
+	// Emit from this existing walk so nested emphasis/links retain their marks on
+	// both sides, without a second recursive token traversal. Tables/headings omit it.
+	emitImage?: (image: Tokens.Image, pending: InlinePiece[][]) => boolean,
 ): InlinePiece[][] {
 	const lines: InlinePiece[][] = [[]];
 	const current = (): InlinePiece[] => {
@@ -908,6 +1079,24 @@ function collectInlineLines(
 				case "link": {
 					const link = token as Tokens.Link;
 					const linkMarks = { ...marks, href: parseHref(link.href) };
+					const agentId = parseAgentReference(linkMarks.href);
+					if (agentId) {
+						// The whole authored title is one body-font atom, never a status item
+						// followed by separately wrapping bold/code/link-label fragments.
+						// A session reference is a single title chip, not a Markdown document:
+						// image labels contribute their alt text just like the flowing renderer.
+						let label = agentReferenceLabel(link.tokens ?? []);
+						if (ctx.formulas) {
+							label = label.replace(MATH_SENTINEL_RE, (source, index) => {
+								const latex = ctx.formulas?.[Number(index)];
+								return latex != null ? `$${latex}$` : source;
+							});
+						}
+						push(
+							agentReferencePiece(normalizeAgentReferenceLabel(label) || agentId, linkMarks.href),
+						);
+						continue;
+					}
 					walk(link.tokens ?? [], linkMarks);
 					// Append once to the logical link BEFORE measuring. Decorating each
 					// painted fragment would repeat the suffix and invalidate line widths.
@@ -920,6 +1109,7 @@ function collectInlineLines(
 				}
 				case "image": {
 					const img = token as Tokens.Image;
+					if (emitImage?.(img, lines)) continue;
 					push(textPiece(img.text.length > 0 ? img.text : (img.href ?? "image"), marks, variant));
 					continue;
 				}
@@ -946,6 +1136,39 @@ function collectInlineLines(
 	walk(tokens, EMPTY_MARKS);
 	while (lines.length > 0 && lines.at(-1)?.length === 0) lines.pop();
 	return lines.length === 0 ? [[]] : lines;
+}
+
+/** Keep explicit Markdown breaks as word boundaries while discarding label styling. */
+function agentReferenceLabel(tokens: readonly Token[]): string {
+	return inlineTokensToPlainText(
+		tokens.map((token) => {
+			if (token.type === "br") return { type: "text", text: " " };
+			const nested = "tokens" in token ? token.tokens : undefined;
+			if (Array.isArray(nested) && nested.length > 0 && token.type !== "codespan") {
+				return { type: token.type, text: agentReferenceLabel(nested) };
+			}
+			return token;
+		}),
+	);
+}
+
+function agentReferencePiece(label: string, href: string | null): InlinePiece {
+	const { font, chromeWidth, maxWidth, letterSpacing } = agentReferenceMetrics();
+	const text = label;
+	const naturalWidth = measureRichInlineStats(
+		prepareRichInline([{ text, font, break: "never", letterSpacing }]),
+		TABLE_NATURAL_WIDTH_BOUND,
+	).maxLineWidth;
+	const width = Math.min(maxWidth, naturalWidth + chromeWidth);
+	return {
+		text,
+		font,
+		className: "vlist-frag agent-reference-atom is-link",
+		href,
+		breakMode: "never",
+		extraWidth: width - naturalWidth,
+		agentReferenceWidth: width,
+	};
 }
 
 function textPiece(text: string, marks: MarkState, variant: InlineVariant): InlinePiece | null {
@@ -986,7 +1209,13 @@ function codePiece(text: string, marks: MarkState): InlinePiece | null {
 function canMerge(a: InlinePiece, b: InlinePiece): boolean {
 	// A math atom's width lives in its own `extraWidth`; concatenating its
 	// placeholder text into a neighbour would silently drop the formula.
-	if (a.math != null || b.math != null) return false;
+	if (
+		a.math != null ||
+		b.math != null ||
+		a.agentReferenceWidth !== undefined ||
+		b.agentReferenceWidth !== undefined
+	)
+		return false;
 	return (
 		a.font === b.font &&
 		a.className === b.className &&
@@ -1147,6 +1376,7 @@ function buildTableCell(
 		};
 	});
 	const flow = prepareRichInline(items);
+	const agentReferences = agentReferencesForPieces(items, resolved);
 	// Natural width (max-content): a bound large enough that no wrap can occur.
 	const natural = measureRichInlineStats(flow, TABLE_NATURAL_WIDTH_BOUND);
 	// A cell formula must survive into the render layer, exactly like a paragraph's
@@ -1162,6 +1392,7 @@ function buildTableCell(
 	}
 	return {
 		flow,
+		...(agentReferences ? { agentReferences, inlineHeight: agentReferenceMetrics().height } : {}),
 		classNames: resolved.map((p) => p.className),
 		hrefs: resolved.map((p) => p.href),
 		fonts: resolved.map((p) => p.font),
@@ -1187,6 +1418,15 @@ function buildTableCell(
 function measureCellMinWidth(pieces: readonly InlinePiece[]): number {
 	let widest = 0;
 	for (const piece of pieces) {
+		// References stay atomic but ellipsize with their column. Their min-content
+		// floor is just the fixed status/padding chrome, not the full title width.
+		if (piece.agentReferenceWidth !== undefined) {
+			widest = Math.max(
+				widest,
+				Math.min(piece.agentReferenceWidth, agentReferenceMetrics().chromeWidth),
+			);
+			continue;
+		}
 		// A math atom is unbreakable and already carries its full width.
 		if (piece.math != null) {
 			const width = piece.math.width;
@@ -1281,7 +1521,12 @@ function boldenPiece(piece: InlinePiece): InlinePiece {
 	// the same generation, so a stale constant here would fail every match and
 	// silently leave header cells measured at regular weight (i.e. too narrow).
 	const { font } = typographyMetrics();
-	if (piece.math != null || piece.font === font.inlineCode) return piece;
+	if (
+		piece.math != null ||
+		piece.agentReferenceWidth !== undefined ||
+		piece.font === font.inlineCode
+	)
+		return piece;
 	const bold = piece.font === font.bodyItalic ? font.bodyBoldItalic : font.bodyBold;
 	if (piece.font === bold) return piece;
 	return { ...piece, font: bold };
@@ -1516,6 +1761,21 @@ function hrefScheme(value: string): string | null {
 }
 
 /**
+ * Image destinations follow MarkdownContent's defaultUrlTransform allow-list,
+ * plus document assets and validated device-qualified file references. Never use
+ * parseHref here: it canonicalizes URLs and turns file paths into link markers.
+ * The renderer owns source resolution; this layer only returns inert source data.
+ */
+function parseImageSource(href: string): string | null {
+	const source = decodeCharacterReferences(href);
+	if (source.trim().length === 0) return null;
+	const scheme = hrefScheme(source);
+	if (scheme === null) return source;
+	if (/^nf-file$/i.test(scheme)) return parseLocalFilePath(source) ? source : null;
+	return /^(?:https?|ircs?|mailto|xmpp|nf-doc-asset)$/i.test(scheme) ? source : null;
+}
+
+/**
  * Normalize a link target, or return null when it must not be rendered as a link.
  *
  * Absolute http(s) URLs are canonicalized through `URL` (that is what the chunked
@@ -1554,6 +1814,10 @@ function parseHref(href: string | null | undefined): string | null {
 	// Decoding only matters when there is a reference to decode; skipping the
 	// regex passes keeps the common link on one string scan.
 	const probe = trimmed.includes("&") ? decodeCharacterReferences(trimmed) : trimmed;
+	if (isAgentReference(probe)) {
+		const id = parseAgentReference(probe);
+		return id ? agentReferenceMarker(id) : null;
+	}
 	// These are file hints, never browser-navigable schemes. Validate the full
 	// shape and carry the location/device in an inert marker before filtering.
 	if (/^(?:file:|nf-file:|[a-z]:[\\/])/i.test(probe)) {
@@ -1602,6 +1866,7 @@ export const MARKDOWN_CONSTANTS = {
 	BLOCKQUOTE_PADDING,
 	BLOCKQUOTE_BORDER,
 	CODE_LANG_EXTRA_TOP,
+	IMAGE_PREVIEW_HEIGHT,
 	INLINE_CODE_EXTRA_WIDTH,
 	MERMAID_PLACEHOLDER_HEIGHT,
 	KATEX_PLACEHOLDER_HEIGHT,

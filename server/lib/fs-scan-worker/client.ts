@@ -1,14 +1,11 @@
-/**
- * Run storage directory walks only in filesystem workers, with bounded concurrency.
- * A failed worker is never replaced with a walk on the server thread. Failed
- * candidates enter a short cooldown before another request can retry isolation.
- */
-
-import { Worker } from "node:worker_threads";
-import { compiledWorkerSpecifiers, workerEntryFromSpecifier } from "../compiled-worker";
+/** Bounded filesystem workers; failures never walk directories on the server thread. */
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
 import { hotSafe } from "../hot-safe";
 import { logger } from "../logger";
 import { isCompiledRuntime } from "../runtime-target";
+import { WorkerCleanupError } from "../worker-runtime/lifecycle";
+import { WorkerPool, WorkerPoolError, type WorkerTaskContext } from "../worker-runtime/pool";
+import { TaskQueueError } from "../worker-runtime/queue";
 import {
 	DIR_SCAN_MAX_DEPTH,
 	DIR_SCAN_MAX_ENTRIES,
@@ -21,7 +18,7 @@ export { DirectoryMeasureAbortedError };
 
 const CONCURRENCY = 4;
 const READY_TIMEOUT_MS = 5_000;
-/** A multi-million-entry tree can take minutes. This only bounds a wedged worker. */
+/** The original long scan budget includes queueing and startup. */
 const MEASURE_TIMEOUT_MS = 15 * 60 * 1000;
 const RETRY_COOLDOWN_MS = 5_000;
 
@@ -31,21 +28,6 @@ export class FsScanWorkerUnavailableError extends Error {
 		super(`Filesystem scan worker unavailable: ${reason}`, { cause });
 		this.name = "FsScanWorkerUnavailableError";
 	}
-}
-
-interface FsScanGate {
-	active: number;
-	waiters: Array<() => void>;
-	unavailableError?: FsScanWorkerUnavailableError;
-	retryAfter?: number;
-	resolvedSpecifier?: string;
-}
-
-function gate(): FsScanGate {
-	return hotSafe<FsScanGate>("narrafork.fsScan.gate", () => ({
-		active: 0,
-		waiters: [],
-	}));
 }
 
 export function fsScanWorkerSpecifierCandidates(
@@ -58,57 +40,6 @@ export function fsScanWorkerSpecifierCandidates(
 		moduleUrl,
 		compiled,
 	);
-}
-
-async function withSlot<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (signal?.aborted) throw new DirectoryMeasureAbortedError();
-	const current = gate();
-	if (current.active >= CONCURRENCY) {
-		await new Promise<void>((resolve, reject) => {
-			const resume = () => {
-				signal?.removeEventListener("abort", onAbort);
-				// Reserve the slot before resolving, so a new caller cannot take it.
-				current.active++;
-				resolve();
-			};
-			const onAbort = () => {
-				const index = current.waiters.indexOf(resume);
-				if (index !== -1) current.waiters.splice(index, 1);
-				reject(new DirectoryMeasureAbortedError());
-			};
-			current.waiters.push(resume);
-			signal?.addEventListener("abort", onAbort, { once: true });
-		});
-	} else {
-		current.active++;
-	}
-	try {
-		if (signal?.aborted) throw new DirectoryMeasureAbortedError();
-		return await run();
-	} finally {
-		current.active--;
-		current.waiters.shift()?.();
-	}
-}
-
-interface WorkerResultMessage {
-	type: "result";
-	requestId: string;
-	roots: unknown;
-}
-
-interface WorkerProgressMessage {
-	type: "progress";
-	requestId: string;
-	entriesScanned: number;
-	sizeBytes: number;
-}
-
-interface WorkerErrorMessage {
-	type: "error";
-	requestId: string;
-	message: string;
-	aborted?: boolean;
 }
 
 function validMeasurements(value: unknown, count: number): value is DirectoryTreeMeasurement[] {
@@ -128,159 +59,172 @@ function validMeasurements(value: unknown, count: number): value is DirectoryTre
 	);
 }
 
-function measureInWorker(
-	specifier: string,
-	roots: string[],
-	options: MeasureDirectoryTreesOptions,
-): Promise<DirectoryTreeMeasurement[]> {
-	const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-	const maxEntries = options.maxEntries ?? DIR_SCAN_MAX_ENTRIES;
-	const maxDepth = options.maxDepth ?? DIR_SCAN_MAX_DEPTH;
-	return new Promise((resolve, reject) => {
-		const worker = new Worker(workerEntryFromSpecifier(specifier));
-		let settled = false;
-		let ready = false;
-		let measureTimer: ReturnType<typeof setTimeout> | undefined;
-		const readyTimer = setTimeout(
-			() => finish(new Error("filesystem scan worker did not become ready")),
-			READY_TIMEOUT_MS,
-		);
-
-		const finish = (error?: unknown, result?: DirectoryTreeMeasurement[]) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(readyTimer);
-			clearTimeout(measureTimer);
-			options.signal?.removeEventListener("abort", onAbort);
-			void worker.terminate().catch(() => {});
-			if (error) reject(error);
-			else if (result) resolve(result);
-			else reject(new Error("filesystem scan worker returned no measurements"));
-		};
-
-		const onAbort = () => {
+type Scan = { roots: string[]; options: MeasureDirectoryTreesOptions };
+function createPool() {
+	return new WorkerPool<Scan, DirectoryTreeMeasurement[]>({
+		concurrency: CONCURRENCY,
+		maxQueued: 32,
+		maxQueuedBytes: 64 * 1024 * 1024,
+		timeoutMs: MEASURE_TIMEOUT_MS,
+		reuse: false,
+		async create(context) {
+			checkLegacyScans();
+			if (owner.unavailableError && Date.now() < owner.retryAfter) throw owner.unavailableError;
+			let connected: Awaited<ReturnType<typeof connectCompiledWorker>>;
 			try {
-				worker.postMessage({ type: "cancel", requestId });
-			} catch {
-				// The worker is already gone.
+				connected = await connectCompiledWorker(fsScanWorkerSpecifierCandidates(), {
+					signal: context.signal,
+					deadlineAt: Math.min(context.deadlineAt, Date.now() + READY_TIMEOUT_MS),
+					timeoutMs: READY_TIMEOUT_MS,
+					sendPing: false,
+					isReady: (message) => {
+						if ((message as { type?: string })?.type !== "ready")
+							throw new Error("filesystem scan worker sent no ready handshake");
+						return true;
+					},
+				});
+			} catch (error) {
+				if (error instanceof WorkerCleanupError || context.signal.aborted) throw error;
+				throw unavailable(error);
 			}
-			finish(new DirectoryMeasureAbortedError());
-		};
-
-		if (options.signal) {
-			if (options.signal.aborted) {
-				finish(new DirectoryMeasureAbortedError());
-				return;
-			}
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-
-		worker.once("error", (error) => finish(error));
-		worker.once("exit", (code) => {
-			finish(new Error(`filesystem scan worker exited before completing (code ${code})`));
-		});
-		worker.on("message", (message: { type?: string }) => {
-			if (settled) return;
-			if (!ready) {
-				if (message?.type !== "ready") {
-					finish(new Error("filesystem scan worker sent no ready handshake"));
-					return;
-				}
-				ready = true;
-				clearTimeout(readyTimer);
-				measureTimer = setTimeout(
-					() => finish(new Error("filesystem scan worker timed out")),
-					MEASURE_TIMEOUT_MS,
-				);
-				try {
-					worker.postMessage({
-						type: "measure",
-						requestId,
-						roots,
-						maxEntries,
-						maxDepth,
-					});
-				} catch (error) {
-					finish(error);
-				}
-				return;
-			}
-			if (message?.type === "progress") {
-				const progress = message as WorkerProgressMessage;
-				if (progress.requestId === requestId) {
-					options.onProgress?.({
-						entriesScanned: progress.entriesScanned,
-						sizeBytes: progress.sizeBytes,
-					});
-				}
-				return;
-			}
-			if (message?.type === "result") {
-				const result = message as WorkerResultMessage;
-				if (result.requestId !== requestId) return;
-				if (!validMeasurements(result.roots, roots.length)) {
-					finish(new Error("filesystem scan worker returned invalid measurements"));
-				} else {
-					finish(undefined, result.roots);
-				}
-				return;
-			}
-			if (message?.type === "error") {
-				const failure = message as WorkerErrorMessage;
-				if (failure.requestId !== requestId) return;
-				finish(
-					failure.aborted
-						? new DirectoryMeasureAbortedError()
-						: new Error(failure.message || "filesystem scan worker failed"),
-				);
-			}
-		});
+			owner.unavailableError = undefined;
+			const { worker, handle } = connected;
+			return {
+				get closed() {
+					return handle.closed;
+				},
+				close: () => handle.close(),
+				run: ({ roots, options }, task: WorkerTaskContext) =>
+					new Promise<DirectoryTreeMeasurement[]>((resolve, reject) => {
+						const requestId = task.requestId;
+						const finish = (error?: unknown, result?: DirectoryTreeMeasurement[]) => {
+							worker.off("message", onMessage);
+							worker.off("error", onError);
+							worker.off("exit", onExit);
+							if (error !== undefined) reject(error);
+							else if (result) resolve(result);
+							else reject(new Error("filesystem scan worker returned no measurements"));
+						};
+						const onError = (error: Error) => finish(error);
+						const onExit = (code: number) =>
+							finish(new Error(`filesystem scan worker exited before completing (code ${code})`));
+						const onMessage = (message: {
+							type?: string;
+							requestId?: string;
+							roots?: unknown;
+							entriesScanned: number;
+							sizeBytes: number;
+							aborted?: boolean;
+							message?: string;
+						}) => {
+							if (!message || typeof message !== "object" || Array.isArray(message)) {
+								finish(new Error("filesystem scan worker returned an invalid response"));
+								return;
+							}
+							if (message.type === "ready" && message.requestId === undefined) return;
+							if (typeof message.requestId !== "string") {
+								finish(new Error("filesystem scan worker returned an invalid response"));
+								return;
+							}
+							if (message.requestId !== requestId) return;
+							try {
+								if (message.type === "progress") {
+									if (
+										!Number.isSafeInteger(message.entriesScanned) ||
+										message.entriesScanned < 0 ||
+										!Number.isSafeInteger(message.sizeBytes) ||
+										message.sizeBytes < 0
+									)
+										throw new Error("filesystem scan worker returned invalid progress");
+									options.onProgress?.({
+										entriesScanned: message.entriesScanned,
+										sizeBytes: message.sizeBytes,
+									});
+								} else if (message.type === "result") {
+									if (!validMeasurements(message.roots, roots.length))
+										finish(new Error("filesystem scan worker returned invalid measurements"));
+									else finish(undefined, message.roots);
+								} else if (message.type === "error")
+									finish(
+										message.aborted === true
+											? new DirectoryMeasureAbortedError()
+											: new Error(
+													typeof message.message === "string"
+														? message.message
+														: "filesystem scan worker failed",
+												),
+									);
+								else finish(new Error("filesystem scan worker returned an invalid response"));
+							} catch (error) {
+								finish(error);
+							}
+						};
+						worker.on("message", onMessage);
+						worker.on("error", onError);
+						worker.on("exit", onExit);
+						try {
+							worker.postMessage({
+								type: "measure",
+								requestId,
+								roots,
+								maxEntries: options.maxEntries ?? DIR_SCAN_MAX_ENTRIES,
+								maxDepth: options.maxDepth ?? DIR_SCAN_MAX_DEPTH,
+							});
+						} catch (error) {
+							finish(error);
+						}
+					}),
+			};
+		},
 	});
 }
-
-async function measureWithWorkers(
-	roots: string[],
-	options: MeasureDirectoryTreesOptions,
-): Promise<DirectoryTreeMeasurement[]> {
-	const current = gate();
-	if (current.unavailableError && Date.now() < (current.retryAfter ?? 0)) {
-		throw current.unavailableError;
+const owner = hotSafe("narrafork.fsScan.gate", () => ({
+	pool: createPool(),
+	restartRequired: false,
+	unavailableError: undefined as FsScanWorkerUnavailableError | undefined,
+	retryAfter: 0,
+}));
+// The old gate released counters before observing exit and retained no handles.
+// Even zero old counters cannot prove resource reclamation. Preserve that owner and
+// require an operator restart for this one-time upgrade, never for ordinary failures.
+owner.restartRequired ??= !owner.pool;
+owner.pool ??= createPool();
+owner.retryAfter ??= 0;
+function checkLegacyScans(): void {
+	if (owner.restartRequired)
+		throw new FsScanWorkerUnavailableError(
+			new Error("Legacy filesystem worker ownership cannot be verified; process restart required"),
+		);
+}
+function unavailable(cause: unknown): FsScanWorkerUnavailableError {
+	if (cause instanceof FsScanWorkerUnavailableError) return cause;
+	const error = new FsScanWorkerUnavailableError(cause);
+	owner.unavailableError = error;
+	owner.retryAfter = Date.now() + RETRY_COOLDOWN_MS;
+	try {
+		logger.warn("Filesystem scan worker unavailable; directory measurement failed", {
+			kind: "fs-scan",
+			outcome: "failed",
+		});
+	} catch {
+		// A diagnostic sink cannot replace the scan failure or bypass cleanup.
 	}
+	return error;
+}
 
-	const candidates = current.resolvedSpecifier
-		? [current.resolvedSpecifier]
-		: fsScanWorkerSpecifierCandidates();
-	const failures: unknown[] = [];
-	for (const specifier of candidates) {
-		if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
-		try {
-			const result = await measureInWorker(specifier, roots, options);
-			current.resolvedSpecifier = specifier;
-			current.unavailableError = undefined;
-			current.retryAfter = undefined;
-			return result;
-		} catch (error) {
-			if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
-			if (error instanceof DirectoryMeasureAbortedError) throw error;
-			failures.push(error);
-		}
-	}
-	current.resolvedSpecifier = undefined;
-	const lastError = failures.at(-1);
-	const error = new FsScanWorkerUnavailableError(
-		failures.length > 1
-			? new AggregateError(
-					failures,
-					lastError instanceof Error ? lastError.message : String(lastError),
-				)
-			: (lastError ?? new Error("no filesystem scan worker candidates")),
-	);
-	current.unavailableError = error;
-	current.retryAfter = Date.now() + RETRY_COOLDOWN_MS;
-	logger.warn("Filesystem scan worker unavailable; directory measurement failed", {
-		reason: error.message,
-	});
-	throw error;
+/** Production shutdown: admission remains closed until an explicit test reset. */
+export async function closeFsScanWorkers(): Promise<void> {
+	await owner.pool.close();
+	checkLegacyScans();
+}
+export async function resetFsScanWorkersForTest(): Promise<void> {
+	await closeFsScanWorkers();
+	owner.pool = createPool();
+	owner.unavailableError = undefined;
+	owner.retryAfter = 0;
+}
+export function fsScanWorkerStats() {
+	return owner.pool.stats;
 }
 
 export async function measureDirectoriesOffThread(
@@ -288,6 +232,28 @@ export async function measureDirectoriesOffThread(
 	options: MeasureDirectoryTreesOptions = {},
 ): Promise<DirectoryTreeMeasurement[]> {
 	if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
-	if (roots.length === 0) return [];
-	return withSlot(() => measureWithWorkers(roots, options), options.signal);
+	checkLegacyScans();
+	// Even empty/control requests must not bypass production shutdown.
+	if (roots.length === 0 && !owner.pool.stats.closed) return [];
+	try {
+		return await owner.pool.run(
+			{ roots, options },
+			{
+				signal: options.signal,
+				deadlineAt: Date.now() + MEASURE_TIMEOUT_MS,
+				bytes: roots.reduce((bytes, root) => bytes + root.length * 2, 0),
+			},
+		);
+	} catch (error) {
+		if (error instanceof WorkerCleanupError) throw error;
+		if (options.signal?.aborted) throw new DirectoryMeasureAbortedError();
+		if (
+			error instanceof DirectoryMeasureAbortedError ||
+			error instanceof WorkerCleanupError ||
+			error instanceof WorkerPoolError ||
+			(error instanceof TaskQueueError && error.code !== "TASK_QUEUE_TIMEOUT")
+		)
+			throw error;
+		throw unavailable(error);
+	}
 }

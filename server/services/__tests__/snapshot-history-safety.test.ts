@@ -51,6 +51,8 @@ function addNarrator(cwd: string) {
 			id: narratorId,
 			cwd,
 			status: "idle",
+			// The existing restore/COW suite exercises the enabled remote branch.
+			defaultDeviceId: "remote-test",
 			apiConversationId: "keep-until-commit",
 			createdAt: now,
 			updatedAt: now,
@@ -74,6 +76,25 @@ function addMessage(
 	return messageId;
 }
 
+// Budget fixtures need >5k rows; per-row inserts cost ~2.5s locally and exceed the 5s
+// test timeout on slower CI runners, so batch them into multi-row statements.
+const BULK_INSERT_ROWS = 500;
+function insertBulkHistory(
+	messages: (typeof narratorMessages.$inferInsert)[],
+	refs: (typeof narratorMessageRefs.$inferInsert)[] = [],
+) {
+	db.transaction((tx) => {
+		for (let start = 0; start < messages.length; start += BULK_INSERT_ROWS)
+			tx.insert(narratorMessages)
+				.values(messages.slice(start, start + BULK_INSERT_ROWS))
+				.run();
+		for (let start = 0; start < refs.length; start += BULK_INSERT_ROWS)
+			tx.insert(narratorMessageRefs)
+				.values(refs.slice(start, start + BULK_INSERT_ROWS))
+				.run();
+	});
+}
+
 function addTool(narratorId: string, messageId: string, toolUseId: string, filePath: string) {
 	const id = generateId();
 	db.insert(narratorToolCalls)
@@ -85,7 +106,7 @@ function addTool(narratorId: string, messageId: string, toolUseId: string, fileP
 			toolName: "Write",
 			inputJson: { file_path: filePath, content: "changed\n" },
 			status: "success",
-			executionDeviceId: "local",
+			executionDeviceId: "remote-test",
 			executionCwd: join(filePath, ".."),
 			executionPathFlavor: "posix",
 			resolvedFilePath: filePath,
@@ -489,19 +510,16 @@ describe("origin-bound derived history cleanup", () => {
 		]);
 		const origin = addAgentCall(narratorId, selected, "many-children");
 		const child = addChild(cwd, narratorId, origin);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++)
-				tx.insert(narratorMessages)
-					.values({
-						id: generateId(),
-						narratorId: child,
-						parentToolUseId: "many-children",
-						role: "assistant",
-						contentJson: [],
-						createdAt: now,
-					})
-					.run();
-		});
+		insertBulkHistory(
+			Array.from({ length: 5_001 }, () => ({
+				id: generateId(),
+				narratorId: child,
+				parentToolUseId: "many-children",
+				role: "assistant" as const,
+				contentJson: [],
+				createdAt: now,
+			})),
+		);
 		await expect(
 			narratorService.deleteMessage(narratorId, selected, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);
@@ -513,17 +531,22 @@ describe("origin-bound derived history cleanup", () => {
 	test("an oversized caller ref range is rejected before loading message bodies", async () => {
 		const { narratorId } = fixture();
 		const boundary = addMessage(narratorId, [{ type: "text", text: "boundary" }], 0);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++) {
-				const id = generateId();
-				tx.insert(narratorMessages)
-					.values({ id, narratorId, role: "assistant", contentJson: [], createdAt: now })
-					.run();
-				tx.insert(narratorMessageRefs)
-					.values({ id: generateId(), narratorId, messageId: id, seq: index + 1 })
-					.run();
-			}
-		});
+		const messages = Array.from({ length: 5_001 }, () => ({
+			id: generateId(),
+			narratorId,
+			role: "assistant" as const,
+			contentJson: [],
+			createdAt: now,
+		}));
+		insertBulkHistory(
+			messages,
+			messages.map((message, index) => ({
+				id: generateId(),
+				narratorId,
+				messageId: message.id,
+				seq: index + 1,
+			})),
+		);
 		await expect(
 			narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);
@@ -1149,10 +1172,132 @@ describe("message history truncation timing", () => {
 	});
 });
 
+describe("message-only checkpoint device boundaries", () => {
+	test.each([
+		"deleteMessage",
+		"deleteMessageBlocks",
+	] as const)("%s does not turn legacy local calls into remote checkpoints after a device switch", async (method) => {
+		const { narratorId, cwd } = fixture();
+		db.update(narrators).set({ defaultDeviceId: null }).where(eq(narrators.id, narratorId)).run();
+		const toolUseId = generateId();
+		const messageId = addMessage(narratorId, [{ type: "tool_use", id: toolUseId, name: "Write" }]);
+		const path = join(cwd, "legacy-local.txt");
+		writeFileSync(path, "keep local bytes\n");
+		const call = addTool(narratorId, messageId, toolUseId, path);
+		db.update(narratorToolCalls)
+			.set({ executionDeviceId: null, executionTargetsJson: null })
+			.where(eq(narratorToolCalls.id, call))
+			.run();
+		db.update(narrators)
+			.set({ defaultDeviceId: "remote-test" })
+			.where(eq(narrators.id, narratorId))
+			.run();
+		if (method === "deleteMessage")
+			await narratorService.deleteMessage(narratorId, messageId, { skipRevert: true });
+		else
+			await narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }], {
+				skipRevert: true,
+			});
+		expect(
+			db.select().from(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).all(),
+		).toHaveLength(0);
+		expect(readFileSync(path, "utf8")).toBe("keep local bytes\n");
+	});
+
+	test("mixed parent and child history retains only a child's explicitly frozen remote target", async () => {
+		const { narratorId, cwd } = fixture();
+		db.update(narrators).set({ defaultDeviceId: null }).where(eq(narrators.id, narratorId)).run();
+		const selected = addMessage(narratorId, [
+			{ type: "tool_use", id: "mixed-agent", name: "Agent" },
+		]);
+		const origin = addAgentCall(narratorId, selected, "mixed-agent");
+		const child = addChild(cwd, narratorId, origin);
+		const childId = childMessage(child, "mixed-agent", "unreferenced mixed child");
+		const remoteCall = addTool(child, childId, "remote-write", join(cwd, "remote-child.txt"));
+		const localCall = addTool(child, childId, "local-write", join(cwd, "local-child.txt"));
+		const legacyCall = addTool(child, childId, "legacy-write", join(cwd, "legacy-child.txt"));
+		db.update(narratorToolCalls)
+			.set({ executionDeviceId: "local" })
+			.where(eq(narratorToolCalls.id, localCall))
+			.run();
+		db.update(narratorToolCalls)
+			.set({ executionDeviceId: null, executionTargetsJson: null })
+			.where(eq(narratorToolCalls.id, legacyCall))
+			.run();
+		await narratorService.deleteMessage(narratorId, selected);
+		const calls = db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.narratorId, narratorId))
+			.all();
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({
+			isFileHistoryCheckpoint: true,
+			executionDeviceId: "remote-test",
+			executionOriginToolCallId: remoteCall,
+		});
+		expect(messageBlocks(childId)).toBeUndefined();
+		expect(narratorState(child)?.status).toBe("archived");
+	});
+
+	for (const method of ["deleteMessage", "deleteMessageBlocks"] as const) {
+		test(`${method} preserves remote evidence in a mixed local-default selection`, async () => {
+			const { narratorId, cwd } = fixture();
+			db.update(narrators).set({ defaultDeviceId: null }).where(eq(narrators.id, narratorId)).run();
+			const remoteUse = generateId();
+			const localUse = generateId();
+			const messageId = addMessage(narratorId, [
+				{ type: "tool_use", id: remoteUse, name: "Write" },
+				{ type: "tool_use", id: localUse, name: "Write" },
+			]);
+			const remoteCall = addTool(narratorId, messageId, remoteUse, join(cwd, "remote.txt"));
+			const localCall = addTool(narratorId, messageId, localUse, join(cwd, "local.txt"));
+			db.update(narratorToolCalls)
+				.set({ executionDeviceId: "local" })
+				.where(eq(narratorToolCalls.id, localCall))
+				.run();
+			if (method === "deleteMessage") await narratorService.deleteMessage(narratorId, messageId);
+			else
+				await narratorService.deleteMessageBlocks(narratorId, [
+					{ messageId, blockIndex: 0 },
+					{ messageId, blockIndex: 1 },
+				]);
+			const calls = db
+				.select()
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.narratorId, narratorId))
+				.all();
+			expect(calls).toHaveLength(1);
+			expect(calls[0]).toMatchObject({
+				isFileHistoryCheckpoint: true,
+				executionDeviceId: "remote-test",
+				executionOriginToolCallId: remoteCall,
+				inputJson: { file_path: join(cwd, "remote.txt"), content: "changed\n" },
+			});
+		});
+	}
+
+	test("a local tool override in a remote-default session creates no file checkpoint", async () => {
+		const { narratorId, cwd } = fixture();
+		const toolUseId = generateId();
+		const messageId = addMessage(narratorId, [{ type: "tool_use", id: toolUseId, name: "Write" }]);
+		const call = addTool(narratorId, messageId, toolUseId, join(cwd, "local.txt"));
+		db.update(narratorToolCalls)
+			.set({ executionDeviceId: "local" })
+			.where(eq(narratorToolCalls.id, call))
+			.run();
+		await narratorService.deleteMessage(narratorId, messageId, { skipRevert: true });
+		expect(
+			db.select().from(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).all(),
+		).toHaveLength(0);
+	});
+});
+
 describe("keep-files range snapshot diagnostics", () => {
 	for (const shape of ["no-tools", "large-write", "large-bash-tree-boundary"] as const) {
 		test(`${shape}: real range deletion preserves bytes without capturing or restoring trees`, async () => {
 			const { narratorId, cwd } = fixture();
+			db.update(narrators).set({ defaultDeviceId: null }).where(eq(narrators.id, narratorId)).run();
 			const boundary = addMessage(narratorId, [{ type: "text", text: "keep user turn" }], 1);
 			const path = join(cwd, "kept-workspace.txt");
 			writeFileSync(path, "current workspace bytes\n");
@@ -1167,6 +1312,10 @@ describe("keep-files range snapshot diagnostics", () => {
 			const payloadBytes = shape === "no-tools" ? 0 : 3 * 1024 * 1024;
 			if (shape !== "no-tools") {
 				const call = addTool(narratorId, tail, toolUseId, path);
+				db.update(narratorToolCalls)
+					.set({ executionDeviceId: "local" })
+					.where(eq(narratorToolCalls.id, call))
+					.run();
 				db.update(narratorToolCalls)
 					.set(
 						shape === "large-write"
@@ -1222,12 +1371,7 @@ describe("keep-files range snapshot diagnostics", () => {
 					),
 				)
 				.all();
-			expect(checkpoints).toHaveLength(shape === "no-tools" ? 0 : 1);
-			if (shape === "large-bash-tree-boundary")
-				expect(checkpoints[0]).toMatchObject({
-					treeHashBefore: "a".repeat(40),
-					treeHashAfter: "b".repeat(40),
-				});
+			expect(checkpoints).toHaveLength(0);
 			const timing = [...info.mock.calls, ...warn.mock.calls].find(
 				([message]) => message === "Message history truncation completed",
 			)?.[1];

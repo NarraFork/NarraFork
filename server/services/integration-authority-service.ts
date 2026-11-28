@@ -9,8 +9,15 @@ import {
 } from "@shared/integrations/resources";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import { db } from "../db";
+import { activeDatabaseBackend, db, sqlite } from "../db";
 import { integrationAuthorities, integrationCapabilityGrants } from "../db/schema";
+import {
+	type ReadQueryOptions,
+	readDomainTask,
+	readQuery,
+	readQueryFirst,
+} from "../db/worker-read";
+import { WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -192,11 +199,23 @@ function inspectBoundedJson(
  * Every reader parses rows strictly, so one such row would make the whole authority fail
  * to load. They grant nothing now and are left out; the next grant replacement revokes them.
  */
-function isDescribableGrant(grant: IntegrationCapabilityGrant): boolean {
+function isDescribableGrant(
+	grant: Pick<IntegrationCapabilityGrant, "capabilityId" | "scopeType">,
+): boolean {
 	return (
 		grant.capabilityId in CANONICAL_CAPABILITY_DESCRIPTORS &&
 		(grant.scopeType === "global" || resourceTypeIsCanonical(grant.scopeType))
 	);
+}
+
+function assertGrantCount(count: number): void {
+	if (count > MAX_GRANTS_PER_AUTHORITY) {
+		throw new AppError(
+			"Integration authority grant limit was exceeded",
+			500,
+			"INTEGRATION_GRANT_LIMIT_EXCEEDED",
+		);
+	}
 }
 
 function normalizeScope(scope: ResourceScope): ResourceScope {
@@ -578,11 +597,54 @@ export class IntegrationAuthorityService {
 	async getSnapshot(
 		authorityId: string,
 		options: { includeExpired?: boolean } = {},
+		readOptions?: ReadQueryOptions,
 	): Promise<IntegrationAuthoritySnapshot | null> {
+		readOptions?.signal?.throwIfAborted();
 		const id = normalizeId(authorityId, "authorityId");
-		const storedAuthority = await db.query.integrationAuthorities.findFirst({
-			where: eq(integrationAuthorities.id, id),
-		});
+		if (activeDatabaseBackend === "sqlite") {
+			const now = new Date().toISOString();
+			const snapshot = await readDomainTask(
+				sqlite,
+				"platformIntegrationAuthoritySnapshot",
+				{ authorityId: id, includeExpired: options.includeExpired === true, now },
+				{ ...readOptions, executionPolicy: "worker-required" },
+			);
+			if (!snapshot.storedAuthority) return null;
+			if (snapshot.grants.length > MAX_GRANTS_PER_AUTHORITY)
+				throw new AppError(
+					"Integration authority grant limit was exceeded",
+					500,
+					"INTEGRATION_GRANT_LIMIT_EXCEEDED",
+				);
+			const stored = snapshot.storedAuthority;
+			const authority =
+				stored.state === "active" && stored.expiresAt !== null && stored.expiresAt <= now
+					? { ...stored, state: "expired" as const }
+					: stored;
+			const grants = snapshot.grants.map(
+				(row): IntegrationCapabilityGrant => ({
+					...row,
+					constraintsJson:
+						row.constraintsJson === null
+							? null
+							: inspectBoundedJson(
+									integrationCapabilityGrants.constraintsJson.mapFromDriverValue(
+										row.constraintsJson,
+									),
+									MAX_CONSTRAINTS_BYTES,
+									"grant constraints",
+								),
+				}),
+			);
+			return { authority, grants: grants.filter(isDescribableGrant) };
+		}
+		const storedAuthority = await readQueryFirst(
+			db.query.integrationAuthorities.findMany({
+				limit: 1,
+				where: eq(integrationAuthorities.id, id),
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!storedAuthority) return null;
 		const now = new Date().toISOString();
 		const authority =
@@ -591,35 +653,81 @@ export class IntegrationAuthorityService {
 			storedAuthority.expiresAt <= now
 				? { ...storedAuthority, state: "expired" as const }
 				: storedAuthority;
-		const grants = await db.query.integrationCapabilityGrants.findMany({
-			where: options.includeExpired
-				? and(
-						eq(integrationCapabilityGrants.authorityId, id),
-						isNull(integrationCapabilityGrants.revokedAt),
-					)
-				: and(
-						eq(integrationCapabilityGrants.authorityId, id),
-						isNull(integrationCapabilityGrants.revokedAt),
-						or(
-							isNull(integrationCapabilityGrants.expiresAt),
-							gt(integrationCapabilityGrants.expiresAt, now),
+		readOptions?.signal?.throwIfAborted();
+		const grants = await readQuery(
+			db.query.integrationCapabilityGrants.findMany({
+				where: options.includeExpired
+					? and(
+							eq(integrationCapabilityGrants.authorityId, id),
+							isNull(integrationCapabilityGrants.revokedAt),
+						)
+					: and(
+							eq(integrationCapabilityGrants.authorityId, id),
+							isNull(integrationCapabilityGrants.revokedAt),
+							or(
+								isNull(integrationCapabilityGrants.expiresAt),
+								gt(integrationCapabilityGrants.expiresAt, now),
+							),
 						),
-					),
-			orderBy: [
-				asc(integrationCapabilityGrants.capabilityId),
-				asc(integrationCapabilityGrants.scopeKey),
-				asc(integrationCapabilityGrants.id),
-			],
-			limit: MAX_GRANTS_PER_AUTHORITY + 1,
-		});
-		if (grants.length > MAX_GRANTS_PER_AUTHORITY) {
-			throw new AppError(
-				"Integration authority grant limit was exceeded",
-				500,
-				"INTEGRATION_GRANT_LIMIT_EXCEEDED",
-			);
-		}
+				orderBy: [
+					asc(integrationCapabilityGrants.capabilityId),
+					asc(integrationCapabilityGrants.scopeKey),
+					asc(integrationCapabilityGrants.id),
+				],
+				limit: MAX_GRANTS_PER_AUTHORITY + 1,
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
+		assertGrantCount(grants.length);
 		return { authority, grants: grants.filter(isDescribableGrant) };
+	}
+
+	async getCommittedDisplaySnapshot(authorityId: string, signal?: AbortSignal) {
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		const id = normalizeId(authorityId, "authorityId");
+		const grant = integrationCapabilityGrants;
+		const order = sql`${grant.capabilityId}, ${grant.scopeKey}, ${grant.id}`;
+		const rows = await readQuery(
+			db
+				.select({
+					// Send the policy once even if the authority has many grants.
+					policyJson: sql<IntegrationAuthority["policyJson"]>`case
+					when row_number() over (order by ${order}) = 1 then ${integrationAuthorities.policyJson}
+				end`.mapWith(integrationAuthorities.policyJson),
+					grant: {
+						capabilityId: grant.capabilityId,
+						scopeType: grant.scopeType,
+						scopeId: grant.scopeId,
+					},
+				})
+				.from(integrationAuthorities)
+				.leftJoin(
+					grant,
+					and(
+						eq(grant.authorityId, integrationAuthorities.id),
+						isNull(grant.revokedAt),
+						or(isNull(grant.expiresAt), gt(grant.expiresAt, new Date().toISOString())),
+					),
+				)
+				.where(eq(integrationAuthorities.id, id))
+				.orderBy(order)
+				.limit(MAX_GRANTS_PER_AUTHORITY + 1),
+			{
+				diagnosticSource: "oauth-grant-detail",
+				maxRows: MAX_GRANTS_PER_AUTHORITY + 1,
+				signal,
+				timeoutMs: 5_000,
+			},
+		);
+		if (!rows[0]) return null;
+		assertGrantCount(rows.length);
+		return {
+			policyJson: rows[0].policyJson,
+			grants: rows.flatMap(({ grant }) => (grant && isDescribableGrant(grant) ? [grant] : [])),
+		};
 	}
 
 	async requireSnapshot(
@@ -927,22 +1035,25 @@ export class IntegrationAuthorityService {
 	}): Promise<IntegrationAuthoritySnapshot[]> {
 		const integrationId = normalizeId(input.integrationId, "integrationId");
 		const integrationType = integrationTypeFor(input.kind);
-		const authorities = await db.query.integrationAuthorities.findMany({
-			where: input.includeRevoked
-				? and(
-						eq(integrationAuthorities.kind, input.kind),
-						eq(integrationAuthorities.integrationType, integrationType),
-						eq(integrationAuthorities.integrationId, integrationId),
-					)
-				: and(
-						eq(integrationAuthorities.kind, input.kind),
-						eq(integrationAuthorities.integrationType, integrationType),
-						eq(integrationAuthorities.integrationId, integrationId),
-						eq(integrationAuthorities.state, "active"),
-					),
-			orderBy: [asc(integrationAuthorities.createdAt), asc(integrationAuthorities.id)],
-			limit: MAX_GRANTS_PER_AUTHORITY + 1,
-		});
+		const authorities = await readQuery(
+			db.query.integrationAuthorities.findMany({
+				where: input.includeRevoked
+					? and(
+							eq(integrationAuthorities.kind, input.kind),
+							eq(integrationAuthorities.integrationType, integrationType),
+							eq(integrationAuthorities.integrationId, integrationId),
+						)
+					: and(
+							eq(integrationAuthorities.kind, input.kind),
+							eq(integrationAuthorities.integrationType, integrationType),
+							eq(integrationAuthorities.integrationId, integrationId),
+							eq(integrationAuthorities.state, "active"),
+						),
+				orderBy: [asc(integrationAuthorities.createdAt), asc(integrationAuthorities.id)],
+				limit: MAX_GRANTS_PER_AUTHORITY + 1,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (authorities.length > MAX_GRANTS_PER_AUTHORITY) {
 			throw new AppError(
 				"Integration authority limit was exceeded",
@@ -950,11 +1061,12 @@ export class IntegrationAuthorityService {
 				"INTEGRATION_AUTHORITY_LIMIT_EXCEEDED",
 			);
 		}
-		const snapshots = await Promise.all(
-			authorities.map((authority) =>
-				this.requireSnapshot(authority.id, { includeExpired: input.includeExpired }),
-			),
-		);
+		const snapshots: IntegrationAuthoritySnapshot[] = [];
+		for (const authority of authorities) {
+			snapshots.push(
+				await this.requireSnapshot(authority.id, { includeExpired: input.includeExpired }),
+			);
+		}
 		return input.includeRevoked
 			? snapshots
 			: snapshots.filter((snapshot) => snapshot.authority.state === "active");

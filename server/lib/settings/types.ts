@@ -5,11 +5,13 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { NoProxyRule } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
 import type { StorageRetentionSettings } from "@shared/storage-retention";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
@@ -81,6 +83,12 @@ export interface CustomApiProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/**
+	 * Chat Completions：工具返回的图片放哪。缺省 `"off"`（不发）。
+	 * OpenAI 官方只允许 tool content 是文本，DeepSeek 官方扩展了 image_url 内容块，
+	 * Command Code 的 CLI 结构是「工具文本 + 独立 user 图片消息」。见 shared/tool-result-images.ts。
+	 */
+	toolResultImages?: ToolResultImagesMode;
 	/**
 	 * Which User-Agent to present on outbound requests. Absent = provider default
 	 * (Claude CLI UA for official Anthropic, narrafork UA otherwise).
@@ -167,6 +175,11 @@ export interface OpenAIProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/**
+	 * Chat Completions：工具返回的图片放哪。缺省 `"off"`（不发）。
+	 * 只有 `apiMode === "completions"` 生效；Responses / Codex 有自己的路径。
+	 */
+	toolResultImages?: ToolResultImagesMode;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
@@ -187,6 +200,7 @@ export interface OpenAIProviderConfig {
 }
 
 export interface AnthropicProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Anthropic", "Anthropic Proxy". */
@@ -243,6 +257,7 @@ export interface AnthropicProviderConfig {
 }
 
 export interface NUGProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars). */
 	id: string;
 	/** User-defined display name, e.g. "NUG Production". */
@@ -289,6 +304,7 @@ export interface NUGProviderConfig {
 }
 
 export interface GeminiProviderConfig {
+	toolResultImages?: ToolResultImagesMode;
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
 	/** User-defined display name, e.g. "Gemini", "Google AI". */
@@ -389,6 +405,12 @@ export interface McpToolPermission {
 	enabled?: boolean;
 }
 
+export interface McpOAuthConfig {
+	/** Pre-registered client id; omitted means dynamic client registration. */
+	clientId?: string;
+	scope?: string;
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -408,6 +430,8 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
+	/** sse/streamable-http: OAuth client settings; tokens and secrets live in mcp-oauth.json. */
+	oauth?: McpOAuthConfig;
 	/** Authoritative loading policy; absent only on legacy input. */
 	mode?: McpLoadingMode;
 	/** Compatibility projection of mode !== disabled. */
@@ -450,6 +474,16 @@ export interface OutboundProxyConfig {
 	mode: OutboundProxyMode;
 	/** Proxy URL, only used when mode is "custom". */
 	url?: string;
+	/**
+	 * Targets that must bypass the proxy, shared by every proxied channel.
+	 *
+	 * Evaluated in `net/proxy.ts` after the loopback and ambient `NO_PROXY`
+	 * checks, right before a request becomes a proxied connection. Rules support
+	 * wildcard globs and regular expressions; a rule only exempts a target and
+	 * can never force one through the proxy. See `net/no-proxy.ts` for the
+	 * matching priority and syntax.
+	 */
+	noProxyRules?: NoProxyRule[];
 }
 
 /**
@@ -587,6 +621,7 @@ export function isModelProtocol(value: unknown): value is ModelProtocol {
 }
 
 export interface TokenDanceSettings {
+	toolResultImages?: ToolResultImagesMode;
 	apiKey: string;
 	disabled: boolean;
 	generation: number;
@@ -656,7 +691,7 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
-	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	/** How credential files (e.g. credentials.json) are stored. See lib/secret-store.ts. */
 	secrets?: {
 		/** Encrypt credential files with the instance key in secret.key. Default true. */
 		encrypt?: boolean;
@@ -1000,13 +1035,9 @@ export interface NarraForkSettings {
 	};
 	workspace: {
 		/**
-		 * Whether tool calls / external edits capture content-addressed whole-tree
-		 * snapshots of the workspace (the precise rollback boundary). When off, the
-		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
-		 * degrade automatically when a worktree proves too large to scan within the
-		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
-		 * were removed; migrated on load.
+		 * Legacy compatibility field, default false. Local file-history and whole-tree
+		 * capture stay disabled regardless of this value. Previously stored as
+		 * `chapters.treeSnapshotsEnabled`; still migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
@@ -1085,7 +1116,7 @@ export interface NarraForkSettings {
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.
-	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
+	 * Credentials are managed separately (credentials.json; codex-credentials.json before it).
 	 */
 	codex?: {
 		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */

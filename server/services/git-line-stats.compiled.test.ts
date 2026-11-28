@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -26,7 +26,13 @@ test("compiled Git line statistics embed the worker and run after all copied sou
 		const copied = [
 			"server/services/git-line-stats.ts",
 			"server/services/git-untracked-line-worker.ts",
+			"server/services/git-current-baseline-session.ts",
 			"server/lib/compiled-worker.ts",
+			"server/lib/hot-safe.ts",
+			"server/lib/id.ts",
+			"server/lib/worker-runtime/lifecycle.ts",
+			"server/lib/worker-runtime/pool.ts",
+			"server/lib/worker-runtime/queue.ts",
 			"server/lib/errors.ts",
 			"server/lib/logger.ts",
 			"server/lib/narrafork-home.ts",
@@ -41,6 +47,12 @@ test("compiled Git line statistics embed the worker and run after all copied sou
 			await mkdir(dirname(target), { recursive: true });
 			await copyFile(join(project, path), target);
 		}
+		await mkdir(join(source, "node_modules"), { recursive: true });
+		await cp(
+			dirname(Bun.resolveSync("nanoid", import.meta.dir)),
+			join(source, "node_modules/nanoid"),
+			{ recursive: true },
+		);
 		await writeFile(
 			join(source, "tsconfig.json"),
 			JSON.stringify({ compilerOptions: { paths: { "@shared/*": ["./shared/*"] } } }),

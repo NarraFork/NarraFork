@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { db } from "../db";
 import { gatewaySessionMappings, narrators } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { loadGatewayConfig } from "../gateway/config";
 import { gateway, resolveGatewayAppUserId } from "../gateway/gateway";
 import { WebhookAdapter } from "../gateway/platforms/webhook";
@@ -23,6 +24,7 @@ import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
 import { defaultTaskBackendForNewSession } from "../services/task-source";
+import { teamIdOfNarrator } from "../services/teams/team-membership";
 
 export const gatewayRoutes = new Hono();
 
@@ -53,7 +55,10 @@ gatewayRoutes.post("/reload", async (c) => {
 // ---------------------------------------------------------------------------
 
 gatewayRoutes.get("/sessions", async (c) => {
-	const sessions = await db.select().from(gatewaySessionMappings).all();
+	const sessions = await readQuery(db.select().from(gatewaySessionMappings), {
+		executionPolicy: "worker-required",
+		signal: c.req.raw.signal,
+	});
 	return c.json(sessions);
 });
 
@@ -114,13 +119,17 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 	// Find or create session mapping, then forward to narrator
 	const now = new Date().toISOString();
 
-	const mapping = await db.query.gatewaySessionMappings.findFirst({
-		where: and(
-			eq(gatewaySessionMappings.platform, msg.platform),
-			eq(gatewaySessionMappings.chatId, msg.chatId),
-			eq(gatewaySessionMappings.userId, msg.userId),
-		),
-	});
+	const mapping = await readQueryFirst(
+		db.query.gatewaySessionMappings.findMany({
+			where: and(
+				eq(gatewaySessionMappings.platform, msg.platform),
+				eq(gatewaySessionMappings.chatId, msg.chatId),
+				eq(gatewaySessionMappings.userId, msg.userId),
+			),
+			limit: 1,
+		}),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal, maxRows: 1 },
+	);
 
 	let narratorId: string;
 
@@ -134,6 +143,16 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 
 	if (mapping) {
 		narratorId = mapping.narratorId;
+		// A team session (coordinator or subagent) is only used from NarraFork (M1): the
+		// webhook sender has no proven NarraFork identity to speak in a shared conversation as.
+		if (teamIdOfNarrator(narratorId))
+			return c.json(
+				{
+					error: "This session belongs to a team and can only be used from NarraFork",
+					code: "TEAM_SESSION_NOT_FROM_IM",
+				},
+				409,
+			);
 	} else {
 		narratorId = generateId();
 		const mappingId = generateId();

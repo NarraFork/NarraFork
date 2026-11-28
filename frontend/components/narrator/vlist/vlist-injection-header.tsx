@@ -23,7 +23,13 @@ import {
 	type InjectionTarget,
 } from "@shared/pretext-layout/injection-target";
 import { PLATFORM_INJECTION_SOURCES as ADAPTER_PLATFORM_SOURCES } from "@shared/pretext-layout/segment-adapter";
-import { IconBook2, IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
+import {
+	IconBook2,
+	IconChecklist,
+	IconEye,
+	IconSparkles,
+	IconTerminal2,
+} from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ReminderFrequencySettings } from "./ReminderFrequencySettings";
@@ -162,6 +168,7 @@ export function InjectionSpeakerHeader({
 	isBroadcast,
 	creator,
 	source,
+	watch,
 	deliveryState,
 	onOpenSession,
 	openSessionLabel,
@@ -193,6 +200,8 @@ export function InjectionSpeakerHeader({
 	creator?: BubbleCreator | null;
 	/** Canonical mailbox/outbox lifecycle, shown only while delivery is unresolved. */
 	deliveryState?: DeliveryState | null;
+	/** A Watch observation's result, delivered as a bash completion. */
+	watch?: boolean;
 	/** Producer tag, used only to recognize platform-authored rows. */
 	source?: string | null;
 	/**
@@ -291,6 +300,11 @@ export function InjectionSpeakerHeader({
 				 */
 				<ThemeIcon size={20} radius="sm" variant="light" color="blue">
 					<IconBook2 size={12} />
+				</ThemeIcon>
+			) : watch ? (
+				// A Watch result is the observation reporting back, not the command's output.
+				<ThemeIcon size={20} radius="sm" variant="light" color="grape">
+					<IconEye size={12} />
 				</ThemeIcon>
 			) : source === "bg_bash" ? (
 				/*
@@ -465,6 +479,7 @@ export function injectInjectionBubbleChrome(
 			creator={(extra.creator as BubbleCreator | null | undefined) ?? null}
 			deliveryState={(extra.deliveryState as DeliveryState | null | undefined) ?? null}
 			source={(extra.source as string | null | undefined) ?? null}
+			watch={extra.watch === true}
 			onOpenSession={openSession}
 			openSessionLabel={target ? navigation?.labels?.[target.kind] : undefined}
 		/>

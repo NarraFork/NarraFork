@@ -23,6 +23,16 @@ function provider(id: string, extra: Record<string, unknown> = {}) {
 const families = ["customApiProviders", "nugProviders"] as const;
 
 describe("provider settings three-way rebase", () => {
+	test("TokenDance image preference follows server changes unless locally edited", () => {
+		const saved = providersStateFromSettings({ tokendance: { toolResultImages: "off" } });
+		const baseline = createSnapshot(saved);
+		const fresh = { tokendance: { toolResultImages: "separate" } };
+		expect(rebaseProviderState(saved, baseline, fresh).tokenDanceToolResultImages).toBe("separate");
+		expect(
+			rebaseProviderState({ ...saved, tokenDanceToolResultImages: "inline" }, baseline, fresh)
+				.tokenDanceToolResultImages,
+		).toBe("inline");
+	});
 	for (const family of families) {
 		test(`${family}: combines edits, deletions and additions by immutable ID`, () => {
 			const saved = providersStateFromSettings({

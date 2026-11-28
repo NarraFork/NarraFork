@@ -1,8 +1,100 @@
+import { hasRenderableProgress, type ToolProgressPayload } from "@shared/tool-progress";
 import { z } from "zod/v4";
 import { normalizeToolName, sanitizeToolNameSegment } from "../agent/tool-name";
 import { toolRegistry } from "../agent/tool-registry";
 import type { ToolContext, ToolDefinition, ToolResult } from "../agent/types";
 import { type McpDirectoryEntry, mcpManager } from "./manager";
+
+/** Same gap a file transfer uses between live bars. Kept local so that tool stays untouched. */
+const PROGRESS_REPAINT_MS = 250;
+
+/**
+ * The generic progress row is a single nowrap line. An MCP `message` is free
+ * text, so it is clipped to code points before it becomes `currentItem`.
+ */
+const PROGRESS_MESSAGE_CODE_POINTS = 80;
+
+interface McpProgressNotice {
+	progress: number;
+	total?: number;
+	message?: string;
+}
+
+function clipProgressMessage(message: string): string {
+	const points = [...message];
+	if (points.length <= PROGRESS_MESSAGE_CODE_POINTS) return message;
+	return `${points.slice(0, PROGRESS_MESSAGE_CODE_POINTS).join("")}…`;
+}
+
+/** Map one MCP progress notice onto the shared bar payload, or skip it. */
+function mcpProgressPayload(notice: McpProgressNotice): ToolProgressPayload | null {
+	if (typeof notice.progress !== "number" || !Number.isFinite(notice.progress)) return null;
+	const payload: ToolProgressPayload = { completed: notice.progress };
+	if (typeof notice.total === "number" && Number.isFinite(notice.total) && notice.total > 0) {
+		payload.total = notice.total;
+	}
+	if (typeof notice.message === "string") {
+		const message = notice.message.trim();
+		if (message) payload.currentItem = clipProgressMessage(message);
+	}
+	if (!hasRenderableProgress(payload)) return null;
+	return payload;
+}
+
+/**
+ * Coalesce MCP progress into `emitStructuredProgress`.
+ *
+ * The first renderable notice goes out immediately; notices inside 250ms keep
+ * only the latest. The trailing notice is flushed when the call ends. An MCP
+ * handler often emits progress and returns in the same turn, so dropping that
+ * frame would hide the last count. The timer does not outlive the call.
+ */
+function createMcpProgressThrottle(emit: (payload: ToolProgressPayload) => void): {
+	push: (notice: McpProgressNotice) => void;
+	flush: () => void;
+} {
+	let latest: ToolProgressPayload | null = null;
+	let lastEmitAt = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+
+	const deliver = () => {
+		const payload = latest;
+		latest = null;
+		if (!payload) return;
+		lastEmitAt = Date.now();
+		emit(payload);
+	};
+
+	return {
+		push(notice) {
+			const payload = mcpProgressPayload(notice);
+			if (!payload) return;
+			latest = payload;
+			const elapsed = lastEmitAt === 0 ? PROGRESS_REPAINT_MS : Date.now() - lastEmitAt;
+			if (elapsed >= PROGRESS_REPAINT_MS) {
+				if (timer) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				deliver();
+				return;
+			}
+			if (!timer) {
+				timer = setTimeout(() => {
+					timer = undefined;
+					deliver();
+				}, PROGRESS_REPAINT_MS - elapsed);
+			}
+		},
+		flush() {
+			if (timer) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+			deliver();
+		},
+	};
+}
 
 /**
  * Build a NarraFork tool name from MCP server name + tool name.
@@ -50,8 +142,17 @@ function createMcpToolDefinition(
 					ctx.emitLongRunning?.(toolUseId, Date.now() - start);
 				}, 60_000);
 			}
+			const progress = ctx.emitStructuredProgress
+				? createMcpProgressThrottle(ctx.emitStructuredProgress)
+				: null;
 			try {
-				const result = await mcpManager.callTool(serverId, originalName, args, ctx.signal);
+				const result = await mcpManager.callTool(
+					serverId,
+					originalName,
+					args,
+					ctx.signal,
+					progress ? (notice) => progress.push(notice) : undefined,
+				);
 				const parts: string[] = [];
 				for (const item of result.content) {
 					if (item.type === "text" && item.text) {
@@ -60,9 +161,26 @@ function createMcpToolDefinition(
 						parts.push(
 							`[image: ${item.mimeType ?? "image/png"}, ${item.data.length} bytes base64]`,
 						);
+					} else if (item.type === "audio" && item.data) {
+						parts.push(
+							`[audio: ${item.mimeType ?? "audio/wav"}, ${item.data.length} bytes base64]`,
+						);
 					} else if (item.type === "resource" && item.resource) {
-						const resource = item.resource as { uri?: string; text?: string };
-						parts.push(resource.text ?? `[resource: ${resource.uri ?? "unknown"}]`);
+						const resource = item.resource as {
+							uri?: string;
+							text?: string;
+							blob?: string;
+							mimeType?: string;
+						};
+						parts.push(
+							resource.text ??
+								`[resource: ${resource.uri ?? "unknown"}${resource.blob ? `, ${resource.mimeType ?? "application/octet-stream"}, ${resource.blob.length} bytes base64` : ""}]`,
+						);
+					} else if (item.type === "resource_link" && item.uri) {
+						const label = item.title ?? item.name;
+						parts.push(
+							`[resource link: ${label ? `${label} <${item.uri}>` : item.uri}${item.mimeType ? `, ${item.mimeType}` : ""}]`,
+						);
 					}
 				}
 				return { output: parts.join("\n\n") || "(no output)", isError: result.isError };
@@ -76,6 +194,7 @@ function createMcpToolDefinition(
 				};
 			} finally {
 				if (longRunningTimer) clearTimeout(longRunningTimer);
+				progress?.flush();
 			}
 		},
 	};

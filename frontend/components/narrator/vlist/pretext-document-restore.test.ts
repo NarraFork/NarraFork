@@ -319,7 +319,7 @@ describe("pretext document restore across a narrator switch", () => {
 		});
 	}
 
-	test("a layout-generation change retries within the canonical path, never with an extra tail", async () => {
+	test("a layout-generation change retargets the canonical path without aborts, retries or an extra tail", async () => {
 		const first = await mount("n1");
 		unmount(first);
 		await settle();
@@ -336,8 +336,10 @@ describe("pretext document restore across a narrator switch", () => {
 		await settle();
 		expect(latest().messageVersion).toBe(4);
 		expect(latest().messages).toHaveLength(3);
-		expect(fetchCalls).toBe(2);
+		expect(latest().manifest?.widthBucket).toBe("920");
+		expect(fetchCalls).toBe(1);
 		expect(fetchQueries.every((query) => query.afterSeq === -1)).toBe(true);
+		expect(fetchQueries.every((query) => query.signal?.aborted === false)).toBe(true);
 	});
 
 	test("unmount cancellation aborts a warm read and never commits or starts a fallback", async () => {

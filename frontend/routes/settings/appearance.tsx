@@ -1,10 +1,15 @@
-import { Stack, Switch, Title } from "@mantine/core";
+import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
+import { AppearanceSwitch } from "../../components/settings/AppearanceSyncControl";
+import { PluginOverlaySettings } from "../../components/settings/PluginOverlaySettings";
 import { useLocalNumberPref, useLocalPref } from "../../hooks/useLocalPref";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/appearance")({
 	component: SettingsAppearancePage,
@@ -59,8 +64,10 @@ function SettingsAppearancePage() {
 				lodAltGesture={lodAltGesture}
 				setLodAltGesture={setLodAltGesture}
 			/>
+			<PluginOverlaySettings />
 			{/* TEMPORARY debug toggle (mock stream harness). Delete with ../mock/. */}
-			<Switch
+			<AppearanceSwitch
+				preferenceKey="narrafork_mock_stream"
 				label={t("mockStreamPanel")}
 				description={t("mockStreamPanelDesc")}
 				checked={mockStream}

@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { db } from "../db";
 import {
 	fileAttributions,
 	narratorMessages,
@@ -11,6 +11,8 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import * as workerReads from "../db/worker-read";
+import { compileDbAll } from "../db/worker-read-adapter";
 import { generateId } from "../lib/id";
 import { recordAttribution, recordAttributions } from "./file-attribution-service";
 import { normalizeWorkspacePath } from "./git-workspace";
@@ -368,6 +370,47 @@ describe("unified workspace modification view", () => {
 		// Zero rows took part, so "no badge" is the correct rendering, not a symptom of a
 		// window that ran out.
 		expect(view.windowCount).toBe(0);
+	});
+});
+
+describe("history read cancellation", () => {
+	test("rejects an already cancelled request even when no paths were requested", async () => {
+		const ws = makeWorkspace("nf-view-cancelled-");
+		const reason = new Error("Request cancelled");
+		await expect(
+			getWorkspaceModificationView(ws, { filePaths: [], signal: AbortSignal.abort(reason) }),
+		).rejects.toBe(reason);
+	});
+
+	test("does not fetch row details when cancellation arrives after the candidate read", async () => {
+		const ws = makeWorkspace("nf-view-cancelled-batch-");
+		const narratorId = await createNarrator("Author", ws);
+		await record({ workspacePath: ws, filePath: "a.ts", narratorId, action: "write" });
+		const controller = new AbortController();
+		const reason = new Error("Request cancelled");
+		const readDbAll = workerReads.readDbAll;
+		let reads = 0;
+		const queries = spyOn(workerReads, "readDbAll").mockImplementation(
+			async <T>(...args: Parameters<typeof readDbAll>): Promise<T[]> => {
+				const rows = await readDbAll<T>(...args);
+				if (++reads === 2) controller.abort(reason); // Stored keys, then row candidates.
+				return rows;
+			},
+		);
+		try {
+			await expect(
+				getWorkspaceModificationView(ws, { filePaths: ["a.ts"], signal: controller.signal }),
+			).rejects.toBe(reason);
+			expect(queries).toHaveBeenCalledTimes(2);
+			for (const [, , options] of queries.mock.calls) {
+				expect(options).toMatchObject({
+					executionPolicy: "worker-required",
+					signal: controller.signal,
+				});
+			}
+		} finally {
+			queries.mockRestore();
+		}
 	});
 });
 
@@ -983,28 +1026,19 @@ describe("scoped per-path history", () => {
 		// A UNION ALL branch per (path, cwd) pair reached 414 KiB and timed out in production.
 		const longestAttributionStatement = async (filePaths: string[]) => {
 			const lengths: number[] = [];
-			const prepare = sqlite.prepare.bind(sqlite);
-			const query = sqlite.query.bind(sqlite);
-			const record = (text: string) => {
-				if (text.includes("file_attributions")) lengths.push(Buffer.byteLength(text));
-			};
-			sqlite.prepare = ((text: string, ...rest: unknown[]) => {
-				record(text);
-				return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
-			}) as typeof sqlite.prepare;
-			sqlite.query = ((text: string) => {
-				record(text);
-				return query(text);
-			}) as typeof sqlite.query;
+			const queries = spyOn(workerReads, "readDbAll");
 			try {
 				await getWorkspaceModificationView(ws, {
 					additionalScopes: scopes,
 					filePaths,
 					projection: "byFile",
 				});
+				for (const [source, query] of queries.mock.calls) {
+					const { sql } = compileDbAll(source, query);
+					if (sql.includes("file_attributions")) lengths.push(Buffer.byteLength(sql));
+				}
 			} finally {
-				sqlite.prepare = prepare;
-				sqlite.query = query;
+				queries.mockRestore();
 			}
 			expect(lengths.length).toBeGreaterThan(0);
 			return Math.max(...lengths);

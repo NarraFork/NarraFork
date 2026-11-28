@@ -1,14 +1,22 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { GitLineStats } from "@shared/git-line-stats";
-import type { GitWorkspaceCategory, GitWorkspaceSnapshot } from "@shared/git-workspace-events";
+import type { GitStatusPageCacheState } from "@shared/git-status-page";
+import type {
+	GitStagingWatchState,
+	GitWorkspaceCategory,
+	GitWorkspaceSnapshot,
+} from "@shared/git-workspace-events";
 import { AppError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import type { getGitWorkspaceStatus } from "./git-management-service";
+import * as stagingService from "./git-staging-lists-service";
 import { GitStatusQueryCoordinator } from "./git-status-query";
 import type { GitWorkspaceTarget } from "./git-workspace";
 import {
 	boundGitSnapshot,
 	changedGitCategories,
 	GIT_SNAPSHOT_MAX_BYTES,
+	GitWatchFactsError,
 	GitWorkspaceWatchPool,
 	probeGitWatch,
 	projectGitSnapshot,
@@ -32,6 +40,219 @@ const remoteTarget = (generation: number): GitWorkspaceTarget => ({
 		supportsGitWorkspaceWatch: true,
 	} as NonNullable<GitWorkspaceTarget["backend"]>,
 });
+test("published SQLite generations refresh groups without refreshing ordinary Git", async () => {
+	let state: GitStagingWatchState = {
+		fingerprint: "initial",
+		databaseIdentity: "database",
+		generation: 1,
+		observationId: "observation",
+		listIds: ["A", "B"],
+	};
+	let probes = 0;
+	const fixture = snapshotFixture();
+	const events: Array<Parameters<typeof eventBus.emit>[0]> = [];
+	const onChange = (event: Parameters<typeof eventBus.emit>[0]) => events.push(event);
+	eventBus.on("git:staging_lists_changed", onChange);
+	const pool = new GitWorkspaceWatchPool(
+		async () => {
+			probes++;
+			return {
+				fingerprints: { worktree: "same" },
+				uncertain: [],
+				stagingListsFingerprint: state.fingerprint,
+				stagingListsState: state,
+			};
+		},
+		5,
+		fixture.reads,
+	);
+	const off = pool.subscribe(
+		target(),
+		() => {},
+		() => {},
+	);
+	try {
+		await waitFor(() => fixture.counts.lineStats === 1 && probes >= 2);
+		const baseline = { ...fixture.counts };
+		state = { ...state, fingerprint: "move-a", generation: 2 };
+		await waitFor(() => events.length === 1);
+		expect(events[0]).toEqual({
+			type: "git:staging_lists_changed",
+			workspaceKey: "workspace",
+			metadataChanged: true,
+			affectedListIds: ["A", "B"],
+			generation: 2,
+			observationId: "observation",
+		});
+		state = { ...state, fingerprint: "rename", generation: 3 };
+		await waitFor(() => events.length === 2);
+		expect(events[1]).toEqual({
+			type: "git:staging_lists_changed",
+			workspaceKey: "workspace",
+			metadataChanged: true,
+			affectedListIds: ["A", "B"],
+			generation: 3,
+			observationId: "observation",
+		});
+		expect(fixture.counts.status).toBe(baseline.status);
+		expect(fixture.counts.lineStats).toBe(baseline.lineStats);
+		expect(fixture.counts.invalidate).toBe(baseline.invalidate);
+	} finally {
+		off();
+		eventBus.off("git:staging_lists_changed", onChange);
+	}
+});
+
+test("remote watch carries ordinary Git facts only", async () => {
+	const remote = remoteTarget(1);
+	remote.backend = {
+		...remote.backend,
+		gitWorkspace: async () => ({
+			outputs: {
+				worktree: "work",
+				index: "index",
+				head: "head",
+				stash: "stash",
+				stagingListsFingerprint: "ignored",
+				stagingListsState: "ignored",
+			},
+		}),
+	} as NonNullable<GitWorkspaceTarget["backend"]>;
+	const sample = await probeGitWatch(remote, new AbortController().signal);
+	expect(sample).toEqual({
+		fingerprints: { worktree: "work", index: "index", head: "head", stash: "stash" },
+		uncertain: [],
+	});
+});
+
+test("failed native Git facts retain the published SQLite observation", async () => {
+	let state: GitStagingWatchState = {
+		fingerprint: "initial",
+		databaseIdentity: "database",
+		generation: 1,
+		observationId: "observation",
+		listIds: ["A"],
+	};
+	let probes = 0;
+	const fixture = snapshotFixture();
+	const events: unknown[] = [];
+	const changed = (event: unknown) => events.push(event);
+	eventBus.on("git:staging_lists_changed", changed);
+	const pool = new GitWorkspaceWatchPool(
+		async () => {
+			probes++;
+			throw new GitWatchFactsError(state.fingerprint, new Error("native index unavailable"), state);
+		},
+		5,
+		fixture.reads,
+	);
+	const off = pool.subscribe(target(), () => {});
+	try {
+		await waitFor(() => probes >= 2);
+		state = { ...state, fingerprint: "external", generation: 2 };
+		await waitFor(() => events.length === 1);
+		expect(events[0]).toEqual({
+			type: "git:staging_lists_changed",
+			workspaceKey: "workspace",
+			metadataChanged: true,
+			affectedListIds: ["A"],
+			generation: 2,
+			observationId: "observation",
+		});
+	} finally {
+		off();
+		eventBus.off("git:staging_lists_changed", changed);
+	}
+});
+
+test("stable incomplete fingerprints never become a hundred synthetic changes", () => {
+	const sample = { fingerprints: { worktree: "bounded" }, uncertain: ["worktree" as const] };
+	expect(changedGitCategories(undefined, sample)).toContain("worktree");
+	for (let i = 0; i < 100; i++) expect(changedGitCategories(sample, sample)).toEqual([]);
+	expect(changedGitCategories(sample, { ...sample, fingerprints: { worktree: "edited" } })).toEqual(
+		["worktree"],
+	);
+});
+
+test("a hundred observed edits coalesce into one in-flight scan and one trailing scan", async () => {
+	let release = () => {};
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let scans = 0;
+	let active = 0;
+	let maximum = 0;
+	let probes = 0;
+	let identity = 0;
+	const original = stagingService.createGitStagingListsService;
+	const factory = spyOn(stagingService, "createGitStagingListsService").mockImplementation(
+		(context) =>
+			original(context, {
+				execute: async <T>(request: import("./git-staging-worker").GitStagingWork) => {
+					if (request.method === "actionPaths") return ["f"] as T;
+					if (request.method === "baseline")
+						return {
+							initialized: true,
+							generation: 1,
+							observationId: "observed",
+							state: "ready",
+						} as T;
+					scans++;
+					active++;
+					maximum = Math.max(maximum, active);
+					if (scans === 1) await held;
+					active--;
+					return {
+						outcome: "applied",
+						affectedListIds: ["A"],
+						generation: scans,
+						observationId: "observed",
+					} as T;
+				},
+			}),
+	);
+	const fixture = snapshotFixture();
+	const pool = new GitWorkspaceWatchPool(
+		async () => {
+			probes++;
+			return { fingerprints: { worktree: String(identity) }, uncertain: [] };
+		},
+		1,
+		fixture.reads,
+	);
+	const local = { ...target(), backend: { kind: "local" } } as GitWorkspaceTarget;
+	const off = pool.subscribe(local, () => {}, undefined, {
+		authorizationKey: "owner:narrator",
+		writable: true,
+		beforeWrite: async () => {},
+		authorizePaths: async () => {},
+		observation: () => {},
+	});
+	try {
+		await waitFor(() => scans === 1);
+		expect(active).toBe(1);
+		for (let i = 0; i < 100; i++) {
+			identity++;
+			await pause(1);
+		}
+		expect(scans).toBe(1);
+		release();
+		await waitFor(() => scans === 2);
+		const baseline = probes;
+		await waitFor(() => probes >= baseline + 5);
+		expect(scans).toBe(2);
+		expect(maximum).toBe(1);
+		off();
+		const stopped = probes;
+		await pause(15);
+		expect(probes).toBe(stopped);
+	} finally {
+		release();
+		off();
+		factory.mockRestore();
+	}
+});
+
 const pause = (ms = 15) => new Promise((resolve) => setTimeout(resolve, ms));
 function required<T>(value: T | undefined): T {
 	if (value === undefined) throw new Error("Missing expected snapshot fixture value");
@@ -341,7 +562,7 @@ describe("panel-only Git watch pool", () => {
 		const second = await probeGitWatch(remote, new AbortController().signal);
 		expect(first.uncertain).toContain("index");
 		expect(first.fingerprints.index).toBeUndefined();
-		expect(changedGitCategories(first, second)).toEqual(["index"]);
+		expect(changedGitCategories(first, second)).toEqual([]);
 	});
 	test("remote idle and equal-line edits never invalidate history; RPC output/time stays bounded", async () => {
 		const calls: Record<string, unknown>[] = [];
@@ -372,7 +593,7 @@ describe("panel-only Git watch pool", () => {
 		head = "next";
 		expect(
 			changedGitCategories(capped, await probeGitWatch(remote, new AbortController().signal)),
-		).toEqual(["worktree", "head"]);
+		).toEqual(["head"]);
 		for (const call of calls) {
 			expect(call.maxBytes).toBe(WATCH_MAX_BYTES);
 			expect(call.timeoutMs).toBe(5000);
@@ -398,12 +619,14 @@ describe("panel-only Git watch pool", () => {
 						head: "head",
 						stash: "stash",
 						uncertainWorktree: "false",
+						stagingListsFingerprint: "remote-public-marker",
 					},
 				};
 			},
 		} as unknown as NonNullable<GitWorkspaceTarget["backend"]>;
 		const first = await probeGitWatch(remote, new AbortController().signal);
 		expect(calls).toBe(1);
+		expect(first.stagingListsFingerprint).toBeUndefined();
 		expect(
 			changedGitCategories(first, await probeGitWatch(remote, new AbortController().signal)),
 		).toEqual([]);
@@ -1013,4 +1236,276 @@ describe("directory-owned Git snapshots", () => {
 		expect(bounded.detailsTruncated).toBe(true);
 		expect(bounded.lineStats?.complete).toBe(true);
 	});
+});
+
+describe("watch-owned paging cache production", () => {
+	const cache = (memberVersion = 1, statsVersion = 0): GitStatusPageCacheState => ({
+		status: "ready",
+		workerEpoch: "worker-1",
+		memberVersion,
+		statsVersion,
+		updating: statsVersion === 0,
+	});
+
+	test("first subscription prewarms while its initial fingerprint probe is still pending", async () => {
+		const fixture = snapshotFixture();
+		const probe = deferred<{ fingerprints: { worktree: string }; uncertain: [] }>();
+		let productions = 0;
+		const pool = new GitWorkspaceWatchPool(async () => probe.promise, 5, {
+			...fixture.reads,
+			observePages: async () => {
+				productions++;
+				return cache(1, 1);
+			},
+		});
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			() => {},
+		);
+		try {
+			await waitFor(() => productions === 1);
+		} finally {
+			off();
+			probe.resolve({ fingerprints: { worktree: "first" }, uncertain: [] });
+		}
+	});
+
+	test("first subscription prewarms once and sends complete statistics before the 200-file projection", async () => {
+		const fixture = snapshotFixture();
+		const release = deferred<void>();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		const files = Array.from({ length: 561 }, (_, i) => ({ path: `dir/f-${i}`, status: " M" }));
+		let productions = 0;
+		let released = 0;
+		let fullCount = 0;
+		const reads = {
+			...fixture.reads,
+			status: async () => ({ ...statusFacts(), files, totalFiles: files.length }),
+			lineStats: async () => {
+				fixture.counts.lineStats++;
+				return {
+					...lineFacts(),
+					files: files.map(({ path }) => ({
+						path,
+						unstagedLinesAdded: 2,
+						unstagedLinesRemoved: 1,
+						complete: true,
+					})),
+				};
+			},
+			observePages: async (
+				_target: GitWorkspaceTarget,
+				signal: AbortSignal,
+				readStats: (signal: AbortSignal) => Promise<GitLineStats>,
+				onPublished?: (cache: GitStatusPageCacheState) => void,
+			) => {
+				productions++;
+				onPublished?.(cache());
+				await release.promise;
+				fullCount = (await readStats(signal)).files.length;
+				return cache(1, 1);
+			},
+			pagesState: async () => cache(1, 1),
+			releasePages: () => {
+				released++;
+			},
+		};
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			reads,
+		);
+		const first = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		const second = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => snapshots.some((value) => value.statusPages?.memberVersion === 1));
+			expect(
+				snapshots.some(
+					(value) => value.statusPages?.statsVersion === 0 && value.statusPages.updating,
+				),
+			).toBe(true);
+			release.resolve();
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.statsVersion === 1 && !value.updating),
+			);
+			expect(productions).toBe(1);
+			expect(fullCount).toBe(561);
+			expect(fixture.counts.lineStats).toBe(1);
+			expect(snapshots.at(-1)?.status?.files).toHaveLength(200);
+			expect(snapshots.at(-1)?.lineStats?.files).toHaveLength(200);
+			first();
+			expect(released).toBe(0);
+		} finally {
+			second();
+			first();
+		}
+		expect(released).toBe(1);
+	});
+
+	test("dirty advances before production and burst edits allow only one trailing publication", async () => {
+		const fixture = snapshotFixture();
+		const gate = deferred<void>();
+		const order: string[] = [];
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let fingerprint = "a";
+		let productions = 0;
+		let validations = 0;
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: fingerprint }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				invalidate: () => {
+					order.push("dirty");
+				},
+				validatePages: async () => {
+					validations++;
+					return { changed: false, reliable: true };
+				},
+				observePages: async (_target, _signal, _readStats, onPublished) => {
+					const round = ++productions;
+					order.push("produce");
+					if (round === 1) await gate.promise;
+					onPublished?.(cache(round, round));
+					return cache(round, round);
+				},
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => productions === 1);
+			fingerprint = "b";
+			await waitFor(() => order.filter((value) => value === "dirty").length === 2);
+			for (let i = 0; i < 10; i++) {
+				fingerprint = `change-${i}`;
+				await pause(6);
+			}
+			gate.resolve();
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 2 && !value.updating),
+			);
+			expect(order[0]).toBe("dirty");
+			expect(order[1]).toBe("produce");
+			expect(productions).toBe(2);
+			expect(validations).toBe(0);
+			expect(snapshots.some((value) => value.statusPages?.memberVersion === 1)).toBe(false);
+		} finally {
+			off();
+			gate.resolve();
+		}
+	});
+
+	test("capacity busy is stable until released capacity makes the existing subscription retryable", async () => {
+		const fixture = snapshotFixture();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let productions = 0;
+		let admitted = false;
+		const state = (): GitStatusPageCacheState =>
+			admitted
+				? cache(1, 1)
+				: { ...cache(0, 0), status: "error", updating: false, errorCode: "GIT_STATUS_PAGE_BUSY" };
+		let capacityReleased = false;
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				observePages: async () => {
+					productions++;
+					if (capacityReleased) admitted = true;
+					return state();
+				},
+				pagesState: async () =>
+					capacityReleased && !admitted
+						? { ...cache(0, 0), status: "pending", updating: false }
+						: state(),
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() =>
+				snapshots.some(
+					(value) => value.statusPages?.errorCode === "GIT_STATUS_PAGE_BUSY" && !value.updating,
+				),
+			);
+			await pause(50);
+			expect(productions).toBe(1);
+			capacityReleased = true;
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 1 && !value.updating),
+			);
+			expect(productions).toBe(2);
+		} finally {
+			off();
+		}
+	});
+
+	test("failed production exposes error and an existing subscription wakes after Worker loss", async () => {
+		const fixture = snapshotFixture();
+		const snapshots: GitWorkspaceSnapshot[] = [];
+		let productions = 0;
+		let lost = false;
+		let currentCache = cache(1, 1);
+		const pool = new GitWorkspaceWatchPool(
+			async () => ({ fingerprints: { worktree: "same" }, uncertain: [] }),
+			5,
+			{
+				...fixture.reads,
+				observePages: async () => {
+					productions++;
+					if (productions === 1) throw new Error("worker unavailable");
+					currentCache = {
+						...cache(productions, productions),
+						workerEpoch: lost ? "worker-2" : "worker-1",
+					};
+					lost = false;
+					return currentCache;
+				},
+				pagesState: async () =>
+					productions === 1 || lost
+						? { ...cache(0, 0), status: "pending", workerEpoch: "worker-2" }
+						: currentCache,
+			},
+		);
+		const off = pool.subscribe(
+			target(),
+			() => {},
+			(value) => snapshots.push(value),
+		);
+		try {
+			await waitFor(() => snapshots.some((value) => value.statusPages?.status === "error"));
+			await waitFor(() =>
+				snapshots.some((value) => value.statusPages?.memberVersion === 2 && !value.updating),
+			);
+			lost = true;
+			await waitFor(() =>
+				snapshots.some(
+					(value) =>
+						value.statusPages?.workerEpoch === "worker-2" &&
+						value.statusPages.memberVersion === 3 &&
+						!value.updating,
+				),
+			);
+			expect(productions).toBe(3);
+		} finally {
+			off();
+		}
+	}, 7000);
 });

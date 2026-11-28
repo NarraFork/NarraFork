@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import type { NarratorListItem } from "./NarratorListCard";
 import {
 	applyNarratorListEvent,
+	filterNarratorsByLocalQuery,
 	isNarratorMutationPendingFor,
 	type NarratorsInfiniteData,
 } from "./narrator-list-utils";
@@ -150,5 +151,57 @@ describe("isNarratorMutationPendingFor", () => {
 		expect(isNarratorMutationPendingFor({ ...mutation, isPending: false }, "narrator-a")).toBe(
 			false,
 		);
+	});
+});
+
+/** A list holding one parent row and one ask-in-passing child under it. */
+function cacheWithChild() {
+	const parent = item("parent", {
+		askInPassingSessions: [item("kid", { isAskInPassing: true, status: "idle" })],
+	});
+	return { pages: [{ items: [parent] }], pageParams: [undefined] } as NarratorsInfiniteData;
+}
+
+describe("applyNarratorListEvent — 顺便提问子会话", () => {
+	test("patches the child in place and leaves the parent alone", () => {
+		const old = cacheWithChild();
+
+		const next = applyNarratorListEvent(old, "kid", { status: "working", title: "kid-new" });
+
+		expect(next).not.toBe(old);
+		const parent = next?.pages[0].items[0] as NarratorListItem;
+		expect(parent.status).toBe("active");
+		expect(parent.askInPassingSessions?.[0].status).toBe("working");
+		expect(parent.askInPassingSessions?.[0].title).toBe("kid-new");
+	});
+
+	test("archiving a child drops only that row", () => {
+		const old = cacheWithChild();
+
+		const next = applyNarratorListEvent(old, "kid", { status: "archived" });
+
+		const parent = next?.pages[0].items[0] as NarratorListItem;
+		expect(parent.id).toBe("parent");
+		expect(parent.askInPassingSessions).toEqual([]);
+	});
+
+	test("an unknown id still leaves the cache untouched", () => {
+		const old = cacheWithChild();
+		expect(applyNarratorListEvent(old, "nobody", { status: "working" })).toBe(old);
+	});
+});
+
+describe("filterNarratorsByLocalQuery — 顺便提问子会话", () => {
+	const parent = item("parent", {
+		title: "Parent session",
+		askInPassingSessions: [item("kid", { title: "Needle in a child" })],
+	});
+
+	test("keeps the parent when only a child matches", () => {
+		expect(filterNarratorsByLocalQuery([parent], "needle")).toEqual([parent]);
+	});
+
+	test("drops the parent when neither it nor its children match", () => {
+		expect(filterNarratorsByLocalQuery([parent], "absent")).toEqual([]);
 	});
 });

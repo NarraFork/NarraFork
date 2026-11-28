@@ -196,13 +196,22 @@ export function createMailbox(limits: MailboxLimits, buffers?: MailboxBuffers): 
 		}
 	}
 
-	function checkOpen(): void {
-		const reason = load(header, CLOSED);
-		if (reason > 0) throw error("MAILBOX_CLOSED", `Mailbox is closed (reason ${reason})`, reason);
-		if (reason < 0) protocol("Invalid mailbox close reason");
+	function closed(reason: number): MailboxError {
+		return error("MAILBOX_CLOSED", `Mailbox is closed (reason ${reason})`, reason);
+	}
+
+	/** ABI integrity only; a positive (sticky) close reason is not a fault here. */
+	function checkIntact(): void {
+		if (load(header, CLOSED) < 0) protocol("Invalid mailbox close reason");
 		checkHeader();
 		checkFrame(REQUEST, requestBytes / 2);
 		checkFrame(RESPONSE, responseBytes / 2);
+	}
+
+	function checkOpen(): void {
+		const reason = load(header, CLOSED);
+		if (reason > 0) throw closed(reason);
+		checkIntact();
 	}
 
 	function checkSequence(sequence: number): void {
@@ -245,8 +254,9 @@ export function createMailbox(limits: MailboxLimits, buffers?: MailboxBuffers): 
 		) {
 			protocol("Mailbox frame changed while writing");
 		}
+		// READY commits publication. The peer may consume and close as soon as it
+		// is notified; that normal completion must not retroactively fail this write.
 		signal(header, slot);
-		checkOpen();
 	}
 
 	function take(
@@ -282,8 +292,10 @@ export function createMailbox(limits: MailboxLimits, buffers?: MailboxBuffers): 
 		) {
 			protocol("Mailbox frame changed while reading");
 		}
+		// EMPTY commits consumption. The producer may close as soon as it is notified;
+		// that normal completion must not retroactively discard the frame just read.
 		signal(header, slot);
-		checkOpen();
+		checkIntact();
 		return { sequence, text };
 	}
 
@@ -320,10 +332,14 @@ export function createMailbox(limits: MailboxLimits, buffers?: MailboxBuffers): 
 			const end = deadline(timeoutMs);
 			for (;;) {
 				const observed = load(header, RESPONSE + 1);
+				// Sample closure BEFORE the slot: the consumer may drain the frame and then close
+				// normally. Only a close that precedes a still-unconsumed frame is a failure.
+				const reason = load(header, CLOSED);
 				checkHeader();
 				checkFrame(RESPONSE, responseBytes / 2);
 				if (load(header, RESPONSE) === EMPTY) return;
-				checkOpen();
+				if (reason > 0) throw closed(reason);
+				checkIntact();
 				const remaining = end - now();
 				if (remaining <= 0) throw error("MAILBOX_TIMEOUT", "Response consumption timed out");
 				if (typeof waitAsync !== "function") protocol("Atomics.waitAsync is required");

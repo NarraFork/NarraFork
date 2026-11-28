@@ -7,6 +7,8 @@ import {
 } from "../../shared/helper-distribution";
 import {
 	MAX_MIRROR_METADATA_BYTES,
+	MIRROR_MAIN_COMMIT_TIMEOUT_MS,
+	MIRROR_MAIN_TRANSFER_TIMEOUT_MS,
 	type MirrorAssetDescriptor,
 	mirrorAssetsForTarget,
 	parseMirrorAssetDescriptor,
@@ -22,7 +24,7 @@ import {
 } from "../../shared/remote-peer-manifest";
 import { parseUpdateIndex } from "../../shared/update-index";
 import type { UpdateIndexV1 } from "../../shared/update-index-types";
-import { getConfig } from "../lib/config";
+import { getConfig, MAX_MIRROR_STORAGE_BYTES } from "../lib/config";
 import { logger } from "../lib/logger";
 import type { StorageBackend } from "../storage/types";
 import { objectPath, validateMirrorMetadata, verifyMirrorAsset } from "./mirror-ingest-io";
@@ -70,6 +72,8 @@ const toolPath = (product: string, kind: string, tag: string) =>
 interface TargetMarker {
 	version: string;
 	fingerprint: string;
+	/** Missing in old catalogs: never infer executable visibility from object existence. */
+	projectionVersion: 1 | 2;
 }
 interface CatalogState {
 	schemaVersion: 2;
@@ -280,7 +284,7 @@ export class MirrorIngestService {
 		const bytes = await this.smallFile(statePath(product));
 		if (!bytes) return null;
 		const data = JSON.parse(bytes.toString("utf8"));
-		if (data.schemaVersion === 1) {
+		if (data.schemaVersion === 1 || (data.schemaVersion === 2 && "assets" in data)) {
 			const old = parseMirrorSnapshot(data, repo);
 			return {
 				schemaVersion: 2,
@@ -291,6 +295,7 @@ export class MirrorIngestService {
 					{
 						version: old.targetVersion,
 						fingerprint: fingerprint(old.index, old.targetVersion) as string,
+						projectionVersion: old.schemaVersion,
 					},
 				],
 			};
@@ -307,13 +312,24 @@ export class MirrorIngestService {
 		const index = parseUpdateIndex(data.index, repo);
 		const targets: TargetMarker[] = [];
 		for (const marker of data.targets) {
-			if (!marker || typeof marker.version !== "string" || typeof marker.fingerprint !== "string")
+			if (
+				!marker ||
+				typeof marker.version !== "string" ||
+				typeof marker.fingerprint !== "string" ||
+				(marker.projectionVersion !== undefined &&
+					marker.projectionVersion !== 1 &&
+					marker.projectionVersion !== 2)
+			)
 				throw new Error("Invalid stored mirror target marker");
 			if (
 				fingerprint(index, marker.version) === marker.fingerprint &&
 				!targets.some((t) => t.version === marker.version)
 			)
-				targets.push({ version: marker.version, fingerprint: marker.fingerprint });
+				targets.push({
+					version: marker.version,
+					fingerprint: marker.fingerprint,
+					projectionVersion: marker.projectionVersion ?? 1,
+				});
 		}
 		return { schemaVersion: 2, repository: repo, indexCommit: data.indexCommit, index, targets };
 	}
@@ -326,7 +342,9 @@ export class MirrorIngestService {
 		return catalog
 			? {
 					index: catalog.index,
-					assets: catalog.targets.flatMap((t) => mirrorAssetsForTarget(catalog.index, t.version)),
+					assets: catalog.targets.flatMap((t) =>
+						mirrorAssetsForTarget(catalog.index, t.version, t.projectionVersion),
+					),
 				}
 			: null;
 	}
@@ -347,7 +365,7 @@ export class MirrorIngestService {
 			(asset.kind === "patch-meta" && !asset.name.endsWith(".zstd-patch.meta.json")) ||
 			(asset.kind === "notes" && !/^notes\/[A-Za-z0-9.+-]+\.json$/.test(asset.name))
 		)
-			throw new Error("Only canonical metadata, patches and component binaries may be uploaded");
+			throw new Error("Only canonical mirror assets may be uploaded");
 		if (!this.storage.saveVerifiedFile)
 			throw new MirrorIngestError(503, "STORAGE_VERIFICATION_UNAVAILABLE");
 		if (this.uploads.size >= MAX_MIRROR_UPLOAD_CONCURRENCY || this.uploads.has(asset.sha256))
@@ -363,14 +381,19 @@ export class MirrorIngestService {
 			const timeoutMs =
 				delivery === "relay"
 					? mirrorTransferTimeoutMs(getConfig().mirrorRelay?.transferTimeoutMinutes)
-					: 120_000;
+					: asset.kind === "main-binary"
+						? MIRROR_MAIN_TRANSFER_TIMEOUT_MS
+						: 120_000;
 			signal.throwIfAborted();
 			await this.storage.saveVerifiedFile(objectPath(asset.sha256), stream, {
 				size: asset.size,
 				sha256: asset.sha256,
 				signal,
 				timeoutMs: Math.min(limits?.uploadTimeoutMs ?? timeoutMs, timeoutMs),
-				quotaBytes: Math.min(limits?.quotaBytes ?? 8 * 1024 ** 3, 8 * 1024 ** 3),
+				quotaBytes: Math.min(
+					limits?.quotaBytes ?? MAX_MIRROR_STORAGE_BYTES,
+					MAX_MIRROR_STORAGE_BYTES,
+				),
 				minFreeBytes: Math.max(limits?.minFreeBytes ?? 256 * 1024 ** 2, 0),
 			});
 			signal.throwIfAborted();
@@ -397,11 +420,15 @@ export class MirrorIngestService {
 			throw new MirrorIngestError(503, "STORAGE_COMMIT_UNAVAILABLE");
 		if (this.commits.size >= 2 || this.commits.has(product))
 			throw new MirrorIngestError(409, "MIRROR_COMMIT_IN_PROGRESS");
+		const snapshot = parseMirrorSnapshot(input, repo);
+		const started = Date.now();
 		this.commits.add(product);
-		const deadline = AbortSignal.any([signal, AbortSignal.timeout(120_000)]);
+		const deadline = AbortSignal.any([
+			signal,
+			AbortSignal.timeout(snapshot.schemaVersion === 2 ? MIRROR_MAIN_COMMIT_TIMEOUT_MS : 120_000),
+		]);
 		try {
 			deadline.throwIfAborted();
-			const snapshot = parseMirrorSnapshot(input, repo);
 			const previous = await this.catalog(product);
 			if (previous && snapshot.index.generation < previous.index.generation)
 				throw new MirrorIngestError(409, "STALE_CANONICAL_SNAPSHOT");
@@ -421,9 +448,14 @@ export class MirrorIngestService {
 					t.version !== snapshot.targetVersion &&
 					fingerprint(snapshot.index, t.version) === t.fingerprint,
 			);
+			const targetFingerprint = fingerprint(snapshot.index, snapshot.targetVersion) as string;
+			const priorTarget = previous?.targets.find(
+				(t) => t.version === snapshot.targetVersion && t.fingerprint === targetFingerprint,
+			);
 			targets.push({
 				version: snapshot.targetVersion,
-				fingerprint: fingerprint(snapshot.index, snapshot.targetVersion) as string,
+				fingerprint: targetFingerprint,
+				projectionVersion: priorTarget?.projectionVersion === 2 ? 2 : snapshot.schemaVersion,
 			});
 			if (targets.length > 32) throw new Error("Mirror target marker limit");
 			const state: CatalogState = {
@@ -448,6 +480,13 @@ export class MirrorIngestService {
 			};
 		} finally {
 			this.commits.delete(product);
+			if (Date.now() - started >= 1000)
+				logger.info("Slow mirror snapshot verification", {
+					projectionVersion: snapshot.schemaVersion,
+					assets: snapshot.assets.length,
+					bytes: snapshot.assets.reduce((sum, asset) => sum + asset.size, 0),
+					durationMs: Date.now() - started,
+				});
 		}
 	}
 

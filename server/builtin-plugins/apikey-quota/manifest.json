@@ -25,11 +25,12 @@
 		"startupTimeoutMs": 15000,
 		"activationTimeoutMs": 30000
 	},
-	"activationEvents": ["onTool:query-balance"],
+	"activationEvents": ["onCommand:query-balance"],
 	"contributes": {
 		"providers": [],
 		"searchProviders": [],
-		"tools": [
+		"tools": [],
+		"commands": [
 			{
 				"id": "query-balance",
 				"title": "Query API key quota",
@@ -37,7 +38,7 @@
 				"inputSchema": {
 					"type": "object",
 					"properties": {
-						"mode": { "enum": ["probe", "refresh"] },
+						"mode": { "type": "string", "enum": ["probe", "refresh"] },
 						"baseUrl": { "type": "string", "maxLength": 2048 },
 						"apiKey": { "type": "string", "maxLength": 4096 },
 						"headers": {
@@ -48,7 +49,7 @@
 						"proxy": { "type": ["string", "null"], "maxLength": 2048 },
 						"tlsRejectUnauthorized": { "type": "boolean" },
 						"timeoutMs": { "type": "number" },
-						"adapter": { "enum": ["sub2api", "new-api", "new-api-user"] },
+						"adapter": { "type": "string", "enum": ["sub2api", "new-api", "new-api-user"] },
 						"root": { "type": "string", "maxLength": 2048 },
 						"siteUrl": { "type": "string", "maxLength": 2048 },
 						"accessToken": { "type": "string", "maxLength": 4096 },
@@ -57,11 +58,9 @@
 					"required": ["mode", "baseUrl", "apiKey"],
 					"additionalProperties": false
 				},
-				"execution": "server",
-				"allowBackground": true
+				"handler": "server"
 			}
 		],
-		"commands": [],
 		"events": [],
 		"views": []
 	},

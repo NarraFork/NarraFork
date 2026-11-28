@@ -101,11 +101,17 @@ export function createShare(opts: CreateShareOpts): ShareRecord {
 	if (typeof timer === "object" && "unref" in timer) timer.unref();
 	timers.set(id, timer);
 
-	logger.info("Share created", {
-		id,
-		originalName: opts.originalName,
+	// Canonical formatting remains outside the sink guard: real formatting failures still fail.
+	const diagnostic = {
+		stage: "created",
+		...(Number.isFinite(opts.size) ? { size: opts.size } : {}),
 		expiresAt: expiresAt.toISOString(),
-	});
+	};
+	try {
+		logger.info("Share created", diagnostic);
+	} catch {
+		// Observability cannot turn a registered artifact into a failed publication.
+	}
 	return record;
 }
 

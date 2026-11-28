@@ -1,3 +1,4 @@
+import { ValidationError } from "../errors";
 import { hotSafe } from "../hot-safe";
 import type { ChatParams, ProviderAdapter } from "./provider";
 
@@ -5,6 +6,8 @@ export interface ModelTraceRequest {
 	adapter: ProviderAdapter;
 	/** Effective routing provider captured with the adapter, never re-resolved on retry. */
 	provider: string;
+	credentialId?: string;
+	validateCredential?: () => boolean;
 	params: Pick<
 		ChatParams,
 		| "conversationId"
@@ -17,6 +20,7 @@ export interface ModelTraceRequest {
 		| "toolResults"
 		| "toolLoadingStrategy"
 		| "images"
+		| "media"
 		| "reasoningEffort"
 		| "maxOutputTokens"
 		| "serviceTier"
@@ -33,11 +37,15 @@ export function rememberModelTraceRequest(
 	adapter: ProviderAdapter,
 	params: ModelTraceRequest["params"],
 	provider: string,
+	credentialId?: string,
+	validateCredential?: () => boolean,
 ): void {
 	requests.delete(narratorId);
 	requests.set(narratorId, {
 		adapter,
 		provider,
+		credentialId,
+		validateCredential,
 		params: {
 			conversationId: params.conversationId,
 			stickySessionKey: params.stickySessionKey,
@@ -51,6 +59,7 @@ export function rememberModelTraceRequest(
 			toolResults: params.toolResults.slice(),
 			toolLoadingStrategy: params.toolLoadingStrategy,
 			images: params.images?.slice(),
+			media: params.media?.slice(),
 			reasoningEffort: params.reasoningEffort,
 			maxOutputTokens: params.maxOutputTokens,
 			serviceTier: params.serviceTier,
@@ -65,6 +74,67 @@ export function rememberModelTraceRequest(
 
 export function getModelTraceRequest(narratorId: string): ModelTraceRequest | undefined {
 	return requests.get(narratorId);
+}
+
+export function requireModelTraceAnchor(narratorId: string): ModelTraceRequest {
+	const anchor = getModelTraceRequest(narratorId);
+	if (!anchor?.params.conversationId) {
+		throw new ValidationError("No recent upstream request to fork; send a message and try again");
+	}
+	if (!anchor.adapter.supportsDiagnosticFork?.(anchor.params.model, anchor.credentialId)) {
+		throw new ValidationError("This provider cannot safely fork the diagnostic request prefix");
+	}
+	assertModelTraceCredential(anchor);
+	return anchor;
+}
+
+function assertModelTraceCredential(anchor: ModelTraceRequest): void {
+	if (
+		anchor.adapter.isDiagnosticConnectionCurrent?.() === false ||
+		anchor.validateCredential?.() === false
+	) {
+		throw new ValidationError(
+			"The parent diagnostic connection or credential changed; send a message and try again",
+		);
+	}
+}
+
+export function buildModelTraceProbeParams(
+	anchor: ModelTraceRequest,
+	transportSessionKey: string,
+	signal: AbortSignal,
+	prompt: string,
+): ChatParams {
+	assertModelTraceCredential(anchor);
+	const source = anchor.params;
+	if (
+		!transportSessionKey ||
+		transportSessionKey === source.stickySessionKey ||
+		transportSessionKey === source.conversationId
+	) {
+		throw new ValidationError("A diagnostic fork requires an independent transport session");
+	}
+	return {
+		...source,
+		history: source.history.slice(),
+		tools: source.tools.slice(),
+		toolResults: source.toolResults.slice(),
+		images: source.images?.slice(),
+		media: source.media?.slice(),
+		metadata: source.metadata ? { ...source.metadata } : undefined,
+		diagnostic: true,
+		diagnosticFork: {
+			suffix: prompt,
+			credentialId: anchor.credentialId,
+			validateCredential: () => {
+				assertModelTraceCredential(anchor);
+				return true;
+			},
+		},
+		transportSessionKey,
+		resetUpstreamSession: true,
+		signal,
+	};
 }
 
 export function forgetModelTraceRequest(narratorId: string): void {

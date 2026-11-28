@@ -23,6 +23,7 @@ import type { EditorActor, EditorDocumentDependencies } from "../services/editor
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
 import { createEditorDocumentRoutes, readEditorMetadata } from "./editor-documents";
+import { drainNativeEditorService } from "./editor-native-fixture";
 import { fsRoutes } from "./fs";
 import { createFileReferenceRoutes } from "./narrator-file-references";
 
@@ -94,6 +95,86 @@ async function openDoc(origin = "legacy", deviceId = "local") {
 	expect(response.status).toBe(200);
 	return (await response.json()) as EditorDocumentDescriptor;
 }
+test("revoked browser DELETE cannot drain an in-flight metadata owner; fixture drain joins its ACK", async () => {
+	const response = await request(base(), "POST", { path, origin: "legacy", protocol: "raw-v2" });
+	const doc = (await response.json()) as EditorDocumentDescriptor;
+	let entered!: () => void, resume!: () => void;
+	const entering = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const resuming = new Promise<void>((resolve) => {
+		resume = resolve;
+	});
+	const run = service.streams.workers.run.bind(service.streams.workers);
+	const close = spyOn(service.streams.workers, "run").mockImplementation(async (owner, input) => {
+		if (input.action === "close") {
+			entered();
+			await resuming;
+		}
+		return run(owner, input);
+	});
+	const probing = request(`${base()}/${doc.docId}/disk-state`);
+	let draining: Promise<void> | undefined;
+	try {
+		await entering;
+		db.update(narrators).set({ ownerUserId: null }).where(eq(narrators.id, narratorId)).run();
+		expect((await request(`${base()}/${doc.docId}`, "DELETE")).status).toBe(404);
+		expect(service.diagnostics.streams).toMatchObject({ active: 1, streams: 1 });
+		let drained = false;
+		draining = drainNativeEditorService(service).then(() => {
+			drained = true;
+		});
+		await Promise.resolve();
+		expect(drained).toBe(false);
+		expect(service.diagnostics.streams.active).toBe(1);
+		resume();
+		await draining;
+		expect((await probing).status).toBe(503);
+		expect(service.diagnostics.documents).toBe(0);
+		expect(service.diagnostics.streams).toMatchObject({
+			active: 0,
+			queued: 0,
+			streams: 0,
+			workers: 0,
+		});
+	} finally {
+		resume();
+		try {
+			await probing;
+			await draining;
+		} finally {
+			close.mockRestore();
+		}
+	}
+});
+
+test.each([
+	"failure",
+	"timeout",
+] as const)("fixture service drain reports %s without freeing its active owner", async (mode) => {
+	const response = await request(base(), "POST", { path, origin: "legacy", protocol: "raw-v2" });
+	const doc = (await response.json()) as EditorDocumentDescriptor;
+	const opened = await request(`${base()}/${doc.docId}/raw-reads`, "POST", {
+		versionHandle: doc.versionHandle,
+	});
+	expect(opened.status).toBe(200);
+	const failure = new Error("fixture close ACK unavailable");
+	const close = spyOn(service, "dispose").mockImplementation(() =>
+		mode === "failure" ? Promise.reject(failure) : new Promise(() => {}),
+	);
+	try {
+		if (mode === "failure") await expect(drainNativeEditorService(service)).rejects.toBe(failure);
+		else
+			await expect(drainNativeEditorService(service, Date.now())).rejects.toThrow(
+				"cleanup did not settle",
+			);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(service.diagnostics.streams).toMatchObject({ active: 1, streams: 1 });
+	} finally {
+		close.mockRestore();
+	}
+});
+
 test("raw-v2 streams exact BOM bytes, has separate cache/hash domain and rejects all v1 writes", async () => {
 	await writeFile(path, "\ufeffone\r\ntwo\rthree\n\ufeff");
 	const v1 = await openDoc();

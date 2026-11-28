@@ -1,8 +1,13 @@
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { ScheduledRunInterruptTarget } from "@shared/scheduled-task-status";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
+import { workerFailure, workerRejection } from "../../../tests/fixtures/worker-rejection";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import { narrators, scheduledTaskRuns, scheduledTasks } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
+import { DbReadError } from "../../lib/db-worker/errors";
+import * as readPool from "../../lib/db-worker/pool";
+import { NotFoundError } from "../../lib/errors";
 import type { RunControl, RunResult } from "../agent-runtime/ownership";
 import {
 	bindScheduledRunMember,
@@ -18,7 +23,7 @@ import {
 	unregisterScheduledRun,
 } from "../scheduled-run-registry";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, disposeWorkerDb } = getWorkerTestDb();
 const controls = new Map<string, RunControl>();
 const executionEpochs = new Map<string, string>();
 const reconciledTasks: string[] = [];
@@ -42,7 +47,14 @@ mock.module("../agent-runtime/ownership", () => ({
 }));
 mock.module("../narrator-service", () => ({
 	narratorService: {
-		getById: (id: string) => db.query.narrators.findFirst({ where: eq(narrators.id, id) }),
+		getById: async (id: string) => {
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({ where: eq(narrators.id, id) }),
+				{ executionPolicy: "worker-required" },
+			);
+			if (!narrator) throw new NotFoundError("Narrator", id);
+			return narrator;
+		},
 	},
 }));
 mock.module("../narrator-session-state", () => ({ pendingPermissions, pendingDangerReflections }));
@@ -245,7 +257,226 @@ afterEach(async () => {
 	await db.delete(scheduledTasks);
 	await db.delete(narrators);
 });
-afterAll(() => sqlite.close());
+afterAll(disposeWorkerDb);
+
+describe("scheduled run Worker reads", () => {
+	for (const code of ["DB_READ_FAILED", "DB_READ_TASK_TIMEOUT", "DB_READ_UNAVAILABLE"]) {
+		test(`${code} preserves pending work without a main-thread read fallback`, async () => {
+			const run = await seedWaiting();
+			const error = new DbReadError(code, "injected scheduled run read failure");
+			const dispatch = spyOn(readPool, "runReadTask").mockRejectedValue(error);
+			const prepare = spyOn(sqlite, "prepare");
+			const query = spyOn(sqlite, "query");
+			try {
+				expect(await workerFailure(recordScheduledAutoHandled(run.runId, "question", "note"))).toBe(
+					error,
+				);
+				expect(await workerFailure(markScheduledRunBlocked(run.runId, "question"))).toBe(error);
+				expect(await workerFailure(cancelScheduledTaskWaitingRuns(run.taskId, "paused"))).toBe(
+					error,
+				);
+				expect(await workerFailure(recoverScheduledRuns())).toBe(error);
+				expect(await workerFailure(filterScheduledRecoveryNarrators([run.narratorId]))).toBe(error);
+				expect(await workerFailure(pollScheduledRuns())).toBe(error);
+				expect(dispatch).toHaveBeenCalledTimes(6);
+				expect(prepare).not.toHaveBeenCalled();
+				expect(query).not.toHaveBeenCalled();
+			} finally {
+				dispatch.mockRestore();
+				prepare.mockRestore();
+				query.mockRestore();
+			}
+			expect(await runRow(run.runId)).toMatchObject({ status: "waiting", autoHandled: null });
+			expect(notices).toHaveLength(0);
+			expect(reminders).toHaveLength(0);
+			expect(cancellations).toHaveLength(0);
+		});
+	}
+
+	for (const code of [
+		"DB_READ_FAILED",
+		"DB_READ_TASK_TIMEOUT",
+		"DB_READ_UNAVAILABLE",
+		"UNEXPECTED",
+	]) {
+		test(`${code} ancestry failures reject child attachment, lookup and reporting`, async () => {
+			const run = await seed();
+			const child = `${run.narratorId}-child`;
+			const now = new Date().toISOString();
+			await db.insert(narrators).values({
+				id: child,
+				parentNarratorId: run.narratorId,
+				createdAt: now,
+				updatedAt: now,
+			});
+			const childRun = control("child-logical");
+			childRun.deliverTo = {
+				narratorId: run.narratorId,
+				toolCallId: "parent-call",
+				toolUseId: "parent-use",
+			};
+			controls.set(child, childRun);
+			await attachScheduledRuntimeRun({ narratorId: child, run: childRun });
+			const member = getScheduledRunMember(child);
+			expect(member?.runId).toBe(run.runId);
+			const error =
+				code === "UNEXPECTED"
+					? new Error("unexpected ancestry read failure")
+					: new DbReadError(code, "injected ancestry read failure");
+			const dispatch = spyOn(readPool, "runReadTask").mockRejectedValue(error);
+			const prepare = spyOn(sqlite, "prepare");
+			const query = spyOn(sqlite, "query");
+			try {
+				expect(
+					await workerFailure(attachScheduledRuntimeRun({ narratorId: child, run: childRun })),
+				).toBe(error);
+				expect(await workerFailure(lookupScheduledRun(child))).toBe(error);
+				expect(
+					await workerFailure(
+						reportScheduledRun(child, { outcome: "done", summary: "unverified" }),
+					),
+				).toBe(error);
+				expect(dispatch).toHaveBeenCalledTimes(3);
+				expect(prepare).not.toHaveBeenCalled();
+				expect(query).not.toHaveBeenCalled();
+				expect(getScheduledRunMember(child)).toBe(member);
+			} finally {
+				dispatch.mockRestore();
+				prepare.mockRestore();
+				query.mockRestore();
+			}
+			expect(await runRow(run.runId)).toMatchObject({ status: "running", outcome: null });
+			expect(notices).toHaveLength(0);
+		});
+	}
+
+	test("a missing narrator leaves attachment and ancestry lookup unassociated", async () => {
+		const run = await seed();
+		const child = `${run.narratorId}-missing-child`;
+		const childRun = control("missing-child-logical");
+		childRun.deliverTo = {
+			narratorId: run.narratorId,
+			toolCallId: "parent-call",
+			toolUseId: "parent-use",
+		};
+		controls.set(child, childRun);
+		await attachScheduledRuntimeRun({ narratorId: child, run: childRun });
+		expect(getScheduledRunMember(child)).toBeUndefined();
+		// A stale in-memory receipt can outlive the deleted narrator row.
+		bindScheduledRunMember({
+			runId: run.runId,
+			narratorId: child,
+			logicalRunId: "missing-child-logical",
+			parentNarratorId: run.narratorId,
+		});
+		expect(await lookupScheduledRun(child)).toBeUndefined();
+		expect((await runRow(run.runId))?.status).toBe("running");
+	});
+
+	test("disabled Workers fail without cancelling accepted work or reading inline", async () => {
+		const run = await seedWaiting();
+		const previousWorker = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		const prepare = spyOn(sqlite, "prepare");
+		const query = spyOn(sqlite, "query");
+		try {
+			expect(
+				await workerFailure(cancelScheduledTaskWaitingRuns(run.taskId, "paused")),
+			).toMatchObject({
+				code: "DB_READ_UNAVAILABLE",
+			});
+			expect(prepare).not.toHaveBeenCalled();
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			if (previousWorker === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previousWorker;
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+		expect((await runRow(run.runId))?.status).toBe("waiting");
+		expect(notices).toHaveLength(0);
+	});
+
+	test("recovery decisions read persisted identity and terminal fences on Workers", async () => {
+		const run = await seed();
+		const dispatch = spyOn(readPool, "runReadTask");
+		const prepare = spyOn(sqlite, "prepare");
+		const query = spyOn(sqlite, "query");
+		try {
+			expect(await filterScheduledRecoveryNarrators([run.narratorId])).toEqual(
+				new Set([run.narratorId]),
+			);
+			expect(dispatch).toHaveBeenCalledTimes(2);
+			expect(prepare).not.toHaveBeenCalled();
+			expect(query).not.toHaveBeenCalled();
+		} finally {
+			dispatch.mockRestore();
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+	});
+
+	test("an epoch rotation during the block read discards its stale observation", async () => {
+		const run = await seed({ executionEpoch: "before-read" });
+		if (!run.logicalRunId) throw new Error("Expected a logical run");
+		const logicalRunId = run.logicalRunId;
+		const read = readPool.runReadTask;
+		const dispatch = spyOn(readPool, "runReadTask").mockImplementationOnce((async (
+			path,
+			params,
+			options,
+		) => {
+			const result = await read(path, params, options);
+			executionEpochs.set(run.narratorId, "after-read");
+			expect(
+				rotateScheduledRunExecutionEpoch({
+					narratorId: run.narratorId,
+					logicalRunId,
+					previousEpoch: "before-read",
+					executionEpoch: "after-read",
+				}),
+			).toBe(true);
+			return result;
+		}) as typeof read);
+		try {
+			await markScheduledRunBlocked(run.runId, "permission");
+			expect(dispatch).toHaveBeenCalledTimes(1);
+		} finally {
+			dispatch.mockRestore();
+		}
+		expect((await runRow(run.runId))?.status).toBe("running");
+		expect(notices).toHaveLength(0);
+	});
+
+	test("a stale poll page cannot cancel a continuation attached while the Worker read", async () => {
+		const run = await seed({ deadlineAt: new Date(Date.now() - 1).toISOString() });
+		const continuation = control("continuation-after-read");
+		const read = readPool.runReadTask;
+		const dispatch = spyOn(readPool, "runReadTask").mockImplementationOnce((async (
+			path,
+			params,
+			options,
+		) => {
+			const result = await read(path, params, options);
+			controls.set(run.narratorId, continuation);
+			await attachScheduledRuntimeRun({ narratorId: run.narratorId, run: continuation });
+			return result;
+		}) as typeof read);
+		try {
+			await pollScheduledRuns();
+			expect(dispatch).toHaveBeenCalledTimes(1);
+		} finally {
+			dispatch.mockRestore();
+		}
+		expect(continuation.cancel.signal.aborted).toBe(false);
+		expect(cancellations).toHaveLength(0);
+		expect((await runRow(run.runId))?.status).toBe("running");
+		// The next fresh observation still enforces the original absolute deadline.
+		await pollScheduledRuns();
+		expect(continuation.cancel.signal.aborted).toBe(true);
+		expect((await runRow(run.runId))?.status).toBe("timed_out");
+	});
+});
 
 describe("scheduled run identity and reporting", () => {
 	test("temporary model is runtime-only and preserves a concurrent saved preference", async () => {
@@ -279,7 +510,9 @@ describe("scheduled run identity and reporting", () => {
 		await pollScheduledRuns();
 		expect((await runRow(run.runId))?.status).toBe("running");
 		expect(reminders).toHaveLength(0);
-		await expect(bindScheduledRunTrigger(run.runId, run.narratorId, "duplicate")).rejects.toThrow();
+		expect(
+			await workerRejection(bindScheduledRunTrigger(run.runId, run.narratorId, "duplicate")),
+		).toThrow();
 	});
 
 	test("trusted question-answer continuation stays associated, but a new person turn does not", async () => {
@@ -313,9 +546,11 @@ describe("scheduled run identity and reporting", () => {
 		await reportScheduledRun(run.narratorId, { outcome: "no_change" });
 		expect((await runRow(run.runId))?.outcomeSummary).toBeNull();
 		controls.set(run.narratorId, control("a-persons-next-run"));
-		await expect(
-			reportScheduledRun(run.narratorId, { outcome: "done", summary: "stale" }),
-		).rejects.toThrow();
+		expect(
+			await workerRejection(
+				reportScheduledRun(run.narratorId, { outcome: "done", summary: "stale" }),
+			),
+		).toThrow();
 		expect((await runRow(run.runId))?.outcome).toBe("no_change");
 	});
 
@@ -532,9 +767,11 @@ describe("scheduled run identity and reporting", () => {
 		const run = await seed();
 		expect(await finalizeScheduledRun(run.runId, "failed", { errorKind: "provider" })).toBe(true);
 		expect(await finalizeScheduledRun(run.runId, "completed")).toBe(false);
-		await expect(
-			reportScheduledRun(run.narratorId, { outcome: "done", summary: "late" }),
-		).rejects.toThrow();
+		expect(
+			await workerRejection(
+				reportScheduledRun(run.narratorId, { outcome: "done", summary: "late" }),
+			),
+		).toThrow();
 		expect((await taskRow(run.taskId))?.consecutiveFailures).toBe(1);
 		expect((await runRow(run.runId))?.status).toBe("failed");
 	});
@@ -755,9 +992,11 @@ describe("accepted waiting run ledger", () => {
 				.set({ consecutiveFailures: 4 })
 				.where(eq(scheduledTasks.id, run.taskId));
 			expect(await claimScheduledRunNudge(run.runId)).toBe(false);
-			await expect(
-				reportScheduledRun(run.narratorId, { outcome: "done", summary: "not dispatched" }),
-			).rejects.toThrow();
+			expect(
+				await workerRejection(
+					reportScheduledRun(run.narratorId, { outcome: "done", summary: "not dispatched" }),
+				),
+			).toThrow();
 			expect(await finalizeScheduledRun(run.runId, "completed")).toBe(false);
 			expect(await finalizeScheduledRun(run.runId, status, { errorKind: "busy_timeout" })).toBe(
 				true,

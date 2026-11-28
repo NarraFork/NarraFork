@@ -1712,6 +1712,85 @@ test("a selection from the very start of a closed row opens it first, like one f
 	expect(a.errors).toEqual([]);
 }, 60_000);
 
+test("a programmatic caret waits for focus callbacks, with bounded failure and scheduler cleanup", async () => {
+	const { pageId, idOf } = await page();
+	const a = await openHost(h, "page", pageId);
+	await shows(a, DEFAULT_ROWS);
+	const ship = idOf("Ship the fold");
+	const result = await a.call(async (f, id) => {
+		const original = { setTimeout: window.setTimeout, clearTimeout: window.clearTimeout };
+		const schedule: Window["setTimeout"] = original.setTimeout;
+		const cancel: Window["clearTimeout"] = original.clearTimeout;
+		const held: Array<() => void> = [];
+		const arrivals: Promise<void>[] = [];
+		const handles: number[] = [];
+		// Let the real focus callbacks become due, but control their execution order explicitly.
+		// The barrier must stay pending until they run, not merely until focus/selection agree.
+		const controlled = ((callback: TimerHandler, delay?: number, ...args: unknown[]) => {
+			if (window.setTimeout === controlled || typeof callback !== "function")
+				return schedule.call(window, callback, delay, ...args);
+			let arrived = () => {};
+			arrivals.push(
+				new Promise<void>((resolve) => {
+					arrived = resolve;
+				}),
+			);
+			const handle = schedule.call(
+				window,
+				() => {
+					held.push(() => callback(...args));
+					arrived();
+				},
+				delay,
+			);
+			handles.push(handle);
+			return handle;
+		}) as typeof window.setTimeout;
+		window.setTimeout = controlled;
+		try {
+			let finished = false;
+			const ready = f.caretReady(id as never).then((placed) => {
+				finished = true;
+				return placed;
+			});
+			await Promise.all(arrivals);
+			const before = { pending: !finished, restored: window.setTimeout === controlled };
+			for (const run of held) run();
+			const placed = await ready;
+			const restored = window.setTimeout === controlled && window.clearTimeout === cancel;
+			f.view().pm.dom.blur();
+			let failure = "";
+			try {
+				// A zero deadline deterministically expires while the focus callbacks remain held.
+				await f.caretReady(id as never, -1, 0);
+			} catch (error) {
+				failure = String(error);
+			}
+			return {
+				scheduled: arrivals.length > 0,
+				before,
+				placed,
+				restored,
+				failure,
+				failureRestored: window.setTimeout === controlled && window.clearTimeout === cancel,
+			};
+		} finally {
+			window.setTimeout = original.setTimeout;
+			window.clearTimeout = original.clearTimeout;
+			for (const handle of handles) cancel.call(window, handle);
+		}
+	}, ship);
+	expect(result).toEqual({
+		scheduled: true,
+		before: { pending: true, restored: true },
+		placed: true,
+		restored: true,
+		failure: "Error: outline focus setup did not finish",
+		failureRestored: true,
+	});
+	expect(a.errors).toEqual([]);
+}, 30_000);
+
 test("a closed row wholly inside a text selection opens first too; the whole page takes two presses", async () => {
 	const { pageId, idOf } = await page();
 	const a = await openHost(h, "page", pageId);
@@ -1757,7 +1836,9 @@ test("a closed row wholly inside a text selection opens first too; the whole pag
 
 	// With the keyboard: the cursor at the end of the row above, Shift+Down twice, Backspace.
 	// Exactly two presses: each is followed by a wait for the selection's head to move.
-	await caret(a, ship);
+	// Let this programmatic focus finish its scheduled DOM-selection repair before native input.
+	// Otherwise that repair can overwrite Shift+Down before Chromium emits selectionchange.
+	expect(await a.call((f, id) => f.caretReady(id as never), ship)).toBe(true);
 	for (const press_ of ["first", "second"]) {
 		const was = JSON.stringify(await head(a));
 		await press(a, "Shift+ArrowDown");

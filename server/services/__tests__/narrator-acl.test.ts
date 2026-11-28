@@ -21,9 +21,9 @@
  * Run: NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$(mktemp -d) \
  *      bun test server/services/__tests__/narrator-acl.test.ts
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { and, eq, sql } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import { aclGrants, narrators, users } from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
@@ -358,6 +358,51 @@ describe("listNarratorAudience", () => {
 		if (audience.everyone) throw new Error("unreachable");
 		expect(audience.userIds).toEqual([friendId]);
 	});
+	test("full fan-out reads every bounded grant page", async () => {
+		const id = await makeNarrator({ ownerUserId: ownerId });
+		const principalIds = [friendId, ...Array.from({ length: 499 }, () => generateId()), strangerId];
+		await db.insert(aclGrants).values(
+			principalIds.map((principalId, index) => ({
+				id: `${id}-${String(index).padStart(4, "0")}`,
+				scopeType: "narrator" as const,
+				scopeId: id,
+				principalType: "user" as const,
+				principalId,
+				capability: "read" as const,
+				grantedBy: ownerId,
+				createdAt: new Date().toISOString(),
+			})),
+		);
+		const audience = await listNarratorAudience(await rowOf(id));
+		if (audience.everyone) throw new Error("private audience widened");
+		expect(new Set(audience.userIds)).toEqual(new Set([ownerId, ...principalIds]));
+	});
+
+	test("candidate intersections run in workers and retain only their existing audience", async () => {
+		const id = await makeNarrator({ ownerUserId: ownerId });
+		await grant(id, friendId, "read");
+		const row = await rowOf(id);
+		const prepare = spyOn(sqlite, "prepare").mockImplementation(() => {
+			throw new Error("main prepare");
+		});
+		const query = spyOn(sqlite, "query").mockImplementation(() => {
+			throw new Error("main query");
+		});
+		try {
+			expect(await listNarratorAudience(row, undefined, [friendId, strangerId])).toEqual({
+				everyone: false,
+				userIds: [friendId],
+			});
+			expect(await listNarratorAudience(row, undefined, [])).toEqual({
+				everyone: false,
+				userIds: [],
+			});
+		} finally {
+			prepare.mockRestore();
+			query.mockRestore();
+		}
+	});
+
 	test("notification audience budget retains the owner without widening default broadcasts", async () => {
 		const id = await makeNarrator({ ownerUserId: ownerId });
 		await grant(id, friendId, "read");

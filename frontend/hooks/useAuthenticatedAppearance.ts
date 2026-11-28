@@ -1,17 +1,47 @@
-import { useComputedColorScheme } from "@mantine/core";
+import {
+	type MantineColorScheme,
+	useComputedColorScheme,
+	useMantineColorScheme,
+} from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { setTypography } from "@shared/pretext-layout/typography";
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	appearanceStore,
+	subscribeAppearancePreferences,
+} from "../lib/appearance-preference-store";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { ensureTypographyCssVars } from "../lib/typography-css-vars";
 import { typographyFromPreferences } from "../lib/typography-preferences";
 import { useLocalNumberPref, useLocalPref } from "./useLocalPref";
 import type { useUserPreferences } from "./useUserPreferences";
+import { useUserPreferencesChangeSync } from "./useUserPreferencesChangeSync";
 
-/** Shared preferences only: no navigation, badges, workspace or realtime subscriptions. */
+/** Presentation and account-preference invalidation shared by app and standalone windows. */
 export function useAuthenticatedAppearance(prefs: ReturnType<typeof useUserPreferences>["data"]) {
 	const { i18n } = useTranslation("common");
+	const { t: settingsText } = useTranslation("settings");
+	useUserPreferencesChangeSync();
+	const theme = useSyncExternalStore(
+		subscribeAppearancePreferences,
+		() => appearanceStore.get("colorScheme"),
+		() => "auto",
+	) as MantineColorScheme;
+	const syncError = useSyncExternalStore(
+		subscribeAppearancePreferences,
+		() => appearanceStore.error,
+		() => null,
+	);
+	const { setColorScheme } = useMantineColorScheme();
+	useEffect(() => {
+		setColorScheme(theme);
+	}, [theme, setColorScheme]);
+	useEffect(() => {
+		if (syncError)
+			notifications.show({ color: "red", message: settingsText("appearanceSyncFailed") });
+	}, [syncError, settingsText]);
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [blurInMs] = useLocalNumberPref("narrafork_blur_in_ms");

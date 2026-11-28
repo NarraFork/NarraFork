@@ -1,0 +1,1 @@
+ALTER TABLE "user_preferences" ADD COLUMN "appearance_preferences" text DEFAULT '{}' NOT NULL;

@@ -228,6 +228,8 @@ export const TOGGLEABLE_CARD_KINDS = new Set([
 	// Task notices (`tasks_notice`) fold their task lines behind their heading. Every other
 	// system card ignores the callback.
 	"system-text",
+	// The team page's Team-call chip opens onto the ordinary cards it folds.
+	"team-chip",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
 export const TRACE_KINDS = new Set(["activity-trace", "reasoning-steps"]);

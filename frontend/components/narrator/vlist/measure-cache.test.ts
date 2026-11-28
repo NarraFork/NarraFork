@@ -49,6 +49,37 @@ describe("text preview cache keys", () => {
 		);
 	});
 
+	it("re-keys a meta row when only its progress bar moves", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const data = (completed: number, currentItem: string) => ({
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "meta.progress",
+						body: {
+							kind: "meta-rows",
+							rows: [
+								{
+									text: "",
+									progress: {
+										ratio: completed / 3,
+										percent: Math.round((completed / 3) * 100),
+										figures: [`${completed}/3`, currentItem],
+									},
+								},
+							],
+						},
+					},
+				],
+			},
+		});
+		const base = extractDataRevision(data(1, "batch-2"));
+		expect(extractDataRevision(data(1, "batch-2"))).toBe(base);
+		expect(extractDataRevision(data(2, "batch-2"))).not.toBe(base);
+		expect(extractDataRevision(data(1, "batch-3"))).not.toBe(base);
+	});
+
 	it("keys direct text expansion independently from card expansion", async () => {
 		const { buildCacheKey } = await import("./measure-cache");
 		const key = (opts: Record<string, unknown>) => buildCacheKey("body", "reasoning", 400, 5, opts);
@@ -70,6 +101,28 @@ describe("text preview cache keys", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const data = (body: string) => ({ steps: [{ key: "seg0", title: "step", body }] });
 		expect(extractDataRevision(data("first"))).not.toBe(extractDataRevision(data("other")));
+	});
+
+	it("remeasures an open reasoning card as translations arrive at the same document revision", async () => {
+		const { measureElementCached } = await import("./registry");
+		const text = "First.\n\nSecond.";
+		const measure = (translatedText?: string) =>
+			measureElementCached(
+				"reasoning",
+				{ text, translatedText },
+				420,
+				5,
+				{ expanded: true },
+				"reasoning-translation-cache",
+				1,
+			);
+		const original = measure();
+		const partial = measure("第一。\n\nSecond.");
+		const complete = measure("第一。\n\n第二。");
+		expect(original).toMatchObject({ displayText: text, hasTranslationToggle: false });
+		expect(partial).toMatchObject({ displayText: "第一。\n\nSecond.", hasTranslationToggle: true });
+		expect(complete).toMatchObject({ displayText: "第一。\n\n第二。", hasTranslationToggle: true });
+		expect(measure("第一。\n\n第二。")).toBe(complete);
 	});
 });
 
@@ -1502,6 +1555,19 @@ describe("extractDataRevision", () => {
 			const after = extractDataRevision(traceWith(agentCard({ liveOutputChars: 1240 })));
 			expect(after).not.toBe(before);
 			expect(after).toContain("gl:1240");
+		});
+
+		it("a new Agent execution re-keys the row even when its status and geometry are unchanged", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const before = extractDataRevision(
+				traceWith(agentCard({ toolCallId: "pk", executionAttempt: 1 })),
+			);
+			expect(
+				extractDataRevision(traceWith(agentCard({ toolCallId: "pk", executionAttempt: 2 }))),
+			).not.toBe(before);
+			expect(
+				extractDataRevision(traceWith(agentCard({ toolCallId: "new-pk", executionAttempt: 1 }))),
+			).not.toBe(before);
 		});
 
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {

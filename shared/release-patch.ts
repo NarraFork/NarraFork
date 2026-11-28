@@ -3,7 +3,7 @@ import { compareReleaseVersions, isValidReleaseVersion } from "./release-version
 export const MAX_RELEASE_PATCH_BYTES = 512 * 1024 * 1024;
 /** Legacy dictionary decoding needs buffers; large updates must use streaming patch-from. */
 export const MAX_RELEASE_LEGACY_BYTES = 8 * 1024 * 1024;
-export const MAX_RELEASE_BINARY_BYTES = 1024 * 1024 * 1024;
+export const MAX_RELEASE_BINARY_BYTES = 4 * 1024 ** 3;
 export const MAX_RELEASE_PATCH_STEPS = 16;
 export const MAX_RELEASE_PATCH_METADATA = 32;
 export const RELEASE_SHA512_RE = /^[A-Za-z0-9+/]{86}==$/;

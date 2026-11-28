@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import type {
-	MirrorAssetDescriptor,
-	MirrorSnapshotV1,
+import {
+	MIRROR_MAIN_TRANSFER_TIMEOUT_MS,
+	type MirrorAssetDescriptor,
+	type MirrorSnapshot,
 } from "../../shared/independent-update-mirror";
 import { validateReleasePatchMetadata } from "../../shared/release-patch";
 import { parseUpdateNotes } from "../../shared/update-index";
@@ -54,6 +55,7 @@ export async function verifyMirrorAsset(
 	const stream = await storage.getFileStream(path);
 	if (!stream) throw new Error("Required mirror asset missing");
 	if (
+		asset.kind !== "main-binary" &&
 		asset.kind !== "patch" &&
 		asset.kind !== "helpers-binary" &&
 		asset.kind !== "executor-binary" &&
@@ -78,7 +80,7 @@ export async function verifyMirrorAsset(
 	signal.addEventListener("abort", abort, { once: true });
 	const timer = setTimeout(
 		() => reject(new Error("Mirror verification deadline exceeded")),
-		120_000,
+		asset.kind === "main-binary" ? MIRROR_MAIN_TRANSFER_TIMEOUT_MS : 120_000,
 	);
 	try {
 		if (signal.aborted) throw new Error("Mirror verification aborted");
@@ -90,7 +92,7 @@ export async function verifyMirrorAsset(
 			hash.update(value);
 		}
 		if (count !== asset.size || hash.digest("hex") !== asset.sha256)
-			throw new Error("Mirror patch SHA256 mismatch");
+			throw new Error("Mirror asset SHA256 mismatch");
 	} finally {
 		clearTimeout(timer);
 		signal.removeEventListener("abort", abort);
@@ -99,7 +101,7 @@ export async function verifyMirrorAsset(
 }
 
 export function validateMirrorMetadata(
-	snapshot: MirrorSnapshotV1,
+	snapshot: MirrorSnapshot,
 	asset: MirrorAssetDescriptor,
 	bytes: Buffer,
 ) {

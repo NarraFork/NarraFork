@@ -50,7 +50,6 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		}, 800);
 	};
 
-	// Create terminal on mount
 	useEffect(() => {
 		if (!terminalSupported) return;
 		let cancelled = false;
@@ -164,7 +163,6 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		},
 	});
 
-	// Create xterm instance
 	useEffect(() => {
 		if (!containerRef.current) return;
 		const term = new Terminal({

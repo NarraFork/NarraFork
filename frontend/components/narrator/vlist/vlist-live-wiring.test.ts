@@ -89,9 +89,10 @@ const REQUIRED_EVENTS = [
 /**
  * Streaming-frequency events that must stay OUT of the DOCUMENT PATCH channel.
  *
- * `tool_use_chunk` / `tool_output` fire per delta, and a document patch rebuilds
- * from the persisted message set — routing them here would mean a full rebuild per
- * chunk. They are handled by the live streaming ROW instead
+ * Full top-level `tool_use_chunk` / `tool_output` fire per delta and belong to the
+ * streaming ROW. The document channel accepts only reduced CHILD chunk headers;
+ * `useVListLivePatches.test.tsx` verifies that routing and duplicate no-op behavior.
+ * Top-level chunks and raw outputs are handled by the live streaming ROW instead
  * (`useVListStreamingMessage` + `streaming-tool-chunks.ts`), which is rebuilt once
  * per frame anyway and leaves every committed row's measurement cached.
  *
@@ -107,7 +108,7 @@ const REQUIRED_EVENTS = [
  * it belongs to the render-only store (`../reflection-progress-store.ts`), fed from
  * `useNarratorPanelWS`.
  */
-const FORBIDDEN_EVENTS = ["onToolUseChunk", "onToolOutput", "onReflectionProgress"];
+const FORBIDDEN_EVENTS = ["onToolOutput", "onReflectionProgress"];
 /** Events the streaming ROW must fold, so live tool state is never dropped again. */
 const REQUIRED_STREAMING_ROW_EVENTS = [
 	"onToolUseChunk",
@@ -123,7 +124,7 @@ describe("vlist live lifecycle subscription set", () => {
 		expect(missing).toEqual([]);
 	});
 
-	it("keeps streaming-frequency tool events out of the document patch channel", () => {
+	it("keeps raw tool output and reflection progress out of the document patch channel", () => {
 		const present = FORBIDDEN_EVENTS.filter((event) => LIVE_HOOK.includes(`${event}:`));
 		expect(present).toEqual([]);
 	});
@@ -227,6 +228,70 @@ describe("LivePatchQueue", () => {
 		});
 		h.frame();
 		expect(missed).toBe(1);
+	});
+
+	it("notifies per-entry misses after one successful mixed-batch apply, once per callback", async () => {
+		const { LivePatchQueue } = await import("./vlist-live-patch");
+		let drain: (() => void) | undefined;
+		let applying = false;
+		let applications = 0;
+		let notifications = 0;
+		const queue = new LivePatchQueue({
+			currentNarratorId: () => "n1",
+			apply: (patch) => {
+				applying = true;
+				applications++;
+				const result = patch([]);
+				applying = false;
+				expect(result.messages).toHaveLength(1);
+				return result.changed;
+			},
+			schedule: (callback) => {
+				drain = callback;
+				return 1;
+			},
+			cancel: () => {},
+		});
+		const onMiss = () => {
+			expect(applying).toBe(false);
+			notifications++;
+		};
+		const miss: LivePatch = (messages) => ({ messages, changed: false });
+		queue.enqueue(marker("matched"));
+		queue.enqueue(miss, onMiss);
+		queue.enqueue(miss, onMiss);
+		drain?.();
+		expect(applications).toBe(1);
+		expect(notifications).toBe(1);
+	});
+
+	it("drops mixed-batch fallback notifications if the narrator changes during apply", async () => {
+		const { LivePatchQueue } = await import("./vlist-live-patch");
+		let drain: (() => void) | undefined;
+		let narrator = "n1";
+		let notifications = 0;
+		const queue = new LivePatchQueue({
+			currentNarratorId: () => narrator,
+			apply: (patch) => {
+				const result = patch([]);
+				narrator = "n2";
+				return result.changed;
+			},
+			schedule: (callback) => {
+				drain = callback;
+				return 1;
+			},
+			cancel: () => {},
+		});
+		queue.enqueue(marker("matched"));
+		queue.enqueue(
+			(messages) => ({ messages, changed: false }),
+			() => {
+				notifications++;
+			},
+		);
+		drain?.();
+		expect(notifications).toBe(0);
 	});
 
 	it("drops a batch whose narrator changed before the frame drained", async () => {

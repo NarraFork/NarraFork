@@ -18,6 +18,10 @@
  * `toBlockCatchUp`).
  */
 
+import {
+	type ReasoningTranslationPatch,
+	readReasoningTranslationPatch,
+} from "@shared/reasoning-translation";
 import { blockIdForElement } from "../services/narrator-block-ids";
 import { ledgerBlockId, toEnvelopes } from "../services/narrator-block-page";
 import type { NarratorServerMessage } from "./narrator-ws-types";
@@ -140,7 +144,17 @@ function withToolBlock(frame: Frame): NarratorServerMessage | undefined {
 }
 
 /** The frames a v2 connection receives for one v1 broadcast frame. */
+export function reasoningTranslationPatchFrame(
+	message: ReasoningTranslationPatch,
+): ReasoningTranslationPatch {
+	const frame = readReasoningTranslationPatch(message);
+	if (!frame) throw new Error("Invalid reasoning translation patch");
+	return frame;
+}
+
 export function toBlockFrames(message: NarratorServerMessage): NarratorServerMessage[] {
+	if (message.type === "reasoning_translation_patch")
+		return [reasoningTranslationPatchFrame(message)];
 	const frame = message as unknown as Frame;
 	if (MESSAGE_FRAMES.has(frame.type)) return [upserted(frame) ?? message];
 	if (TOOL_FRAMES.has(frame.type)) return [withToolBlock(frame) ?? message];

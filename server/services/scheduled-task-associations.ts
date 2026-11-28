@@ -3,6 +3,7 @@ import type { ScheduledTaskAssociationsPage } from "@shared/scheduled-task-targe
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, scheduledTasks } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
@@ -68,10 +69,13 @@ export async function listNarratorScheduledTasks(
 	options: ScheduledTaskPageOptions = {},
 ): Promise<ScheduledTaskAssociationsPage> {
 	const live = await resolveTaskPrincipal(principal.userId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { ...NARRATOR_ACL_COLUMNS, scheduledTaskId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { ...NARRATOR_ACL_COLUMNS, scheduledTaskId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator || !(await canReadNarrator(narrator, live)))
 		throw new NotFoundError("Narrator", narratorId);
 	const limit = scheduledTaskPageLimit(options.limit);
@@ -95,12 +99,15 @@ export async function listNarratorScheduledTasks(
 	]);
 	let cached = cache.get(key);
 	if (!cached || cached.expiresAt <= Date.now()) {
-		const candidates = await db
-			.select({ id: scheduledTasks.id })
-			.from(scheduledTasks)
-			.where(where)
-			.orderBy(asc(scheduledTasks.id))
-			.limit(limit + 1);
+		const candidates = await readQuery(
+			db
+				.select({ id: scheduledTasks.id })
+				.from(scheduledTasks)
+				.where(where)
+				.orderBy(asc(scheduledTasks.id))
+				.limit(limit + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		cached = { ids: candidates.map((row) => row.id), expiresAt: Date.now() + CACHE_TTL_MS };
 		cache.delete(key);
 		if (cache.size >= MAX_CACHED_PAGES) {
@@ -110,26 +117,29 @@ export async function listNarratorScheduledTasks(
 		cache.set(key, cached);
 	}
 	if (!cached.ids.length) return { tasks: [], nextCursor: null };
-	const rows = await db
-		.select({
-			id: scheduledTasks.id,
-			name: scheduledTasks.name,
-			enabled: scheduledTasks.enabled,
-			completedAt: scheduledTasks.completedAt,
-			firedCount: scheduledTasks.firedCount,
-			schedule: scheduledTasks.schedule,
-			cronExpr: scheduledTasks.cronExpr,
-			timezone: scheduledTasks.timezone,
-			createdAt: scheduledTasks.createdAt,
-			lastStatus: scheduledTasks.lastStatus,
-			modelPolicy: scheduledTasks.modelPolicy,
-			requireReport: scheduledTasks.requireReport,
-			hasUnfinishedRun: unfinished.mapWith(Boolean).as("has_unfinished_run"),
-		})
-		.from(scheduledTasks)
-		.where(and(where, inArray(scheduledTasks.id, cached.ids)))
-		.orderBy(asc(scheduledTasks.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: scheduledTasks.id,
+				name: scheduledTasks.name,
+				enabled: scheduledTasks.enabled,
+				completedAt: scheduledTasks.completedAt,
+				firedCount: scheduledTasks.firedCount,
+				schedule: scheduledTasks.schedule,
+				cronExpr: scheduledTasks.cronExpr,
+				timezone: scheduledTasks.timezone,
+				createdAt: scheduledTasks.createdAt,
+				lastStatus: scheduledTasks.lastStatus,
+				modelPolicy: scheduledTasks.modelPolicy,
+				requireReport: scheduledTasks.requireReport,
+				hasUnfinishedRun: unfinished.mapWith(Boolean).as("has_unfinished_run"),
+			})
+			.from(scheduledTasks)
+			.where(and(where, inArray(scheduledTasks.id, cached.ids)))
+			.orderBy(asc(scheduledTasks.id))
+			.limit(limit + 1),
+		{ executionPolicy: "worker-required" },
+	);
 	const tasks = rows.slice(0, limit).map((row) => {
 		const schedule = readTaskSchedule(row);
 		return {

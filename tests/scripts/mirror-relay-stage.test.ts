@@ -164,9 +164,9 @@ describe("WebDAV relay producer", () => {
 		)?.[1];
 		expect(payload?.length).toBe(manifest.payload.size);
 		expect(sha(payload as Uint8Array)).toBe(manifest.payload.sha256);
-		for (const bytes of github.raw.values())
+		for (const [name, bytes] of github.raw)
 			expect([...f.dav.objects.values()].some((actual) => Buffer.from(actual).equals(bytes))).toBe(
-				true,
+				name !== github.name,
 			);
 	});
 	test("payload is independent of signed ready bytes near the 1MiB limit", async () => {

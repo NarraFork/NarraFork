@@ -25,7 +25,6 @@ import {
 	UPDATE_INDEX_BRANCH,
 	UPDATE_INDEX_FILE,
 	type UpdateIndexAsset,
-	type UpdateIndexBinary,
 	type UpdateIndexV1,
 } from "../../shared/update-index-types";
 import { logger } from "../lib/logger";
@@ -258,42 +257,6 @@ export function validateGithubBinaryMetadata(
 		};
 	} catch {
 		throw new GithubUpdateError("INVALID_METADATA", "Invalid recoveryManifestVersions declaration");
-	}
-}
-
-/** Mirror checks use the same GitHub sidecar authority, frozen transport and bounded reader. */
-export async function readIndexedGithubBinaryMetadata(
-	input: { repository: string; version: string; commit: string; binary: UpdateIndexBinary },
-	options: { signal: AbortSignal; fetcher: GithubFetch },
-): Promise<{ sha512: string; recoveryManifestVersions: number[] }> {
-	const { binary } = input;
-	if (
-		!Number.isSafeInteger(binary.metadata.size) ||
-		binary.metadata.size <= 0 ||
-		binary.metadata.size > 64 * 1024
-	) {
-		throw new GithubUpdateError("INVALID_METADATA", "Invalid GitHub sidecar size");
-	}
-	const url = `https://github.com/${input.repository}/releases/download/v${input.version}/${binary.metadata.name}`;
-	validateGithubAssetUrl(url, input.repository, input.version, `${binary.name}.metadata.json`);
-	const signal = AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]);
-	const response = await fetchGithubAsset(url, signal, options.fetcher);
-	try {
-		if (!response.ok)
-			throw new GithubUpdateError("NETWORK_ERROR", "GitHub binary sidecar unavailable");
-		const metadata = await readBoundedJson(response, 64 * 1024, signal);
-		if (metadata.bytes !== binary.metadata.size || metadata.sha256 !== binary.metadata.sha256) {
-			throw new GithubUpdateError("INVALID_METADATA", "GitHub sidecar size or checksum mismatch");
-		}
-		return validateGithubBinaryMetadata(metadata.value, {
-			name: binary.name,
-			platform: binary.platform,
-			version: input.version,
-			size: binary.size,
-			indexed: { sha256: binary.sha256, sha512: binary.sha512, commit: input.commit },
-		});
-	} finally {
-		await abortable(response.body?.cancel() ?? Promise.resolve(), signal).catch(() => {});
 	}
 }
 

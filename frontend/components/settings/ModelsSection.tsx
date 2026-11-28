@@ -1,4 +1,4 @@
-import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
+import type { ComboboxData, ComboboxItemGroup, OptionsFilter } from "@mantine/core";
 import { Alert, Button, MultiSelect, NumberInput, Select, Stack, Text } from "@mantine/core";
 import {
 	isSubagentReasoningEffort,
@@ -11,6 +11,7 @@ import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
+import { defaultModelOptionsFilter } from "../../lib/model-search";
 import { CmdListEditor } from "../common/CmdListEditor";
 import {
 	SubagentReasoningEffortSection,
@@ -85,6 +86,11 @@ export interface ModelsSectionProps {
 	setSubagentModelReasoningEfforts: (v: SubagentModelReasoningEfforts) => void;
 	groupedModels: ComboboxData;
 	/**
+	 * From `useAllModels()`. Without it the pickers still match the group header,
+	 * value and prefix, but not the targets behind the Default/Summary rows.
+	 */
+	modelOptionsFilter?: OptionsFilter<string>;
+	/**
 	 * Models kept only because default/summary still point at a delisted id.
 	 * Used to warn under those Selects so the user reassigns the role instead
 	 * of wondering why a dead model is stuck in the list.
@@ -125,6 +131,7 @@ export function ModelsSection({
 	subagentModelReasoningEfforts,
 	setSubagentModelReasoningEfforts,
 	groupedModels,
+	modelOptionsFilter = defaultModelOptionsFilter,
 	catalogMissingModels = [],
 	navigate,
 }: ModelsSectionProps) {
@@ -245,6 +252,7 @@ export function ModelsSection({
 				label={t("defaultModel")}
 				data={prefixedModelsNoDefault}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}
 				onChange={(v) => {
@@ -258,6 +266,7 @@ export function ModelsSection({
 				label={t("summaryModel")}
 				data={prefixedModelsNoSummary}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
 				onChange={(v) => {
@@ -272,6 +281,7 @@ export function ModelsSection({
 				description={t("translationModelDesc")}
 				data={prefixedModels}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={translationModel}
 				onChange={(v) => setTranslationModel(v ?? FOLLOW_SUMMARY_MODEL)}
@@ -281,6 +291,7 @@ export function ModelsSection({
 				description={t("promptOptimizeModelDesc")}
 				data={prefixedModels}
 				searchable
+				filter={modelOptionsFilter}
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={promptOptimizeModel}
 				onChange={(v) => setPromptOptimizeModel(v ?? FOLLOW_SUMMARY_MODEL)}
@@ -307,6 +318,7 @@ export function ModelsSection({
 					label={t("subagentExploreModel")}
 					data={prefixedModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
@@ -317,6 +329,7 @@ export function ModelsSection({
 					label={t("subagentPlanModel")}
 					data={prefixedModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
@@ -327,6 +340,7 @@ export function ModelsSection({
 					label={t("subagentSearchModel")}
 					data={prefixedModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
@@ -337,6 +351,7 @@ export function ModelsSection({
 					label={t("subagentReviewModel")}
 					data={prefixedModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
@@ -355,6 +370,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsExplore")}
 					data={poolModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
@@ -365,6 +381,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsPlan")}
 					data={poolModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
@@ -375,6 +392,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsGeneral")}
 					data={poolModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
@@ -385,6 +403,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsSearch")}
 					data={poolModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
@@ -395,6 +414,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsReview")}
 					data={poolModels}
 					searchable
+					filter={modelOptionsFilter}
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}

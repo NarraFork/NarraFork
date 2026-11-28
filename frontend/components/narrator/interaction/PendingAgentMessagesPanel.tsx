@@ -1,15 +1,13 @@
 import { ActionIcon, Button, Group, Stack, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { IconChevronDown, IconChevronUp, IconPlayerPlay, IconX } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../../lib/api";
-import { narratorWSManager } from "../../../lib/narrator-ws-manager";
+import { usePendingAgentMessages } from "./use-pending-agent-messages";
 
-export const pendingAgentMessagesQueryKey = (narratorId: string) =>
-	["narrator-agent-inbox", narratorId] as const;
+export { pendingAgentMessagesQueryKey } from "./use-pending-agent-messages";
 
 /**
  * Messages other agents queued for this session that no turn has read yet. A session
@@ -18,26 +16,8 @@ export const pendingAgentMessagesQueryKey = (narratorId: string) =>
  */
 export function PendingAgentMessagesPanel({ narratorId }: { narratorId: string }) {
 	const { t } = useTranslation("narrator");
-	const queryClient = useQueryClient();
-	const queryKey = pendingAgentMessagesQueryKey(narratorId);
 	const [expanded, setExpanded] = useState(false);
-	const { data } = useQuery<PendingAgentMessagesPage>({
-		queryKey,
-		queryFn: ({ signal }) => api.getPendingAgentMessages(narratorId, signal),
-		staleTime: 5_000,
-	});
-
-	useEffect(() => {
-		const handle = narratorWSManager.addListener(
-			{ narratorIds: [narratorId], types: ["agent_inbox_changed", "status_change"] },
-			() => {
-				void queryClient.invalidateQueries({ queryKey: pendingAgentMessagesQueryKey(narratorId) });
-			},
-		);
-		return () => narratorWSManager.removeListener(handle);
-	}, [narratorId, queryClient]);
-
-	const refresh = () => queryClient.invalidateQueries({ queryKey });
+	const { data, refresh } = usePendingAgentMessages(narratorId);
 	const fail = (error: unknown) =>
 		notifications.show({
 			color: "red",

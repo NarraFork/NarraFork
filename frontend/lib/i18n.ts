@@ -144,6 +144,21 @@ function getRouteNamespaces(path: string): Namespace[] {
 	if (path === "/changelog") return ["common", "nav", "settings"];
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
+	// A team page holds the coordinator's session view (which may open outline panels).
+	if (path.startsWith("/projects/") && path.includes("/teams/")) {
+		return [
+			"common",
+			"nav",
+			"projects",
+			"narrators",
+			"narrator",
+			"settings",
+			"terminal",
+			"git",
+			"chat",
+			"outline",
+		];
+	}
 	if (path.startsWith("/projects/")) {
 		return ["common", "nav", "projects", "narrator", "settings", "terminal", "git", "chat"];
 	}

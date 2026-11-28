@@ -1,17 +1,39 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { loadavg, tmpdir } from "node:os";
+import { join, parse, resolve } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import {
 	initializeAbsentReceiptProtectionSource,
 	installResourceProtectionTriggers,
+	receiptProjectionPrefix,
 } from "../db/resource-protection-index";
+import * as workerRead from "../db/worker-read";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
 import type { WorktreeJournalRecord } from "./narrator-worktree-journal";
-import { createResourceProtectionIndex } from "./resource-protection-index";
-import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
+import {
+	canonicalProtectionPath,
+	createResourceProtectionIndex,
+	getResourceProtectionShutdownSnapshot,
+	maintainProtectionIndex,
+	readProtectionClaims,
+	resetResourceProtectionIndexForTests,
+	startProtectionIndexMaintenance,
+	stopResourceProtectionIndex,
+} from "./resource-protection-index";
+import {
+	legacyTreeSnapshotPhysicalDir,
+	treeSnapshotKey,
+	treeSnapshotPhysicalDir,
+} from "./tree-snapshot-paths";
+import {
+	createLifecycleGuard,
+	type LifecycleTarget,
+	type ResourceClaim,
+} from "./worktree-lifecycle-guard";
 
 let database: Database;
 let root: string;
@@ -21,15 +43,39 @@ const deadline = () => performance.now() + 15_000;
 function changes() {
 	return (database.query("SELECT total_changes() AS n").get() as { n: number }).n;
 }
-async function claims(
-	targets: LifecycleTarget[],
-	includeLegacyReceipts = true,
+// Settle Worker-backed promises before native matchers so Bun keeps dispatching worker messages.
+async function expectFailure(work: Promise<unknown>, message?: string) {
+	const error = await work.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	expect(error).toBeInstanceOf(Error);
+	if (message) expect((error as Error).message).toContain(message);
+}
+async function collectClaims(
+	result: Awaited<ReturnType<typeof service.read>>,
 ): Promise<ResourceClaim[]> {
-	const result = await service.read(targets, deadline(), undefined, includeLegacyReceipts);
 	if (!result.complete) throw new Error("incomplete");
 	const resultClaims: ResourceClaim[] = [];
 	for await (const claim of result.claims) resultClaims.push(claim);
 	return resultClaims;
+}
+async function claims(
+	targets: LifecycleTarget[],
+	includeLegacyReceipts = true,
+): Promise<ResourceClaim[]> {
+	// The index consumes comparison identities already canonicalized by its guard.
+	const canonicalTargets = await Promise.all(
+		targets.map(async (target) => ({
+			...target,
+			...(target.path && (target.deviceId ?? "local") === "local"
+				? { path: await canonicalProtectionPath(target.path) }
+				: {}),
+		})),
+	);
+	return collectClaims(
+		await service.read(canonicalTargets, deadline(), undefined, includeLegacyReceipts),
+	);
 }
 async function bootstrap() {
 	for (let attempt = 0; attempt < 1000; attempt++) {
@@ -59,9 +105,9 @@ function receipt(destination: string): WorktreeJournalRecord {
 }
 
 beforeEach(async () => {
-	root = await mkdtemp(join(tmpdir(), "nf-protection-index-"));
+	root = await canonicalProtectionPath(await mkdtemp(join(tmpdir(), "nf-protection-index-")));
 	receipts = join(root, "worktree-requests");
-	database = new Database(":memory:");
+	database = openFileWorkerDatabase();
 	database.exec(`
 		CREATE TABLE narrators(id TEXT PRIMARY KEY, cwd TEXT, default_device_id TEXT,
 			workspace_context TEXT, workspace_revision INTEGER NOT NULL DEFAULT 0, title TEXT);
@@ -84,7 +130,8 @@ beforeEach(async () => {
 	service = createResourceProtectionIndex(database, receipts);
 });
 afterEach(async () => {
-	database.close();
+	await service.stop();
+	await closeFileWorkerDatabase(database);
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -158,6 +205,147 @@ describe("absent legacy namespace startup", () => {
 			database.query("SELECT * FROM resource_protection_paths WHERE source='receipt'").all(),
 		).toEqual(pins);
 		expect((await claims([{ path: root }])).some((claim) => claim.kind === "receipt")).toBe(true);
+	});
+});
+
+describe("bounded protection maintenance reads", () => {
+	test("each steady idle pass uses two worker reads and zero writes", async () => {
+		narrator("n", root);
+		registry("r", root);
+		await bootstrap();
+		const before = changes();
+		const reads = spyOn(workerRead, "readNativeRows");
+		const queries = spyOn(database, "query");
+		try {
+			for (let pass = 0; pass < 3; pass++) {
+				reads.mockClear();
+				await service.maintain(deadline());
+				expect(reads).toHaveBeenCalledTimes(2);
+				expect(reads.mock.calls[0]?.[1]).toStartWith("SELECT source, cursor, complete");
+				expect(reads.mock.calls[0]?.[3]?.maxRows).toBe(3);
+				expect(reads.mock.calls[1]?.[1]).toContain("WHERE dirty = 1");
+			}
+			expect(
+				queries.mock.calls.filter(([sql]) => /^\s*(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql)),
+			).toHaveLength(0);
+			expect(changes()).toBe(before);
+		} finally {
+			queries.mockRestore();
+			reads.mockRestore();
+		}
+	});
+	for (const source of ["narrator", "registry", "receipt"] as const) {
+		test(`a missing ${source} progress row fails before maintenance writes`, async () => {
+			await bootstrap();
+			database
+				.query("DELETE FROM resource_protection_sources WHERE source = ? AND source_id = ''")
+				.run(source);
+			const before = changes();
+			const reads = spyOn(workerRead, "readNativeRows");
+			try {
+				await expectFailure(service.maintain(deadline()), "triggers not installed");
+				expect(reads).toHaveBeenCalledTimes(1);
+				expect(changes()).toBe(before);
+			} finally {
+				reads.mockRestore();
+			}
+		});
+	}
+	test("empty dirty pages do not hide later source revisions", async () => {
+		narrator("n", root);
+		await bootstrap();
+		for (const name of ["first", "second"]) {
+			await service.maintain(deadline());
+			const path = join(root, name);
+			database.query("UPDATE narrators SET cwd = ? WHERE id = 'n'").run(path);
+			await service.maintain(deadline());
+			expect(
+				database
+					.query(`SELECT dirty FROM resource_protection_sources
+					WHERE source = 'narrator' AND source_id = 'n'`)
+					.get(),
+			).toEqual({ dirty: 0 });
+			expect(
+				database
+					.query(`SELECT canonical_path FROM resource_protection_paths
+					WHERE source = 'narrator' AND source_id = 'n' AND slot = 0`)
+					.get(),
+			).toEqual({ canonical_path: path });
+		}
+	});
+	test("stop after the last worker read still rejects an idle maintenance pass", async () => {
+		await bootstrap();
+		const original = workerRead.readNativeRows;
+		let stopping: Promise<void> | undefined;
+		const reads = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+			const rows = await original(...args);
+			if (args[1].includes("WHERE dirty = 1")) {
+				// Let readRows validate its result before stopping in the next continuation.
+				queueMicrotask(() => {
+					queueMicrotask(() => {
+						stopping = service.stop();
+					});
+				});
+			}
+			return rows;
+		}) as typeof original);
+		try {
+			await expectFailure(service.maintain(deadline()), "stopped");
+			await stopping;
+			expect(reads).toHaveBeenCalledTimes(2);
+		} finally {
+			await service.stop();
+			reads.mockRestore();
+		}
+	});
+	test("overlapping maintenance reads the latest receipt cursor inside its single flight", async () => {
+		await mkdir(receipts);
+		database
+			.query("UPDATE resource_protection_sources SET complete = 1 WHERE source != 'receipt'")
+			.run();
+		const snapshotRead = Promise.withResolvers<void>();
+		const releaseSnapshot = Promise.withResolvers<void>();
+		const original = workerRead.readNativeRows;
+		let snapshots = 0;
+		const receiptCursors: unknown[] = [];
+		const reads = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+			const rows = await original(...args);
+			if (args[1].startsWith("SELECT source, cursor, complete") && ++snapshots === 1) {
+				snapshotRead.resolve();
+				await releaseSnapshot.promise;
+			}
+			if (args[1].startsWith("SELECT cursor, complete") && args[1].includes("'receipt'"))
+				receiptCursors.push(rows[0]?.cursor);
+			return rows;
+		}) as typeof original);
+		const opens = spyOn(fs, "opendir");
+		let delayed: Promise<void> | undefined;
+		try {
+			delayed = service.maintain(deadline());
+			await snapshotRead.promise;
+			await service.maintain(deadline());
+			expect(
+				database
+					.query(`SELECT cursor, complete FROM resource_protection_sources
+					WHERE source = 'receipt' AND source_id = ''`)
+					.get(),
+			).toEqual({ cursor: "eof", complete: 0 });
+			releaseSnapshot.resolve();
+			await delayed;
+			expect(receiptCursors).toEqual([null, "eof"]);
+			expect(opens).toHaveBeenCalledTimes(1);
+			expect(
+				database
+					.query(`SELECT cursor, complete FROM resource_protection_sources
+					WHERE source = 'receipt' AND source_id = ''`)
+					.get(),
+			).toEqual({ cursor: "eof", complete: 1 });
+		} finally {
+			releaseSnapshot.resolve();
+			await delayed?.catch(() => {});
+			opens.mockRestore();
+			reads.mockRestore();
+		}
 	});
 });
 
@@ -289,6 +477,45 @@ describe("resource protection reverse index", () => {
 		expect(remaining("resource_protection_sources")).toBe(0);
 		expect(await claims([{ path: old }])).toEqual([]);
 	});
+	test("guard-canonicalized parent aliases and native case identities reach fresh and clean claims without writes", async () => {
+		const physical = join(root, "Physical-Root");
+		const alias = join(root, "Visible-Alias");
+		await mkdir(physical);
+		await symlink(physical, alias, process.platform === "win32" ? "junction" : "dir");
+		const raw = join(alias, "Checkout");
+		await mkdir(raw);
+		narrator("parent-alias", raw);
+		const requested = process.platform === "win32" ? raw.toUpperCase() : raw;
+		const canonical = await canonicalProtectionPath(requested);
+		const read = spyOn(service, "read");
+		try {
+			const before = changes();
+			expect(
+				(await claims([{ path: requested }], false)).some(
+					(claim) => claim.id === "parent-alias" && claim.path === raw,
+				),
+			).toBe(true);
+			expect(read.mock.calls[0]?.[0]).toEqual([{ path: canonical }]);
+			expect(changes()).toBe(before);
+			await bootstrap();
+			const warm = changes();
+			expect(
+				(await claims([{ path: requested }])).some(
+					(claim) => claim.id === "parent-alias" && claim.path === raw,
+				),
+			).toBe(true);
+			expect(read.mock.calls.at(-1)?.[0]).toEqual([{ path: canonical }]);
+			expect(changes()).toBe(warm);
+			expect(
+				database
+					.query(`SELECT canonical_path, alias_sensitive FROM resource_protection_paths
+				WHERE source='narrator' AND source_id='parent-alias'`)
+					.get(),
+			).toEqual({ canonical_path: canonical, alias_sensitive: 1 });
+		} finally {
+			read.mockRestore();
+		}
+	});
 	test("warm known aliases are revalidated without maintenance writes", async () => {
 		const one = join(root, "one"),
 			two = join(root, "two"),
@@ -307,10 +534,28 @@ describe("resource protection reverse index", () => {
 	test("revision changes during canonicalization cannot publish stale clean rows", async () => {
 		narrator("n", root);
 		await bootstrap();
-		database.query("UPDATE narrators SET cwd = ? WHERE id = 'n'").run(join(root, "intermediate"));
-		const maintaining = service.maintain(deadline());
-		database.query("UPDATE narrators SET cwd = ? WHERE id = 'n'").run(join(root, "new"));
-		await maintaining;
+		const intermediate = join(root, "intermediate");
+		database.query("UPDATE narrators SET cwd = ? WHERE id = 'n'").run(intermediate);
+		const canonicalizing = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const realpath = fs.realpath;
+		const spy = spyOn(fs, "realpath").mockImplementation((async (path) => {
+			if (path === intermediate) {
+				canonicalizing.resolve();
+				await release.promise;
+			}
+			return realpath(path);
+		}) as typeof fs.realpath);
+		try {
+			const maintaining = service.maintain(deadline());
+			await canonicalizing.promise;
+			database.query("UPDATE narrators SET cwd = ? WHERE id = 'n'").run(join(root, "new"));
+			release.resolve();
+			await maintaining;
+		} finally {
+			release.resolve();
+			spy.mockRestore();
+		}
 		expect(
 			database
 				.query(
@@ -328,20 +573,21 @@ describe("resource protection reverse index", () => {
 		await bootstrap();
 		const result = await service.read([{ path: root }], deadline());
 		narrator("later", root);
-		await expect(
+		await expectFailure(
 			(async () => {
 				for await (const _claim of result.claims) {
 					/* exhaust proof */
 				}
 			})(),
-		).rejects.toThrow("changed during inspection");
+			"changed during inspection",
+		);
 		await expect(service.read([{ path: root }], performance.now() - 1)).rejects.toThrow();
 		await expect(service.read([{ path: root }], deadline(), AbortSignal.abort())).rejects.toThrow();
 	});
 	test("unrelated writes do not invalidate clear; index publication does", async () => {
 		narrator("n", root);
 		await bootstrap();
-		const unrelated = [{ path: join(root, "..", "unrelated") }];
+		const unrelated = [{ path: await canonicalProtectionPath(join(root, "..", "unrelated")) }];
 		const result = await service.read(unrelated, deadline());
 		database.query("UPDATE narrators SET title='chat only' WHERE id='n'").run();
 		const found: ResourceClaim[] = [];
@@ -350,13 +596,14 @@ describe("resource protection reverse index", () => {
 		database.query("UPDATE narrators SET cwd=? WHERE id='n'").run(join(root, "new"));
 		const publishing = await service.read(unrelated, deadline());
 		await service.maintain(deadline());
-		await expect(
+		await expectFailure(
 			(async () => {
 				for await (const _claim of publishing.claims) {
 					/* exhaust proof */
 				}
 			})(),
-		).rejects.toThrow("changed during inspection");
+			"changed during inspection",
+		);
 	});
 	test("idle maintenance performs no writes and missing ordinary paths are not volatile aliases", async () => {
 		for (let i = 0; i < 1100; i++) narrator(`missing-${i}`, join(root, `absent-${i}`));
@@ -370,7 +617,8 @@ describe("resource protection reverse index", () => {
 		await service.maintain(deadline());
 		expect(changes()).toBe(before);
 		expect(await claims([{ path: join(root, "unrelated") }])).toEqual([]);
-	});
+		// 1100 sources bootstrap through Worker pages; Windows CI needs several seconds.
+	}, 30_000);
 	test("descendant keyset pages follow path index order and equal-key lookups retain null paths", async () => {
 		for (let i = 0; i < 150; i++)
 			registry(`r${String(149 - i).padStart(3, "0")}`, join(root, String(i).padStart(3, "0")));
@@ -384,15 +632,15 @@ describe("resource protection reverse index", () => {
 		expect((await claims([{ repositoryKey: "repo-no-path" }])).map((claim) => claim.id)).toEqual([
 			"no-path",
 		]);
-	});
+	}, 30_000);
 	test("raw empty workspace_context remains malformed JSON instead of an empty inventory", async () => {
 		narrator("empty-context", root);
 		database.query("UPDATE narrators SET workspace_context='' WHERE id='empty-context'").run();
-		await expect(claims([{ path: join(root, "unrelated") }], false)).rejects.toThrow();
+		await expectFailure(claims([{ path: join(root, "unrelated") }], false));
 	});
 	test("oversized raw legacy scalars reject before entering the JavaScript projection", async () => {
 		registry("large", "x".repeat(200_000));
-		await expect(claims([{ path: root }], false)).rejects.toThrow("row budget");
+		await expectFailure(claims([{ path: root }], false), "row budget");
 	});
 	test("uninitialised inventory beyond one page is never complete", async () => {
 		for (let i = 0; i < 65; i++) registry(`r${i}`, root);
@@ -401,42 +649,169 @@ describe("resource protection reverse index", () => {
 		expect((await service.read([{ path: root }], deadline())).complete).toBe(true);
 	});
 	test("more than old row/byte limits stays queryable through targeted indexes", async () => {
-		database.transaction(() => {
-			for (let i = 0; i < 8500; i++)
-				registry(`r${String(i).padStart(5, "0")}`, root, `project-${i}`);
-		})();
-		await bootstrap();
-		const before = changes();
-		expect((await claims([{ repositoryKey: "repo-r08499" }])).map((claim) => claim.id)).toEqual([
-			"r08499",
-		]);
-		expect(await claims([{ path: join(root, "unrelated") }])).toHaveLength(8500); // all are ancestors, no artificial cap
-		expect(changes()).toBe(before);
-		for (const [where, args, expected] of [
-			["device_id = ? AND canonical_path = ?", ["local", root], "idx_protection_path"],
-			[
-				"device_id = ? AND canonical_path >= ? AND canonical_path < ?",
-				["local", `${root}/`, `${root}0`],
-				"idx_protection_path",
-			],
-			[
-				"device_id = ? AND repository_key = ?",
-				["local", "repo-r08499"],
-				"idx_protection_repository",
-			],
-			["scope_project_id = ?", ["project-8499"], "idx_protection_scope"],
-			["shadow_key = ?", ["key"], "idx_protection_shadow"],
-		] as const) {
-			const pathOrder = where.includes("canonical_path >=");
-			const order = pathOrder ? "canonical_path,source,source_id,slot" : "source,source_id,slot";
-			const parameters = pathOrder ? "?,?,?,?" : "?,?,?";
-			const cursor = pathOrder ? ["", "", "", -1] : ["", "", -1];
-			const plan = database
-				.query(`EXPLAIN QUERY PLAN SELECT source, source_id, slot, claim_json, canonical_path FROM resource_protection_paths WHERE ${where}
+		const profile = process.env.NF_RESOURCE_PROTECTION_PROFILE === "1";
+		const startedAt = performance.now();
+		const cpuStart = process.cpuUsage();
+		const metrics: Record<string, { calls: number; ms: number; maxMs: number }> = {};
+		let stage = "seed";
+		let progressReports = 0;
+		const loopDelay = profile ? monitorEventLoopDelay({ resolution: 10 }) : undefined;
+		loopDelay?.enable();
+		const cleanup: (() => void)[] = [];
+		function record(kind: string, started: number) {
+			const elapsed = performance.now() - started;
+			metrics[kind] ??= { calls: 0, ms: 0, maxMs: 0 };
+			const metric = metrics[kind];
+			metric.calls++;
+			metric.ms += elapsed;
+			metric.maxMs = Math.max(metric.maxMs, elapsed);
+		}
+		function report(event: string) {
+			if (!profile) return;
+			const cpu = process.cpuUsage(cpuStart);
+			console.info(
+				"resource-protection-profile",
+				JSON.stringify({
+					event,
+					stage,
+					at: new Date().toISOString(),
+					elapsedMs: performance.now() - startedAt,
+					cpuUserMs: cpu.user / 1000,
+					cpuSystemMs: cpu.system / 1000,
+					load: loadavg(),
+					loopDelayMaxMs: (loopDelay?.max ?? 0) / 1e6,
+					loopDelayP99Ms: (loopDelay?.percentile(99) ?? 0) / 1e6,
+					metrics,
+				}),
+			);
+		}
+		const nativeRead = workerRead.readNativeRows;
+		const reads = spyOn(workerRead, "readNativeRows");
+		if (profile) {
+			reads.mockImplementation((async (...args) => {
+				const started = performance.now();
+				const sql = args[1];
+				const kind = sql.startsWith("WITH requested")
+					? "candidateFacts"
+					: sql.includes("WHERE id IN")
+						? "rawFacts"
+						: "otherReads";
+				try {
+					return await nativeRead(...args);
+				} finally {
+					record(kind, started);
+					if (reads.mock.calls.length % 400 === 0 && progressReports < 16) {
+						progressReports++;
+						report("progress");
+					}
+				}
+			}) as typeof nativeRead);
+			const realpath = fs.realpath;
+			const pathSpy = spyOn(fs, "realpath").mockImplementation((async (path: fsSync.PathLike) => {
+				const started = performance.now();
+				try {
+					return await realpath(path);
+				} finally {
+					record("realpath", started);
+				}
+			}) as typeof realpath);
+			const lstat = fs.lstat;
+			const statSpy = spyOn(fs, "lstat").mockImplementation((async (path: fsSync.PathLike) => {
+				const started = performance.now();
+				try {
+					return await lstat(path);
+				} finally {
+					record("lstat", started);
+				}
+			}) as typeof lstat);
+			cleanup.push(
+				() => pathSpy.mockRestore(),
+				() => statSpy.mockRestore(),
+			);
+			const transaction = database.transaction.bind(database);
+			const transactions = spyOn(database, "transaction").mockImplementation(((fn) => {
+				const run = transaction(fn);
+				return Object.assign((...args: Parameters<typeof run>) => {
+					const started = performance.now();
+					try {
+						return run(...args);
+					} finally {
+						record("sqliteTransactions", started);
+					}
+				}, run);
+			}) as typeof database.transaction);
+			cleanup.push(() => transactions.mockRestore());
+		}
+		const statements = new Set<ReturnType<Database["query"]>>();
+		const originalQuery = database.query.bind(database);
+		const queries = spyOn(database, "query").mockImplementation(((...args) => {
+			const statement = originalQuery(...args);
+			statements.add(statement);
+			return statement;
+		}) as typeof database.query);
+		try {
+			database.transaction(() => {
+				for (let i = 0; i < 8500; i++)
+					registry(`r${String(i).padStart(5, "0")}`, root, `project-${i}`);
+			})();
+			report("seeded");
+			stage = "maintain";
+			await bootstrap();
+			report("maintained");
+			stage = "targetedClaims";
+			const before = changes();
+			expect((await claims([{ repositoryKey: "repo-r08499" }])).map((claim) => claim.id)).toEqual([
+				"r08499",
+			]);
+			report("targetedClaimsRead");
+			stage = "allClaims";
+			expect(await claims([{ path: join(root, "unrelated") }])).toHaveLength(8500); // all are ancestors, no artificial cap
+			report("allClaimsRead");
+			stage = "plansAndAssertions";
+			expect(changes()).toBe(before);
+			for (const [where, args, expected] of [
+				["device_id = ? AND canonical_path = ?", ["local", root], "idx_protection_path"],
+				[
+					"device_id = ? AND canonical_path >= ? AND canonical_path < ?",
+					["local", `${root}/`, `${root}0`],
+					"idx_protection_path",
+				],
+				[
+					"device_id = ? AND repository_key = ?",
+					["local", "repo-r08499"],
+					"idx_protection_repository",
+				],
+				["scope_project_id = ?", ["project-8499"], "idx_protection_scope"],
+				["shadow_key = ?", ["key"], "idx_protection_shadow"],
+			] as const) {
+				const pathOrder = where.includes("canonical_path >=");
+				const order = pathOrder ? "canonical_path,source,source_id,slot" : "source,source_id,slot";
+				const parameters = pathOrder ? "?,?,?,?" : "?,?,?";
+				const cursor = pathOrder ? ["", "", "", -1] : ["", "", -1];
+				const plan = database
+					.query(`EXPLAIN QUERY PLAN SELECT source, source_id, slot, claim_json, canonical_path FROM resource_protection_paths WHERE ${where}
 					AND (${order}) > (${parameters}) ORDER BY ${order} LIMIT 64`)
-				.all(...args, ...cursor);
-			expect(JSON.stringify(plan)).toContain(expected);
-			expect(JSON.stringify(plan)).not.toContain("USE TEMP B-TREE");
+					.all(...args, ...cursor);
+				expect(JSON.stringify(plan)).toContain(expected);
+				expect(JSON.stringify(plan)).not.toContain("USE TEMP B-TREE");
+			}
+			expect(
+				reads.mock.calls.filter(
+					([, sql]) =>
+						sql.includes("FROM narrator_worktree_resources") && sql.includes("WHERE id IN"),
+				),
+			).toHaveLength(532);
+			expect(reads.mock.calls.filter(([, sql]) => sql.startsWith("WITH requested"))).toHaveLength(
+				533,
+			);
+			expect(reads.mock.calls.length).toBeLessThan(2500);
+		} finally {
+			report("finished");
+			loopDelay?.disable();
+			for (const restore of cleanup) restore();
+			for (const statement of statements) statement.finalize();
+			queries.mockRestore();
+			reads.mockRestore();
 		}
 	}, 60_000);
 	test("a slow first dirty item cannot starve the rest of a short page", async () => {
@@ -491,22 +866,18 @@ describe("resource protection reverse index", () => {
 			.run(join(root, "elsewhere"));
 		const pages: { sql: string; args: unknown[]; size: number }[] = [];
 		const query = database.query.bind(database);
-		const spy = spyOn(database, "query").mockImplementation(((sql: string) => {
-			const statement = query(sql);
-			if (!/^SELECT source, source_id, slot, canonical_path/.test(sql)) return statement;
-			return new Proxy(statement, {
-				get(target, property) {
-					if (property === "all")
-						return (...args: never[]) => {
-							const rows = target.all(...args);
-							pages.push({ sql, args, size: rows.length });
-							return rows;
-						};
-					const value = Reflect.get(target, property, target);
-					return typeof value === "function" ? value.bind(target) : value;
-				},
-			});
-		}) as typeof database.query);
+		const read = workerRead.readNativeRows;
+		const spy = spyOn(workerRead, "readNativeRows").mockImplementation((async (
+			client,
+			sql,
+			binds = [],
+			options,
+		) => {
+			const rows = await read(client, sql, binds, options);
+			if (/^SELECT source, source_id, slot, canonical_path/.test(sql))
+				pages.push({ sql, args: [...binds], size: rows.length });
+			return rows;
+		}) as typeof read);
 		const before = changes();
 		try {
 			expect(new Set((await claims([{ path: owned }])).map((claim) => claim.id))).toEqual(
@@ -532,7 +903,780 @@ describe("resource protection reverse index", () => {
 	});
 });
 
+describe("device ownership and native path identities", () => {
+	for (const path of ["/", "/remote/linux/workspace", "C:\\Remote\\Workspace"])
+		test(`committed remote context never invents local ownership for ${path}`, async () => {
+			narrator("remote", path, {
+				cwd: path,
+				deviceId: "remote-device",
+				pathFlavor: path.startsWith("/") ? "posix" : "windows",
+				revision: 4,
+				git: { repositoryKey: "remote-repository" },
+			});
+			database.query("UPDATE narrators SET workspace_revision=4 WHERE id='remote'").run();
+			const localTargets = [{ path: root }, { path: await canonicalProtectionPath(resolve("/")) }];
+			const realpath = spyOn(fs, "realpath").mockImplementation(async () => {
+				throw new Error("Remote cwd must not touch the host filesystem");
+			});
+			try {
+				const before = changes();
+				for (const target of localTargets)
+					expect(
+						await collectClaims(await service.read([target], deadline(), undefined, false)),
+					).toEqual([]);
+				const remote = await claims([{ deviceId: "remote-device", path }], false);
+				expect(remote.length).toBeGreaterThan(0);
+				expect(
+					remote.every((claim) => claim.deviceId === "remote-device" && claim.revision === 4),
+				).toBe(true);
+				expect(changes()).toBe(before);
+				await bootstrap();
+				for (const target of localTargets)
+					expect(await collectClaims(await service.read([target], deadline()))).toEqual([]);
+				expect(
+					(await claims([{ deviceId: "remote-device", repositoryKey: "remote-repository" }])).map(
+						(claim) => claim.id,
+					),
+				).toEqual(["remote"]);
+				expect(realpath).not.toHaveBeenCalled();
+			} finally {
+				realpath.mockRestore();
+			}
+		});
+	test("an explicit default device owns pre-context cwd without inventing a local root", async () => {
+		narrator("pre-context", "/");
+		database
+			.query("UPDATE narrators SET default_device_id='remote-device' WHERE id='pre-context'")
+			.run();
+		await bootstrap();
+		expect(await claims([{ path: root }])).toEqual([]);
+		expect(await claims([{ path: "/" }])).toEqual([]);
+		const found = await claims([{ deviceId: "remote-device", path: "/" }]);
+		expect(found.map((claim) => claim.id)).toEqual(["pre-context"]);
+		expect(found.every((claim) => claim.deviceId === "remote-device")).toBe(true);
+	});
+	for (const cwd of [".", "/"]) {
+		test(`remote default cannot prove a context's absent device even when cwd matches: ${cwd}`, async () => {
+			narrator("ambiguous", cwd, { cwd });
+			database
+				.query("UPDATE narrators SET default_device_id='remote-device' WHERE id='ambiguous'")
+				.run();
+			const before = changes();
+			await expect(claims([{ path: root }], false)).rejects.toThrow(
+				"Legacy context device is unverifiable",
+			);
+			expect(changes()).toBe(before);
+			await service.maintain(deadline());
+			expect(
+				database
+					.query(`SELECT dirty FROM resource_protection_sources
+				WHERE source='narrator' AND source_id='ambiguous'`)
+					.get(),
+			).toEqual({ dirty: 1 });
+			await expect(claims([{ deviceId: "remote-device", path: cwd }], false)).rejects.toThrow(
+				"unverifiable",
+			);
+		});
+	}
+	for (const remoteCwd of ["./remote-context", "/remote/workspace", "C:\\Remote\\Workspace"])
+		test(`a distinct legacy remote context retains the previous absolute host owner: ${remoteCwd}`, async () => {
+			const host = join(root, "previous-host-workspace");
+			const context = { cwd: remoteCwd, deviceId: "remote-device", revision: 3 };
+			narrator("legacy-switched", host, context);
+			database
+				.query(`UPDATE narrators SET default_device_id='remote-device', workspace_revision=3
+			WHERE id='legacy-switched'`)
+				.run();
+			const before = changes();
+			expect(await claims([{ path: host }], false)).toEqual([
+				{
+					kind: "narrator",
+					id: "legacy-switched",
+					revision: 3,
+					deviceId: "local",
+					path: host,
+				},
+			]);
+			expect(
+				(await claims([{ deviceId: "remote-device", path: context.cwd }], false)).map(
+					(claim) => claim.path,
+				),
+			).toEqual([context.cwd]);
+			expect(changes()).toBe(before);
+			await bootstrap();
+			expect((await claims([{ path: host }])).map((claim) => claim.deviceId)).toEqual(["local"]);
+			expect(await claims([{ path: parse(host).root }])).toHaveLength(1); // Probe the host's drive, not the runner cwd's drive.
+			expect(
+				database
+					.query(
+						"SELECT cwd, default_device_id, workspace_context FROM narrators WHERE id='legacy-switched'",
+					)
+					.get(),
+			).toEqual({
+				cwd: host,
+				default_device_id: "remote-device",
+				workspace_context: JSON.stringify(context),
+			});
+		});
+	test("a committed context device wins over a stale default without a fabricated local claim", async () => {
+		narrator("remote", root, { cwd: "/", deviceId: "context-device" });
+		database.query("UPDATE narrators SET default_device_id='stale-device' WHERE id='remote'").run();
+		await bootstrap();
+		expect(await claims([{ path: root }])).toEqual([]);
+		expect(await claims([{ deviceId: "stale-device", path: root }])).toEqual([]);
+		expect((await claims([{ deviceId: "context-device", path: "/" }])).length).toBeGreaterThan(0);
+	});
+	test("genuine local legacy and relative cwd keep the null-device contract", async () => {
+		narrator("legacy", root);
+		narrator("relative", "relative-local-workspace");
+		await bootstrap();
+		expect((await claims([{ path: root }])).map((claim) => claim.id)).toEqual(["legacy"]);
+		const relative = await claims([{ path: resolve("relative-local-workspace") }]);
+		expect(relative).toEqual([
+			{
+				kind: "narrator",
+				id: "relative",
+				revision: 0,
+				deviceId: "local",
+				path: resolve("relative-local-workspace"),
+			},
+		]);
+	});
+	test.skipIf(process.platform === "win32")(
+		"POSIX backslash components remain distinct without alias churn",
+		async () => {
+			const literal = join(root, "repository\\checkout");
+			const separators = join(root, "repository", "checkout");
+			await mkdir(literal);
+			narrator("literal", literal);
+			await bootstrap();
+			expect(await canonicalProtectionPath(literal)).toBe(literal);
+			expect((await claims([{ path: literal }])).map((claim) => claim.id)).toEqual(["literal"]);
+			expect(await claims([{ path: separators }])).toEqual([]);
+			expect((await claims([{ path: root }])).map((claim) => claim.id)).toEqual(["literal"]);
+			expect(
+				database
+					.query(`SELECT canonical_path, alias_sensitive FROM resource_protection_paths
+			WHERE source = 'narrator' AND source_id = 'literal'`)
+					.get(),
+			).toEqual({
+				canonical_path: literal,
+				alias_sensitive: 0,
+			});
+			const before = changes();
+			await service.maintain(deadline());
+			expect(changes()).toBe(before);
+		},
+	);
+});
+
+describe("persisted projection upgrades", () => {
+	function oldProjection() {
+		database.exec(`DROP TRIGGER resource_protection_narrator_insert;
+			CREATE TRIGGER resource_protection_narrator_insert AFTER INSERT ON narrators
+			BEGIN SELECT 1; END;`);
+	}
+	function localPaths() {
+		return (
+			database
+				.query(`SELECT count(*) AS n FROM resource_protection_paths
+			WHERE source = 'narrator' AND device_id = 'local'`)
+				.get() as { n: number }
+		).n;
+	}
+	async function receiptProjectionFixture(count: number, dirty: readonly number[] = []) {
+		await bootstrap();
+		await mkdir(receipts);
+		const files: string[] = [];
+		const paths: string[] = [];
+		for (let i = 0; i < count; i++) {
+			const file = join(receipts, `${i.toString(16).padStart(64, "0")}.json`);
+			const path = join(root, `pin-${i.toString().padStart(3, "0")}`);
+			files.push(file);
+			paths.push(path);
+			await mkdir(path);
+			await writeFile(join(path, "history.bin"), `history-${i}`);
+			database
+				.query(`INSERT INTO resource_protection_sources(source, source_id, dirty)
+				VALUES ('receipt', ?, ?)`)
+				.run(file, dirty.includes(i) ? 1 : 0);
+			if (dirty.includes(i)) {
+				await writeFile(file, JSON.stringify(receipt(path)));
+			} else {
+				database
+					.query(`INSERT INTO resource_protection_paths
+					(source, source_id, slot, device_id, canonical_path, claim_json)
+					VALUES ('receipt', ?, 0, 'local', ?, ?)`)
+					.run(
+						file,
+						join(root, `old-${i}`),
+						JSON.stringify({
+							kind: "receipt",
+							id: file,
+							deviceId: "local",
+							path,
+							repositoryKey: "historical-repository",
+						}),
+					);
+			}
+		}
+		database
+			.query(`UPDATE resource_protection_sources SET cursor='eof', complete=?
+			WHERE source='receipt' AND source_id=''`)
+			.run(dirty.length ? 0 : 1);
+		oldProjection();
+		installResourceProtectionTriggers(database);
+		service = createResourceProtectionIndex(database, receipts);
+		const progress = () =>
+			database
+				.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source='receipt' AND source_id=''`)
+				.get() as { cursor: string; complete: number };
+		return { files, paths, progress };
+	}
+	test("old clean local ghosts are ignored immediately and reprojected without rewriting business rows", async () => {
+		narrator("remote", "/", { cwd: "/", deviceId: "remote-device", revision: 1 });
+		database
+			.query("UPDATE narrators SET default_device_id='remote-device', workspace_revision=1")
+			.run();
+		registry("registry-evidence", join(root, "retained"));
+		await bootstrap();
+		database
+			.query(`UPDATE resource_protection_paths SET device_id='local', canonical_path='/', claim_json=?
+			WHERE source='narrator'`)
+			.run(JSON.stringify({ kind: "narrator", id: "remote", deviceId: "local", path: "/" }));
+		const business = database.query("SELECT * FROM narrators").all();
+		const registryEvidence = database.query("SELECT * FROM narrator_worktree_resources").all();
+		const paths = database.query("SELECT * FROM resource_protection_paths").all();
+		oldProjection();
+		const before = changes();
+		installResourceProtectionTriggers(database);
+		expect(changes() - before).toBeLessThanOrEqual(3); // Fixed heads only, never historical row UPDATE.
+		expect(database.query("SELECT * FROM resource_protection_paths").all()).toEqual(paths);
+		service = createResourceProtectionIndex(database, receipts);
+		const reading = changes();
+		expect(await claims([{ path: join(root, "unrelated") }], false)).toEqual([]);
+		expect(
+			(await claims([{ deviceId: "remote-device", path: "/" }], false)).length,
+		).toBeGreaterThan(0);
+		expect(changes()).toBe(reading);
+		await bootstrap();
+		expect(localPaths()).toBe(0);
+		expect(await claims([{ path: join(root, "unrelated") }])).toEqual([]);
+		expect(database.query("SELECT * FROM narrators").all()).toEqual(business);
+		expect(database.query("SELECT * FROM narrator_worktree_resources").all()).toEqual(
+			registryEvidence,
+		);
+		service = createResourceProtectionIndex(database, receipts);
+		const idle = changes();
+		installResourceProtectionTriggers(database);
+		await service.maintain(deadline());
+		expect(changes()).toBe(idle);
+	});
+	test("reprojection advances only 64 existing clean rows per pass and resumes after restart", async () => {
+		for (let i = 0; i < 130; i++) {
+			const id = `remote-${i.toString().padStart(3, "0")}`;
+			narrator(id, "/");
+			database.query("UPDATE narrators SET default_device_id='remote-device' WHERE id=?").run(id);
+		}
+		await bootstrap();
+		database
+			.query(`UPDATE resource_protection_paths SET device_id='local', canonical_path='/'
+			WHERE source='narrator'`)
+			.run();
+		oldProjection();
+		installResourceProtectionTriggers(database);
+		service = createResourceProtectionIndex(database, receipts);
+		expect(localPaths()).toBe(130);
+		const reading = changes();
+		expect((await service.read([{ path: root }], deadline(), undefined, false)).complete).toBe(
+			false,
+		);
+		expect(changes()).toBe(reading);
+		await service.maintain(deadline());
+		expect(localPaths()).toBe(66);
+		const progress = database
+			.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source='narrator' AND source_id=''`)
+			.get();
+		expect(progress).toEqual({ cursor: "remote-063", complete: 0 });
+		service = createResourceProtectionIndex(database, receipts);
+		const restarting = changes();
+		installResourceProtectionTriggers(database);
+		expect(changes()).toBe(restarting);
+		expect(
+			database
+				.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source='narrator' AND source_id=''`)
+				.get(),
+		).toEqual(progress);
+		await service.maintain(deadline());
+		expect(localPaths()).toBe(2);
+		await bootstrap();
+		expect(localPaths()).toBe(0);
+		expect(await claims([{ path: root }])).toEqual([]);
+		expect(await claims([{ deviceId: "remote-device", path: "/" }])).toHaveLength(130);
+	});
+	test.skipIf(process.platform === "win32")(
+		"upgrading an immutable v1 shadow pin preserves its old physical footprint and exact source JSON",
+		async () => {
+			await bootstrap();
+			const logicalPath = join(root, "historical\\checkout");
+			const oldPhysical = legacyTreeSnapshotPhysicalDir("local", logicalPath);
+			const newPhysical = treeSnapshotPhysicalDir("local", logicalPath);
+			expect(oldPhysical).not.toBe(newPhysical);
+			await mkdir(oldPhysical, { recursive: true });
+			await writeFile(join(oldPhysical, "history.bin"), Buffer.from([0, 255, 13, 10]));
+			const file = join(receipts, `${"a".repeat(64)}.json`);
+			const rawKey = `local\0${logicalPath}`;
+			const rawJson = JSON.stringify(
+				{
+					kind: "receipt",
+					id: file,
+					deviceId: "local",
+					repositoryKey: "historical-pin",
+					shadowKey: rawKey,
+				},
+				null,
+				2,
+			);
+			database
+				.query(`INSERT INTO resource_protection_sources(source, source_id, dirty)
+			VALUES ('receipt', ?, 0)`)
+				.run(file);
+			database
+				.query(`INSERT INTO resource_protection_paths
+			(source, source_id, slot, device_id, canonical_path, shadow_key, claim_json)
+			VALUES ('receipt', ?, -1, 'local', ?, ?, ?)`)
+				.run(file, oldPhysical, rawKey, rawJson);
+			oldProjection();
+			installResourceProtectionTriggers(database);
+			service = createResourceProtectionIndex(database, receipts);
+			await bootstrap();
+			const projected = database
+				.query(`SELECT slot, canonical_path, shadow_key, claim_json
+			FROM resource_protection_paths WHERE source='receipt' AND source_id=? ORDER BY slot`)
+				.all(file) as {
+				slot: number;
+				canonical_path: string;
+				shadow_key: string | null;
+				claim_json: string;
+			}[];
+			expect(projected).toHaveLength(2);
+			expect(projected[0]).toEqual({
+				slot: -1,
+				canonical_path: newPhysical,
+				shadow_key: treeSnapshotKey("local", logicalPath),
+				claim_json: rawJson,
+			});
+			expect(projected[1]?.shadow_key).toBeNull();
+			expect(JSON.parse(projected[1]?.claim_json ?? "null")).toMatchObject({
+				kind: "receipt",
+				id: file,
+				deviceId: "local",
+				path: oldPhysical,
+			});
+			const guard = createLifecycleGuard({
+				canonicalPath: canonicalProtectionPath,
+				readClaims: (budget, signal, targets) => service.read(targets ?? [], budget, signal),
+			});
+			for (const path of [oldPhysical, newPhysical])
+				expect(await guard.inspect([{ path }], "historical shadow retirement")).toMatchObject({
+					status: "protected",
+					complete: true,
+				});
+			expect(await fs.readFile(join(oldPhysical, "history.bin"))).toEqual(
+				Buffer.from([0, 255, 13, 10]),
+			);
+			oldProjection();
+			installResourceProtectionTriggers(database);
+			service = createResourceProtectionIndex(database, receipts);
+			await bootstrap();
+			expect(
+				database
+					.query(`SELECT slot, canonical_path, shadow_key, claim_json
+			FROM resource_protection_paths WHERE source='receipt' AND source_id=? ORDER BY slot`)
+					.all(file),
+			).toEqual(projected);
+			const before = changes();
+			await service.maintain(deadline());
+			expect(changes()).toBe(before);
+		},
+	);
+	for (const interruption of ["deadline", "cancel"] as const) {
+		test(`receipt reprojection commits interrupted page prefixes and eventually traverses 64+ pins: ${interruption}`, async () => {
+			const { files, paths, progress } = await receiptProjectionFixture(70, [0, 37]);
+			const attempts = new Map<string, number>();
+			const ownedPaths = new Set(paths);
+			const realpath = fs.realpath;
+			let controller = new AbortController();
+			let lookups = 0;
+			const spy = spyOn(fs, "realpath").mockImplementation((async (path) => {
+				if (typeof path === "string" && ownedPaths.has(path)) {
+					attempts.set(path, (attempts.get(path) ?? 0) + 1);
+					lookups++;
+					if (interruption === "deadline") await Bun.sleep(20);
+					else if (lookups === 18) controller.abort();
+				}
+				return realpath(path);
+			}) as typeof fs.realpath);
+			let interrupted = 0;
+			let previous = -1;
+			try {
+				for (let pass = 0; pass < 8 && !progress().complete; pass++) {
+					controller = new AbortController();
+					lookups = 0;
+					try {
+						// The production per-pass budget stays 1s, with legal 20ms filesystem calls.
+						await service.maintain(performance.now() + 1000, controller.signal);
+					} catch (error) {
+						expect(String(error)).toMatch(
+							/Protection index (?:budget exceeded|deadline|cancelled)/,
+						);
+						interrupted++;
+					}
+					const head = progress();
+					const after = head.cursor.startsWith(receiptProjectionPrefix)
+						? files.indexOf(JSON.parse(head.cursor.slice(receiptProjectionPrefix.length)).after)
+						: files.length;
+					expect(after).toBeGreaterThanOrEqual(previous);
+					if (pass === 0) {
+						expect(interrupted).toBe(1);
+						expect(after).toBeGreaterThan(0);
+						expect(after).toBeLessThan(files.length - 1);
+						expect(
+							database
+								.query(`SELECT dirty FROM resource_protection_sources
+							WHERE source='receipt' AND source_id=?`)
+								.get(files[0]),
+						).toEqual({ dirty: 1 });
+						// A new instance must resume the durable prefix, not just an in-memory offset.
+						service = createResourceProtectionIndex(database, receipts);
+					}
+					previous = after;
+				}
+				expect(interrupted).toBeGreaterThan(0);
+				expect(progress()).toEqual({ cursor: "eof", complete: 1 });
+				expect(attempts.get(paths[1] ?? "")).toBe(1); // The saved prefix is never re-read.
+				expect(await claims([{ path: root }])).toHaveLength(70);
+				expect(
+					database
+						.query(`SELECT 1 FROM resource_protection_sources
+					WHERE source='receipt' AND source_id!='' AND dirty=1 LIMIT 1`)
+						.get(),
+				).toBeNull();
+				for (let i = 0; i < paths.length; i++)
+					expect(await fs.readFile(join(paths[i] ?? "", "history.bin"), "utf8")).toBe(
+						`history-${i}`,
+					);
+				const before = changes();
+				await service.maintain(deadline());
+				expect(changes()).toBe(before);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+	}
+	for (const concurrentChange of ["pin", "cursor"] as const) {
+		test(`receipt reprojection rejects a stale per-pin ${concurrentChange} CAS without rewinding or revoking evidence`, async () => {
+			const { files, paths, progress } = await receiptProjectionFixture(3);
+			const initial = progress();
+			const advanced =
+				receiptProjectionPrefix +
+				JSON.stringify({
+					...JSON.parse(initial.cursor.slice(receiptProjectionPrefix.length)),
+					after: files[0],
+				});
+			const realpath = fs.realpath;
+			let changed = false;
+			const spy = spyOn(fs, "realpath").mockImplementation((async (path) => {
+				if (!changed && path === paths[0]) {
+					changed = true;
+					if (concurrentChange === "pin") {
+						database
+							.query(`UPDATE resource_protection_sources SET revision=revision+1
+							WHERE source='receipt' AND source_id=?`)
+							.run(files[0]);
+					} else {
+						database
+							.query(`UPDATE resource_protection_sources SET cursor=?, revision=revision+1
+							WHERE source='receipt' AND source_id=''`)
+							.run(advanced);
+					}
+				}
+				return realpath(path);
+			}) as typeof fs.realpath);
+			try {
+				await expect(service.maintain(deadline())).rejects.toThrow(
+					concurrentChange === "pin"
+						? "Receipt pin changed during projection"
+						: "Receipt projection cursor or pin changed",
+				);
+			} finally {
+				spy.mockRestore();
+			}
+			expect(changed).toBe(true);
+			expect(progress()).toEqual(
+				concurrentChange === "pin" ? initial : { ...initial, cursor: advanced },
+			);
+			expect(
+				database
+					.query(`SELECT canonical_path FROM resource_protection_paths
+				WHERE source='receipt' AND source_id=?`)
+					.get(files[0]),
+			).toEqual({
+				canonical_path: concurrentChange === "pin" ? join(root, "old-0") : paths[0],
+			});
+			expect(
+				database
+					.query(`SELECT count(*) AS n FROM resource_protection_paths WHERE source='receipt'`)
+					.get(),
+			).toEqual({ n: 3 });
+			service = createResourceProtectionIndex(database, receipts);
+			await bootstrap();
+			expect(progress()).toEqual({ cursor: "eof", complete: 1 });
+			expect(await claims([{ path: root }])).toHaveLength(3);
+			for (let i = 0; i < paths.length; i++)
+				expect(await fs.readFile(join(paths[i] ?? "", "history.bin"), "utf8")).toBe(`history-${i}`);
+		});
+	}
+	test("a cursor write failure after saving a pin keeps its evidence and safely repeats only that pin", async () => {
+		const { files, paths, progress } = await receiptProjectionFixture(3);
+		const before = progress();
+		database.exec(`CREATE TRIGGER fail_receipt_projection_cursor BEFORE UPDATE ON resource_protection_sources
+			WHEN OLD.source='receipt' AND OLD.source_id='' AND NEW.cursor IS NOT OLD.cursor
+			BEGIN SELECT RAISE(ABORT, 'injected projection cursor failure'); END`);
+		await expect(service.maintain(deadline())).rejects.toThrow(
+			"injected projection cursor failure",
+		);
+		expect(progress()).toEqual(before);
+		expect(
+			database
+				.query(`SELECT canonical_path FROM resource_protection_paths
+			WHERE source='receipt' AND source_id=?`)
+				.get(files[0]),
+		).toEqual({ canonical_path: paths[0] });
+		expect(
+			database
+				.query(`SELECT count(*) AS n FROM resource_protection_paths WHERE source='receipt'`)
+				.get(),
+		).toEqual({ n: 3 });
+		expect((await service.read([{ path: root }], deadline())).complete).toBe(false);
+		database.exec("DROP TRIGGER fail_receipt_projection_cursor");
+		service = createResourceProtectionIndex(database, receipts);
+		await bootstrap();
+		expect(progress()).toEqual({ cursor: "eof", complete: 1 });
+		expect(await claims([{ path: root }])).toHaveLength(3);
+		for (let i = 0; i < paths.length; i++)
+			expect(await fs.readFile(join(paths[i] ?? "", "history.bin"), "utf8")).toBe(`history-${i}`);
+	});
+	test("cancelled receipt reprojection retains its durable cursor and pins for restart", async () => {
+		await mkdir(receipts);
+		const file = join(receipts, `${"a".repeat(64)}.json`);
+		await writeFile(file, JSON.stringify(receipt(root)));
+		await bootstrap();
+		oldProjection();
+		installResourceProtectionTriggers(database);
+		service = createResourceProtectionIndex(database, receipts);
+		const head = () =>
+			database
+				.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source='receipt' AND source_id=''`)
+				.get();
+		const pins = database
+			.query("SELECT * FROM resource_protection_paths WHERE source='receipt'")
+			.all();
+		const progress = head();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<string>();
+		const realpath = fs.realpath;
+		const spy = spyOn(fs, "realpath").mockImplementation((async (path) => {
+			if (path === root) {
+				entered.resolve();
+				return release.promise;
+			}
+			return realpath(path);
+		}) as typeof fs.realpath);
+		try {
+			const controller = new AbortController();
+			const work = service.maintain(deadline(), controller.signal);
+			await entered.promise;
+			controller.abort();
+			await expect(work).rejects.toThrow();
+			expect(head()).toEqual(progress);
+			expect(
+				database.query("SELECT * FROM resource_protection_paths WHERE source='receipt'").all(),
+			).toEqual(pins);
+			expect((await service.read([{ path: root }], deadline())).complete).toBe(false);
+		} finally {
+			release.resolve(root);
+			spy.mockRestore();
+		}
+		service = createResourceProtectionIndex(database, receipts);
+		installResourceProtectionTriggers(database);
+		expect(head()).toEqual(progress);
+		await rm(file);
+		await bootstrap();
+		expect((await claims([{ path: root }])).map((claim) => claim.id)).toEqual([file]);
+	});
+	test("oversized historical receipt projections stay pinned and incomplete without weakening ordinary reads", async () => {
+		await bootstrap();
+		const file = join(receipts, `${"a".repeat(64)}.json`);
+		database
+			.query(`INSERT INTO resource_protection_sources(source, source_id, dirty)
+			VALUES ('receipt', ?, 0)`)
+			.run(file);
+		database
+			.query(`INSERT INTO resource_protection_paths
+			(source, source_id, slot, device_id, canonical_path, claim_json)
+			VALUES ('receipt', ?, 0, 'local', ?, ?)`)
+			.run(file, root, "x".repeat(200_000));
+		oldProjection();
+		installResourceProtectionTriggers(database);
+		service = createResourceProtectionIndex(database, receipts);
+		const failure = await service.maintain(deadline()).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(() => {
+			throw failure;
+		}).toThrow("row budget");
+		expect(
+			database
+				.query(`SELECT dirty FROM resource_protection_sources
+			WHERE source='receipt' AND source_id=?`)
+				.get(file),
+		).toEqual({ dirty: 0 });
+		expect(
+			database
+				.query(`SELECT canonical_path, length(claim_json) AS n FROM resource_protection_paths
+			WHERE source='receipt' AND source_id=?`)
+				.get(file),
+		).toEqual({ canonical_path: root, n: 200_000 });
+		expect((await service.read([{ path: root }], deadline())).complete).toBe(false);
+		const before = changes();
+		expect(await claims([{ path: root }], false)).toEqual([]);
+		expect(changes()).toBe(before);
+	});
+	test.skipIf(process.platform === "win32")(
+		"receipt pin projection is paged and restartable without rereading removed or rewritten journals",
+		async () => {
+			const literal = join(root, "historic\\checkout");
+			const oldCanonical = join(root, "historic", "checkout");
+			await mkdir(receipts);
+			const state =
+				database.query(`INSERT INTO resource_protection_sources(source, source_id, dirty)
+			VALUES ('receipt', ?, 0)`);
+			const pin = database.query(`INSERT INTO resource_protection_paths
+			(source, source_id, slot, device_id, canonical_path, claim_json)
+			VALUES ('receipt', ?, 0, 'local', ?, ?)`);
+			for (let i = 0; i < 130; i++) {
+				const file = join(receipts, `${i.toString().padStart(64, "0")}.json`);
+				state.run(file);
+				pin.run(
+					file,
+					oldCanonical,
+					JSON.stringify({
+						kind: "receipt",
+						id: file,
+						deviceId: "local",
+						path: literal,
+						repositoryKey: "historic-repository",
+					}),
+				);
+			}
+			database
+				.query(`UPDATE resource_protection_sources SET cursor='eof', complete=1
+			WHERE source='receipt' AND source_id=''`)
+				.run();
+			await writeFile(
+				join(receipts, `${"0".repeat(64)}.json`),
+				JSON.stringify({ dispatchState: "not_started" }),
+			);
+			await writeFile(join(receipts, `${"f".repeat(64)}.json`), JSON.stringify(receipt(root)));
+			oldProjection();
+			installResourceProtectionTriggers(database);
+			const head = () =>
+				database
+					.query(`SELECT cursor, complete FROM resource_protection_sources
+			WHERE source='receipt' AND source_id=''`)
+					.get() as { cursor: string; complete: number };
+			expect(head().cursor.startsWith(receiptProjectionPrefix)).toBe(true);
+			const open = spyOn(fs, "open");
+			const opendir = spyOn(fs, "opendir");
+			try {
+				await service.maintain(deadline());
+				const updated = () =>
+					database
+						.query(`SELECT count(*) AS n FROM resource_protection_paths
+				WHERE source='receipt' AND canonical_path=?`)
+						.get(literal);
+				expect(updated()).toEqual({ n: 64 });
+				const progress = head();
+				expect(progress.complete).toBe(0);
+				expect((await service.read([{ path: literal }], deadline())).complete).toBe(false);
+				await rm(receipts, { recursive: true });
+				const before = changes();
+				initializeAbsentReceiptProtectionSource(database, receipts);
+				expect(head()).toEqual(progress); // Missing namespace cannot bypass projection.
+				expect(changes()).toBe(before);
+				service = createResourceProtectionIndex(database, receipts);
+				installResourceProtectionTriggers(database);
+				expect(head()).toEqual(progress);
+				await service.maintain(deadline());
+				expect(updated()).toEqual({ n: 128 });
+				await bootstrap();
+				expect(updated()).toEqual({ n: 130 });
+				expect(head()).toEqual({ cursor: "eof", complete: 1 });
+				expect(await claims([{ path: literal }])).toHaveLength(130);
+				expect(await claims([{ path: oldCanonical }])).toEqual([]);
+				expect(open).not.toHaveBeenCalled();
+				expect(opendir).not.toHaveBeenCalled();
+				const idle = changes();
+				await service.maintain(deadline());
+				expect(changes()).toBe(idle);
+			} finally {
+				open.mockRestore();
+				opendir.mockRestore();
+			}
+		},
+	);
+});
+
 describe("one-time legacy receipt pins", () => {
+	for (const path of ["C:\\Remote\\Workspace", "\\\\Server\\Share\\Workspace"])
+		test(`remote Windows receipt and shadow pins never require host absolute syntax: ${path}`, async () => {
+			await mkdir(receipts);
+			const file = join(receipts, `${"e".repeat(64)}.json`);
+			await writeFile(file, JSON.stringify({ ...receipt(path), deviceId: "remote-device" }));
+			await bootstrap();
+			expect(
+				(await claims([{ deviceId: "remote-device", path }])).map((claim) => claim.id),
+			).toEqual([file]);
+			expect(await claims([{ path: root }])).toEqual([]);
+			const shadowKey = treeSnapshotKey("remote-device", path);
+			database
+				.query(`UPDATE resource_protection_paths SET claim_json=?, shadow_key=NULL
+				WHERE source='receipt' AND source_id=?`)
+				.run(
+					JSON.stringify({
+						kind: "receipt",
+						id: file,
+						deviceId: "remote-device",
+						shadowKey,
+					}),
+					file,
+				);
+			database.exec(`DROP TRIGGER resource_protection_narrator_insert;
+				CREATE TRIGGER resource_protection_narrator_insert AFTER INSERT ON narrators
+				BEGIN SELECT 1; END;`);
+			installResourceProtectionTriggers(database);
+			service = createResourceProtectionIndex(database, receipts);
+			await rm(file);
+			await bootstrap();
+			expect((await claims([{ shadowKey }])).map((claim) => claim.id)).toEqual([file]);
+			expect(await claims([{ path: root }])).toEqual([]);
+		});
 	for (const phase of ["pending not_started", "failed not_started", "legacy validation failure"]) {
 		test(`${phase} completes import without pinning rejected destinations`, async () => {
 			await mkdir(receipts);
@@ -594,7 +1738,7 @@ describe("one-time legacy receipt pins", () => {
 		database.exec(`CREATE TRIGGER fail_receipt_registration BEFORE INSERT ON resource_protection_sources
 			WHEN NEW.source = 'receipt' AND NEW.source_id != '' BEGIN
 			SELECT RAISE(ABORT, 'injected receipt write failure'); END`);
-		await expect(service.maintain(deadline())).rejects.toThrow("injected receipt write failure");
+		await expectFailure(service.maintain(deadline()), "injected receipt write failure");
 		expect(database.query("SELECT count(*) AS n FROM resource_protection_paths").get()).toEqual({
 			n: 0,
 		});
@@ -806,7 +1950,7 @@ describe("one-time legacy receipt pins", () => {
 			expect.arrayContaining(["cwd", "registry"]),
 		);
 		expect(changes()).toBe(before);
-		await expect(claims([{ path: root }])).rejects.toThrow();
+		await expectFailure(claims([{ path: root }]));
 	});
 	test("completed import never reads renamed or unreadable receipt directories again", async () => {
 		await mkdir(receipts);
@@ -934,5 +2078,306 @@ describe("one-time legacy receipt pins", () => {
 				.get(later),
 		).toEqual({ present: 1 });
 		expect(await claims([{ path: root }], false)).toEqual([]);
+	});
+});
+
+describe("bounded protection fact batches", () => {
+	test("candidate facts preserve exact source, source id and slot keys", async () => {
+		await bootstrap();
+		for (const source of ["narrator", "registry", "receipt"] as const) {
+			database
+				.query(
+					"INSERT INTO resource_protection_sources(source,source_id,dirty) VALUES(?, 'shared', 0)",
+				)
+				.run(source);
+			for (const slot of [-1, 0, 1]) {
+				const wanted =
+					(source === "narrator" && slot === 0) ||
+					(source === "registry" && slot === 1) ||
+					(source === "receipt" && slot === -1);
+				const claim: ResourceClaim = { kind: source, id: `${source}:${slot}`, path: root };
+				database
+					.query(`INSERT INTO resource_protection_paths(source,source_id,slot,device_id,canonical_path,repository_key,claim_json)
+				VALUES(?, 'shared', ?, 'local', ?, ?, ?)`)
+					.run(source, slot, root, wanted ? "wanted" : "decoy", JSON.stringify(claim));
+			}
+		}
+		expect((await claims([{ repositoryKey: "wanted" }])).map((claim) => claim.id).sort()).toEqual([
+			"narrator:0",
+			"receipt:-1",
+			"registry:1",
+		]);
+	});
+	test("dirty oversized candidates are skipped while clean oversized candidates fail closed", async () => {
+		narrator("dirty", root);
+		registry("clean", root);
+		await bootstrap();
+		database.query("UPDATE narrators SET cwd=? WHERE id='dirty'").run(join(root, "new"));
+		database
+			.query("UPDATE resource_protection_paths SET claim_json=? WHERE source='narrator'")
+			.run("x".repeat(64 * 1024 + 1));
+		expect(
+			(await claims([{ path: root }])).some(
+				(claim) => claim.id === "dirty" && claim.path === join(root, "new"),
+			),
+		).toBe(true);
+		database
+			.query("UPDATE resource_protection_paths SET claim_json=? WHERE source='registry'")
+			.run("x".repeat(64 * 1024 + 1));
+		await expectFailure(claims([{ repositoryKey: "repo-clean" }]), "row budget");
+	});
+	test("a candidate removed after raw paging is not interpreted as an empty inventory", async () => {
+		registry("r", root);
+		await bootstrap();
+		const original = workerRead.readNativeRows;
+		let removed = false;
+		const read = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+			const rows = await original(...args);
+			if (
+				!removed &&
+				args[1].startsWith("SELECT source, source_id, slot, canonical_path") &&
+				rows.length
+			) {
+				removed = true;
+				database
+					.query("DELETE FROM resource_protection_paths WHERE source='registry' AND source_id='r'")
+					.run();
+			}
+			return rows;
+		}) as typeof original);
+		try {
+			await expectFailure(claims([{ repositoryKey: "repo-r" }]), "disappeared");
+			expect(removed).toBe(true);
+		} finally {
+			read.mockRestore();
+		}
+	});
+	test("incomplete candidate fact batches fail closed", async () => {
+		registry("r", root);
+		await bootstrap();
+		const original = workerRead.readNativeRows;
+		const read = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+			const rows = await original(...args);
+			return args[1].startsWith("WITH requested") ? [] : rows;
+		}) as typeof original);
+		try {
+			await expectFailure(claims([{ repositoryKey: "repo-r" }]), "facts incomplete");
+		} finally {
+			read.mockRestore();
+		}
+	});
+	test("a source revision changed after a candidate batch invalidates the final proof", async () => {
+		narrator("n", root);
+		await bootstrap();
+		const original = workerRead.readNativeRows;
+		let changed = false;
+		const read = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+			const rows = await original(...args);
+			if (!changed && args[1].startsWith("WITH requested") && rows.length) {
+				changed = true;
+				database.query("UPDATE narrators SET cwd=? WHERE id='n'").run(join(root, "changed"));
+			}
+			return rows;
+		}) as typeof original);
+		try {
+			await expectFailure(claims([{ path: root }]), "changed during inspection");
+			expect(changed).toBe(true);
+		} finally {
+			read.mockRestore();
+		}
+	});
+	for (const phase of ["maintenance", "candidates"] as const) {
+		test(`stop drains the current ${phase} batch without submitting the next batch`, async () => {
+			for (let i = 0; i < 64; i++) registry(`r-${i}`, root);
+			if (phase === "candidates") await bootstrap();
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const original = workerRead.readNativeRows;
+			let batches = 0;
+			const read = spyOn(workerRead, "readNativeRows").mockImplementation((async (...args) => {
+				const rows = await original(...args);
+				const batch =
+					phase === "candidates"
+						? args[1].startsWith("WITH requested")
+						: args[1].includes("FROM narrator_worktree_resources") &&
+							args[1].includes("WHERE id IN");
+				if (batch) {
+					batches++;
+					expect(args[3]?.maxRows).toBe(16);
+					started.resolve();
+					await release.promise;
+				}
+				return rows;
+			}) as typeof original);
+			try {
+				const work =
+					phase === "maintenance" ? service.maintain(deadline()) : claims([{ path: root }]);
+				const finished = work.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				await started.promise;
+				let stopped = false;
+				const stopping = service.stop().then(() => {
+					stopped = true;
+				});
+				await Promise.resolve();
+				expect(stopped).toBe(false);
+				release.resolve();
+				expect(await finished).toBeInstanceOf(Error);
+				expect(((await finished) as Error).message).toContain("stopped");
+				await stopping;
+				expect(batches).toBe(1);
+			} finally {
+				release.resolve();
+				await service.stop();
+				read.mockRestore();
+			}
+		});
+	}
+});
+
+describe("resource protection shutdown", () => {
+	test("a previously created iterator cannot submit more reads after stop", async () => {
+		await bootstrap();
+		const result = await service.read([{ path: root }], deadline());
+		await service.stop();
+		const read = spyOn(workerRead, "readNativeRows");
+		try {
+			await expect(result.claims[Symbol.asyncIterator]().next()).rejects.toThrow("stopped");
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	});
+	test("stops a running maintenance timer without rearming or admitting more reads", async () => {
+		await resetResourceProtectionIndexForTests(service);
+		const reading = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<never[]>();
+		const read = spyOn(workerRead, "readNativeRows").mockImplementation(() => {
+			reading.resolve();
+			return release.promise;
+		});
+		const previousTest = process.env.NARRAFORK_TEST;
+		const timers = spyOn(globalThis, "setTimeout");
+		try {
+			delete process.env.NARRAFORK_TEST;
+			startProtectionIndexMaintenance();
+			process.env.NARRAFORK_TEST = previousTest;
+			await reading.promise;
+			const stopping = stopResourceProtectionIndex();
+			const repeated = stopResourceProtectionIndex();
+			expect(getResourceProtectionShutdownSnapshot().stopped).toBe(true);
+			await expect(maintainProtectionIndex()).rejects.toThrow("stopped");
+			await expect(readProtectionClaims([], deadline())).rejects.toThrow("stopped");
+			startProtectionIndexMaintenance();
+			expect(read).toHaveBeenCalledTimes(1);
+			release.resolve([]);
+			await Promise.all([stopping, repeated]);
+			expect(getResourceProtectionShutdownSnapshot()).toEqual({
+				stopped: true,
+				pendingTasks: 0,
+				pendingReceiptImports: 0,
+				maintenanceScheduled: false,
+			});
+			expect(timers.mock.calls.filter(([, delay]) => delay === 1000)).toHaveLength(0);
+		} finally {
+			process.env.NARRAFORK_TEST = previousTest;
+			release.resolve([]);
+			await stopResourceProtectionIndex();
+			timers.mockRestore();
+			read.mockRestore();
+		}
+	});
+
+	async function blockedReceiptRead() {
+		await mkdir(receipts);
+		database
+			.query("UPDATE resource_protection_sources SET complete=1 WHERE source!='receipt'")
+			.run();
+		const reading = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<void>();
+		const closing = Promise.withResolvers<void>();
+		const releaseClose = Promise.withResolvers<void>();
+		const opendir = fs.opendir;
+		const spy = spyOn(fs, "opendir").mockImplementation(async (...args) => {
+			const dir = await opendir(...args);
+			const read = dir.read.bind(dir);
+			const close = dir.close.bind(dir);
+			spyOn(dir, "read").mockImplementationOnce(async () => {
+				reading.resolve();
+				await releaseRead.promise;
+				return read();
+			});
+			spyOn(dir, "close").mockImplementationOnce(async () => {
+				closing.resolve();
+				await releaseClose.promise;
+				return close();
+			});
+			return dir;
+		});
+		const work = service.maintain(performance.now() + 1000);
+		const returned = expect(work).rejects.toThrow();
+		await reading.promise;
+		await returned;
+		return { releaseRead, closing, releaseClose, spy };
+	}
+	test("waits for real receipt work and its close after the bounded maintenance returned", async () => {
+		const blocked = await blockedReceiptRead();
+		try {
+			expect(service.getShutdownSnapshot().pendingReceiptImports).toBe(1);
+			let settled = false;
+			const stopping = service.stop().then(() => {
+				settled = true;
+			});
+			const repeated = service.stop();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			blocked.releaseRead.resolve();
+			await blocked.closing.promise;
+			expect(settled).toBe(false);
+			expect(service.getShutdownSnapshot().pendingReceiptImports).toBe(1);
+			blocked.releaseClose.resolve();
+			await Promise.all([stopping, repeated]);
+			expect(service.getShutdownSnapshot()).toEqual({
+				stopped: true,
+				pendingTasks: 0,
+				pendingReceiptImports: 0,
+			});
+		} finally {
+			blocked.releaseRead.resolve();
+			blocked.releaseClose.resolve();
+			await service.stop();
+			blocked.spy.mockRestore();
+		}
+	});
+	test("a shutdown deadline retains unclosed receipt work until it actually settles", async () => {
+		const blocked = await blockedReceiptRead();
+		try {
+			await expect(service.stop({ deadlineAt: Date.now() + 10 })).rejects.toThrow(
+				"shutdown deadline",
+			);
+			expect(service.getShutdownSnapshot().pendingTasks).toBeGreaterThan(0);
+			expect(service.getShutdownSnapshot().pendingReceiptImports).toBe(1);
+			const reads = spyOn(workerRead, "readNativeRows");
+			try {
+				await expect(service.maintain()).rejects.toThrow("stopped");
+				await expect(service.read([], deadline())).rejects.toThrow("stopped");
+				expect(reads).not.toHaveBeenCalled();
+			} finally {
+				reads.mockRestore();
+			}
+			blocked.releaseRead.resolve();
+			await blocked.closing.promise;
+			expect(service.getShutdownSnapshot().pendingReceiptImports).toBe(1);
+			blocked.releaseClose.resolve();
+			await service.stop();
+			expect(service.getShutdownSnapshot().pendingTasks).toBe(0);
+		} finally {
+			blocked.releaseRead.resolve();
+			blocked.releaseClose.resolve();
+			await service.stop();
+			blocked.spy.mockRestore();
+		}
 	});
 });

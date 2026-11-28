@@ -113,7 +113,7 @@ oauthGrantRoutes.get("/", async (c) => {
 
 oauthGrantRoutes.get("/:id", async (c) => {
 	const grantId = c.req.param("id");
-	const grant = await getUserOAuthGrant(c.get("user").sub, grantId);
+	const grant = await getUserOAuthGrant(c.get("user").sub, grantId, { signal: c.req.raw.signal });
 	if (!grant) throw new NotFoundError("OAuth grant", grantId);
 	return c.json(toConnectedAppGrant(grant));
 });

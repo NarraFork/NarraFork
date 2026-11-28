@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Browser } from "puppeteer-core";
+import { logger } from "../../logger";
 import { settings } from "../../settings";
 import { createShare, getShare, revokeShareRegistry } from "../../shares";
 import { reserveDiagnostic } from "../diagnostic-admission";
@@ -26,6 +27,7 @@ import {
 } from "../memory-profiler";
 import type { BrowserSession } from "../session";
 import type { TraceLease } from "../tracing-lease";
+import { installMemoryWorker } from "./memory-worker.fixture";
 
 function required<T>(value: T | undefined | null): T {
 	if (value === undefined || value === null) throw new Error("Missing expected test value");
@@ -69,9 +71,11 @@ class FakeWorker extends EventEmitter {
 	}
 	async terminate() {
 		this.terminated = true;
+		this.emit("exit", 0);
 		return 0;
 	}
 }
+let fixtureId = 0;
 async function fixture(
 	options: {
 		worker?: FakeWorker;
@@ -81,6 +85,8 @@ async function fixture(
 		shareMaxBytes?: () => number;
 		moveArtifact?: typeof rename;
 		cleanupMs?: number;
+		/** Only the startup-timeout test races the startup budget; others must not hinge on it. */
+		startMs?: number;
 		stopMs?: number;
 		workerCleanupMs?: number;
 		replyGraceMs?: number;
@@ -106,18 +112,22 @@ async function fixture(
 	let confirmed = 0;
 	let uncertain = 0;
 	let leases = 0;
+	const id = ++fixtureId;
+	const specifiers = [`file:///worker-${id}-a`, `file:///worker-${id}-b`];
+	const thread = installMemoryWorker(
+		options.spawn ??
+			(() => {
+				queueMicrotask(() => worker.reply({ kind: "ready" }));
+				return worker;
+			}),
+		specifiers,
+	);
 	const api = createMemoryProfiler({
 		root: join(root, "private"),
 		sharesRoot: join(root, "shares"),
 		shareMaxBytes: options.shareMaxBytes,
 		moveArtifact: options.moveArtifact,
-		spawn:
-			options.spawn ??
-			(() => {
-				queueMicrotask(() => worker.reply({ kind: "ready" }));
-				return worker;
-			}),
-		specifiers: () => ["file:///worker-a", "file:///worker-b"],
+		specifiers: () => specifiers,
 		setup:
 			options.setup ??
 			(async () => ({
@@ -155,11 +165,12 @@ async function fixture(
 			}),
 		revokeShare: (id) => {
 			revoked.push(id);
+			revokeShareRegistry(id);
 			registered.delete(id);
 			return null;
 		},
 		limits: {
-			startTimeoutMs: 50,
+			startTimeoutMs: options.startMs ?? 2_000,
 			stopTimeoutMs: options.stopMs ?? 50,
 			workerCleanupTimeoutMs: options.workerCleanupMs ?? 30,
 			replyGraceMs: options.replyGraceMs ?? 20,
@@ -177,9 +188,17 @@ async function fixture(
 		revoked,
 		counts: () => ({ detached, confirmed, uncertain, leases }),
 		async dispose() {
-			if (session.memoryJob)
-				await cancelMemoryProfile(session, session.memoryProfile?.view.profileId as string);
+			const job = session.memoryJob;
+			if (job) {
+				// Cancel's reply is bounded and rejects at once if this job's response budget already
+				// expired. Wait for done instead, so the next test never meets this job's global slot.
+				await cancelMemoryProfile(session, session.memoryProfile?.view.profileId as string).catch(
+					() => {},
+				);
+				await job.done;
+			}
 			await rm(root, { recursive: true, force: true });
+			thread.mockRestore();
 		},
 	};
 }
@@ -284,11 +303,14 @@ describe("memory profile supervisor", () => {
 	test("startup timeout cancels worker and keeps endpoint out of thrown errors", async () => {
 		const worker = new FakeWorker();
 		worker.record = false;
-		const f = await fixture({ worker });
+		const f = await fixture({ worker, startMs: 50 });
 		try {
-			await expect(f.api.startMemoryProfile(f.session)).rejects.toThrow(
-				"Memory profile failed (timeout)",
-			);
+			const pending = f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
+			await expect(pending).rejects.toThrow("Memory profile failed (timeout)");
+			// The rejection is bounded by the 30ms response budget, not by cleanup: on a busy runner
+			// it arrives while worker teardown still owns the job and the global diagnostic slot.
+			await done;
 			expect(statusMemoryProfile(f.session).state).toBe("failed");
 			expect(f.session.memoryJob).toBeUndefined();
 			expect(f.counts().confirmed).toBe(1);
@@ -401,15 +423,18 @@ describe("memory profile supervisor", () => {
 		try {
 			const controller = new AbortController();
 			const pending = f.api.startMemoryProfile(f.session, { signal: controller.signal });
+			await until(() => typeof resolve === "function");
 			controller.abort(new Error("SECRET-ENDPOINT-CANARY"));
 			await expect(pending).rejects.toThrow("(cancelled)");
+			expect(f.session.memoryJob).toBeDefined();
+			expect(() => reserveDiagnostic("snapshot")).toThrow();
 			resolve({
 				targetId: "late",
 				detach: async () => {
 					detached = true;
 				},
 			});
-			await until(() => detached);
+			await until(() => detached && !f.session.memoryJob);
 			expect(f.session.memoryJob).toBeUndefined();
 		} finally {
 			await f.dispose();
@@ -591,6 +616,117 @@ describe("memory profile supervisor", () => {
 			}
 		}
 	});
+	test("share success diagnostic excludes name/path/ID canaries without swallowing formatting errors", async () => {
+		const f = await fixture();
+		const id = "private-id-canary";
+		const invalidId = "format-failure-share";
+		const sink = spyOn(logger, "info").mockImplementation(() => {});
+		const opts = {
+			id,
+			originalName: "/private/name-body-canary",
+			storagePath: join(f.root, "private-path-canary"),
+			size: 12,
+			createdBy: "owner",
+			expiryHours: 24,
+		};
+		try {
+			expect(createShare(opts).originalName).toBe(opts.originalName);
+			expect(sink.mock.calls[0][1]).toMatchObject({ stage: "created", size: 12 });
+			expect(JSON.stringify(sink.mock.calls)).not.toContain("canary");
+			const format = spyOn(Date.prototype, "toISOString").mockImplementation(() => {
+				throw new RangeError("format failure");
+			});
+			try {
+				expect(() => createShare({ ...opts, id: invalidId })).toThrow(RangeError);
+				expect(sink).toHaveBeenCalledTimes(1);
+			} finally {
+				format.mockRestore();
+			}
+		} finally {
+			sink.mockRestore();
+			revokeShareRegistry(id);
+			revokeShareRegistry(invalidId);
+			await f.dispose();
+		}
+	});
+
+	test("share creation logger failure preserves successful publication and cleanup", async () => {
+		const f = await fixture({ register: createShare });
+		const sink = spyOn(logger, "info").mockImplementation(() => {
+			throw new Error("sink failed");
+		});
+		const ids: string[] = [];
+		try {
+			const started = await f.api.startMemoryProfile(f.session);
+			await complete(f.worker);
+			const result = await stopMemoryProfile(f.session, required(started.profileId));
+			expect(result.state).toBe("completed");
+			expect(result.artifacts).toHaveLength(1);
+			for (const artifact of result.artifacts ?? []) {
+				ids.push(artifact.shareId);
+				expect(getShare(artifact.shareId)?.storagePath).toBe(artifact.path);
+			}
+			expect(sink).toHaveBeenCalledTimes(1);
+			expect(f.session.memoryJob).toBeUndefined();
+			expect(f.counts().detached).toBe(1);
+		} finally {
+			sink.mockRestore();
+			for (const id of ids) revokeShareRegistry(id);
+			await f.dispose();
+		}
+	});
+
+	test("cancelled publication cannot revoke or remove artifacts before actual worker exit", async () => {
+		const worker = new FakeWorker();
+		let resume!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		let terminating = false;
+		const terminate = worker.terminate.bind(worker);
+		worker.terminate = async () => {
+			terminating = true;
+			await gate;
+			return terminate();
+		};
+		const ids: string[] = [];
+		const f = await fixture({
+			worker,
+			register: (opts) => {
+				const record = createShare(opts);
+				ids.push(opts.id);
+				f.page.emit("close");
+				return record;
+			},
+		});
+		try {
+			const started = await f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
+			await complete(worker);
+			await until(() => terminating);
+			await expect(cancelMemoryProfile(f.session, required(started.profileId))).rejects.toThrow(
+				"(timeout)",
+			);
+			expect(f.session.memoryJob).toBeDefined();
+			expect(ids).toHaveLength(1);
+			expect(f.revoked).toHaveLength(0);
+			const share = required(getShare(ids[0]));
+			expect(await readFile(share.storagePath, "utf8")).toContain("complete");
+			expect(await readFile(join(required(worker.request).dir, "private.raw"), "utf8")).toContain(
+				"CANARY",
+			);
+			resume();
+			await done;
+			expect(f.revoked).toHaveLength(1);
+			expect(getShare(ids[0])).toBeNull();
+			expect(f.session.memoryJob).toBeUndefined();
+		} finally {
+			resume();
+			for (const id of ids) revokeShareRegistry(id);
+			await f.dispose();
+		}
+	});
+
 	test("failed registry transaction revokes every staged share and asynchronously removes dirs", async () => {
 		let registrations = 0;
 		const f = await fixture({
@@ -690,8 +826,11 @@ describe("memory profile supervisor", () => {
 		}
 	});
 	test("fixed artifact names, exact sizes and no symlinks are enforced", async () => {
+		// Publication rejects these artifacts immediately, then worker teardown still
+		// runs inside the response budget. On a loaded CI runner that teardown exceeded
+		// the 30ms default and the supervisor reported "timeout" instead of "bytes".
 		for (const variant of ["name", "size", "symlink"]) {
-			const f = await fixture();
+			const f = await fixture({ cleanupMs: 1_000 });
 			try {
 				const view = await f.api.startMemoryProfile(f.session);
 				const request = required(f.worker.request);
@@ -837,20 +976,38 @@ describe("memory profile supervisor", () => {
 			await f.dispose();
 		}
 	});
-	test("non-settling publication remains bounded by main cleanup and rolls registry back", async () => {
-		const f = await fixture({ moveArtifact: () => new Promise<void>(() => {}) });
+	test("non-settling publication bounds response but retains resources until late rollback", async () => {
+		let resume!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		const f = await fixture({
+			moveArtifact: async (source, target) => {
+				await gate;
+				await rename(source, target);
+			},
+		});
 		try {
 			const started = await f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
 			await complete(f.worker);
 			const began = Date.now();
-			const result = await stopMemoryProfile(f.session, required(started.profileId));
+			await expect(stopMemoryProfile(f.session, required(started.profileId))).rejects.toThrow(
+				"(timeout)",
+			);
 			expect(Date.now() - began).toBeLessThan(120);
+			expect(f.registered.size).toBe(0);
+			expect(f.session.memoryJob).toBeDefined();
+			expect(() => reserveDiagnostic("snapshot")).toThrow();
+			resume();
+			await done;
+			const result = statusMemoryProfile(f.session);
 			expect(result.state).toBe("failed");
 			expect(result.stage).toBe("timeout");
-			expect(f.registered.size).toBe(0);
 			expect(f.revoked).toHaveLength(1);
 			expect(f.session.memoryJob).toBeUndefined();
 		} finally {
+			resume();
 			await f.dispose();
 		}
 	});
@@ -858,12 +1015,15 @@ describe("memory profile supervisor", () => {
 		const f = await fixture();
 		try {
 			const started = await f.api.startMemoryProfile(f.session);
+			const done = required(f.session.memoryJob).done;
 			required(f.session.memoryProfile).done = new Promise<void>(() => {});
 			const began = Date.now();
 			await expect(stopMemoryProfile(f.session, required(started.profileId))).rejects.toThrow(
 				"Memory profile failed (timeout)",
 			);
 			expect(Date.now() - began).toBeLessThan(300);
+			// The stop reply has its own deadline; the job's cleanup may still be finishing after it.
+			await done;
 			expect(f.session.memoryJob).toBeUndefined();
 			expect(statusMemoryProfile(f.session).state).toBe("failed");
 		} finally {

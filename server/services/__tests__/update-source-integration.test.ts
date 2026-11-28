@@ -221,7 +221,11 @@ describe("selected update source integration", () => {
 		};
 		const identity = getCurrentUpdateSourceIdentity();
 		installFetch((url) => {
-			if (url === sidecarUrl) return new Response(metadata);
+			if (
+				url.startsWith(serverUrl) &&
+				url.endsWith(`/assets/${createHash("sha256").update(metadata).digest("hex")}`)
+			)
+				return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/private-product/mirror/`);
 			return url.endsWith("/index") ? Response.json(mirrorIndex()) : emptyAvailability();
 		});
@@ -247,8 +251,8 @@ describe("selected update source integration", () => {
 		expect(after.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
 		expect(getCurrentUpdateSourceIdentity()).toEqual(identity);
 		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(true);
-		expect(requested.every((url) => url.startsWith(serverUrl) || url === sidecarUrl)).toBe(true);
-		expect(requested.filter((url) => url === sidecarUrl)).toHaveLength(2);
+		expect(requested.every((url) => new URL(url).origin === serverUrl)).toBe(true);
+		expect(requested.filter((url) => url.includes("/assets/"))).toHaveLength(2);
 	});
 
 	test("beta-to-stable change during forced GitHub detection refuses the captured result", async () => {
@@ -287,7 +291,11 @@ describe("selected update source integration", () => {
 		};
 		const update = settings.update;
 		installFetch((url) => {
-			if (url === sidecarUrl) return new Response(metadata);
+			if (
+				url.startsWith(serverUrl) &&
+				url.endsWith(`/assets/${createHash("sha256").update(metadata).digest("hex")}`)
+			)
+				return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/first/mirror/`);
 			if (field === "product") update.product = "second";
 			else update.channel = "beta";
@@ -296,7 +304,7 @@ describe("selected update source integration", () => {
 		const checked = await checkForUpdate({ force: true });
 		if (!checked.releaseInfo) throw new Error("Missing checked canonical release");
 		expect(checked.releaseInfo.recoveryManifestVersions).toEqual([1, 2, 3]);
-		expect(requested.filter((url) => url === sidecarUrl)).toHaveLength(1);
+		expect(requested.filter((url) => url.includes("/assets/"))).toHaveLength(1);
 		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(false);
 		const before = [...requested];
 		expect((await downloadUpdate(checked.releaseInfo)).success).toBe(false);
@@ -458,7 +466,7 @@ describe("selected update source integration", () => {
 		expect(requested).toEqual([]);
 		expectNoTemporaryArtifacts();
 	});
-	test("canonical mirror selects full with only its trusted GitHub sidecar through frozen transport", async () => {
+	test("canonical mirror selects full and reads its sidecar through frozen mirror-only transport", async () => {
 		const serverUrl = "https://updates.integration.example";
 		settings.update = {
 			...selectGithub(),
@@ -469,7 +477,11 @@ describe("selected update source integration", () => {
 		};
 		const update = settings.update;
 		installFetch((url) => {
-			if (url === sidecarUrl) return new Response(metadata);
+			if (
+				url.startsWith(serverUrl) &&
+				url.endsWith(`/assets/${createHash("sha256").update(metadata).digest("hex")}`)
+			)
+				return new Response(metadata);
 			expect(url).toStartWith(`${serverUrl}/api/v3/products/custom-product/mirror/`);
 			if (url.endsWith("/index")) {
 				// The remaining requests must retain this check's captured transport.
@@ -485,9 +497,12 @@ describe("selected update source integration", () => {
 		expect(result.source).toBe("update-server");
 		expect(result.repository).toBe(repository);
 		expect(result.strategy).toBe("full");
-		expect(result.releaseInfo?._github?.downloadUrl).toBe(binaryUrl);
+		expect(result.releaseInfo?._github).toBeUndefined();
+		expect(result.releaseInfo?._mirror?.full.url).toBe(
+			`${serverUrl}/api/v3/products/custom-product/mirror/assets/${createHash("sha256").update(payload).digest("hex")}`,
+		);
 		expect(result.releaseInfo?.recoveryManifestVersions).toEqual([1, 2, 3]);
-		expect(requested.filter((url) => !url.startsWith(serverUrl))).toEqual([sidecarUrl]);
+		expect(requested.filter((url) => new URL(url).origin !== serverUrl)).toEqual([]);
 		expect(requested).not.toContain(binaryUrl);
 		expect(requested.some((url) => url.startsWith("https://api.github.com/"))).toBe(false);
 		expect(requestOptions).toHaveLength(3);

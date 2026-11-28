@@ -49,4 +49,39 @@ export const worktreePrepareSchema = z
 			message: "Provide a branch name or task requirement",
 		},
 	);
+const worktreePath = z
+	.string()
+	.min(1)
+	.max(4096)
+	.refine((value) => !value.includes("\0"), {
+		message: "path must not contain NUL",
+	});
+export const worktreeRemovalPlanSchema = z
+	.object({
+		workspaceKey,
+		path: worktreePath,
+	})
+	.strict();
+export const worktreeRemovalRequestSchema = z
+	.object({
+		expectedRevision: z.number().int().nonnegative(),
+		workspaceKey,
+		path: worktreePath,
+		force: z.boolean().optional(),
+		confirmedLoss: z
+			.object({
+				head: z.string().max(128).nullable(),
+				dirtyFileCount: z.number().int().nonnegative().max(1_000_000_000),
+				unreachableCommits: z.number().int().nonnegative().max(1_000_000_000_000),
+			})
+			.strict()
+			.optional(),
+		acknowledgeUnregistered: z.boolean().optional(),
+	})
+	.strict()
+	.refine((input) => !input.force || input.confirmedLoss !== undefined, {
+		message: "force must carry the confirmed loss",
+	});
 export type WorktreeCreateRequest = z.infer<typeof worktreeCreateSchema>;
+export type WorktreeRemovalPlanRequest = z.infer<typeof worktreeRemovalPlanSchema>;
+export type WorktreeRemovalRequest = z.infer<typeof worktreeRemovalRequestSchema>;

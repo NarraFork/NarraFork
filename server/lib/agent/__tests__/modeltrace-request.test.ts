@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+	buildModelTraceProbeParams,
 	forgetModelTraceRequest,
 	getModelTraceRequest,
 	rememberModelTraceRequest,
+	requireModelTraceAnchor,
 } from "../modeltrace-request";
 import type { ChatParams, ProviderAdapter } from "../provider";
 
@@ -97,6 +99,25 @@ describe("ModelTrace frozen request prefix", () => {
 		expect(getModelTraceRequest(id)?.params.content).toBe("latest input");
 		forgetModelTraceRequest(id);
 		expect(getModelTraceRequest(id)).toBeUndefined();
+	});
+
+	test("rejects a rotated credential before construction and before transport", () => {
+		let current = true;
+		const fake = { ...adapter, supportsDiagnosticFork: () => true };
+		rememberModelTraceRequest(id, fake, request(), "test", "credential", () => current);
+		const anchor = requireModelTraceAnchor(id);
+		const probe = buildModelTraceProbeParams(
+			anchor,
+			"child",
+			new AbortController().signal,
+			"probe",
+		);
+		current = false;
+		expect(() => requireModelTraceAnchor(id)).toThrow("credential changed");
+		expect(() => buildModelTraceProbeParams(anchor, "child", probe.signal, "probe")).toThrow(
+			"credential changed",
+		);
+		expect(() => probe.diagnosticFork?.validateCredential?.()).toThrow("credential changed");
 	});
 
 	test("bounds retained request count and refreshes recently used keys", () => {

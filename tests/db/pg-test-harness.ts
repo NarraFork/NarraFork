@@ -312,8 +312,12 @@ export async function withPostgres<T>(
 		stage = "readiness";
 		let ready = false;
 		for (let i = 0; i < 20; i++) {
-			const probe = await exec("SELECT 1;");
-			if (probe.code === 0 && probe.stdout.trim() === "1") {
+			// The image's init server accepts Unix sockets, then stops before the real TCP server.
+			const probe = await run(
+				[PODMAN, "exec", name, "pg_isready", "-h", "127.0.0.1", "-U", user, "-d", database],
+				{ signal: options.signal, env: PODMAN_ENV },
+			);
+			if (probe.code === 0) {
 				ready = true;
 				break;
 			}

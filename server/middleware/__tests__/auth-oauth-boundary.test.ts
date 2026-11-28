@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import * as oauth from "../../lib/oauth-provider";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import type { AccountRole } from "../../services/registration/account-store";
 import type { AuthPrincipal } from "../auth";
 import {
 	requireAdmin,
+	requireAuth,
 	requireExternalAuth,
 	requireExternalScope,
 	requireSessionAuth,
@@ -48,6 +50,27 @@ function appWithPrincipal(principal: AuthPrincipal): Hono {
 }
 
 describe("session/oauth auth boundary", () => {
+	test("OAuth storage failures are not converted into invalid credentials", async () => {
+		const { DrizzleQueryError } = await import("drizzle-orm/errors");
+		const failure = new DrizzleQueryError("SELECT session", [], new Error("storage unavailable"));
+		const lookup = spyOn(oauth, "validateAccessToken").mockRejectedValue(failure);
+		let observed: unknown;
+		const app = new Hono();
+		app.onError((error, c) => {
+			observed = error;
+			return c.json({ error: "Internal error" }, 500);
+		});
+		app.get("/", requireAuth, (c) => c.text("authorized"));
+		try {
+			const response = await app.request("/", {
+				headers: { Authorization: "Bearer oauth-storage-failure" },
+			});
+			expect(response.status).toBe(500);
+			expect(observed).toBe(failure);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
 	test("rejects an OAuth admin principal at the admin boundary", async () => {
 		const app = appWithPrincipal({
 			type: "oauth",

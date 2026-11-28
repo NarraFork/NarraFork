@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
 import { parseModelId } from "@shared/model-id";
 import {
@@ -5,7 +6,9 @@ import {
 	selectTokenDanceProtocol,
 	TOKENDANCE_APP_URL,
 	TOKENDANCE_ORIGIN,
+	type TokenDanceCatalogModel,
 } from "@shared/tokendance";
+import type { OpenAIProviderConfig } from "../settings";
 import { resolveModelProtocol } from "../settings/provider";
 import { readWithTimeout } from "../stream-timeout";
 import {
@@ -14,6 +17,7 @@ import {
 	getTokenDanceRuntimeConfig,
 	registerTokenDanceRequest,
 	setTokenDanceRecoveryAction,
+	type TokenDanceRuntimeConfig,
 } from "../tokendance-runtime";
 import { AnthropicProvider } from "./anthropic-provider";
 import { GeminiProvider } from "./gemini-provider";
@@ -38,11 +42,15 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 		redactText: mask,
 		transportHeaders(headers) {
 			headers.set("X-App-URL", TOKENDANCE_APP_URL);
+			// Per-key custom headers cannot silently dispatch as another credential.
+			if (headers.has("Authorization")) headers.set("Authorization", `Bearer ${apiKey}`);
+			if (headers.has("x-api-key")) headers.set("x-api-key", apiKey);
+			if (headers.has("x-goog-api-key")) headers.set("x-goog-api-key", apiKey);
 		},
 		async fetch(input, init, next) {
-			assertTokenDanceConnection(generation);
+			assertTokenDanceConnection(generation, apiKey);
 			const controller = new AbortController();
-			const unregister = registerTokenDanceRequest(controller, generation);
+			const unregister = registerTokenDanceRequest(controller, generation, apiKey);
 			const signal = init?.signal;
 			const abort = () => controller.abort(signal?.reason);
 			if (signal?.aborted) abort();
@@ -67,9 +75,11 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 						response.headers.get("TokenDance-Recovery-Action"),
 					);
 					if (action) {
-						setTokenDanceRecoveryAction(action, generation);
+						const accepted = setTokenDanceRecoveryAction(action, generation, apiKey);
 						void response.body?.cancel().catch(() => {});
-						const message = `TokenDance requires user action: ${action}`;
+						const message = accepted
+							? `TokenDance requires user action: ${action}`
+							: `TokenDance API error ${response.status}`;
 						throw new ApiError(
 							response.status,
 							message,
@@ -78,9 +88,9 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 								phase: "http",
 								statusCode: response.status,
 								message,
-								tokendanceRecoveryAction: action,
-								retryable: false,
-								resumable: false,
+								...(accepted
+									? { tokendanceRecoveryAction: action, retryable: false, resumable: false }
+									: {}),
 							}),
 						);
 					}
@@ -125,8 +135,6 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 							statusCode: response.status,
 							message: mask(message),
 							responseSnippet: body,
-							tokendanceRecoveryAction: action,
-							...(action ? { retryable: false, resumable: false } : {}),
 						}),
 					);
 				}
@@ -199,24 +207,44 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 	};
 }
 
-/** A singleton platform namespace; delegates never infer protocol from the model's name. */
+type TokenDanceProviderConfig = TokenDanceRuntimeConfig & {
+	models?: TokenDanceCatalogModel[];
+} & Partial<
+		Pick<OpenAIProviderConfig, "proxy" | "userAgentMode" | "customUserAgent" | "extraHeaders">
+	>;
+
+/** One fixed credential in the platform namespace; never infer protocol from the model name. */
 export class TokenDanceProvider implements ProviderAdapter {
 	private delegate?: ProviderAdapter;
 	private model?: string;
 	private protocol?: string;
-	private readonly config = (() => {
-		const config = getTokenDanceRuntimeConfig();
-		return config ? { ...config } : undefined;
-	})();
+	private config?: TokenDanceProviderConfig;
+	private readonly sessionScope: string;
+
+	constructor(apiKey?: string, config?: TokenDanceProviderConfig) {
+		const initial = config ?? getTokenDanceRuntimeConfig();
+		this.config = initial
+			? { ...initial, ...(apiKey !== undefined ? { apiKey } : {}) }
+			: apiKey
+				? { apiKey, generation: 0, disabled: false }
+				: undefined;
+		this.sessionScope = createHash("sha256")
+			.update(JSON.stringify([this.config?.apiKey, this.config?.generation]))
+			.digest("hex");
+	}
 
 	prepareForModel(model: string): void {
+		// Only the presentation preference is live; secret/network/generation remain captured.
+		const current = getTokenDanceRuntimeConfig() ?? this.config;
 		if (!this.config || this.config.disabled)
 			throw new Error("TokenDance connection is not configured or is disabled.");
-		assertTokenDanceConnection(this.config.generation);
+		assertTokenDanceConnection(this.config.generation, this.config.apiKey);
 		const parsed = parseModelId(model);
 		if (parsed.provider && parsed.provider !== "tokendance")
 			throw new Error("Invalid TokenDance model namespace.");
-		const catalog = getTokenDanceCatalogModels().find((entry) => entry.id === parsed.model);
+		const catalog = (this.config.models ?? getTokenDanceCatalogModels()).find(
+			(entry) => entry.id === parsed.model,
+		);
 		// 设置页为这个模型显式选的协议优先于目录推荐。模型仍必须在目录里，否则没有上下文长度。
 		const override = resolveModelProtocol("tokendance", model);
 		const recommended = catalog && selectTokenDanceProtocol(catalog.supported_protocols);
@@ -230,9 +258,12 @@ export class TokenDanceProvider implements ProviderAdapter {
 				throw new Error(
 					"TokenDance model protocol changed. Rebuild the conversation before retrying.",
 				);
-			return;
+			if (current?.toolResultImages === this.config.toolResultImages) return;
 		}
+		this.config.toolResultImages = current?.toolResultImages;
 		const config = {
+			...this.config,
+			toolResultImages: this.config.toolResultImages,
 			id: "tokendance",
 			name: "TokenDance",
 			prefix: "tokendance",
@@ -288,18 +319,30 @@ export class TokenDanceProvider implements ProviderAdapter {
 		this.active(args[2]).injectSystemPrompt(...args);
 	}
 	async *chat(params: ChatParams) {
-		yield* this.active(params.model).chat(params);
+		// Upstream prompt/session caches must not join two users of the same conversation.
+		const scope = (value: string | undefined) =>
+			value ? `${value}:tokendance:${this.sessionScope}` : value;
+		const delegate = this.active(params.model);
+		delegate.prepareForModel?.(params.model);
+		yield* delegate.chat({
+			...params,
+			conversationId: `${params.conversationId}:tokendance:${this.sessionScope}`,
+			transportSessionKey: scope(params.transportSessionKey),
+			stickySessionKey: scope(params.stickySessionKey),
+		});
 	}
 	async generate(text: string, model: string) {
 		return (await this.generateWithMeta(text, model)).text;
 	}
-	generateWithMeta(
+	async generateWithMeta(
 		text: string,
 		model: string,
 		system?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.active(model).generateWithMeta(text, model, system, options);
+		const delegate = this.active(model);
+		delegate.prepareForModel?.(model);
+		return delegate.generateWithMeta(text, model, system, options);
 	}
 	async generateWithHistory(
 		system: string,
@@ -318,6 +361,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const delegate = this.active(model);
+		delegate.prepareForModel?.(model);
 		return delegate.generateWithHistoryWithMeta
 			? delegate.generateWithHistoryWithMeta(system, content, model, locale, options)
 			: { text: await delegate.generateWithHistory(system, content, model, locale, options) };

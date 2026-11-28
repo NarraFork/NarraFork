@@ -42,6 +42,12 @@ export function resolvePath(...segments: string[]): string {
 	return toForwardSlash(normalize(resolve(...segments)));
 }
 
+/** Bun can return `C:` for realpath(`C:\\`). Apply only to filesystem results,
+ * never raw user input, where a bare drive is legitimately drive-relative. */
+export function normalizeRealpathResult(path: string, platform = process.platform): string {
+	return platform === "win32" && /^[a-z]:$/i.test(path) ? `${path}${win32.sep}` : path;
+}
+
 /**
  * Normalize a path for string comparison.
  * On Windows (or Windows-style paths), comparisons should be case-insensitive.
@@ -84,6 +90,23 @@ export function normalizePathForOS(path: string, os: string): string {
 /** Compare canonical paths using the target backend's path grammar. */
 export function pathsEqualForOS(a: string, b: string, os: string): boolean {
 	return normalizePathForOS(a, os) === normalizePathForOS(b, os);
+}
+
+/**
+ * Whether the default filesystem of `platform` compares file names case-insensitively: NTFS on
+ * Windows, APFS/HFS+ on macOS. Linux (and every other POSIX platform) is case-sensitive.
+ */
+export function caseInsensitiveFileNames(platform: string = process.platform): boolean {
+	return platform === "win32" || platform === "darwin";
+}
+
+/**
+ * Identity key of a local absolute path on `platform`: its OS grammar ({@link normalizePathForOS}),
+ * case-folded where the default filesystem ignores case ({@link caseInsensitiveFileNames}).
+ */
+export function localPathIdentityKey(path: string, platform: string = process.platform): string {
+	const key = normalizePathForOS(path, platform);
+	return caseInsensitiveFileNames(platform) ? key.toLowerCase() : key;
 }
 
 /**

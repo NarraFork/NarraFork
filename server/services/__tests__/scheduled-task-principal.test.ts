@@ -1,11 +1,13 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, projects, scheduledTasks, users } from "../../db/schema";
+import { DbReadError } from "../../lib/db-worker/errors";
 import { generateId } from "../../lib/id";
+import { narratorService } from "../narrator-service";
 
 // Exercise the persisted service/ACL path; never dispatch work to a model.
 const realSession = { ...(await import("../narrator-session")) };
@@ -126,6 +128,25 @@ describe("scheduled execution resolves its owner's live principal", () => {
 		const env = await environment();
 		const id = await legacyTask(env, await makeUser("admin"));
 		expect((await launch(id)).target).toBe(env.narratorId);
+	});
+	test("a failed reuse Worker read does not create or dispatch a replacement", async () => {
+		const env = await environment();
+		const id = await legacyTask(env, await makeUser("admin"));
+		const read = spyOn(narratorService, "getById").mockRejectedValueOnce(
+			new DbReadError("DB_READ_WORKER_EXIT", "reuse Worker unavailable"),
+		);
+		const create = spyOn(narratorService, "create");
+		try {
+			const result = await launch(id);
+			expect(result.target).toBeNull();
+			expect(result.task?.lastStatus).toBe("failed");
+			expect(result.task?.lastError).toContain("reuse Worker unavailable");
+			expect(read).toHaveBeenCalledWith(env.narratorId);
+			expect(create).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+			create.mockRestore();
+		}
 	});
 	test("a non-admin creator without project access is refused", async () => {
 		const env = await environment(await makeUser("user"));

@@ -46,7 +46,7 @@ type GracefulShutdownFn = (request: GracefulShutdownRequest) => Promise<Graceful
  * the handler must not open a restart-handoff session or leave a recovery manifest behind
  * claiming a spawned successor.
  */
-type OperatorShutdownFn = (options: { reason: string }) => Promise<GracefulShutdownResult>;
+type OperatorShutdownFn = (options: { reason: string }) => Promise<GracefulShutdownResult | null>;
 
 type GracefulRestartSession = {
 	token: string;
@@ -138,12 +138,16 @@ export function scheduleOperatorShutdown(options: { reason: string }): boolean {
 		graceMs: OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS,
 	});
 	const timer = setTimeout(() => {
-		void fn(options).catch((err) => {
-			logger.error("Operator shutdown failed", {
-				reason: options.reason,
-				error: err instanceof Error ? err.message : String(err),
+		void fn(options)
+			.then((result) => {
+				if (result === null) _operatorShutdownPending = false;
+			})
+			.catch((err) => {
+				logger.error("Operator shutdown failed", {
+					reason: options.reason,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			});
-		});
 	}, OPERATOR_SHUTDOWN_RESPONSE_GRACE_MS);
 	// Never let the grace timer be the reason the process lingers if it exits another way first.
 	(timer as { unref?: () => void }).unref?.();

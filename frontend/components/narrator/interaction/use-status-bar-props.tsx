@@ -1,10 +1,13 @@
 import type { ModelCard } from "@shared/model-catalog/card";
+import type { RuntimeModelSummary } from "@shared/model-runtime";
 import type { TFunction } from "i18next";
 import type React from "react";
 import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
+import type { Mutate, PendingMutate } from "./mutate";
 import type { NarratorInteractionStatusBarProps } from "./NarratorInteractionStatusBar";
+import type { DangerReflectionLevel } from "./reflection-types";
 import { useFastModeControl } from "./use-fast-mode-control";
-import { useModelSelection } from "./use-model-selection";
+import { type ModelSelectionSettings, useModelSelection } from "./use-model-selection";
 import { usePermissionModeControl } from "./use-permission-mode-control";
 
 /**
@@ -52,28 +55,28 @@ export interface UseStatusBarPropsOptions {
 	resolvedBareModel: string;
 	resolvedModelOption: ModelOption | undefined;
 	narratorReasoningEffort: string | null | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: settings passthrough shared with useModelSelection.
-	settingsData: any;
-	modelCard: ModelCard | null | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	reasoningEffortMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	updateSettingsMutation: any;
+	settingsData: ModelSelectionSettings | undefined;
+	modelCard?: ModelCard | null;
+	modelSummary?: RuntimeModelSummary;
+	reasoningEffortMutation: PendingMutate<{ id: string; reasoningEffort: string | null }>;
+	updateSettingsMutation: {
+		mutate: (data: Record<string, unknown>, options?: { onSuccess?: () => void }) => void;
+	};
 
 	// fast mode
 	narratorFastModeOverride: "inherit" | "on" | "off" | null | undefined;
+	effectiveFastMode: boolean | undefined;
+	fastModeSource: string | undefined;
+	isSubagent: boolean;
 	fastModeDefault: boolean;
 	fastModeUsesTapSettings: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	updateUserPrefs: any;
+	fastModeMutation: Mutate<{ id: string; fastModeOverride: "inherit" | "on" | "off" }>;
+	updateUserPrefs: Mutate<{ fastModeDefault: boolean }>;
 
 	// permission mode + reflection
 	availablePermissionModes: string[];
 	permissionModesUnavailableReason: string | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	permModeMutation: any;
+	permModeMutation: Mutate<{ id: string; permissionMode: string }>;
 	hasPlanTrait: boolean;
 	planModePending: boolean;
 	planModeSupported: boolean;
@@ -87,15 +90,16 @@ export interface UseStatusBarPropsOptions {
 	planReflectionAutoApproveGlobal: boolean;
 	dangerReflectionGlobal: boolean;
 	questionReflectionGlobal: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: reflection level enum passthrough.
-	dangerReflectionGlobalLevel: any;
+	dangerReflectionGlobalLevel: DangerReflectionLevel;
 	settingsLoaded: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	enterPlanModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	exitPlanModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
-	reflectionOverridesMutation: any;
+	enterPlanModeMutation: Mutate<string>;
+	exitPlanModeMutation: Mutate<string>;
+	reflectionOverridesMutation: Mutate<{
+		id: string;
+		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
+	}>;
 	confirm: (options: { message: React.ReactNode }) => Promise<boolean>;
 	reflectionSettingsDisabled: boolean;
 }
@@ -116,6 +120,7 @@ export function useStatusBarProps(
 				: undefined,
 		settingsData: options.settingsData,
 		modelCard: options.modelCard,
+		modelSummary: options.modelSummary,
 		reasoningEffortMutation: options.reasoningEffortMutation,
 		updateSettingsMutation: options.updateSettingsMutation,
 	});
@@ -123,6 +128,9 @@ export function useStatusBarProps(
 	const { renderFastModeControl } = useFastModeControl({
 		narratorId: options.narratorId,
 		narratorFastModeOverride: options.narratorFastModeOverride,
+		effectiveFastMode: options.effectiveFastMode,
+		fastModeSource: options.fastModeSource,
+		isSubagent: options.isSubagent,
 		fastModeDefault: options.fastModeDefault,
 		fastModeUsesTapSettings: options.fastModeUsesTapSettings,
 		fastModeMutation: options.fastModeMutation,
@@ -169,7 +177,7 @@ export function useStatusBarProps(
 		workIndicator: options.workIndicator,
 		queue: options.queue,
 		tasks: options.tasks,
-		model: options.model,
+		model: { ...options.model, summary: options.modelSummary },
 		reasoning: {
 			supported: modelSelection.supportsReasoningEffort,
 			displayed: modelSelection.displayedReasoningEffort,

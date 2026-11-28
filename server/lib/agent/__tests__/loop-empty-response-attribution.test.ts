@@ -551,6 +551,44 @@ describe("空响应细分归因", () => {
 });
 
 describe("an empty reply after handing work off is a finish", () => {
+	test.each([
+		true,
+		false,
+	])("an empty reply without tools consults pending wake: %s", async (pending) => {
+		providerScenario = "usage_only_forever";
+		providerAttempts = 0;
+		const events = await runLoop({ hasPendingWake: () => pending });
+		if (pending) {
+			expect(events.at(-1)).toEqual({ type: "done", reason: "reasoning_only_idle" });
+			expect(providerAttempts).toBe(1);
+			expect(events.some((event) => event.type === "retrying")).toBe(false);
+		} else {
+			expect(events.at(-1)?.type).toBe("invalid_state");
+			expect(providerAttempts).toBeGreaterThan(1);
+		}
+	});
+
+	test("pending wake does not hide a refusal", async () => {
+		providerScenario = "stop_reason_without_content_forever";
+		providerAttempts = 0;
+		const events = await runLoop({ hasPendingWake: () => true });
+		expect(events.at(-1)?.type).toBe("invalid_state");
+	});
+
+	test("aborting during the pending wake check still reports Aborted", async () => {
+		providerScenario = "usage_only_forever";
+		providerAttempts = 0;
+		const controller = new AbortController();
+		const events = await runLoop({
+			signal: controller.signal,
+			hasPendingWake: () => {
+				controller.abort();
+				return true;
+			},
+		});
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+	});
+
 	async function quietRun(
 		overrides: Partial<AgentConfig>,
 		tail: typeof quietTail,
@@ -587,6 +625,19 @@ describe("an empty reply after handing work off is a finish", () => {
 
 	test("so is one that stops normally without text", async () => {
 		expect(lastType(await quietRun({ bot: true }, { stopReason: "stop" }))).toBe("done");
+	});
+
+	test("an uppercase Gemini STOP after a hand-off finishes quietly", async () => {
+		const events = await quietRun(
+			{},
+			{ stopReason: "STOP" },
+			{
+				name: "Send",
+				input: '{"id":"parent","message":"done"}',
+			},
+		);
+		expect(events.at(-1)).toEqual({ type: "done" });
+		expect(providerAttempts).toBe(2);
 	});
 
 	test.each([

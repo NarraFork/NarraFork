@@ -300,6 +300,31 @@ function assertJsonLimits(value: unknown, limits: PluginStateStoreLimits): void 
 	visit(value, 0);
 }
 
+/**
+ * Validate a whole state or journal document.
+ *
+ * `maxObjectKeys` is a budget for one value, but these documents are containers of
+ * unrelated entries: `maxOperations` operations (or `maxDiagnostics` diagnostics), each
+ * carrying its own `context` object, add up to far more keys than a single value may have.
+ * Counting them against the same budget means a healthy journal is rejected once it holds
+ * a few hundred ordinary operations — and because the check runs on write, the failure only
+ * shows up after enough normal use, as a plugin that suddenly cannot record anything.
+ * The key budget therefore applies per entry; the byte limits still bound the total.
+ */
+function assertDocumentLimits(document: unknown, limits: PluginStateStoreLimits): void {
+	assertJsonLimits(document, { ...limits, maxObjectKeys: Number.POSITIVE_INFINITY });
+	if (!isRecord(document)) return;
+	if (isRecord(document.plugins)) {
+		for (const state of Object.values(document.plugins)) assertJsonLimits(state, limits);
+	}
+	if (Array.isArray(document.operations)) {
+		for (const operation of document.operations) assertJsonLimits(operation, limits);
+	}
+	if (Array.isArray(document.diagnostics)) {
+		for (const diagnostic of document.diagnostics) assertJsonLimits(diagnostic, limits);
+	}
+}
+
 function parsePackageReference(value: unknown, label: string): PluginPackageReference | null {
 	if (value === null) return null;
 	if (!isRecord(value)) throw new ValidationError(`${label} is invalid`);
@@ -685,7 +710,7 @@ function parseJournalEntry(value: unknown, limits: PluginStateStoreLimits): Plug
 }
 
 function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): StateFileDocument {
-	assertJsonLimits(value, limits);
+	assertDocumentLimits(value, limits);
 	if (!isRecord(value) || value.version !== STATE_FILE_VERSION || !isRecord(value.plugins)) {
 		throw new ValidationError("Plugin state file has an unsupported or invalid format");
 	}
@@ -706,7 +731,7 @@ function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): Sta
 }
 
 function parseJournalDocument(value: unknown, limits: PluginStateStoreLimits): JournalFileDocument {
-	assertJsonLimits(value, limits);
+	assertDocumentLimits(value, limits);
 	if (
 		!isRecord(value) ||
 		value.version !== JOURNAL_FILE_VERSION ||
@@ -1381,7 +1406,7 @@ export class PluginStateStore {
 	}
 
 	private async atomicWrite(path: string, value: unknown, maxBytes: number): Promise<void> {
-		assertJsonLimits(value, this.limits);
+		assertDocumentLimits(value, this.limits);
 		const json = `${JSON.stringify(value, null, 2)}\n`;
 		if (Buffer.byteLength(json, "utf8") > maxBytes) {
 			throw new ValidationError(`${basename(path)} exceeds its size limit`);

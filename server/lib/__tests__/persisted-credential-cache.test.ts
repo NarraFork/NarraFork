@@ -8,6 +8,7 @@ import {
 	parsePersistedProviderBalance,
 } from "../provider-balance-cache";
 import type { CustomApiProviderConfig } from "../settings";
+import { parseQuotaSnapshot, QuotaStore } from "../sourcing/quota-store";
 
 const parseNumber = (raw: unknown) => (typeof raw === "number" ? raw : null);
 
@@ -57,7 +58,7 @@ describe("provider balance cache persistence", () => {
 
 	test("a supported discovery survives a restart and keeps refreshing its endpoint", async () => {
 		const file = `provider-balance-test-${crypto.randomUUID()}.json`;
-		const persistence = createPersistedCredentialCache(file, parsePersistedProviderBalance);
+		const persistence = createPersistedCredentialCache(file, parseQuotaSnapshot);
 		let providers = [provider()];
 		const fetch = mock(async () =>
 			Response.json({ mode: "unrestricted", isValid: true, balance: 7, unit: "USD" }),
@@ -66,7 +67,7 @@ describe("provider balance cache persistence", () => {
 			providers: () => providers,
 			globalProxy: () => null,
 			fetch,
-			persistence,
+			store: new QuotaStore(persistence),
 		});
 		const found = await before.request("relay");
 		expect(found?.status).toBe("supported");
@@ -76,7 +77,7 @@ describe("provider balance cache persistence", () => {
 			providers: () => providers,
 			globalProxy: () => null,
 			fetch,
-			persistence: createPersistedCredentialCache(file, parsePersistedProviderBalance),
+			store: new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot)),
 		});
 		const restored = restarted.peek("relay");
 		expect(restored).toMatchObject({ status: "supported", adapter: "sub2api" });
@@ -88,7 +89,7 @@ describe("provider balance cache persistence", () => {
 			providers: () => providers,
 			globalProxy: () => null,
 			fetch,
-			persistence: createPersistedCredentialCache(file, parsePersistedProviderBalance),
+			store: new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot)),
 		});
 		expect(otherAccount.peek("relay")).toMatchObject({ status: "pending", balance: null });
 	});

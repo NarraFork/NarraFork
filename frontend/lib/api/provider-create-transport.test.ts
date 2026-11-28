@@ -230,7 +230,7 @@ describe("provider creation API transport", () => {
 		await expect(settingsApi.getSettings({ maxResponseBytes: 1024 })).rejects.toMatchObject({
 			status: 401,
 		});
-		expect(removedStorageKeys).toEqual(["narrafork_token"]);
+		expect(removedStorageKeys).toContain("narrafork_token");
 		expect(jsonReads).toBe(0);
 	});
 

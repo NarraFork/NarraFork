@@ -9,15 +9,18 @@ import { shouldRunManager } from "./manager/launch-mode";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "./plugin-runtime-worker";
 import { FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG } from "./services/file-change-physical-audit";
 
-// Must run before ANY outbound fetch. Bun's fetch honours ambient HTTP(S)_PROXY
-// even when a request explicitly asks for a direct connection, so the ambient
-// values are snapshotted and blanked here to make the configured proxy policy
-// the single authority. See lib/net/proxy-env.ts.
+// Must run before ANY outbound fetch. Blank ambient HTTP(S)_PROXY so the
+// configured proxy policy is the only authority. Per-request bypass is
+// `proxy: false` in lib/net/outbound-fetch.ts. See lib/net/proxy-env.ts.
 neutralizeAmbientProxyEnv();
 // 管理器令牌只留在本进程内存里。放在拉起任何子进程之前，终端和 Bash 就复制不到它。
 captureManagerTokenFromEnv();
 
-if (parseRevealActivation(process.argv)) {
+if (process.argv[2] === "changelists") {
+	// Offline commands never initialize the application database, manager or HTTP service.
+	const { runGitChangelistCli } = await import("./services/git-changelist-cli");
+	process.exitCode = await runGitChangelistCli(process.argv);
+} else if (parseRevealActivation(process.argv)) {
 	// `narrafork://` activation (Windows "reveal in Explorer"): a short-lived client of the running
 	// server, so it never touches settings, the database or the port. See lib/reveal-protocol.ts.
 	const { runRevealProtocolClient } = await import("./lib/reveal-protocol-client");

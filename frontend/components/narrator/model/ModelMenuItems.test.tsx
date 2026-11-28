@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider, Menu } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -16,6 +17,7 @@ import narratorLocale from "../../../locales/en/narrator.json";
 import settingsLocale from "../../../locales/en/settings.json";
 import narratorZhLocale from "../../../locales/zh-CN/narrator.json";
 import { ModelMenuItems } from "./ModelMenuItems";
+import { PaginatedModelMenuItems } from "./PaginatedModelMenuItems";
 
 const aggregations: ModelAggregation[] = [
 	{ id: "group", name: "Group", routingMode: "priority", models: ["a:one", "a:two"] },
@@ -37,10 +39,40 @@ let setAsDefault: string[];
 let setAsSummary: string[];
 let editDefault: number;
 let editSummary: number;
+let setNativeValue: (input: HTMLInputElement, value: string) => void;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
+const previousInputPrototype = new Map<string, PropertyDescriptor | undefined>();
+let inputPrototype: object;
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	// linkedom gaps in React's change-event pipeline (details in ProxyOverrideField.test.tsx):
+	// an untyped input reports `type` null, and the legacy value watcher needs attachEvent.
+	const inputProto = window.HTMLInputElement.prototype;
+	inputPrototype = inputProto;
+	for (const key of ["type", "attachEvent", "detachEvent", "select", "setSelectionRange"]) {
+		previousInputPrototype.set(key, Object.getOwnPropertyDescriptor(inputProto, key));
+	}
+	const valueSetter = Object.getOwnPropertyDescriptor(inputProto, "value")?.set;
+	if (!valueSetter) throw new Error("HTMLInputElement.prototype.value has no setter");
+	setNativeValue = (input, value) => valueSetter.call(input, value);
+	const typeDescriptor = Object.getOwnPropertyDescriptor(inputProto, "type");
+	if (typeDescriptor?.get) {
+		const nativeGet = typeDescriptor.get;
+		Object.defineProperty(inputProto, "type", {
+			...typeDescriptor,
+			get(this: HTMLInputElement) {
+				return nativeGet.call(this) ?? "text";
+			},
+		});
+	}
+	(window.document as unknown as Record<string, unknown>).oninput = null;
+	Object.defineProperties(inputProto, {
+		attachEvent: { value: () => {}, configurable: true },
+		detachEvent: { value: () => {}, configurable: true },
+		select: { value: () => {}, configurable: true },
+		setSelectionRange: { value: () => {}, configurable: true },
+	});
 	frames = new Map();
 	nextFrame = 0;
 	selected = [];
@@ -95,6 +127,11 @@ beforeEach(async () => {
 afterEach(async () => {
 	await act(async () => root.unmount());
 	host.remove();
+	for (const [key, descriptor] of previousInputPrototype) {
+		if (descriptor) Object.defineProperty(inputPrototype, key, descriptor);
+		else Reflect.deleteProperty(inputPrototype, key);
+	}
+	previousInputPrototype.clear();
 	for (const [key, descriptor] of previousGlobals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -202,11 +239,332 @@ async function flushFrames() {
 		for (const callback of callbacks) callback(0);
 	});
 }
+/** Type into the model filter, driving both of React's change pipelines. */
+async function typeFilter(text: string, placeholder = narratorLocale.modelFilterPlaceholder) {
+	const input = host.querySelector<HTMLInputElement>(`input[placeholder="${placeholder}"]`);
+	if (!input) throw new Error("Missing model filter input");
+	await act(async () => {
+		input.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+	});
+	await act(async () => {
+		setNativeValue(input, text);
+		input.dispatchEvent(new window.Event("input", { bubbles: true }));
+		input.dispatchEvent(new window.Event("keyup", { bubbles: true }));
+	});
+}
+
+test("paginated menu gates reads, pages by gesture, and waits for Chinese composition", async () => {
+	const originalFetch = globalThis.fetch;
+	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	const calls: URL[] = [];
+	localStorage.getItem = (key: string) => (key === "narrafork_token" ? "menu-actor" : null);
+	globalThis.fetch = (async (url: unknown) => {
+		const parsed = new URL(String(url), "http://test");
+		calls.push(parsed);
+		return Response.json({
+			revision: "one",
+			items: [{ value: "auto:x", label: "X", modelId: "x", sourceCount: 2 }],
+			nextCursor: "next",
+			hasMore: true,
+		});
+	}) as unknown as typeof fetch;
+	const flush = async (ms = 0) => {
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, ms));
+		});
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+	};
+	const mount = async (opened: boolean) => {
+		await act(async () =>
+			root.render(
+				<QueryClientProvider client={qc}>
+					<MantineProvider env="test">
+						<I18nextProvider i18n={instance}>
+							<Menu opened>
+								<PaginatedModelMenuItems
+									opened={opened}
+									currentModel="outside:first-page"
+									onSelect={() => {}}
+								/>
+							</Menu>
+						</I18nextProvider>
+					</MantineProvider>
+				</QueryClientProvider>,
+			),
+		);
+		await flush();
+	};
+	try {
+		await mount(false);
+		expect(calls).toHaveLength(0);
+		await mount(true);
+		expect(calls).toHaveLength(1);
+		await flush();
+		expect(calls).toHaveLength(1);
+		const next = Array.from(host.querySelectorAll("button")).find(
+			(row) => row.textContent === narratorLocale.contextComposition.loadMore,
+		);
+		if (!next) throw new Error("missing next page button");
+		await act(async () => next.click());
+		await flush();
+		expect(calls).toHaveLength(2);
+		expect(calls[1].searchParams.get("cursor")).toBe("next");
+		const input = host.querySelector<HTMLInputElement>("input");
+		if (!input) throw new Error("missing filter");
+		const propsKey = Object.keys(input).find((key) => key.startsWith("__reactProps$"));
+		if (!propsKey) throw new Error("missing input handlers");
+		const props = (
+			input as unknown as Record<
+				string,
+				{
+					onCompositionStart: () => void;
+					onCompositionEnd: (event: { currentTarget: HTMLInputElement }) => void;
+				}
+			>
+		)[propsKey];
+		await act(async () => props.onCompositionStart());
+		await typeFilter("中文");
+		await flush(200);
+		expect(calls).toHaveLength(2);
+		await act(async () => props.onCompositionEnd({ currentTarget: input }));
+		await flush(200);
+		expect(calls).toHaveLength(3);
+		expect(calls[2].searchParams.get("q")).toBe("中文");
+		expect(calls[2].searchParams.has("cursor")).toBe(false);
+		await mount(false);
+		await qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
+		await flush();
+		expect(calls).toHaveLength(3);
+	} finally {
+		await act(async () => root.render(null));
+		qc.clear();
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("paginated aggregation members preserve pins and never mix their cursors with auto sources", async () => {
+	const originalFetch = globalThis.fetch;
+	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	const calls: URL[] = [];
+	const choices: string[] = [];
+	const promoted: string[] = [];
+	const defaulted: string[] = [];
+	const summarized: string[] = [];
+	const details: ModelOption[] = [];
+	localStorage.getItem = (key: string) => (key === "narrafork_token" ? "menu-actor" : null);
+	globalThis.fetch = (async (url: unknown) => {
+		const parsed = new URL(String(url), "http://test");
+		calls.push(parsed);
+		const agg = parsed.searchParams.get("aggregationId");
+		const source = parsed.searchParams.get("sourceModelId");
+		const next = parsed.searchParams.get("cursor") === "group-next";
+		return Response.json({
+			revision: "one",
+			items: agg
+				? [
+						{
+							value: `__agg__:${agg}:${next ? "b:two" : "relay:model"}`,
+							concreteValue: next ? "b:two" : "relay:model",
+							label: next ? "Two" : "One",
+							provider: next ? "b" : "a",
+						},
+						...(!next
+							? [
+									{
+										value: `__agg__:${agg}:codex:locked`,
+										label: "Locked",
+										provider: "codex",
+										available: false,
+									},
+									{
+										value: `__agg__:${agg}:auto:nested`,
+										concreteValue: "auto:nested",
+										label: "Nested",
+										provider: "auto",
+									},
+								]
+							: []),
+					]
+				: source
+					? [{ value: "c:x", label: "Source X", provider: "c", available: false }]
+					: [
+							{
+								value: "__agg__:group",
+								label: "Group",
+								provider: "__agg__",
+								aggregationId: "group",
+								memberCount: 2,
+							},
+							{ value: "auto:x", label: "X", modelId: "x", sourceCount: 1 },
+							{ value: "plain:model", label: "Plain", provider: "plain" },
+						],
+			nextCursor: agg && !next ? "group-next" : null,
+			hasMore: !!agg && !next,
+		});
+	}) as unknown as typeof fetch;
+	const flush = async () => {
+		for (let i = 0; i < 4; i++)
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+	};
+	const mount = async (opened: boolean) => {
+		await act(async () =>
+			root.render(
+				<QueryClientProvider client={qc}>
+					<MantineProvider env="test">
+						<I18nextProvider i18n={instance}>
+							<Menu opened>
+								<PaginatedModelMenuItems
+									opened={opened}
+									currentModel="__agg__:group:hidden:pin"
+									onSelect={(value) => choices.push(value)}
+									onSetAsDefaultModel={(value) => {
+										promoted.push(value);
+										defaulted.push(value);
+									}}
+									onSetAsSummaryModel={(value) => {
+										promoted.push(value);
+										summarized.push(value);
+									}}
+									onShowPrice={(model) => details.push(model)}
+								/>
+							</Menu>
+						</I18nextProvider>
+					</MantineProvider>
+				</QueryClientProvider>,
+			),
+		);
+		await flush();
+	};
+	const click = async (text: string) => {
+		const target = Array.from(host.querySelectorAll("button")).find(
+			(row) => row.textContent === text,
+		);
+		if (!target) throw new Error(`Missing paginated choice: ${text}`);
+		await act(async () => target.click());
+		await flush();
+	};
+	const openActions = async (text: string) => {
+		const row = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-menu-item]")).find(
+			(item) => item.textContent === text,
+		);
+		const toggle = row?.parentElement?.parentElement?.querySelector<HTMLButtonElement>(
+			`[aria-label="${narratorLocale.modelActions}"]`,
+		);
+		if (!toggle) throw new Error(`Missing actions: ${text}`);
+		await act(async () => toggle.click());
+		await flush();
+	};
+	try {
+		await mount(false);
+		expect(calls).toHaveLength(0);
+		await mount(true);
+		expect(calls).toHaveLength(1);
+		await openActions("Plainplain");
+		await click(narratorLocale.modelTooltip);
+		expect(details.map((row) => row.value)).toEqual(["plain:model"]);
+		await openActions("Group__agg__");
+		expect(
+			Array.from(host.querySelectorAll("button")).some(
+				(row) => row.textContent === narratorLocale.modelTooltip,
+			),
+		).toBe(false);
+		expect(
+			Array.from(host.querySelectorAll("button")).filter(
+				(row) =>
+					row.textContent === narratorLocale.setAsDefaultModel ||
+					row.textContent === narratorLocale.setAsSummaryModel,
+			),
+		).toHaveLength(2);
+		await click("Group__agg__");
+		expect(choices).toEqual(["__agg__:group"]);
+		await click("2");
+		expect(calls).toHaveLength(2);
+		expect(calls[1].searchParams.get("aggregationId")).toBe("group");
+		expect(calls[1].searchParams.has("sourceModelId")).toBe(false);
+		await flush();
+		expect(calls).toHaveLength(2);
+		const blocked = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
+			(row) => row.textContent === "Lockedcodex",
+		);
+		if (!blocked) throw new Error("missing explicitly unavailable aggregation member");
+		expect(blocked.disabled).toBe(true);
+		await act(async () => blocked.click());
+		expect(choices).toEqual(["__agg__:group"]);
+		const actions = blocked.parentElement?.parentElement?.querySelector<HTMLButtonElement>(
+			`[aria-label="${narratorLocale.modelActions}"]`,
+		);
+		if (!actions) throw new Error("missing unavailable member actions");
+		await act(async () => actions.click());
+		await flush();
+		for (const label of [narratorLocale.setAsDefaultModel, narratorLocale.setAsSummaryModel]) {
+			const promote = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
+				(row) => row.textContent === label,
+			);
+			if (!promote) throw new Error("missing promotion action");
+			expect(promote.disabled).toBe(true);
+			await act(async () => promote.click());
+		}
+		expect(promoted).toEqual([]);
+		await openActions("Nestedauto");
+		expect(
+			Array.from(host.querySelectorAll("button")).some(
+				(row) => row.textContent === narratorLocale.modelTooltip,
+			),
+		).toBe(false);
+		await click("Onea");
+		expect(choices.at(-1)).toBe("__agg__:group:relay:model");
+		await openActions("Onea");
+		await click(narratorLocale.setAsDefaultModel);
+		await click(narratorLocale.setAsSummaryModel);
+		await click(narratorLocale.modelTooltip);
+		expect(defaulted).toEqual(["__agg__:group:relay:model"]);
+		expect(summarized).toEqual(["__agg__:group:relay:model"]);
+		expect(details.map((row) => row.value)).toEqual(["plain:model", "relay:model"]);
+		await click(narratorLocale.contextComposition.loadMore);
+		expect(calls).toHaveLength(3);
+		expect(calls[2].searchParams.get("aggregationId")).toBe("group");
+		expect(calls[2].searchParams.get("cursor")).toBe("group-next");
+		// An unchanged empty filter must not schedule a later cursor reset.
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		});
+		await flush();
+		await click("Twob");
+		expect(choices.at(-1)).toBe("__agg__:group:b:two");
+		await click("back");
+		await click("1");
+		expect(calls).toHaveLength(4);
+		expect(calls[3].searchParams.get("sourceModelId")).toBe("x");
+		expect(calls[3].searchParams.has("aggregationId")).toBe(false);
+		expect(calls[3].searchParams.has("cursor")).toBe(false);
+		await click("Source Xc");
+		expect(choices.at(-1)).toBe("c:x");
+		await openActions("Source Xc");
+		await click(narratorLocale.modelTooltip);
+		expect(details.map((row) => row.value)).toEqual(["plain:model", "relay:model", "c:x"]);
+		await click("back");
+		await click("2");
+		expect(calls).toHaveLength(4); // independently cached first aggregation page
+		await mount(false);
+		await qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
+		await flush();
+		expect(calls).toHaveLength(4);
+		expect(calls.every((url) => url.pathname === "/api/model-catalog/options")).toBe(true);
+	} finally {
+		await act(async () => root.render(null));
+		qc.clear();
+		globalThis.fetch = originalFetch;
+	}
+});
 
 describe("follow parent selection", () => {
 	test.each([
-		["en", "Follow parent"],
-		["zh-CN", "跟随主代理"],
+		["en", narratorLocale.followParent],
+		["zh-CN", narratorZhLocale.followParent],
 	])("shows an honest follow label in %s and keeps concrete selection working", async (language, label) => {
 		await instance.changeLanguage(language);
 		await render(FOLLOW_PARENT_MODEL, models, true, true, {
@@ -336,7 +694,7 @@ describe("provider group header", () => {
 
 describe("group ordering", () => {
 	test("pins default, summary, and aggregations, then sorts providers by label", async () => {
-		// zh-CN titles put 聚合 after every Latin provider label under the default
+		// The translated aggregation title sorts after every Latin provider label under the default
 		// collation, so this header position only holds when the group is pinned.
 		// Insertion order is scrambled and is neither prefix order nor label order.
 		await instance.changeLanguage("zh-CN");
@@ -612,5 +970,133 @@ describe("opening selection positioning", () => {
 		await render("a:two", models, false);
 		await flushFrames();
 		expect(dropdown.scrollTop).toBe(0);
+	});
+});
+
+describe("model filter input", () => {
+	// Rendered with providerLabels { a: "Provider A", xiaomi: "Xiaomi" }.
+	const filterModels: ModelOption[] = [
+		{ value: "__default__", label: "Follow default", provider: "__default__" },
+		{ value: "a:one", label: "One", provider: "a" },
+		{ value: "xiaomi:mimo-v2.6-pro", label: "MiMo Pro", provider: "xiaomi" },
+	];
+	const rows = () => buttons().map((item) => item.textContent);
+
+	test("finds the Default row through its target provider's display name", async () => {
+		await render("a:one", filterModels, true, true, { defaultModelValue: "a:one" });
+		await typeFilter("provider a");
+		// The upstream layout moved provider metadata out of the role row label.
+		expect(rows()).toEqual(["Follow default", "One"]);
+	});
+
+	test("multi-word queries match terms across fields", async () => {
+		await render("a:one", filterModels, true, true, {
+			defaultModelValue: "xiaomi:mimo-v2.6-pro",
+		});
+		// No single field contains "xiaomi pro"; the provider and the label do.
+		await typeFilter("xiaomi pro");
+		expect(rows()).toEqual(["Follow default", "MiMo Pro"]);
+	});
+
+	test("finds models by provider prefix and by model id", async () => {
+		await render("a:one", filterModels, true, true);
+		await typeFilter("xiaomi");
+		expect(rows()).toEqual(["MiMo Pro"]);
+		await typeFilter("mimo-v2.6");
+		expect(rows()).toEqual(["MiMo Pro"]);
+	});
+
+	test("matches the translated group header", async () => {
+		await instance.changeLanguage("zh-CN");
+		await render("a:one", filterModels, true, true);
+		await typeFilter(narratorZhLocale.modelGroupDefault, narratorZhLocale.modelFilterPlaceholder);
+		expect(rows()).toEqual(["Follow default"]);
+	});
+
+	test("shows the empty state and restores every row once cleared", async () => {
+		await render("a:one", filterModels, true, true);
+		await typeFilter("nothing-here");
+		expect(rows()).toEqual([]);
+		expect(host.textContent).toContain(narratorLocale.noModelMatches);
+		await typeFilter("");
+		expect(rows()).toEqual(["Follow default", "One", "MiMo Pro"]);
+	});
+});
+
+describe("shared search across model and provider views", () => {
+	const catalog: ModelOption[] = [
+		{ value: "__default__", label: "Follow default", provider: "__default__" },
+		{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+		{
+			value: "auto:gpt-6-astra",
+			label: "GPT 6 Astra",
+			provider: "__auto__",
+			family: "gpt",
+			autoSources: [
+				{ value: "edge:gpt-6-astra", provider: "edge", available: true, subscription: false },
+			],
+		},
+		{ value: "edge:gpt-6-astra", label: "GPT 6 Astra", provider: "edge" },
+		{
+			value: "nug:opaque-id",
+			label: "Friendly display name",
+			provider: "nug",
+			bareModel: "kimi-k3",
+			channel: "moonshot",
+		},
+	];
+	const options = {
+		defaultModelValue: "auto:gpt-6-astra",
+		summaryModelValue: "__default__",
+		extraProps: { providerLabels: { edge: "Example Cloud", nug: "Gateway Hub" } },
+	};
+	const rows = () => buttons().map((item) => item.textContent);
+	async function switchMode(mode: "model" | "provider") {
+		const target = host.querySelector<HTMLElement>(`[data-model-menu-mode="${mode}"]`);
+		if (!target) throw new Error(`Missing mode control: ${mode}`);
+		await act(async () => target.click());
+	}
+
+	test("preserves a multi-term query across view switches and keeps auto selection values", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud GPT");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
+		await switchMode("model");
+		expect(host.querySelectorAll("[data-model-left]").length).toBe(1);
+		const auto = host.querySelector<HTMLElement>('[data-model-left="auto:gpt-6-astra"]');
+		expect(auto).not.toBeNull();
+		expect(host.querySelector("input")?.value).toBe("Example Cloud GPT");
+		expect(selected).toEqual([]);
+		await act(async () => auto?.click());
+		expect(selected).toEqual(["auto:gpt-6-astra"]);
+		await switchMode("provider");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
+	});
+
+	test("requires every term in both views", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud kimi");
+		expect(rows()).toEqual([]);
+		await switchMode("model");
+		expect(host.querySelectorAll("[data-model-left]").length).toBe(0);
+		expect(host.textContent).toContain(narratorLocale.noModelMatches);
+	});
+
+	test("provider view keeps matching bare ids and channels", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("MOONSHOT kimi-k3");
+		expect(rows()).toEqual(["Friendly display name"]);
+	});
+
+	test("provider renaming rebuilds the search index without clearing the query", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud gpt");
+		await render("edge:gpt-6-astra", catalog, true, true, {
+			...options,
+			extraProps: { providerLabels: { edge: "Renamed Cloud", nug: "Gateway Hub" } },
+		});
+		expect(rows()).toEqual([]);
+		await typeFilter("Renamed Cloud gpt");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
 	});
 });

@@ -6,11 +6,12 @@
  *  - "unrelated": two ordinary narrators, no parent link, given the same registrations.
  * Same configuration, same observed behaviour — nothing may depend on parent/variant.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq, inArray } from "drizzle-orm";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import { narratorBlacklistCmds, narrators, users } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { settings } from "../../lib/settings";
@@ -20,6 +21,7 @@ import {
 } from "../../lib/validators/runtime-registration";
 import { setRunHold } from "../agent-runtime/ownership";
 import { compileDelegationPolicy, isRuntimeToolAllowed } from "../agent-runtime/policy";
+import { executionPolicyEngine } from "../execution-policy/engine";
 import { executionPolicyRepository } from "../execution-policy/repository";
 import { materializeLegacyDelegations } from "../legacy-delegation-materializer";
 import { authorizeAgentControl } from "../narrator-control";
@@ -27,6 +29,7 @@ import { setPolicySource, setRuntimeRegistration } from "../narrator-runtime-reg
 import { narratorService } from "../narrator-service";
 import { resolveSubagentModelForRun } from "../subagent-model";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const A = "anthropic:claude-sonnet-4-20250514";
 const B = "anthropic:claude-opus-4-20250514";
@@ -139,6 +142,7 @@ describe.each(shapes)("%s session: permissions follow the registered source", (s
 		});
 		const after = executionPolicyRepository.loadNow(dependent);
 		expect(after.commandBlacklist.some((rule) => rule.pattern === "rm*")).toBe(true);
+		expect(await executionPolicyRepository.load(dependent)).toEqual(after);
 	});
 
 	test("a capability tightening on the source reaches the dependent", async () => {
@@ -176,6 +180,65 @@ describe.each(shapes)("%s session: permissions follow the registered source", (s
 			false,
 		);
 	});
+});
+
+test("committed policy rejects Worker failures without reading policy inline", async () => {
+	const id = await primary();
+	const inline = spyOn(executionPolicyRepository, "loadNow");
+	const dispatch = spyOn(workerPool, "runReadTask");
+	const original = process.env.NARRAFORK_DB_WORKER;
+	try {
+		process.env.NARRAFORK_DB_WORKER = "off";
+		expect(await captureWorkerRejectionThrower(executionPolicyRepository.load(id))).toThrow(
+			"disabled_by_env",
+		);
+		for (const message of ["worker creation failed", "worker crashed", "worker timed out"]) {
+			dispatch.mockRejectedValueOnce(new Error(message));
+			expect(await captureWorkerRejectionThrower(executionPolicyRepository.load(id))).toThrow(
+				message,
+			);
+		}
+		expect(dispatch).toHaveBeenCalledTimes(4);
+		expect(inline).not.toHaveBeenCalled();
+		expect((await executionPolicyEngine.compileCurrent(id, null, [])).narratorId).toBe(id);
+		expect(dispatch).toHaveBeenCalledTimes(4);
+	} finally {
+		if (original === undefined) delete process.env.NARRAFORK_DB_WORKER;
+		else process.env.NARRAFORK_DB_WORKER = original;
+		dispatch.mockRestore();
+		inline.mockRestore();
+	}
+});
+
+test("committed policy never dispatches inside an active transaction or after cancellation", async () => {
+	const id = await primary();
+	const dispatch = spyOn(workerPool, "runReadTask");
+	try {
+		const inTransaction = sqlite.transaction(() => executionPolicyRepository.load(id))();
+		expect(await captureWorkerRejectionThrower(inTransaction)).toThrow("requires_committed_file");
+		expect(
+			await captureWorkerRejectionThrower(
+				executionPolicyRepository.load(id, AbortSignal.abort(new Error("turn cancelled"))),
+			),
+		).toThrow("turn cancelled");
+		expect(dispatch).not.toHaveBeenCalled();
+	} finally {
+		dispatch.mockRestore();
+	}
+});
+
+test("the Worker rejects a policy over the per-table limit, rather than dropping rules", async () => {
+	const id = await primary();
+	sqlite
+		.query(
+			`WITH RECURSIVE rules(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM rules WHERE n < 2001)
+			INSERT INTO narrator_blacklist_cmds (id, narrator_id, pattern, created_at)
+			SELECT ? || '-' || n, ?, 'command-' || n, ? FROM rules`,
+		)
+		.run(id, id, new Date().toISOString());
+	expect(await captureWorkerRejectionThrower(executionPolicyRepository.load(id))).toThrow(
+		"Permission rule budget exceeded",
+	);
 });
 
 describe.each(shapes)("%s session: model follows the registered source", (shape) => {
@@ -219,9 +282,11 @@ test("a session with no registered source cannot follow one, even with a parent 
 	// A fork-style parent link alone confers neither a model nor a policy source.
 	await db.update(narrators).set({ parentNarratorId: parent }).where(eq(narrators.id, orphan));
 	await narratorService.updateModel(orphan, FOLLOW_PARENT_MODEL);
-	await expect(resolveSubagentModelForRun(await narratorService.getById(orphan))).rejects.toThrow(
-		"registered source",
-	);
+	expect(
+		await captureWorkerRejectionThrower(
+			resolveSubagentModelForRun(await narratorService.getById(orphan)),
+		),
+	).toThrow("registered source");
 	expect(executionPolicyRepository.loadNow(orphan).inheritedNarratorIds).toEqual([orphan]);
 });
 
@@ -252,8 +317,10 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 		await db.update(narrators).set({ parentNarratorId: forkSource }).where(eq(narrators.id, fork));
 		const denied = async (caller: string, target: string, action: "stop" | "archive") =>
 			expect(
-				authorizeAgentControl({ callerNarratorId: caller, targetNarratorId: target, action }),
-			).rejects.toThrow();
+				await captureWorkerRejectionThrower(
+					authorizeAgentControl({ callerNarratorId: caller, targetNarratorId: target, action }),
+				),
+			).toThrow();
 		for (const action of ["stop", "archive"] as const) {
 			await denied(sibling, dependent, action);
 			await denied(dependent, sibling, action);
@@ -273,22 +340,26 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 			targetNarratorId: dependent,
 			action: "steer",
 		});
-		await expect(
-			authorizeAgentControl({
-				callerNarratorId: source,
-				targetNarratorId: dependent,
-				action: "stop",
-			}),
-		).rejects.toThrow("not a direct child");
+		expect(
+			await captureWorkerRejectionThrower(
+				authorizeAgentControl({
+					callerNarratorId: source,
+					targetNarratorId: dependent,
+					action: "stop",
+				}),
+			),
+		).toThrow("not a direct child");
 	});
 
 	test("the controller cannot stop or archive while the user has taken the session over", async () => {
 		const { source, dependent } = await related(shape);
 		setRunHold(dependent, { released: false });
 		for (const action of ["stop", "archive"] as const)
-			await expect(
-				authorizeAgentControl({ callerNarratorId: source, targetNarratorId: dependent, action }),
-			).rejects.toThrow("taken over");
+			expect(
+				await captureWorkerRejectionThrower(
+					authorizeAgentControl({ callerNarratorId: source, targetNarratorId: dependent, action }),
+				),
+			).toThrow("taken over");
 		// A steer (Send doInterrupt) stays authorized; its caller delivers without interrupting.
 		await authorizeAgentControl({
 			callerNarratorId: source,
@@ -306,13 +377,15 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 	test("the controller's own ceiling and the acting user's ACL still bound control", async () => {
 		const { source, dependent } = await related(shape);
 		await setTraits(source, withRuntimePolicyTrait([], { version: 1, deny: ["spawnAgent"] }));
-		await expect(
-			authorizeAgentControl({
-				callerNarratorId: source,
-				targetNarratorId: dependent,
-				action: "stop",
-			}),
-		).rejects.toThrow("capability ceiling");
+		expect(
+			await captureWorkerRejectionThrower(
+				authorizeAgentControl({
+					callerNarratorId: source,
+					targetNarratorId: dependent,
+					action: "stop",
+				}),
+			),
+		).toThrow("capability ceiling");
 		await setTraits(source, []);
 		const [owner, stranger] = [generateId(), generateId()];
 		createdUsers.push(owner, stranger);
@@ -335,14 +408,16 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 			action: "stop",
 			userId: owner,
 		});
-		await expect(
-			authorizeAgentControl({
-				callerNarratorId: source,
-				targetNarratorId: dependent,
-				action: "stop",
-				userId: stranger,
-			}),
-		).rejects.toThrow("current user");
+		expect(
+			await captureWorkerRejectionThrower(
+				authorizeAgentControl({
+					callerNarratorId: source,
+					targetNarratorId: dependent,
+					action: "stop",
+					userId: stranger,
+				}),
+			),
+		).toThrow("current user");
 	});
 });
 

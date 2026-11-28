@@ -12,10 +12,19 @@
  * the explicit `proxy` value that `outbound-fetch.ts` passes as the only thing
  * deciding whether a request is proxied. Bun 1.4.3 adds `proxy: false` for direct
  * requests; startup blanking remains as defence in depth. "system" mode reads the snapshot.
+ *
+ * Exemptions (targets that must be reached directly) are applied here too, so
+ * every channel inherits them: loopback/this-host first, then the ambient
+ * `NO_PROXY` snapshot, then the user-configured `settings.proxy.noProxyRules`
+ * rule list (see `no-proxy.ts`). A rule only exempts; it never enables a proxy.
  */
 
+import type { Agent } from "node:http";
+import type { NoProxyRule } from "@shared/proxy-settings";
+import type { Dispatcher } from "undici";
 import { settings } from "../settings";
 import type { ProxyOverride } from "../settings/types";
+import { matchNoProxyRules, type NoProxyRuleMatch } from "./no-proxy";
 import { createOutboundProxyDispatcher, OutboundProxyConfigurationError } from "./outbound-fetch";
 import { ambientNoProxy, ambientSystemProxy } from "./proxy-env";
 
@@ -115,34 +124,78 @@ function matchesNoProxy(hostname: string, entries: string[]): boolean {
 }
 
 /**
- * Apply loopback and NO_PROXY exemptions to an already-resolved proxy URL for a
- * given target. Returns undefined when the target should be reached directly.
+ * The configured no_proxy rule list shared by every proxied channel
+ * (`settings.proxy.noProxyRules`). Empty when the user configured none.
+ */
+export function getNoProxyRules(): NoProxyRule[] {
+	return settings.proxy?.noProxyRules ?? [];
+}
+
+/** Why a target bypasses the proxy. */
+export type ProxyBypassReason =
+	| { kind: "loopback" }
+	| { kind: "no_proxy_env" }
+	| { kind: "rule"; match: NoProxyRuleMatch };
+
+/**
+ * Explain why `target` bypasses the proxy, or `undefined` when it does not.
+ *
+ * Order: loopback (always) → ambient `NO_PROXY` → configured
+ * `settings.proxy.noProxyRules` (regex rules before wildcard rules; see
+ * `no-proxy.ts` for the full priority and syntax rules).
+ */
+export function explainProxyBypass(target: string | URL): ProxyBypassReason | undefined {
+	let url: URL;
+	try {
+		url = typeof target === "string" ? new URL(target) : target;
+	} catch {
+		// Unparseable target — nothing can be exempted.
+		return undefined;
+	}
+
+	if (isLoopbackHost(url.hostname)) return { kind: "loopback" };
+	if (matchesNoProxy(url.hostname, getNoProxyEntries())) return { kind: "no_proxy_env" };
+	const ruleMatch = matchNoProxyRules(url, getNoProxyRules());
+	return ruleMatch ? { kind: "rule", match: ruleMatch } : undefined;
+}
+
+/**
+ * Apply loopback, `NO_PROXY` and configured-rule exemptions to an
+ * already-resolved proxy URL for a given target. Returns undefined when the
+ * target should be reached directly.
+ *
+ * This is the last step before a request becomes a proxied connection, so every
+ * channel that resolves a proxy through this module honours the configured
+ * no_proxy rules without doing anything of its own.
  */
 export function applyProxyExemptions(
 	proxy: string | undefined,
 	target: string | URL,
 ): string | undefined {
 	if (!proxy) return undefined;
+	// Unparseable target — fall back to the resolved proxy.
+	if (!isParseableTarget(target)) return proxy;
+	return explainProxyBypass(target) ? undefined : proxy;
+}
 
-	let hostname: string;
+/** Whether the target can be parsed as a URL (and therefore rule-matched). */
+function isParseableTarget(target: string | URL): boolean {
+	if (typeof target !== "string") return true;
 	try {
-		hostname = typeof target === "string" ? new URL(target).hostname : target.hostname;
+		new URL(target);
+		return true;
 	} catch {
-		// Unparseable target — fall back to the resolved proxy.
-		return proxy;
+		return false;
 	}
-
-	if (isLoopbackHost(hostname)) return undefined;
-	if (matchesNoProxy(hostname, getNoProxyEntries())) return undefined;
-	return proxy;
 }
 
 /**
- * Resolve the proxy URL for a specific target URL, applying loopback and
- * NO_PROXY exemptions. An optional per-location override takes precedence over
- * the global policy (absent/"default" → global). Returns undefined when the
- * target should be reached directly (no proxy). Use this in every per-request
- * proxy-aware fetch so local gateways are never proxied.
+ * Resolve the proxy URL for a specific target URL, applying loopback, `NO_PROXY`
+ * and configured no_proxy rule exemptions. An optional per-location override
+ * takes precedence over the global policy (absent/"default" → global). Returns
+ * undefined when the target should be reached directly (no proxy). Use this in
+ * every per-request proxy-aware fetch so local gateways and exempted hosts are
+ * never proxied.
  */
 export function resolveProxyForUrl(
 	target: string | URL,
@@ -151,10 +204,13 @@ export function resolveProxyForUrl(
 	return applyProxyExemptions(resolveOverride(override), target);
 }
 
-/** A node `http.Agent`-compatible proxy agent with best-effort teardown. */
-export interface ProxyAgentLike {
-	destroy?: () => void;
-}
+/**
+ * Node HTTP agent passed to gateway clients that speak `http.Agent`
+ * (`ws`, `@slack/bolt`, axios). `HttpsProxyAgent` is one of these.
+ * Discord REST takes an undici {@link Dispatcher} from
+ * {@link createUndiciProxyDispatcher} instead; that client is not an `http.Agent`.
+ */
+export type GatewayProxyAgent = Agent;
 
 function normalizeHttpProxyUrl(proxyUrl: string): string {
 	const trimmed = proxyUrl.trim();
@@ -182,10 +238,10 @@ function normalizeHttpProxyUrl(proxyUrl: string): string {
  */
 export async function createProxyAgent(
 	proxyUrl: string | undefined,
-): Promise<ProxyAgentLike | undefined> {
+): Promise<GatewayProxyAgent | undefined> {
 	if (!proxyUrl) return undefined;
 	const { HttpsProxyAgent } = await import("https-proxy-agent");
-	return new HttpsProxyAgent(normalizeHttpProxyUrl(proxyUrl)) as unknown as ProxyAgentLike;
+	return new HttpsProxyAgent(normalizeHttpProxyUrl(proxyUrl));
 }
 
 /** A real undici dispatcher with best-effort teardown methods. */
@@ -200,14 +256,14 @@ export interface UndiciDispatcherLike {
  */
 export async function createUndiciProxyDispatcher(
 	proxyUrl: string | undefined,
-): Promise<UndiciDispatcherLike | undefined> {
+): Promise<Dispatcher | undefined> {
 	if (!proxyUrl) return undefined;
-	return createOutboundProxyDispatcher(proxyUrl) as UndiciDispatcherLike;
+	return createOutboundProxyDispatcher(proxyUrl);
 }
 
 /** Best-effort teardown of an undici dispatcher (close → destroy → noop). */
 export async function closeUndiciDispatcher(
-	dispatcher: UndiciDispatcherLike | null | undefined,
+	dispatcher: UndiciDispatcherLike | Dispatcher | null | undefined,
 ): Promise<void> {
 	if (!dispatcher) return;
 	try {

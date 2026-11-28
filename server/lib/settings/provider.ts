@@ -17,16 +17,28 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
-import { peekCommandCodeModels } from "../commandcode-models";
+import {
+	captureCommandCodeModelOptions,
+	getCachedCommandCodeModel,
+	getCachedCommandCodeModels,
+	peekCommandCodeModels,
+} from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import {
 	canonicalCatalogModelId,
+	getCatalogModelIdsForProvider,
 	getEffectiveModelProfile,
 	identifyModelValue,
 	resolveEffectiveModelCard,
 } from "../model-catalog";
+import {
+	captureModelOptionsArray,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../model-options-contract";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { registerModelListReader } from "../sourcing/model-list-readers";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
@@ -53,7 +65,9 @@ function s(): NarraForkSettings {
 // Built-in model lists
 // ---------------------------------------------------------------------------
 
-const BUILTIN_CODEX_MODELS = [
+// Compatibility floor for models missing from older/bundled catalogs. New Codex
+// models arrive through catalog updates instead of requiring a narrafork release.
+const FALLBACK_BUILTIN_CODEX_MODELS = [
 	"gpt-6-astra",
 	"gpt-6.1-sol",
 	"gpt-6-sol",
@@ -64,9 +78,11 @@ const BUILTIN_CODEX_MODELS = [
 	"gpt-5.5",
 ];
 
-/** Built-in Codex model IDs (without provider prefix). */
+/** Built-in Codex model IDs (without provider prefix), led by the active catalog. */
 export function getBuiltinCodexModels(): string[] {
-	return [...BUILTIN_CODEX_MODELS];
+	return [
+		...new Set([...getCatalogModelIdsForProvider("codex"), ...FALLBACK_BUILTIN_CODEX_MODELS]),
+	];
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +169,38 @@ registerExtraModelSource("tokendance", {
 });
 
 // Register codex model checker and lister immediately
-registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
-registerCodexModelLister(() => BUILTIN_CODEX_MODELS.map((m) => `codex:${m}`));
+registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
+registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
+
+// The options Worker loads Codex catalog variants itself; only send the tiny compatibility floor.
+registerModelOptionsCapture("codex", (group) =>
+	captureModelOptionsArray(FALLBACK_BUILTIN_CODEX_MODELS, (id) => optionInput(group, id)),
+);
+registerModelOptionsCapture("command-code", (group) =>
+	captureCommandCodeModelOptions(group, s().commandCode?.apiKey, s().commandCode?.baseUrl),
+);
+registerModelOptionsCapture("tokendance", (group) => {
+	const source = getTokenDanceRuntimeConfig() ? s().tokendance?.models : undefined;
+	const capture = captureModelOptionsArray(source, (model) => optionInput(group, model.id));
+	return {
+		...capture,
+		readSlice: (offset, limit) => {
+			const rows = capture.readSlice(offset, limit);
+			return rows.filter((_, index) =>
+				selectTokenDanceProtocol(source?.[offset + index]?.supported_protocols ?? []),
+			);
+		},
+	};
+});
+registerModelListReader("codex", () => getBuiltinCodexModels().map((id) => ({ id })));
+registerModelListReader("tokendance", () => getTokenDanceCatalogModels());
+// Keep Command Code's existing stale-while-revalidate semantics in its catalog owner.
+registerModelListReader("command-code", () => {
+	const config = s().commandCode;
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
+		(id) => getCachedCommandCodeModel(id) ?? { id },
+	);
+});
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
@@ -751,6 +797,19 @@ export function resolveAllowedModelCandidateMatch(
 }
 
 /**
+ * List the concrete models a (possibly meta) model reference can reach, in
+ * reference order. Expansion reads settings only and never advances
+ * aggregation routing, so callers can match by provider before selecting.
+ */
+export function listConcreteModelsForReference(model: string | null | undefined): string[] {
+	const result: string[] = [];
+	for (const value of expandModelReferenceForMatching(model)) {
+		if (!isMetaModelReference(value) && !isModelProviderDisabled(value)) result.push(value);
+	}
+	return result;
+}
+
+/**
  * Format a pool of (possibly meta) model references for human/agent display.
  *
  * Meta references are kept as their token to preserve their "follow" semantics,
@@ -833,16 +892,12 @@ export function resolveEffectiveModel(
 	return raw;
 }
 
-/**
- * Command Code 的模型来自上游目录（`GET /provider/v1/models`），这里只读它已有的缓存：
- * `peekCommandCodeModels` 立刻返回（命中、过期旧值或空），并在需要时补一次去重的后台拉取，
- * 所以这条同步路径不会被上游延迟拖住。未启用或没有凭据时没有模型。
- */
+/** Published directory only; settings/model-list management owns auth checks and refreshes. */
 function listCommandCodeModelValues(): string[] {
 	const config = s().commandCode;
 	if (config?.disabled) return [];
-	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
-		(model) => `${COMMAND_CODE_PREFIX}:${model}`,
+	return getCachedCommandCodeModels(config?.apiKey, config?.baseUrl).map(
+		(model) => `${COMMAND_CODE_PREFIX}:${model.id}`,
 	);
 }
 
@@ -1162,7 +1217,7 @@ export function resolveProvider(model?: string): string {
 	if (explicit) return explicit;
 
 	if (bare) {
-		if (BUILTIN_CODEX_MODELS.includes(bare)) return "codex";
+		if (getBuiltinCodexModels().includes(bare)) return "codex";
 
 		const custom = s().agent.customModels ?? [];
 		const found = custom.find((m) => m.value === bare || m.value === model);

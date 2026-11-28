@@ -4,8 +4,10 @@ import {
 	Badge,
 	Box,
 	Button,
+	CloseButton,
 	Code,
 	Collapse,
+	Divider,
 	Drawer,
 	Group,
 	Indicator,
@@ -13,9 +15,11 @@ import {
 	Progress,
 	Stack,
 	Text,
+	TextInput,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useLocalStorage } from "@mantine/hooks";
 import type { BackgroundTaskListItem, BackgroundTaskType } from "@shared/background-task-list";
 import { isBackgroundTaskActiveStatus } from "@shared/background-task-list";
 import { toolBodyId } from "@shared/pretext-layout/tool-detail";
@@ -29,8 +33,10 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconExternalLink,
+	IconEye,
 	IconInfoCircle,
 	IconRobot,
+	IconSearch,
 	IconTerminal2,
 	IconTransfer,
 	IconX,
@@ -41,19 +47,49 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { useNarratorSubagentsCapability } from "../../../hooks/usePlatform";
+import { useCanOpenTerminals as useNarratorWriteAccess } from "../../../hooks/useTerminals";
 import { api } from "../../../lib/api";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_PADDED_DRAWER_BODY_STYLE,
 } from "../../../lib/safe-area";
+import { ActivityToolCallRow } from "../../dashboard/ActivityToolCallRow";
+import { useNarratorActivity } from "../../dashboard/useNarratorActivity";
 import { ContentViewer } from "../content/ContentViewer";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import { CreateBackgroundTaskForm } from "../ManualResourceForms";
 import { ToolCallInspector } from "../tool-call/ToolCallInspector";
 import classes from "./BackgroundTasksDrawer.module.css";
+import {
+	activeWatchesByTarget,
+	BACKGROUND_TASK_KIND_FILTERS,
+	type BackgroundTaskKindFilter,
+	type BackgroundTaskKinds,
+	DEFAULT_BACKGROUND_TASK_KINDS,
+	isWatchTask,
+	splitBackgroundTasks,
+	watchTargetKey,
+} from "./background-task-filter";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
+import { WatchAttachment, WatchTaskRow, type WatchTaskRowTask } from "./WatchTaskRow";
 
 /** Poll interval for the live output tail of a running task. */
 const TAIL_POLL_INTERVAL_MS = 1_500;
+
+const KIND_FILTER_STORAGE_KEY = "narrafork.backgroundTasks.kinds";
+const FINISHED_COLLAPSED_STORAGE_KEY = "narrafork.backgroundTasks.finishedCollapsed";
+
+const KIND_FILTER_ICONS: Record<BackgroundTaskKindFilter, typeof IconRobot> = {
+	agent: IconRobot,
+	bash: IconTerminal2,
+	watch: IconEye,
+};
+
+const KIND_FILTER_LABELS: Record<BackgroundTaskKindFilter, string> = {
+	agent: "backgroundTasks.filterAgent",
+	bash: "backgroundTasks.filterBash",
+	watch: "backgroundTasks.filterWatch",
+};
 
 /**
  * One row as this panel renders it.
@@ -68,6 +104,7 @@ interface UnifiedTask {
 	backgroundKind: "task" | "service";
 	status: string;
 	label: string;
+	title: string | null;
 	command: string | null;
 	output: string | null;
 	exitCode: number | null;
@@ -75,6 +112,8 @@ interface UnifiedTask {
 	subagentNarratorId: string | null;
 	activeChildTaskCount: number;
 	canCancelActiveWork: boolean;
+	startedAt: string;
+	isWatch: boolean;
 	/** `transfer` rows only: live byte progress, rendered as a real bar. */
 	progress?: ToolProgressPayload;
 }
@@ -90,6 +129,7 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 		backgroundKind: task.backgroundKind ?? "task",
 		status: task.effectiveStatus || task.status,
 		label: task.title || task.alias || task.command || task.subagentType || "Task",
+		title: task.title,
 		command: task.command,
 		output: task.output,
 		exitCode: task.exitCode,
@@ -97,6 +137,8 @@ function toUnifiedTask(task: BackgroundTaskListItem): UnifiedTask {
 		subagentNarratorId: task.subagentNarratorId,
 		activeChildTaskCount: task.activeChildTaskCount,
 		canCancelActiveWork: task.canCancelActiveWork,
+		startedAt: task.startedAt,
+		isWatch: isWatchTask(task),
 		...(task.progress ? { progress: task.progress } : {}),
 	};
 }
@@ -323,6 +365,29 @@ function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailPr
 	);
 }
 
+/** Expanded body of a finished Watch row: its stored result, read once. */
+function WatchOutputDetail({ narratorId, task }: { narratorId: string; task: WatchTaskRowTask }) {
+	const { t } = useTranslation("narrator");
+	const { data, isLoading, isError } = useTaskOutputTail(narratorId, task.id, true, false);
+	return (
+		<Stack gap={2} data-message-selection-ignore>
+			<ContentViewer
+				bodyId={toolBodyId(task.id, "output.main")}
+				content={data?.tail ?? task.output ?? ""}
+				title={t("backgroundTasks.outputLabel")}
+				style={{ maxHeight: 320, fontSize: 11 }}
+				truncated={data?.truncated}
+			/>
+			{isLoading && <Loader size={12} />}
+			{isError && (
+				<Text size="xs" c="red">
+					{t("backgroundTasks.outputLoadFailed")}
+				</Text>
+			)}
+		</Stack>
+	);
+}
+
 interface BackgroundTasksPanelProps {
 	narratorId: string;
 	/**
@@ -353,6 +418,7 @@ export function BackgroundTasksPanel({
 	const dock = useNarratorDockContext();
 	const subagentsCapability = useNarratorSubagentsCapability();
 	const backgroundTasksSupported = subagentsCapability.supported && subagentsCapability.background;
+	const canCreate = useNarratorWriteAccess(backgroundTasksSupported ? narratorId : "") === true;
 	const canOpenSubagentSessions = subagentsCapability.supported && subagentsCapability.detachAttach;
 	const showReattachFallback = canOpenSubagentSessions && !subagentsCapability.reattachBlocksParent;
 	const reattachFallbackReason =
@@ -361,7 +427,44 @@ export function BackgroundTasksPanel({
 	const { tasks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage, refresh } =
 		useBackgroundTaskList(narratorId, backgroundTasksSupported);
 
-	const allTasks = useMemo(() => tasks.map(toUnifiedTask), [tasks]);
+	// Kind toggles and the finished section's collapse are remembered per device.
+	const [storedKinds, setStoredKinds] = useLocalStorage<Partial<BackgroundTaskKinds>>({
+		key: KIND_FILTER_STORAGE_KEY,
+		defaultValue: DEFAULT_BACKGROUND_TASK_KINDS,
+		getInitialValueInEffect: false,
+	});
+	const kinds = useMemo(
+		() => ({ ...DEFAULT_BACKGROUND_TASK_KINDS, ...storedKinds }),
+		[storedKinds],
+	);
+	const [finishedCollapsed, setFinishedCollapsed] = useLocalStorage<boolean>({
+		key: FINISHED_COLLAPSED_STORAGE_KEY,
+		defaultValue: false,
+		getInitialValueInEffect: false,
+	});
+	const [query, setQuery] = useState("");
+	const sections = useMemo(() => {
+		const { running, finished } = splitBackgroundTasks(tasks, { kinds, query });
+		return { running: running.map(toUnifiedTask), finished: finished.map(toUnifiedTask) };
+	}, [tasks, kinds, query]);
+	const allTasks = useMemo(() => [...sections.running, ...sections.finished], [sections]);
+	// Watches show on the row they observe even while the Watch filter hides their own rows.
+	const watchesByTarget = useMemo(
+		() => activeWatchesByTarget(tasks.filter(isWatchTask).map(toUnifiedTask)),
+		[tasks],
+	);
+	// Same activity-level subscription as the dashboard's running cards: one summary
+	// line per recent tool call, not the child's message stream.
+	const activeAgentIds = useMemo(
+		() =>
+			allTasks.flatMap((task) =>
+				task.kind === "agent" && task.subagentNarratorId && isBackgroundTaskActive(task.status)
+					? [task.subagentNarratorId]
+					: [],
+			),
+		[allTasks],
+	);
+	const agentActivity = useNarratorActivity(activeAgentIds);
 
 	const handleOpenSubagent = useCallback(
 		(subagentNarratorId: string) => {
@@ -423,193 +526,321 @@ export function BackgroundTasksPanel({
 		return null;
 	}
 
+	const renderTask = (task: UnifiedTask) => {
+		if (task.isWatch) {
+			return (
+				<WatchTaskRow
+					key={task.id}
+					task={task}
+					onOpenAgent={canOpenSubagentSessions ? handleOpenSubagent : undefined}
+					onCancel={handleCancel}
+					renderOutput={(watch) => <WatchOutputDetail narratorId={narratorId} task={watch} />}
+				/>
+			);
+		}
+		const isActive = isBackgroundTaskActive(task.status);
+		const canOpenSubagent =
+			canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
+		const canInspect = task.kind === "bash" && !!task.toolUseId;
+		// Only bash tasks own their output here; an agent task's real detail
+		// lives in its subagent session, which the row already links to.
+		const canExpand = task.kind === "bash";
+		const expanded = canExpand && expandedTaskIds.has(task.id);
+		const watchKey =
+			task.kind === "agent" && task.subagentNarratorId
+				? watchTargetKey("agent", task.subagentNarratorId)
+				: task.kind === "bash"
+					? watchTargetKey("bash", task.id)
+					: null;
+		const watches = (watchKey && watchesByTarget.get(watchKey)) || [];
+		const recentTools =
+			task.kind === "agent" && task.subagentNarratorId && isActive
+				? (agentActivity.get(task.subagentNarratorId)?.tools ?? [])
+				: [];
+		const Icon =
+			task.kind === "bash" ? IconTerminal2 : task.kind === "transfer" ? IconTransfer : IconRobot;
+		return (
+			<Box
+				key={task.id}
+				data-background-task={task.id}
+				p="xs"
+				style={{
+					border: "1px solid var(--mantine-color-default-border)",
+					borderRadius: "var(--mantine-radius-sm)",
+				}}
+			>
+				{/* Only the header row is clickable, so interacting with the
+					    expanded output (select, scroll, copy) can't collapse it. */}
+				<Box
+					className={classes.header}
+					onClick={() => {
+						if (canOpenSubagent && task.subagentNarratorId) {
+							handleOpenSubagent(task.subagentNarratorId);
+							return;
+						}
+						if (canExpand) handleToggleExpanded(task.id);
+					}}
+					style={{ cursor: canOpenSubagent || canExpand ? "pointer" : "default" }}
+				>
+					<Group gap={6} wrap="nowrap" className={classes.identity}>
+						{canExpand &&
+							(expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />)}
+						<Icon size={14} />
+						<Badge
+							size="xs"
+							variant="light"
+							color={task.backgroundKind === "service" ? "teal" : "blue"}
+						>
+							{t(
+								task.backgroundKind === "service"
+									? "backgroundTasks.kindService"
+									: "backgroundTasks.kindTask",
+							)}
+						</Badge>
+					</Group>
+					{task.kind === "bash" && task.command && (task.toolUseId || !task.title) ? (
+						<Code className={classes.summary} style={{ fontSize: 11 }}>
+							{task.command}
+						</Code>
+					) : (
+						<Text size="xs" fw={500} className={classes.summary}>
+							{task.label}
+						</Text>
+					)}
+					<Group gap={4} justify="flex-end" className={classes.actions}>
+						{canInspect && (
+							<Tooltip label={t("toolCallInspector.inspect")}>
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									color="gray"
+									onClick={(event) => {
+										event.stopPropagation();
+										setInspectedToolUseId(task.toolUseId);
+									}}
+								>
+									<IconInfoCircle size={12} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						{canOpenSubagent && task.subagentNarratorId && (
+							<Tooltip label={t("backgroundTasks.openAgent")}>
+								<ActionIcon
+									size="xs"
+									variant="subtle"
+									color="indigo"
+									onClick={(event) => {
+										event.stopPropagation();
+										handleOpenSubagent(task.subagentNarratorId as string);
+									}}
+								>
+									<IconExternalLink size={12} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						<Badge size="xs" variant="light" color={statusColor(task.status)}>
+							{statusLabel(task.status, task.activeChildTaskCount, t)}
+						</Badge>
+						{task.canCancelActiveWork && (
+							<ActionIcon
+								size="xs"
+								variant="subtle"
+								color="red"
+								onClick={(event) => {
+									event.stopPropagation();
+									handleCancel(task.id);
+								}}
+								title={
+									task.status === "continued"
+										? t("backgroundTasks.cancelContinuation")
+										: task.status === "child_running"
+											? t("backgroundTasks.cancelChildren")
+											: t("backgroundTasks.cancel")
+								}
+							>
+								<IconX size={12} />
+							</ActionIcon>
+						)}
+					</Group>
+				</Box>
+				{recentTools.length > 0 && (
+					<Stack gap={2} mt={4} data-agent-recent-tools>
+						{recentTools.map((tool) => (
+							<ActivityToolCallRow key={tool.toolUseId} tool={tool} />
+						))}
+					</Stack>
+				)}
+				<WatchAttachment watches={watches} />
+				{/* Always shown while it exists — a transfer's bar is the row's whole
+					    point, and it must not be hidden behind expanding the row. */}
+				{task.progress && <TransferProgressBar progress={task.progress} />}
+				{/* A paused transfer's `output` holds the reason it stopped (e.g. a
+					    restart), which is exactly what the user needs to decide whether
+					    to resume. The `!isActive` gate below would hide it, since paused
+					    counts as active. */}
+				{task.status === "paused" && task.output && (
+					<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
+						{task.output.slice(0, 200)}
+					</Text>
+				)}
+				{!expanded && !isActive && task.output && (
+					<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
+						{task.output.slice(0, 200)}
+					</Text>
+				)}
+				{!expanded && !isActive && task.exitCode != null && (
+					<Text size="xs" c="dimmed" mt={4}>
+						exit {task.exitCode}
+					</Text>
+				)}
+				{canExpand && (
+					<Collapse expanded={expanded} keepMounted={false}>
+						<BashTaskDetail
+							narratorId={narratorId}
+							task={task}
+							isActive={isActive}
+							opened={expanded}
+						/>
+					</Collapse>
+				)}
+			</Box>
+		);
+	};
+
 	return (
 		<>
 			<Stack gap="sm" p={chromeless ? "md" : undefined} className={classes.panel}>
+				{canCreate && (
+					<CreateBackgroundTaskForm
+						key={narratorId}
+						create={async (data) => {
+							await api.createBackgroundTask(narratorId, data);
+							refresh();
+						}}
+					/>
+				)}
 				{showReattachFallback && (
 					<Alert color="yellow" variant="light">
 						{reattachFallbackReason}
 					</Alert>
 				)}
-				{allTasks.map((task) => {
-					const isActive = isBackgroundTaskActive(task.status);
-					const canOpenSubagent =
-						canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
-					const canInspect = task.kind === "bash" && !!task.toolUseId;
-					// Only bash tasks own their output here; an agent task's real detail
-					// lives in its subagent session, which the row already links to.
-					const canExpand = task.kind === "bash";
-					const expanded = canExpand && expandedTaskIds.has(task.id);
-					const Icon =
-						task.kind === "bash"
-							? IconTerminal2
-							: task.kind === "transfer"
-								? IconTransfer
-								: IconRobot;
-					return (
-						<Box
-							key={task.id}
-							p="xs"
-							style={{
-								border: "1px solid var(--mantine-color-default-border)",
-								borderRadius: "var(--mantine-radius-sm)",
-							}}
-						>
-							{/* Only the header row is clickable, so interacting with the
-							    expanded output (select, scroll, copy) can't collapse it. */}
-							<Box
-								className={classes.header}
-								onClick={() => {
-									if (canOpenSubagent && task.subagentNarratorId) {
-										handleOpenSubagent(task.subagentNarratorId);
-										return;
-									}
-									if (canExpand) handleToggleExpanded(task.id);
-								}}
-								style={{ cursor: canOpenSubagent || canExpand ? "pointer" : "default" }}
-							>
-								<Group gap={6} wrap="nowrap" className={classes.identity}>
-									{canExpand &&
-										(expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />)}
-									<Icon size={14} />
-									<Badge
-										size="xs"
-										variant="light"
-										color={task.backgroundKind === "service" ? "teal" : "blue"}
+				<Group gap={6} wrap="nowrap" data-background-task-filters>
+					<TextInput
+						size="xs"
+						style={{ flex: 1, minWidth: 0 }}
+						placeholder={t("backgroundTasks.searchPlaceholder")}
+						aria-label={t("backgroundTasks.searchPlaceholder")}
+						leftSection={<IconSearch size={12} />}
+						value={query}
+						onChange={(event) => setQuery(event.currentTarget.value)}
+						rightSection={
+							query ? (
+								<CloseButton
+									size="xs"
+									aria-label={t("backgroundTasks.searchClear")}
+									onClick={() => setQuery("")}
+								/>
+							) : null
+						}
+						data-background-task-search
+					/>
+					<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+						{BACKGROUND_TASK_KIND_FILTERS.map((kind) => {
+							const KindIcon = KIND_FILTER_ICONS[kind];
+							const enabled = kinds[kind];
+							const label = t(KIND_FILTER_LABELS[kind]);
+							return (
+								<Tooltip key={kind} label={label}>
+									<ActionIcon
+										size="md"
+										variant={enabled ? "light" : "subtle"}
+										color={enabled ? "indigo" : "gray"}
+										aria-label={label}
+										aria-pressed={enabled}
+										data-kind-filter={kind}
+										onClick={() => setStoredKinds({ ...kinds, [kind]: !enabled })}
 									>
-										{t(
-											task.backgroundKind === "service"
-												? "backgroundTasks.kindService"
-												: "backgroundTasks.kindTask",
+										<KindIcon size={14} />
+									</ActionIcon>
+								</Tooltip>
+							);
+						})}
+					</Group>
+				</Group>
+
+				{!isLoading && tasks.length === 0 && !hasNextPage ? (
+					<Text size="sm" c="dimmed" ta="center" py="md">
+						{t("backgroundTasks.empty")}
+					</Text>
+				) : (
+					<>
+						<Text size="xs" c="dimmed" fw={600} data-task-section="running">
+							{t("backgroundTasks.sectionRunning", { count: sections.running.length })}
+						</Text>
+						{sections.running.map(renderTask)}
+						{!isLoading && sections.running.length === 0 && (
+							<Text size="xs" c="dimmed" ta="center">
+								{t("backgroundTasks.runningEmpty")}
+							</Text>
+						)}
+						<Divider
+							labelPosition="left"
+							data-task-section="finished"
+							label={
+								<UnstyledButton
+									onClick={() => setFinishedCollapsed(!finishedCollapsed)}
+									aria-expanded={!finishedCollapsed}
+									data-finished-toggle
+								>
+									<Group gap={4} wrap="nowrap">
+										{finishedCollapsed ? (
+											<IconChevronRight size={12} />
+										) : (
+											<IconChevronDown size={12} />
 										)}
-									</Badge>
-								</Group>
-								{task.kind === "bash" && task.command ? (
-									<Code className={classes.summary} style={{ fontSize: 11 }}>
-										{task.command}
-									</Code>
-								) : (
-									<Text size="xs" fw={500} className={classes.summary}>
-										{task.label}
+										<Text size="xs" c="dimmed" fw={600}>
+											{t(
+												hasNextPage
+													? "backgroundTasks.sectionFinishedMore"
+													: "backgroundTasks.sectionFinished",
+												{ count: sections.finished.length },
+											)}
+										</Text>
+									</Group>
+								</UnstyledButton>
+							}
+						/>
+						{!finishedCollapsed && (
+							<>
+								{sections.finished.map(renderTask)}
+								{!isLoading && sections.finished.length === 0 && !hasNextPage && (
+									<Text size="xs" c="dimmed" ta="center">
+										{t("backgroundTasks.finishedEmpty")}
 									</Text>
 								)}
-								<Group gap={4} justify="flex-end" className={classes.actions}>
-									{canInspect && (
-										<Tooltip label={t("toolCallInspector.inspect")}>
-											<ActionIcon
-												size="xs"
-												variant="subtle"
-												color="gray"
-												onClick={(event) => {
-													event.stopPropagation();
-													setInspectedToolUseId(task.toolUseId);
-												}}
-											>
-												<IconInfoCircle size={12} />
-											</ActionIcon>
-										</Tooltip>
-									)}
-									{canOpenSubagent && task.subagentNarratorId && (
-										<Tooltip label={t("backgroundTasks.openAgent")}>
-											<ActionIcon
-												size="xs"
-												variant="subtle"
-												color="indigo"
-												onClick={(event) => {
-													event.stopPropagation();
-													handleOpenSubagent(task.subagentNarratorId as string);
-												}}
-											>
-												<IconExternalLink size={12} />
-											</ActionIcon>
-										</Tooltip>
-									)}
-									<Badge size="xs" variant="light" color={statusColor(task.status)}>
-										{statusLabel(task.status, task.activeChildTaskCount, t)}
-									</Badge>
-									{task.canCancelActiveWork && (
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											color="red"
-											onClick={(event) => {
-												event.stopPropagation();
-												handleCancel(task.id);
-											}}
-											title={
-												task.status === "continued"
-													? t("backgroundTasks.cancelContinuation")
-													: task.status === "child_running"
-														? t("backgroundTasks.cancelChildren")
-														: t("backgroundTasks.cancel")
-											}
-										>
-											<IconX size={12} />
-										</ActionIcon>
-									)}
-								</Group>
-							</Box>
-							{/* Always shown while it exists — a transfer's bar is the row's whole
-							    point, and it must not be hidden behind expanding the row. */}
-							{task.progress && <TransferProgressBar progress={task.progress} />}
-							{/* A paused transfer's `output` holds the reason it stopped (e.g. a
-							    restart), which is exactly what the user needs to decide whether
-							    to resume. The `!isActive` gate below would hide it, since paused
-							    counts as active. */}
-							{task.status === "paused" && task.output && (
-								<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
-									{task.output.slice(0, 200)}
-								</Text>
-							)}
-							{!expanded && !isActive && task.output && (
-								<Text size="xs" c="dimmed" mt={4} lineClamp={2} className={classes.preview}>
-									{task.output.slice(0, 200)}
-								</Text>
-							)}
-							{!expanded && !isActive && task.exitCode != null && (
-								<Text size="xs" c="dimmed" mt={4}>
-									exit {task.exitCode}
-								</Text>
-							)}
-							{canExpand && (
-								<Collapse expanded={expanded} keepMounted={false}>
-									<BashTaskDetail
-										narratorId={narratorId}
-										task={task}
-										isActive={isActive}
-										opened={expanded}
-									/>
-								</Collapse>
-							)}
-						</Box>
-					);
-				})}
+								{/* Explicit control rather than scroll-driven auto-paging: older
+								    tasks are history, and a user scrolling to read one row should
+								    not pull in pages they did not ask for. */}
+								{hasNextPage && (
+									<Button
+										variant="subtle"
+										size="xs"
+										onClick={fetchNextPage}
+										loading={isFetchingNextPage}
+										fullWidth
+									>
+										{t("backgroundTasks.loadOlder")}
+									</Button>
+								)}
+							</>
+						)}
+					</>
+				)}
 
 				{isLoading && (
 					<Group justify="center" py="md">
 						<Loader size="sm" />
 					</Group>
-				)}
-
-				{/* Explicit control rather than scroll-driven auto-paging: older tasks
-				    are history, and a user scrolling to read one row should not pull in
-				    pages they did not ask for. */}
-				{hasNextPage && (
-					<Button
-						variant="subtle"
-						size="xs"
-						onClick={fetchNextPage}
-						loading={isFetchingNextPage}
-						fullWidth
-					>
-						{t("backgroundTasks.loadOlder")}
-					</Button>
-				)}
-
-				{!isLoading && allTasks.length === 0 && (
-					<Text size="sm" c="dimmed" ta="center" py="md">
-						{t("backgroundTasks.empty")}
-					</Text>
 				)}
 			</Stack>
 			<ToolCallInspector

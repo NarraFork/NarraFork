@@ -28,9 +28,11 @@
  * whose `set` names `contentJson` or is not an object literal). A floor, not a proof.
  */
 
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { hasBodyRevisions, legacyBodyTextMatches } from "../../lib/narrator-bodies";
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
 
@@ -50,7 +52,10 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 		count: 6,
 		why: "isolated retention bytes/markers, pre-read budgets and legacy/queued body preparation",
 	},
-	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },
+	"server/lib/narrator-bodies.ts": {
+		count: 7,
+		why: "body reads and final synchronous equality for an already-budgeted legacy body",
+	},
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
 	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
@@ -71,14 +76,17 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
-	"server/services/storage-service.ts": { count: 2, why: "read switch off" },
+	"server/services/storage-service.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },
 	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-epochs.ts": {
 		count: 2,
 		why: "PG compact epoch-only projection, whose column is the body",
 	},
-	"server/services/agent-runtime/publication.ts": { count: 1, why: "column fallback" },
+	"server/lib/db-worker/recall-pg-message-reader.ts": {
+		count: 2,
+		why: "PG-only bounded raw TEXT body/byte admission; JSON codec projection runs in an isolated Worker (escaped NUL is not jsonb-compatible)",
+	},
 	// Writes whose rows the sync queue builds from the column (`insertEnvelopeQueued`'s
 	// contract): a legacy-format import, and the revert program's prepared statements, which
 	// apply without reads or JSON work and so cannot sync inline.
@@ -186,6 +194,51 @@ function scan(): Map<string, string[]> {
 
 describe("raw access to an envelope's body", () => {
 	const hits = scan();
+
+	test("the body layer fences a legacy body's exact text without mutating it", () => {
+		const database = new Database(":memory:");
+		try {
+			database.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, content_json TEXT)");
+			const expected = '[{"type":"text","text":"a"}]';
+			database.query("INSERT INTO narrator_messages VALUES(?,?)").run("message", expected);
+			const changes = () =>
+				database.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
+			const before = changes();
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(true);
+			expect(legacyBodyTextMatches(database, "missing", expected)).toBe(false);
+			expect(legacyBodyTextMatches(database, "message", "[]")).toBe(false);
+			expect(changes()).toBe(before);
+			database
+				.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+				.run(expected.replace('"a"', '"b"'), "message");
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(false);
+			database.query("DELETE FROM narrator_messages WHERE id=?").run("message");
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(false);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("body revision capabilities are cached per connection, not inferred from another schema", () => {
+		const legacy = new Database(":memory:");
+		const current = new Database(":memory:");
+		const incomplete = new Database(":memory:");
+		try {
+			legacy.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, content_json TEXT)");
+			current.run(
+				"CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, body_revision INTEGER, state_revision INTEGER)",
+			);
+			incomplete.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, body_revision INTEGER)");
+			expect(hasBodyRevisions(legacy)).toBe(false);
+			expect(hasBodyRevisions(current)).toBe(true);
+			expect(hasBodyRevisions(incomplete)).toBe(false);
+			expect(hasBodyRevisions(legacy)).toBe(false);
+		} finally {
+			legacy.close();
+			current.close();
+			incomplete.close();
+		}
+	});
 
 	test("no file reads or writes the column as the body beyond its count", () => {
 		const over = [...hits]

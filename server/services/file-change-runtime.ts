@@ -34,6 +34,11 @@ import {
 	type FileChangeNoDispatchProof,
 	type FileChangeOperationRecord,
 } from "./file-change-evidence";
+import {
+	attachFileHistoryBudgetDiagnostic,
+	FileHistoryNamespaceDiagnostics,
+	type FileHistoryStage,
+} from "./file-change-history-diagnostics";
 import { createFileChangeIdentity, type FileChangeScopeIdentity } from "./file-change-identity";
 import {
 	type FileChangeLocalIo,
@@ -204,6 +209,8 @@ export interface LocalFileChangeRuntimeOptions {
 	evidence?: FileChangeEvidenceService;
 	blobStoreOptions?: Omit<FileChangeBlobStoreOptions, "root" | "admission">;
 	quotaBytes?: number;
+	/** Monotonic clock seam for the bounded namespace failure diagnostic only. */
+	historyDiagnosticClock?: () => number;
 }
 type Namespace = {
 	sourceInstanceId: string;
@@ -236,6 +243,7 @@ export class LocalFileChangeRuntime {
 	private readonly readRuntime: (deviceId: string) => RuntimeBinding | null;
 	private readonly io: FileChangeLocalIo;
 	private initialization?: Promise<Namespace>;
+	private readonly historyDiagnostics: FileHistoryNamespaceDiagnostics;
 	private readonly noDispatchObservations = new WeakSet<HostNoDispatchObservation>();
 
 	constructor(private readonly options: LocalFileChangeRuntimeOptions) {
@@ -244,33 +252,59 @@ export class LocalFileChangeRuntime {
 		this.readRuntime = options.readRuntime ?? localFileChangeRuntimeBinding;
 		this.io = options.io ?? fileChangeLocalIo;
 		this.evidence = options.evidence ?? new FileChangeEvidenceService(options.db);
+		this.historyDiagnostics = new FileHistoryNamespaceDiagnostics({
+			now: options.historyDiagnosticClock,
+			log: (message, fields) => logger.warn(message, fields),
+		});
 	}
 
 	initialize(): Promise<Namespace> {
 		if (!this.initialization) {
 			const pending = this.initializeNamespace();
 			this.initialization = pending;
-			void pending.catch(() => {
+			void pending.catch((cause) => {
 				if (this.initialization === pending) this.initialization = undefined;
+				// Count one actual initialization, regardless of its concurrent waiters.
+				this.historyDiagnostics.failure("initialize", cause);
 			});
 		}
 		return this.initialization;
 	}
 
-	private async initializeNamespace(): Promise<Namespace> {
+	private async initializeSourceIdentity(): Promise<string> {
 		const privateRoot = resolve(this.options.privateRoot);
 		await mkdir(privateRoot, { recursive: true, mode: 0o700 });
 		await requireApplicationDataDirectory(privateRoot);
-		const sourceInstanceId = await persistentSourceId(privateRoot);
+		return persistentSourceId(privateRoot);
+	}
+
+	/** Querying an old receipt must never create a replacement source identity. */
+	async readExistingSourceInstanceId(signal?: AbortSignal): Promise<string> {
+		signal?.throwIfAborted();
+		await requireApplicationDataDirectory(resolve(this.options.privateRoot));
+		const sourceInstanceId = await persistentSourceId(this.options.privateRoot, false);
+		signal?.throwIfAborted();
+		return sourceInstanceId;
+	}
+
+	private async initializeNamespace(): Promise<Namespace> {
+		this.historyDiagnostics.clearIdentity();
+		const privateRoot = resolve(this.options.privateRoot);
+		const sourceInstanceId = await this.initializeSourceIdentity();
 		const root = join(privateRoot, "file-change-blobs");
 		await mkdir(root, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "EEXIST") throw error;
 		});
 		await requirePrivateDirectory(root);
-		const catalog = new FileChangeBlobCatalog({
-			db: this.database,
-			namespaceKey: hash([sourceInstanceId, root, await localDirectoryIdentity(root)]),
+		const directoryIdentity = await localDirectoryIdentity(root);
+		const namespaceKey = hash([sourceInstanceId, root, directoryIdentity]);
+		this.historyDiagnostics.rememberIdentity({
+			sourceInstanceId,
+			root,
+			directoryIdentity,
+			namespaceKey,
 		});
+		const catalog = new FileChangeBlobCatalog({ db: this.database, namespaceKey });
 		const budget = catalog.initializeNamespace({
 			expectedGeneration: null,
 			quotaBytes: this.options.quotaBytes,
@@ -503,11 +537,11 @@ export class LocalFileChangeRuntime {
 			.get();
 		if (!actorRow) throw new Error("Executing narrator no longer exists");
 		await boundedFileHistory(async () => {
-			const source = await this.initialize();
+			const sourceInstanceId = await this.initializeSourceIdentity();
 			const subagent = actorRow.type === "subagent" || actorRow.variant.startsWith("subagent");
 			this.evidence.beginNoDispatchOperation(
 				{
-					sourceInstanceId: source.sourceInstanceId,
+					sourceInstanceId,
 					sourceKind: "tool",
 					sourceId: binding.toolCallId,
 					toolCallId: binding.toolCallId,
@@ -754,12 +788,15 @@ export class LocalFileChangeRuntime {
 		}
 		const summary: AttemptSummary = { running: true };
 		records.set(key, summary);
+		// Local writes retain only identity, replay protection and real IO metadata.
+		const historyEnabled = backend.kind !== "local";
+		let sourceInstanceId: string | undefined;
 		let namespace: Namespace | undefined;
 		let operation: FileChangeOperationRecord | undefined;
 		let scope: FileChangeScopeIdentity | undefined;
 		let beforeState: FileChangeState = { kind: "unknown", reason: "history_unavailable" };
 		let intendedAfter: FileChangeState = { kind: "unknown", reason: "history_unavailable" };
-		let historyStatus: FileHistoryStatus = "complete";
+		let historyStatus: FileHistoryStatus = historyEnabled ? "complete" : "disabled";
 		let diskOutcome: FileWriteOutcome = "not_applied";
 		let prepared: PreparedFileChange<Result> | undefined;
 		let observed: LocalFileObservation | undefined;
@@ -768,12 +805,19 @@ export class LocalFileChangeRuntime {
 		let failed = false;
 		let dispatched = false;
 		let effect: FileChangeEffectRecord | undefined;
-		const historyUnavailable = (cause: unknown) => {
-			historyStatus = "unavailable";
-			logger.warn("File history unavailable for this request", {
-				sourceId: request.sourceId,
-				error: String(cause),
-			});
+		let historyStage: FileHistoryStage = "initialize";
+		const historyUnavailable = (cause: unknown, diagnose = true, stage = historyStage) => {
+			if (historyEnabled) historyStatus = "unavailable";
+			if (diagnose && historyEnabled) this.historyDiagnostics.failure(stage, cause);
+			logger.warn(
+				historyEnabled
+					? "File history unavailable for this request"
+					: "File write metadata unavailable",
+				{
+					sourceId: request.sourceId,
+					error: String(cause),
+				},
+			);
 		};
 		try {
 			const digest = await hashLocalFileChangeRequest(
@@ -781,11 +825,24 @@ export class LocalFileChangeRuntime {
 				request.input,
 				request.signal,
 			);
-			// Initialization is optional history work, outside the file's IO queue.
+			// Identity and optional history preparation stay outside the file's IO queue.
+			let initializationRejected = false;
 			try {
-				namespace = await boundedFileHistory(() => this.initialize());
+				if (historyEnabled) {
+					namespace = await boundedFileHistory(() =>
+						this.initialize().catch((cause) => {
+							initializationRejected = true;
+							throw cause;
+						}),
+					);
+					sourceInstanceId = namespace.sourceInstanceId;
+				} else {
+					sourceInstanceId = await boundedFileHistory(() => this.initializeSourceIdentity());
+				}
 			} catch (cause) {
-				historyUnavailable(cause);
+				// Shared initialization failures are diagnosed by initialize(), not each waiter.
+				// A request's own history budget timeout still needs a diagnostic.
+				historyUnavailable(cause, !initializationRejected);
 			}
 			diagnostics.enter("read_before");
 			await withFileWrite(
@@ -833,8 +890,9 @@ export class LocalFileChangeRuntime {
 					prepared = await request.construct(before);
 					if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 						throw new LocalFileValidationError("Output exceeds the 32 MiB file limit");
-					if (namespace) {
+					if (sourceInstanceId) {
 						try {
+							historyStage = "resolve_scope";
 							const cwd = request.remote
 								? { canonicalPath: request.cwd }
 								: await boundedFileHistory((signal) =>
@@ -845,22 +903,18 @@ export class LocalFileChangeRuntime {
 								!backend.paths.equals(cwd.canonicalPath, canonicalPath)
 									? cwd.canonicalPath
 									: footprint.anchor;
+							historyStage = "prepare_scope";
 							scope = this.evidence.prepareScope({
-								sourceInstanceId: namespace.sourceInstanceId,
+								sourceInstanceId,
 								deviceId: backend.deviceId,
 								workspaceInstanceId: request.remote
-									? hash([
-											namespace.sourceInstanceId,
-											backend.deviceId,
-											root,
-											request.remote.rootIdentity,
-										])
-									: hash([namespace.sourceInstanceId, root]),
+									? hash([sourceInstanceId, backend.deviceId, root, request.remote.rootIdentity])
+									: hash([sourceInstanceId, root]),
 								canonicalRoot: root,
 								pathFlavor: backend.pathFlavor as "posix" | "windows",
 							});
 							const input: BeginFileChangeOperation = {
-								sourceInstanceId: namespace.sourceInstanceId,
+								sourceInstanceId,
 								sourceKind: request.sourceKind,
 								sourceId: request.sourceId,
 								attempt: request.attempt,
@@ -872,14 +926,15 @@ export class LocalFileChangeRuntime {
 										? Number(request.input.snapshotRevision)
 										: null,
 								actor: request.actor,
-								executionBinding: request.remote
-									? {
-											deviceId: backend.deviceId,
-											runtimeEpoch: request.runtime.runtimeEpoch,
-											runtimeGeneration: request.runtime.runtimeGeneration,
-											fencingToken: request.runtime.runtimeGeneration,
-										}
-									: null,
+								executionBinding:
+									request.remote || request.sourceKind === "editor"
+										? {
+												deviceId: backend.deviceId,
+												runtimeEpoch: request.runtime.runtimeEpoch,
+												runtimeGeneration: request.runtime.runtimeGeneration,
+												fencingToken: request.runtime.runtimeGeneration,
+											}
+										: null,
 								toolCallId:
 									request.sourceKind === "tool" && request.linkOperation ? request.sourceId : null,
 								toolUseId: request.toolUseId,
@@ -888,6 +943,7 @@ export class LocalFileChangeRuntime {
 								ownerUserId: request.userId,
 								executionSegmentId: request.executionSegmentId ?? null,
 							};
+							historyStage = "begin_operation";
 							const allocated = this.evidence.beginOperation(input);
 							if (allocated.replayed) throw new FileRequestReplayError(allocated.id);
 							operation = allocated;
@@ -903,6 +959,7 @@ export class LocalFileChangeRuntime {
 						}
 						if (operation) {
 							try {
+								historyStage = "link_tool";
 								request.linkOperation?.(operation.id);
 							} catch (cause) {
 								if (cause instanceof FileRequestReplayError) throw cause;
@@ -911,14 +968,16 @@ export class LocalFileChangeRuntime {
 						}
 						// Without both records settlement cannot reference any blobs. Do not spend
 						// quota or hold the write queue publishing history that cannot be attached.
-						if (operation && scope) {
+						if (operation && scope && namespace) {
 							const ns = namespace;
+							let publicationStage: FileHistoryStage = "publish_before";
 							try {
 								const capturedBefore = before;
 								const capturedPrepared = prepared;
-								const states = await boundedFileHistory(async (signal) => [
-									await this.publish(ns, capturedBefore, signal),
-									await this.publish(
+								const states = await boundedFileHistory(async (signal) => {
+									const publishedBefore = await this.publish(ns, capturedBefore, signal);
+									publicationStage = "publish_intended_after";
+									const publishedAfter = await this.publish(
 										ns,
 										{
 											bytes: capturedPrepared.nextBytes,
@@ -929,11 +988,12 @@ export class LocalFileChangeRuntime {
 											identity: null,
 										},
 										signal,
-									),
-								]);
+									);
+									return [publishedBefore, publishedAfter];
+								});
 								[beforeState, intendedAfter] = states;
 							} catch (cause) {
-								historyUnavailable(cause);
+								historyUnavailable(cause, true, publicationStage);
 							}
 						}
 					}
@@ -948,7 +1008,7 @@ export class LocalFileChangeRuntime {
 									? {
 											sourceId: request.sourceId,
 											userId: request.userId as string,
-											sourceInstanceId: namespace?.sourceInstanceId,
+											sourceInstanceId,
 											operationId: operation?.id,
 											snapshotRevision: Number(request.input.snapshotRevision),
 											requestDigest: digest,
@@ -994,6 +1054,7 @@ export class LocalFileChangeRuntime {
 					// only the executor's exact-op query may settle it later.
 					if (!observed && !request.remote) {
 						try {
+							historyStage = "read_after";
 							observed = await io.read(canonicalPath, AbortSignal.timeout(5_000));
 						} catch (cause) {
 							historyUnavailable(cause);
@@ -1003,11 +1064,12 @@ export class LocalFileChangeRuntime {
 						diskOutcome === "applied" &&
 						(!observed?.bytes || !Buffer.from(observed.bytes).equals(prepared.nextBytes))
 					) {
-						if (execution.result.editorReceipt?.outcome === "committed")
+						if (execution.result.editorReceipt?.outcome === "committed") {
+							historyStage = "verify_after";
 							historyUnavailable(
 								new Error("Provider committed; current bytes could not be verified for history"),
 							);
-						else diskOutcome = "unknown";
+						} else diskOutcome = "unknown";
 					}
 					if (diskOutcome !== "applied") {
 						failed = true;
@@ -1022,9 +1084,12 @@ export class LocalFileChangeRuntime {
 			if (cause instanceof LocalFileValidationError) diskOutcome = "conflict";
 		} finally {
 			// All metadata settlement runs after withFileWrite has released the target.
-			if (operation && scope && namespace) {
+			if (operation && scope) {
 				try {
-					let observedAfter: FileChangeState = { kind: "unknown", reason: "missing_after" };
+					let observedAfter: FileChangeState = {
+						kind: "unknown",
+						reason: historyEnabled ? "missing_after" : "history_unavailable",
+					};
 					if (
 						observed &&
 						prepared &&
@@ -1035,13 +1100,15 @@ export class LocalFileChangeRuntime {
 						observedAfter = intendedAfter;
 					else if (observed && before && sameObservedBytes(observed, before))
 						observedAfter = beforeState;
-					else if (observed) {
+					else if (observed && namespace) {
 						const ns = namespace;
 						const captured = observed;
+						historyStage = "publish_observed_after";
 						observedAfter = await boundedFileHistory((signal) =>
 							this.publish(ns, captured, signal),
 						);
 					}
+					historyStage = "record_effect";
 					effect = this.evidence.recordEffect({
 						operationId: operation.id,
 						identity: createFileChangeIdentity(scope, {
@@ -1058,6 +1125,7 @@ export class LocalFileChangeRuntime {
 						linesAdded: prepared?.lineStats?.added,
 						linesRemoved: prepared?.lineStats?.removed,
 					});
+					historyStage = "finish_operation";
 					this.evidence.finishOperation(
 						operation.id,
 						(diskOutcome as FileWriteOutcome) === "applied"
@@ -1066,12 +1134,15 @@ export class LocalFileChangeRuntime {
 								? "interrupted"
 								: "failed",
 					);
-					if (effect.outcome !== "no_change") this.project(request, operation, effect, scope);
+					if (effect.outcome !== "no_change") {
+						historyStage = "project_effect";
+						this.project(request, operation, effect, scope);
+					}
 				} catch (cause) {
 					historyUnavailable(cause);
 				}
 			} else {
-				historyStatus = "unavailable";
+				if (historyEnabled) historyStatus = "unavailable";
 				if (
 					!dispatched &&
 					failed &&
@@ -1079,6 +1150,7 @@ export class LocalFileChangeRuntime {
 					!(error instanceof FileRequestReplayError)
 				) {
 					try {
+						historyStage = "record_no_dispatch";
 						await boundedFileHistory(() => request.noDispatch?.() ?? Promise.resolve());
 					} catch (cause) {
 						historyUnavailable(cause);
@@ -1210,6 +1282,7 @@ export async function boundedFileHistory<T>(body: (signal: AbortSignal) => Promi
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => {
 					const error = new Error("File history preparation budget exceeded");
+					attachFileHistoryBudgetDiagnostic(error);
 					controller.abort(error);
 					reject(error);
 				}, HISTORY_BUDGET_MS);
@@ -1325,6 +1398,8 @@ export function withFileToolNoDispatch(
 					suppressed = true;
 				},
 			});
+			if (!writing && ctx.executionTarget?.backendKind === "local")
+				result.metadata = { ...result.metadata, historyStatus: "disabled" };
 			return withFileHistoryNotice(result, ctx.locale);
 		} finally {
 			if (remoteAttempt) remoteAttempt.running = false;
@@ -1332,7 +1407,12 @@ export function withFileToolNoDispatch(
 				try {
 					await boundedFileHistory(() => record(reason));
 				} catch (error) {
-					if (result) result.metadata = { ...result.metadata, historyStatus: "unavailable" };
+					if (result)
+						result.metadata = {
+							...result.metadata,
+							historyStatus:
+								ctx.executionTarget?.backendKind === "local" ? "disabled" : "unavailable",
+						};
 					logger.warn("Host no-dispatch history unavailable", { toolName, error: String(error) });
 				}
 			}

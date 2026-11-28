@@ -492,8 +492,10 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"model_history_revision",
 		]);
 		// 0047 追加 ModelTrace 舱的两列，0048 追加大纲任务后端，0051 追加回复上下文，
-		// 0060 追加按会话的问题反思覆盖，0062 追加每执行器的工作目录映射。
-		expect(narrators?.slice(-8)).toEqual([
+		// 0060 追加按会话的问题反思覆盖，0062 追加每执行器的工作目录映射，0078 追加顺便提问的分组和归档来源。
+		const recentStart = narrators?.indexOf("runtime_registration_json") ?? -1;
+		expect(recentStart).toBeGreaterThanOrEqual(0);
+		expect(narrators?.slice(recentStart, recentStart + 10)).toEqual([
 			"runtime_registration_json",
 			"policy_source_narrator_id",
 			"hidden_from_lists",
@@ -502,12 +504,17 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"reply_context",
 			"question_reflection_override",
 			"workspace_directories",
+			"ask_in_passing_group_id",
+			"archived_with_narrator_id",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
-		// The main-branch 0010 migration appends background_kind after insert_seq.
-		expect(result.order.get("background_tasks")?.slice(-2)).toEqual([
+		// The main-branch 0010 migration appends background_kind after insert_seq;
+		// 0079 later appends the watch registrant and 0085 the executor session binding.
+		expect(result.order.get("background_tasks")?.slice(-4)).toEqual([
 			"insert_seq",
 			"background_kind",
+			"principal_json",
+			"executor_session_json",
 		]);
 	});
 

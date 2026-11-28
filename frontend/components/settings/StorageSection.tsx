@@ -24,6 +24,7 @@ import {
 	IconCamera,
 	IconDatabase,
 	IconFileCode,
+	IconFileText,
 	IconGitBranch,
 	IconLock,
 	IconPaperclip,
@@ -110,6 +111,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	requestRecordings: <IconFileCode size={18} />,
 	savedRequestRecordings: <IconFileCode size={18} />,
 	dormantIgnored: <IconLock size={18} />,
+	coordinatorOutputs: <IconFileText size={18} />,
 	containers: <IconBox size={18} />,
 };
 
@@ -123,6 +125,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	requestRecordings: "blue",
 	savedRequestRecordings: "grape",
 	dormantIgnored: "yellow",
+	coordinatorOutputs: "indigo",
 	containers: "cyan",
 };
 /**
@@ -783,6 +786,8 @@ export function StorageSection({ refreshToken = 0 }: { refreshToken?: number }) 
 				if (orphans <= 0) return archives;
 				return `${archives} · ${t("storageIgnoredArchiveOrphans", { count: orphans })}`;
 			}
+			case "coordinatorOutputs":
+				return t("storageCoordinatorOutputDirCount", { count: Number(d.narratorDirs ?? 0) });
 			case "containers":
 				if (d.available === false) return t("storageContainersUnavailable");
 				return null;

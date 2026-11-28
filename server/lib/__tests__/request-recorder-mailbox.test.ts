@@ -26,6 +26,7 @@ interface MailboxState {
 	ready: boolean;
 	retryAt: number;
 	worker?: Worker;
+	retiring?: Promise<void>;
 	queued: Array<{ id: number; bytes: number; op: RecorderOperation }>;
 	queuedBytes: number;
 	inflightBytes: number;
@@ -315,6 +316,8 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 		expect(worker).toBeDefined();
 		await worker?.terminate();
 		expect(await pending).toBeInstanceOf(Error);
+		// Caller failure does not return admission: await the common handle's exit cleanup.
+		await state.retiring;
 		expect(state.recordings.size).toBe(0);
 		expect(state.waiters.size).toBe(0);
 		expect(state.queuedBytes + state.inflightBytes).toBe(0);

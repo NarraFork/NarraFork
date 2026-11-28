@@ -4,9 +4,10 @@ import {
 	SCHEDULED_TASK_LIMITS,
 	type ScheduledRunInterruptTarget,
 } from "@shared/scheduled-task-status";
-import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, scheduledTaskRuns, scheduledTasks } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, ForbiddenError, NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
@@ -52,25 +53,31 @@ const conflict = () =>
 	new AppError("Task changed before admission", 409, "SCHEDULED_TASK_CONFLICT");
 
 async function taskWaitingRun(taskId: string) {
-	return db.query.scheduledTaskRuns.findFirst({
-		where: and(eq(scheduledTaskRuns.taskId, taskId), eq(scheduledTaskRuns.status, "waiting")),
-		columns: { id: true },
-	});
+	return readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: and(eq(scheduledTaskRuns.taskId, taskId), eq(scheduledTaskRuns.status, "waiting")),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 async function activeRun(task: Task, targetId: string | null) {
-	return db.query.scheduledTaskRuns.findFirst({
-		where: and(
-			inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
-			or(
-				task.activeRunId ? eq(scheduledTaskRuns.id, task.activeRunId) : undefined,
-				targetId ? eq(scheduledTaskRuns.narratorId, targetId) : undefined,
+	return readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: and(
+				inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
+				or(
+					task.activeRunId ? eq(scheduledTaskRuns.id, task.activeRunId) : undefined,
+					targetId ? eq(scheduledTaskRuns.narratorId, targetId) : undefined,
+				),
+				// An empty OR must never turn into an unbounded global active-run lookup.
+				task.activeRunId || targetId ? undefined : sql`0`,
 			),
-			// An empty OR must never turn into an unbounded global active-run lookup.
-			task.activeRunId || targetId ? undefined : sql`0`,
-		),
-		columns: { id: true, narratorId: true, logicalRunId: true },
-	});
+			columns: { id: true, narratorId: true, logicalRunId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 async function runtimeBusy(narratorId: string | null): Promise<boolean> {
@@ -87,22 +94,25 @@ async function runtimeBusy(narratorId: string | null): Promise<boolean> {
 }
 
 async function queuedForTarget(narratorId: string) {
-	return db
-		.select({
-			id: scheduledTaskRuns.id,
-			interruptTarget: scheduledTaskRuns.interruptTarget,
-			createdAt: scheduledTaskRuns.createdAt,
-		})
-		.from(scheduledTaskRuns)
-		.where(
-			and(eq(scheduledTaskRuns.narratorId, narratorId), eq(scheduledTaskRuns.status, "waiting")),
-		)
-		.orderBy(
-			asc(sql`case when ${scheduledTaskRuns.interruptTarget} is not null then 0 else 1 end`),
-			asc(scheduledTaskRuns.createdAt),
-			asc(scheduledTaskRuns.id),
-		)
-		.limit(TARGET_WAIT_LIMIT);
+	return readQuery(
+		db
+			.select({
+				id: scheduledTaskRuns.id,
+				interruptTarget: scheduledTaskRuns.interruptTarget,
+				createdAt: scheduledTaskRuns.createdAt,
+			})
+			.from(scheduledTaskRuns)
+			.where(
+				and(eq(scheduledTaskRuns.narratorId, narratorId), eq(scheduledTaskRuns.status, "waiting")),
+			)
+			.orderBy(
+				asc(sql`case when ${scheduledTaskRuns.interruptTarget} is not null then 0 else 1 end`),
+				asc(scheduledTaskRuns.createdAt),
+				asc(scheduledTaskRuns.id),
+			)
+			.limit(TARGET_WAIT_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 /** Accepting a trigger spends its occurrence; execution clocks start only at real admission. */
@@ -121,7 +131,10 @@ export async function acceptScheduledTaskRun(
 				await assertTaskProjectWrite(task.projectId, owner);
 			if (task.narratorMode !== "reuse") targetId = null;
 			if (targetId) {
-				const reusable = await db.query.narrators.findFirst({ where: eq(narrators.id, targetId) });
+				const reusable = await readQuery(
+					db.query.narrators.findFirst({ where: eq(narrators.id, targetId) }),
+					{ executionPolicy: "worker-required" },
+				);
 				if (
 					!reusable ||
 					reusable.status === "archived" ||
@@ -156,10 +169,13 @@ export async function acceptScheduledTaskRun(
 			const { captureScheduledInterruptTarget } = await import("./narrator-session");
 			interruptTarget = await captureScheduledInterruptTarget(targetId);
 			if (!occupied && !interruptTarget) {
-				const last = await db.query.narrators.findFirst({
-					where: eq(narrators.id, targetId),
-					columns: { logicalRunId: true },
-				});
+				const last = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, targetId),
+						columns: { logicalRunId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				interruptTarget = {
 					narratorId: targetId,
 					logicalRunId: last?.logicalRunId ?? undefined,
@@ -201,7 +217,7 @@ export async function acceptScheduledTaskRun(
 			: new Date(
 					Date.now() + (interruptTarget ? INTERRUPT_WAIT_MS : task.busyWaitMinutes * 60_000),
 				).toISOString();
-		db.transaction((tx) => {
+		const admitted = db.transaction((tx) => {
 			const accepted = tx
 				.update(scheduledTasks)
 				.set({
@@ -219,10 +235,27 @@ export async function acceptScheduledTaskRun(
 					completedAt: !next && terminal && !task.activeRunId && !pending ? ts : null,
 					updatedAt: ts,
 				})
-				.where(and(eq(scheduledTasks.id, task.id), eq(scheduledTasks.updatedAt, task.updatedAt)))
+				.where(
+					and(
+						eq(scheduledTasks.id, task.id),
+						eq(scheduledTasks.updatedAt, task.updatedAt),
+						eq(scheduledTasks.scheduleRevision, task.scheduleRevision),
+						...(input.manual
+							? []
+							: [
+									eq(scheduledTasks.enabled, true),
+									isNull(scheduledTasks.completedAt),
+									task.nextRunAt ? eq(scheduledTasks.nextRunAt, task.nextRunAt) : sql`0`,
+									lte(scheduledTasks.nextRunAt, input.at.toISOString()),
+								]),
+					),
+				)
 				.returning({ id: scheduledTasks.id })
 				.all();
-			if (!accepted.length) throw conflict();
+			if (!accepted.length) {
+				if (input.manual) throw conflict();
+				return false;
+			}
 			tx.insert(scheduledTaskRuns)
 				.values({
 					id: runId,
@@ -254,7 +287,9 @@ export async function acceptScheduledTaskRun(
 					createdAt: acceptedAt,
 				})
 				.run();
+			return true;
 		});
+		if (!admitted) return;
 		changed();
 		if (accessError) await notifyScheduledRunAdmissionFailure(runId, circuitBreaker);
 		return terminal ? undefined : runId;
@@ -281,17 +316,23 @@ async function finishWaiting(
 
 /** Requires the task+target locks; no cancel or terminal wait is performed while holding them. */
 async function prepareAdvance(runId: string): Promise<ScheduledRunInterruptTarget | undefined> {
-	const run = await db.query.scheduledTaskRuns.findFirst({
-		where: eq(scheduledTaskRuns.id, runId),
-	});
+	const run = await readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: eq(scheduledTaskRuns.id, runId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!run || run.status !== "waiting") {
 		state.interruptAttempts.delete(runId);
 		state.interruptMembers.delete(runId);
 		return;
 	}
-	const task = await db.query.scheduledTasks.findFirst({
-		where: eq(scheduledTasks.id, run.taskId),
-	});
+	const task = await readQuery(
+		db.query.scheduledTasks.findFirst({
+			where: eq(scheduledTasks.id, run.taskId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!task) return;
 	if (!task.enabled && !run.manual) {
 		await finishWaiting(run, "cancelled", "Task paused before dispatch");
@@ -498,13 +539,19 @@ async function interruptReservedTarget(runId: string, target: ScheduledRunInterr
 	// Reservation is durable before any cancellation. Snapshot every member before
 	// finalization removes the registry, and cancel only that exact runtime identity.
 	const { cancelScheduledRunTarget } = await import("./narrator-session");
-	const reserved = await db.query.scheduledTaskRuns.findFirst({
-		where: eq(scheduledTaskRuns.id, runId),
-	});
+	const reserved = await readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: eq(scheduledTaskRuns.id, runId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!reserved || reserved.status !== "waiting") return;
-	const task = await db.query.scheduledTasks.findFirst({
-		where: eq(scheduledTasks.id, reserved.taskId),
-	});
+	const task = await readQuery(
+		db.query.scheduledTasks.findFirst({
+			where: eq(scheduledTasks.id, reserved.taskId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!task) return;
 	try {
 		const owner = await resolveTaskPrincipal(taskOwnerId(task));
@@ -593,10 +640,13 @@ async function interruptReservedTarget(runId: string, target: ScheduledRunInterr
 }
 
 export async function advanceScheduledTaskRun(runId: string): Promise<void> {
-	const run = await db.query.scheduledTaskRuns.findFirst({
-		where: and(eq(scheduledTaskRuns.id, runId), eq(scheduledTaskRuns.status, "waiting")),
-		columns: { taskId: true, narratorId: true },
-	});
+	const run = await readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: and(eq(scheduledTaskRuns.id, runId), eq(scheduledTaskRuns.status, "waiting")),
+			columns: { taskId: true, narratorId: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!run) return;
 	const cancel = await scheduledTaskMutationLocks.acquire(run.taskId, () =>
 		scheduledTaskTargetLocks.acquire(run.narratorId ?? `task:${run.taskId}`, () =>
@@ -607,10 +657,13 @@ export async function advanceScheduledTaskRun(runId: string): Promise<void> {
 		await interruptReservedTarget(runId, cancel);
 		return;
 	}
-	const current = await db.query.scheduledTaskRuns.findFirst({
-		where: eq(scheduledTaskRuns.id, runId),
-		columns: { status: true },
-	});
+	const current = await readQuery(
+		db.query.scheduledTaskRuns.findFirst({
+			where: eq(scheduledTaskRuns.id, runId),
+			columns: { status: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (current && current.status !== "waiting") {
 		try {
 			await cleanupScheduledTaskNarrators(run.taskId);
@@ -629,17 +682,20 @@ export function pollScheduledWaitingRuns(): Promise<void> {
 			state.interruptAttempts.delete(id);
 			state.interruptMembers.delete(id);
 		}
-		const rows = await db
-			.select({ id: scheduledTaskRuns.id })
-			.from(scheduledTaskRuns)
-			.where(
-				and(
-					eq(scheduledTaskRuns.status, "waiting"),
-					state.cursor ? gt(scheduledTaskRuns.id, state.cursor) : undefined,
-				),
-			)
-			.orderBy(asc(scheduledTaskRuns.id))
-			.limit(POLL_LIMIT);
+		const rows = await readQuery(
+			db
+				.select({ id: scheduledTaskRuns.id })
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						eq(scheduledTaskRuns.status, "waiting"),
+						state.cursor ? gt(scheduledTaskRuns.id, state.cursor) : undefined,
+					),
+				)
+				.orderBy(asc(scheduledTaskRuns.id))
+				.limit(POLL_LIMIT),
+			{ executionPolicy: "worker-required" },
+		);
 		state.cursor = rows.length === POLL_LIMIT ? rows.at(-1)?.id : undefined;
 		for (const run of rows) {
 			try {

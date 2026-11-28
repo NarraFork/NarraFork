@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import {
+	noProxyRulesSchema,
 	proxyOverrideSchema,
 	proxyUrlSchema as webFetchProxyUrlSchema,
 } from "@shared/proxy-settings";
@@ -24,32 +25,21 @@ import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import { peekCommandCodeModels } from "../lib/commandcode-models";
+import { getCredentialMigrationConflicts } from "../lib/credential-migration";
+import { purgeCustomApiQuotaCache } from "../lib/custom-api-quota-cache";
 import {
-	getAllCustomApiCachedQuotas,
-	purgeCustomApiQuotaCache,
-} from "../lib/custom-api-quota-cache";
-import {
-	getDeepSeekBalanceGenerations,
 	refreshAllDeepSeekBalances,
 	syncDeepSeekBalanceCache,
 } from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
-import {
-	getAllKimiCachedUsages,
-	purgeKimiUsageCache,
-	refreshAllKimiUsages,
-} from "../lib/kimi-usage-cache";
+import { purgeKimiUsageCache, refreshAllKimiUsages } from "../lib/kimi-usage-cache";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
-import {
-	getOpencodeUsageGenerations,
-	refreshAllOpencodeUsages,
-	syncOpencodeUsageCache,
-} from "../lib/opencode-usage-cache";
+import { refreshAllOpencodeUsages, syncOpencodeUsageCache } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import {
@@ -88,6 +78,8 @@ import {
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { buildRuntimeSettings } from "../lib/settings/runtime";
+import { isSensitiveHeaderName } from "../lib/settings/search-header-secrets";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
@@ -162,6 +154,9 @@ const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom
 const customUserAgentSchema = z.string().max(500).optional();
 const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional();
 
+/** 工具结果图片的去处（Chat Completions 通道），见 shared/tool-result-images.ts。 */
+const toolResultImagesSchema = z.enum(["off", "inline", "separate"]).optional();
+
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -183,6 +178,7 @@ const customApiProviderSchema = z.object({
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
+	toolResultImages: toolResultImagesSchema,
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
@@ -205,6 +201,7 @@ const openaiProviderSchema = z.object({
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
+	toolResultImages: toolResultImagesSchema,
 	defaultContextWindow: z.number().int().min(1).optional(),
 	proxy: proxyOverrideSchema,
 	userAgentMode: userAgentModeSchema,
@@ -235,6 +232,7 @@ const anthropicProviderSchema = z.object({
 });
 
 const nugProviderSchema = z.object({
+	toolResultImages: toolResultImagesSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
@@ -324,6 +322,26 @@ const externalWebSocketOriginSchema = z
 	}, "Origin must be an exact HTTP(S) origin without a path");
 
 /**
+ * Merge a validated `proxy` patch into the stored policy.
+ *
+ * `settings.proxy` is replaced wholesale on PATCH (so switching mode drops a stale
+ * custom URL). The no_proxy rule list is independent of the mode and shared by
+ * every proxied channel, so a patch that omits it keeps the stored rules — only an
+ * explicit array (including `[]`) replaces them. Exported for tests because that
+ * asymmetry is easy to regress and expensive to notice in production.
+ */
+export function mergeProxySettingsPatch(
+	current: NarraForkSettings["proxy"],
+	patch: NonNullable<NarraForkSettings["proxy"]>,
+): NonNullable<NarraForkSettings["proxy"]> {
+	const next = { ...patch };
+	if (next.noProxyRules === undefined && current?.noProxyRules !== undefined) {
+		next.noProxyRules = current.noProxyRules;
+	}
+	return next;
+}
+
+/**
  * Instance-wide settings that only admins may change (enforced by `requireAdmin`
  * on the PATCH route). Per-user preferences live in `/api/user-preferences`, so
  * every field here is shared state. `auth.jwtSecret` stays excluded regardless.
@@ -360,6 +378,11 @@ export const updateSettingsSchema = z
 			.object({
 				mode: z.enum(["system", "direct", "custom"]),
 				url: webFetchProxyUrlSchema,
+				/**
+				 * Targets that bypass the proxy. Omitted = keep the stored list
+				 * (see the merge in the PATCH handler); `[]` clears it.
+				 */
+				noProxyRules: noProxyRulesSchema,
 			})
 			.superRefine((value, ctx) => {
 				if (value.mode === "custom" && !value.url) {
@@ -700,6 +723,7 @@ export const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
+				toolResultImages: toolResultImagesSchema,
 			})
 			.partial()
 			.optional(),
@@ -834,10 +858,6 @@ function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["v
 	};
 }
 
-function isSensitiveHeaderName(name: string): boolean {
-	return /^(authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)$/i.test(name.trim());
-}
-
 function maskSearchProviderBaseUrl(
 	provider: NonNullable<NarraForkSettings["search"]>["customProviders"][number],
 ): string {
@@ -955,8 +975,9 @@ function publicAuthSettings(auth: NarraForkSettings["auth"]) {
 
 async function buildSettingsResponse(
 	source: NarraForkSettings,
-	extra?: { serverRestarting?: boolean; newUrl?: string },
+	extra?: { serverRestarting?: boolean; newUrl?: string; admin?: boolean },
 ) {
+	const admin = extra?.admin === true;
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
@@ -969,11 +990,13 @@ async function buildSettingsResponse(
 		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
-		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
 		// know whether it is on before rendering the site-quota inputs and the balance row.
 		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
+		// Credentials that stopped the move to credentials.json; the providers page lists them.
+		// Labels can be account emails, so only admins see them.
+		...(admin ? { credentialMigrationConflicts: getCredentialMigrationConflicts() } : {}),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1032,12 +1055,6 @@ async function buildSettingsResponse(
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
-		customApiQuotas: getAllCustomApiCachedQuotas(),
-		kimiUsages: getAllKimiCachedUsages(),
-		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
-		// them so an allowance fetched for a replaced account is never rendered
-		// under the new one.
-		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		commandcodeAvailable: hasConfiguredCommandCodeProvider(),
@@ -1216,8 +1233,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
-	// A deleted provider takes all of its keys with it, not just the one settings showed.
-	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(
@@ -1229,6 +1244,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
+	// Quota purge resolves the first credential id before a deleted provider loses its keys.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
 	// rather than the quota one: that set also fires on `protocol`,
 	// `geminiTransport` and `codexAccountId`, none of which changes what the usage
@@ -1274,8 +1291,12 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 }
 
 settingsRoutes.get("/", async (c) => {
-	return c.json(await buildSettingsResponse(settings));
+	return c.json(await buildSettingsResponse(settings, { admin: c.get("user").role === "admin" }));
 });
+
+settingsRoutes.get("/runtime", (c) =>
+	c.json(buildRuntimeSettings(settings, c.get("user").role === "admin")),
+);
 
 settingsRoutes.get("/context-thresholds", (c) => {
 	const model = c.req.query("model") ?? "";
@@ -1805,9 +1826,11 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			} else if (key === "speech") {
 				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {
-				// Replace entirely so switching modes drops the stale custom url.
+				// Replace entirely so switching modes drops the stale custom url; the
+				// shared no_proxy list survives a patch that does not mention it.
+				const proxyPatch = val as NonNullable<NarraForkSettings["proxy"]>;
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				(merged as any).proxy = val;
+				(merged as any).proxy = mergeProxySettingsPatch(current.proxy, proxyPatch);
 			} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
 				const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
 				merged.vnet = {
@@ -1946,12 +1969,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 
 		const responseStartedAt = performance.now();
-		const response = c.json(
-			await buildSettingsResponse(merged, {
-				serverRestarting: needsRestart,
-				newUrl,
-			}),
-		);
+		const response =
+			c.req.query("view") === "runtime"
+				? c.json(buildRuntimeSettings(merged, true))
+				: c.json(
+						await buildSettingsResponse(merged, {
+							serverRestarting: needsRestart,
+							newUrl,
+							admin: true,
+						}),
+					);
 		const finishedAt = performance.now();
 		if (finishedAt - requestStartedAt >= 500) {
 			// Timings only: never log settings contents or provider credentials.

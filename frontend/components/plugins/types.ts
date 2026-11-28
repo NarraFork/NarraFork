@@ -1,21 +1,23 @@
 import type { IDockviewPanelProps } from "dockview-react";
 import type { PluginUiHostLocalRouterOptions, PluginUiPanelDelegate } from "./host-local-router";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
-import type { JsonValue, PluginDockPanelParams, UiRpcNotification, UiRpcRequest } from "./protocol";
+import type {
+	JsonValue,
+	PluginDockPanelParams,
+	PluginHostSurface,
+	UiRpcNotification,
+	UiRpcRequest,
+} from "./protocol";
 
 /**
  * Surfaces a plugin view may declare.
  *
- * Defined once and reused: the same list previously appeared inline in half a dozen
- * places, so adding a surface meant finding every copy. Mirrors the manifest enum in
- * `server/lib/plugins/manifest.ts`.
+ * An alias of `PluginHostSurface` (which owns the runtime zod enum) rather than a
+ * second hand-written list — the client whitelist, the binding schema and the server
+ * manifest enum all have to agree, and copies are how one of them ends up silently
+ * behind.
  */
-export type PluginViewSurface =
-	| "workspace"
-	| "director"
-	| "focus"
-	| "settings"
-	| "provider-settings";
+export type PluginViewSurface = PluginHostSurface;
 
 export type PluginUiStatus =
 	| "available"
@@ -129,7 +131,14 @@ export interface PluginUiContext {
 	};
 	plugin: { id: string; version: string; contributionId: string; panelInstanceId: string };
 	surface: {
-		kind: "narrator-focus" | "workspace" | "director" | "settings" | "provider-settings";
+		kind:
+			| "narrator-focus"
+			| "workspace"
+			| "director"
+			| "settings"
+			| "provider-settings"
+			/** Full-viewport overlay layer; no narrator/workspace is in scope. */
+			| "overlay";
 		active: boolean;
 		visible: boolean;
 	};
@@ -255,4 +264,13 @@ export interface PluginUiSessionController {
 	setVisibility(visible: boolean): void;
 	setActive(active: boolean): void;
 	setFocused(focused: boolean): void;
+	/**
+	 * Push an event into the plugin iframe.
+	 *
+	 * Optional because a controller that has not finished its handshake cannot deliver
+	 * anything — the concrete session drops these silently until then. The overlay host
+	 * uses it to relay pointer positions, since a click-through iframe never receives a
+	 * real DOM event of its own.
+	 */
+	sendNotification?: (method: string, params?: JsonValue) => void;
 }

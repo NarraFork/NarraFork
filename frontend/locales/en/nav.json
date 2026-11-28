@@ -189,5 +189,11 @@
 	"folderColorName_green": "Green",
 	"folderColorName_lime": "Lime",
 	"folderColorName_yellow": "Yellow",
-	"folderColorName_orange": "Orange"
+	"folderColorName_orange": "Orange",
+	"pinToSidebar": "Pin to sidebar",
+	"unpinFromSidebar": "Unpin from sidebar",
+	"pinToSidebarFailed": "Could not pin it to the sidebar",
+	"unpinFromSidebarFailed": "Could not unpin it from the sidebar",
+	"recentTabCoordinatorLabel": "coordinator",
+	"teamTabWaiting": "{{count}} waiting on you"
 }

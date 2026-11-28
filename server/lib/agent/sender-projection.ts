@@ -1,3 +1,4 @@
+import { isNonTurnHostRow } from "@shared/continue-tail";
 import { parseOriginLabel } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import type { DbMessage } from "./provider";
@@ -218,7 +219,14 @@ export function projectMessageSenderForModel<T extends SenderMessage>(message: T
 	return output;
 }
 
-/** Last top-level user across invisible tails, without crossing an assistant turn. */
+/**
+ * Last top-level user across invisible tails, without crossing an assistant turn. Host-written
+ * rows that are nobody's turn (the tool-declaration rebaseline notice, a `user`-role row;
+ * `shared/continue-tail.ts:isNonTurnHostRow`) are looked past too: after Retry keeps such a
+ * notice behind the retried message, that message is still the current input, so its text is
+ * matched to the persisted row instead of being sent again as separate system input. The
+ * notice stays in the history.
+ */
 export function findCurrentSenderMessage<T extends SenderMessage>(
 	messages: readonly T[],
 ): T | undefined {
@@ -228,7 +236,8 @@ export function findCurrentSenderMessage<T extends SenderMessage>(
 			message.parentToolUseId ||
 			message.role === "sys" ||
 			message.role === "disp" ||
-			message.role === "system"
+			message.role === "system" ||
+			isNonTurnHostRow(message.role, Array.isArray(message.contentJson) ? message.contentJson : [])
 		)
 			continue;
 		return message.role === "user" ? message : undefined;

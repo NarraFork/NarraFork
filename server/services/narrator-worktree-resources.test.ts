@@ -1,11 +1,12 @@
 import { afterEach, beforeAll, expect, test } from "bun:test";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narrators } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { generateId } from "../lib/id";
 import { narratorService } from "./narrator-service";
-import { readProtectionClaims } from "./resource-protection-index";
+import { canonicalProtectionPath, readProtectionClaims } from "./resource-protection-index";
 
 beforeAll(() => {
 	if (process.env.NARRAFORK_TEST !== "1")
@@ -35,9 +36,14 @@ async function read(deadline = performance.now() + 5000, signal?: AbortSignal) {
 	try {
 		const result = await readProtectionClaims(
 			[
-				{ deviceId: "local", path: localPathSemantics.resolve(process.cwd(), ".") },
+				{
+					deviceId: "local",
+					path: await canonicalProtectionPath(localPathSemantics.resolve(process.cwd(), ".")),
+				},
 				{ deviceId: "fixture-remote", path: "." },
 				{ deviceId: "fixture-remote", path: "./remote-context" },
+				{ deviceId: "fixture-remote", path: "/" },
+				{ deviceId: "fixture-remote", path: "C:\\Remote\\Workspace" },
 			],
 			deadline,
 			signal,
@@ -124,6 +130,38 @@ test("absolute legacy host cwd remains protected after SwitchDevice changes the 
 		deviceId: "fixture-remote",
 		path: "./remote-context",
 	});
+});
+for (const cwd of ["/", "C:\\Remote\\Workspace"]) {
+	test(`modern atomic remote cwd/context agreement never creates a local claim: ${cwd}`, async () => {
+		const context: WorkspaceContext = {
+			revision: 7,
+			deviceId: "fixture-remote",
+			cwd,
+			pathFlavor: cwd.startsWith("/") ? "posix" : "windows",
+			contextKey: "fixture-committed-remote",
+			capabilities: { switchDirectory: true },
+		};
+		const id = await legacyRow(cwd, "fixture-remote", context);
+		await db.update(narrators).set({ workspaceRevision: 7 }).where(eq(narrators.id, id));
+		const before = sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
+		const result = await read();
+		expect(result.complete).toBe(true);
+		expect(result.owners.filter((owner) => owner.narratorId === id)).toEqual([
+			{ narratorId: id, deviceId: "fixture-remote", path: cwd },
+		]);
+		expect(sqlite.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n).toBe(before);
+		expect(
+			await db
+				.select({ cwd: narrators.cwd, context: narrators.workspaceContext })
+				.from(narrators)
+				.where(eq(narrators.id, id))
+				.get(),
+		).toEqual({ cwd, context });
+	});
+}
+test("an incomplete remote root context stays unavailable instead of fabricating ownership", async () => {
+	await legacyRow("/", "fixture-remote", { cwd: "/" });
+	expect((await read()).complete).toBe(false);
 });
 test("relative raw can use explicit committed remote device evidence when the default is absent", async () => {
 	const id = await legacyRow(".", null, { cwd: "./remote-context", deviceId: "fixture-remote" });

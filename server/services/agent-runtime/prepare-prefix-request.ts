@@ -1,4 +1,5 @@
 import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
+import type { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { getToolMessageWithParams, type Locale } from "../../lib/prompt-i18n";
 import {
 	currentCompactMessageId,
@@ -29,12 +30,14 @@ export interface PreparePrefixRequestOptions<
 	getModel: () => string;
 	getProvider: () => string;
 	signal?: AbortSignal;
+	preparation?: ModelHistoryPreparation;
 	getToolLoading?: (identity: RequestModelIdentity) => RuntimeHistoryOptions["toolLoading"];
 	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
 	/** Runs after tool refresh under the existing /load serialization queue. */
 	buildPrefixPrompt?: (
 		identity: RequestModelIdentity,
 		replyContext: ReplyContext,
+		preparation?: ModelHistoryPreparation,
 	) => Promise<Prompt>;
 }
 
@@ -71,6 +74,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		signal?.throwIfAborted();
 		return narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
+			preparation: options.preparation,
 		});
 	};
 	for (;;) {
@@ -79,7 +83,7 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 		if (!capturedLoading) {
 			// Compatibility for standalone callers without loading-aware prefix epochs.
 			const sourceMessages = await readHistory();
-			const prompt = await options.buildPrefixPrompt?.(identity, replyContext);
+			const prompt = await options.buildPrefixPrompt?.(identity, replyContext, options.preparation);
 			await options.ensureRequestIdentity?.();
 			signal?.throwIfAborted();
 			return { ...identity, sourceMessages, prompt };
@@ -93,12 +97,13 @@ export async function preparePrefixRequest<Prompt extends RequestPrefixPrompt>(
 				narratorId,
 				messages: sourceMessages ?? [],
 				...capturedLoading,
+				preparation: options.preparation,
 				signal,
 				...identity,
 				refreshTools: async () => {
 					await options.refreshToolLoading?.(identity);
 					signal?.throwIfAborted();
-					prompt = await options.buildPrefixPrompt?.(identity, replyContext);
+					prompt = await options.buildPrefixPrompt?.(identity, replyContext, options.preparation);
 					return { ...(options.getToolLoading?.(identity) ?? capturedLoading), prompt };
 				},
 				noticeText: (kind, toolName) =>

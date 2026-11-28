@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
+import { RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { modelHistoryManifest, queryModelHistoryDelta } from "./model-history-delta";
 import { modelHistoryFixtureSql } from "./model-history-fixture";
 import {
@@ -513,7 +515,8 @@ describe("complete bounded model source", () => {
 	});
 	test("real worker completes all pages after the clock crosses the former ten-second cutoff", async () => {
 		const db = fixture(true);
-		for (let index = 0; index < 205; index++) message(db, `slow:${index}`, index);
+		for (let index = 0; index < 205; index++)
+			message(db, `slow:${index}`, index, " PRIVATE_BODY_SECRET /private/PRIVATE_PATH_SECRET");
 		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		const startedAt = Date.now();
 		let now = startedAt;
@@ -542,7 +545,29 @@ describe("complete bounded model source", () => {
 				"Slow model history preparation",
 				expect.objectContaining({ narratorId: "owner", phase: "worker", refs: 205 }),
 			]);
-			expect(JSON.stringify(warn.mock.calls)).not.toContain("slow:204");
+			const diagnostic = warn.mock.calls[0][1];
+			expect(Object.keys(diagnostic ?? {}).sort()).toEqual([
+				"backend",
+				"elapsedMs",
+				"narratorId",
+				"phase",
+				"queued",
+				"refs",
+				"sourceBytes",
+				"toolRows",
+				"workers",
+			]);
+			for (const value of Object.values(diagnostic ?? {}))
+				expect(typeof value === "string" || typeof value === "number").toBe(true);
+			const logs = JSON.stringify(warn.mock.calls);
+			for (const secret of [
+				"slow:204",
+				"PRIVATE_BODY_SECRET",
+				"PRIVATE_PATH_SECRET",
+				db.filename,
+				import.meta.dir,
+			])
+				expect(logs).not.toContain(secret);
 		} finally {
 			warn.mockRestore();
 			worker.mockRestore();
@@ -656,7 +681,12 @@ describe("complete bounded model source", () => {
 		const RealWorker = globalThis.Worker;
 		const worker = spyOn(workerGlobal, "Worker").mockImplementation((specifier, options) => {
 			const instance = new RealWorker(specifier, options);
-			queueMicrotask(() => instance.dispatchEvent(new MessageEvent("messageerror")));
+			const dispatch = instance.postMessage.bind(instance);
+			spyOn(instance, "postMessage").mockImplementation((message) => {
+				if (message && "narratorId" in message)
+					instance.dispatchEvent(new MessageEvent("messageerror"));
+				else dispatch(message);
+			});
 			return instance;
 		});
 		try {

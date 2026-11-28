@@ -43,11 +43,16 @@ function invalidateLocalMetadata(rawPath: string): void {
 	);
 }
 
-/** Publish once, after all working-tree-derived caches have been invalidated. */
-export function invalidateStatus(rawPath: string): void {
+/** A tool may have written: keep lazy facts fresh without discarding verified page snapshots. */
+export function markStatusDirty(rawPath: string): void {
 	invalidateLocalGitLineStats(rawPath);
 	invalidateLocalGitStatusQueries(rawPath);
 	invalidateLocalMetadata(rawPath);
+}
+
+/** Publish once, after all working-tree-derived caches have been invalidated. */
+export function invalidateStatus(rawPath: string): void {
+	markStatusDirty(rawPath);
 	eventBus.emit({
 		type: "git:workspace_invalidated",
 		queryKey: getLocalGitStatusQueryKey(rawPath),

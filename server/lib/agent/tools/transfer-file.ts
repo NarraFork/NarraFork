@@ -33,8 +33,8 @@ const BACKGROUND_PARAM_SCHEMA = {
 	description:
 		"Run the transfer in the background and return immediately with a task handle. " +
 		"A background transfer survives a NarraFork restart, can be paused and resumed, " +
-		"and resumes from where it stopped rather than restarting. Use Await with " +
-		'`type: "transfer"` to wait for it. Recommended for large files and directories.',
+		"and resumes from where it stopped rather than restarting. Completion notifies automatically; " +
+		"use the background task list for progress. Recommended for large files and directories.",
 } as const;
 
 export const transferFileTool: ToolDefinition = {
@@ -377,7 +377,7 @@ async function startBackgroundTransfer(input: {
 			`Started background ${input.direction}: ${route}\n` +
 			`Task: ${alias}\n\n` +
 			`It continues across restarts and can be paused/resumed. ` +
-			`Use Await({ type: "transfer", id: "${alias}" }) to wait for it, or check the ` +
+			`Completion notifies automatically. Check the ` +
 			`background task list for live progress.`,
 		title,
 		metadata: {

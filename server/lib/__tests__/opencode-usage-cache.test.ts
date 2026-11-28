@@ -49,9 +49,8 @@ const provider = (): CustomApiProviderConfig => ({
 let respond: () => Promise<Response> = async () => Response.json(body);
 
 const {
-	getAllOpencodeCachedUsages,
+	getOpencodeKeyUsages,
 	getOpencodeCachedUsage,
-	getOpencodeUsageGenerations,
 	isOpencodeCustomApiProvider,
 	isOpencodeUsageDue,
 	noteOpencodeUsageActivity,
@@ -63,7 +62,7 @@ const {
 	refreshStaleOpencodeUsages,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const { opencodeRoutes } = await import("../../routes/opencode");
+const { quotaSnapshotRoutes } = await import("../../routes/quota-snapshots");
 
 beforeEach(() => {
 	settings.customApiProviders = [];
@@ -94,13 +93,14 @@ function appForRole(role: "admin" | "user") {
 	app.use("*", async (c, next) => {
 		const sub = role === "admin" ? OPENCODE_ADMIN_ID : OPENCODE_USER_ID;
 		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("auth", { type: "session", user: c.get("user") });
 		await next();
 	});
 	app.onError((error) => {
 		const status = (error as { statusCode?: number }).statusCode;
 		return new Response("denied", { status: status ?? 500 });
 	});
-	app.route("/api/opencode", opencodeRoutes);
+	app.route("/api/quota-snapshots", quotaSnapshotRoutes);
 	return app;
 }
 
@@ -234,7 +234,7 @@ describe("OpenCode Go usage", () => {
 			throw new Error("secret-test-key upstream private error");
 		};
 		await refreshStaleOpencodeUsages();
-		const cache = getAllOpencodeCachedUsages()["opencode-test"];
+		const cache = getOpencodeKeyUsages()["opencode-test"];
 		expect(cache?.rolling?.percent).toBe(37);
 		// Never copy transport exceptions, response text, or credentials to the API.
 		expect(cache?.error).toBe("OpenCode usage request failed");
@@ -256,7 +256,6 @@ describe("OpenCode Go usage", () => {
 			const pending = deferred();
 			respond = () => pending.promise;
 			const first = refreshOpencodeUsage("opencode-test");
-			const oldGeneration = getOpencodeUsageGenerations()["opencode-test"];
 			const config = settings.customApiProviders?.[0];
 			if (!config) throw new Error("missing fixture");
 			if (change === "apiKey") config.apiKey = "new-account";
@@ -267,21 +266,16 @@ describe("OpenCode Go usage", () => {
 			if (change === "globalProxy")
 				settings.proxy = { mode: "custom", url: "http://localhost:4321" };
 			if (change === "remove") settings.customApiProviders = [];
-			const current = getAllOpencodeCachedUsages();
-			expect(getOpencodeUsageGenerations()["opencode-test"]).not.toBe(oldGeneration);
-			expect(current["opencode-test"]?.generation).toBe(
-				getOpencodeUsageGenerations()["opencode-test"],
-			);
+			const current = getOpencodeKeyUsages();
 			expect(current["opencode-test"]?.rolling ?? null).toBeNull();
 			pending.resolve(Response.json(body));
 			expect(await first).toBeNull();
-			expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling ?? null).toBeNull();
+			expect(getOpencodeKeyUsages()["opencode-test"]?.rolling ?? null).toBeNull();
 		});
 	}
 
 	test("switching protocol keeps the allowance: it does not change what the endpoint returns", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		const generation = getOpencodeUsageGenerations()["opencode-test"];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		// Count relative to here: `beforeEach` installs a spy and the refresh above ran
 		// through it, so an absolute call count would be pre-loaded.
@@ -291,36 +285,25 @@ describe("OpenCode Go usage", () => {
 		// `protocol` part of the identity, this would rotate the generation, reset the entry
 		// to `fetchedAt: 0`, and make the stale sweep below re-fetch it.
 		settings.customApiProviders = [{ ...provider(), protocol: "anthropic-messages" }];
-		expect(getOpencodeUsageGenerations()["opencode-test"]).toBe(generation);
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 		await refreshStaleOpencodeUsages();
 		expect(fetchSpy.mock.calls.length).toBe(callsSoFar);
 	});
 
-	test("generations stay stable across reads and unrelated edits, and never encode credentials", async () => {
-		const original = getOpencodeUsageGenerations()["opencode-test"];
-		expect(original).toMatch(/^[\da-f-]{36}$/);
+	test("unrelated display edits retain the existing allowance", async () => {
 		await refreshOpencodeUsage("opencode-test");
 		settings.customApiProviders = [{ ...provider(), name: "Renamed" }];
-		expect(getOpencodeUsageGenerations()["opencode-test"]).toBe(original);
-		settings.customApiProviders = [{ ...provider(), apiKey: "second-account" }];
-		const second = getOpencodeUsageGenerations()["opencode-test"];
-		expect(second).not.toBe(original);
-		settings.customApiProviders = [provider()];
-		const third = getOpencodeUsageGenerations()["opencode-test"];
-		expect(third).not.toBe(original);
-		expect(third).not.toBe(second);
-		expect(JSON.stringify(getOpencodeUsageGenerations())).not.toContain(provider().apiKey);
+		expect(getOpencodeCachedUsage("opencode-test")?.rolling?.percent).toBe(37);
 	});
 
 	test("a completed allowance disappears on credential change, disable and removal", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 		settings.customApiProviders = [{ ...provider(), apiKey: "other-account" }];
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling ?? null).toBeNull();
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling ?? null).toBeNull();
 		await refreshOpencodeUsage("opencode-test");
 		settings.customApiProviders = [{ ...provider(), disabled: true }];
-		expect(getAllOpencodeCachedUsages()).toEqual({});
+		expect(getOpencodeKeyUsages()).toEqual({});
 		settings.customApiProviders = [];
 		expect(await refreshOpencodeUsage("opencode-test")).toBeNull();
 	});
@@ -333,7 +316,7 @@ describe("OpenCode Go usage", () => {
 		];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		await refreshAllOpencodeUsages();
-		expect(getAllOpencodeCachedUsages()).toEqual({});
+		expect(getOpencodeKeyUsages()).toEqual({});
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
@@ -379,7 +362,7 @@ describe("OpenCode Go usage", () => {
 	 */
 	test("rejects an oversized declared length and an oversized streamed body", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 
 		// A small, valid body that LIES about its length: only the declared-length branch
 		// can refuse it, since the body itself would parse fine.
@@ -411,7 +394,7 @@ describe("OpenCode Go usage", () => {
 		respond = async () => streamed;
 		await refreshOpencodeUsage("opencode-test");
 
-		const cache = getAllOpencodeCachedUsages()["opencode-test"];
+		const cache = getOpencodeKeyUsages()["opencode-test"];
 		expect(cache?.error).toBe("OpenCode usage request failed");
 		// The oversized body was never applied: the previous allowance survived, so an
 		// under-reported length cannot smuggle a truncated reading into the display.
@@ -450,21 +433,24 @@ describe("OpenCode Go usage", () => {
 		const pending = deferred();
 		respond = () => pending.promise;
 		// A cold read must not block on the upstream call it just started.
-		const cold = await appForRole("user").request("/api/opencode/usages");
-		expect((await cold.json())["opencode-test"]).toEqual({
-			rolling: null,
-			weekly: null,
-			monthly: null,
-			fetchedAt: 0,
-			generation: getOpencodeUsageGenerations()["opencode-test"],
-			hasError: false,
-		});
+		const cold = await appForRole("user").request("/api/quota-snapshots");
+		expect(
+			(await cold.json()).entries.find(
+				(entry: { groupId: string }) => entry.groupId === "opencode-test",
+			),
+		).toMatchObject({ snapshot: null, credentialId: null });
 		pending.resolve(Response.json(body));
 		await refreshAllOpencodeUsages();
-		const warm = await appForRole("user").request("/api/opencode/usages");
-		expect(await warm.json()).toMatchObject({
-			"opencode-test": { rolling: { percent: 37, status: "ok" }, hasError: false },
+		const warm = await appForRole("user").request("/api/quota-snapshots");
+		const entry = (await warm.json()).entries.find(
+			(entry: { groupId: string }) => entry.groupId === "opencode-test",
+		);
+		expect(entry.snapshot.windows).toContainEqual({
+			kind: "5h",
+			usedRatio: 0.37,
+			resetsAt: Date.parse(body.usage.rolling.resetsAt),
 		});
+		expect(entry.snapshot.hasError).toBe(false);
 	});
 
 	test("a failed refresh becomes hasError for users and stays visible only to admins", async () => {
@@ -473,34 +459,34 @@ describe("OpenCode Go usage", () => {
 		};
 		await refreshAllOpencodeUsages();
 
-		const userBody = await (await appForRole("user").request("/api/opencode/usages")).text();
-		const userEntry = JSON.parse(userBody)["opencode-test"];
+		const userBody = await (await appForRole("user").request("/api/quota-snapshots")).text();
+		const userEntry = JSON.parse(userBody).entries.find(
+			(entry: { groupId: string }) => entry.groupId === "opencode-test",
+		).snapshot;
 		expect(userEntry).toMatchObject({ hasError: true });
-		expect(userEntry).not.toHaveProperty("error");
+		expect(userEntry.error).toBe("quota_unavailable");
 		// The failure text is the deployment's business, not the reader's.
 		expect(userBody).not.toContain("internal.example");
 		expect(userBody).not.toContain("sk-live-abc");
 
 		const adminEntry = JSON.parse(
-			await (await appForRole("admin").request("/api/opencode/usages")).text(),
-		)["opencode-test"];
-		// An admin gets the raw entry: the error text is present, and `hasError` is
-		// the non-admin substitute for it, so it is absent here rather than false.
-		expect(adminEntry).toMatchObject({ error: "OpenCode usage request failed" });
-		expect(adminEntry).not.toHaveProperty("hasError");
+			await (await appForRole("admin").request("/api/quota-snapshots")).text(),
+		).entries.find((entry: { groupId: string }) => entry.groupId === "opencode-test").snapshot;
+		// Administrators also receive only a fixed safe error code.
+		expect(adminEntry).toMatchObject({ error: "quota_unavailable", hasError: true });
 	});
 
 	test("POST refresh is admin-only", async () => {
 		expect(
-			(await appForRole("user").request("/api/opencode/usages/refresh", { method: "POST" })).status,
+			(await appForRole("user").request("/api/quota-snapshots/refresh", { method: "POST" })).status,
 		).toBe(403);
 		expect(
-			(await appForRole("admin").request("/api/opencode/usages/refresh", { method: "POST" }))
+			(await appForRole("admin").request("/api/quota-snapshots/refresh", { method: "POST" }))
 				.status,
 		).toBe(200);
 	});
 
-	test("settings projects the same opaque generations to users and admins", async () => {
+	test("settings retires legacy quota generations for users and admins without exposing credentials", async () => {
 		const { settingsRoutes } = await import("../../routes/settings");
 		for (const role of ["user", "admin"] as const) {
 			const app = appForRole(role);
@@ -508,10 +494,11 @@ describe("OpenCode Go usage", () => {
 			const response = await app.request("/api/settings");
 			expect(response.status).toBe(200);
 			const projection = await response.json();
-			expect(projection.opencodeUsageGenerations).toEqual(getOpencodeUsageGenerations());
+			expect(projection).not.toHaveProperty("opencodeUsageGenerations");
+			expect(projection).not.toHaveProperty("deepseekBalanceGenerations");
 			expect(projection.customApiProviders[0].apiKey).not.toBe(provider().apiKey);
 		}
-		// Generations are a runtime projection, never persisted into settings.
+		// Legacy source-specific generations are no longer part of the settings response.
 		expect(settings).not.toHaveProperty("opencodeUsageGenerations");
 		expect(settings.customApiProviders?.[0]).not.toHaveProperty("generation");
 	});

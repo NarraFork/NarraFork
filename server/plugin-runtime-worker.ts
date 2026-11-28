@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { WINDOWS_PLUGIN_LAUNCHER_MODE } from "./lib/plugins/windows-plugin-launcher";
 
 /**
  * Plugin runtime worker mode — self-hosted plugin runtime.
@@ -27,6 +28,12 @@ export const PLUGIN_RUNTIME_WORKER_FLAG = "--plugin-runtime-worker";
 export async function runPluginRuntimeWorker(): Promise<never> {
 	const flagIndex = process.argv.indexOf(PLUGIN_RUNTIME_WORKER_FLAG);
 	const entryPath = flagIndex >= 0 ? process.argv[flagIndex + 1] : undefined;
+	if (entryPath === WINDOWS_PLUGIN_LAUNCHER_MODE) {
+		// The trusted Windows shim joins its dedicated Job before running any plugin command.
+		// Keep this inside the existing pre-main plugin mode: no server, DB or instance lock.
+		const { runWindowsPluginLauncher } = await import("./lib/plugins/windows-plugin-launcher");
+		return runWindowsPluginLauncher(process.argv.slice(flagIndex + 2));
+	}
 	if (!entryPath) {
 		console.error(`[${PLUGIN_RUNTIME_WORKER_FLAG}] missing plugin entry path`);
 		process.exit(2);

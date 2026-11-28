@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # remote-peer is an independent Go module. Its PRs land on
+  # dependabot/go_modules/remote-peer/* branches, where
+  # .github/workflows/remote-peer-dependabot-licenses.yml syncs the license records.
+  - package-ecosystem: gomod
+    directory: /remote-peer
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go

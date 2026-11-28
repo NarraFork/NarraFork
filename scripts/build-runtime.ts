@@ -3,6 +3,7 @@ import { chmod, mkdir, realpath, rename, rm, stat, writeFile } from "node:fs/pro
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getNarraforkHome } from "../server/lib/narrafork-home";
+import { MAX_RELEASE_BINARY_BYTES } from "../shared/release-patch";
 import { runRuntimeBuildCommand } from "./lib/runtime-build-process";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
@@ -52,8 +53,8 @@ export async function buildRuntime(
 		);
 		options.signal?.throwIfAborted();
 		const file = await stat(temporary);
-		if (!file.isFile() || file.size <= 0 || file.size > 1024 * 1024 * 1024) {
-			throw new Error("Runtime executable is missing or exceeds 1 GiB");
+		if (!file.isFile() || file.size <= 0 || file.size > MAX_RELEASE_BINARY_BYTES) {
+			throw new Error("Runtime executable is missing or exceeds the release binary byte limit");
 		}
 		await chmod(temporary, 0o555);
 		await rename(temporary, executable);

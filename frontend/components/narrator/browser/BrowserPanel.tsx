@@ -33,6 +33,7 @@ import { useTranslation } from "react-i18next";
 import {
 	useBrowserSessions,
 	useCloseBrowserSession,
+	useCreateBrowserSession,
 	useInteractBrowserSession,
 	useLoadOptionalTool,
 	useOptionalToolState,
@@ -40,12 +41,14 @@ import {
 	useStopBrowserTracing,
 } from "../../../hooks/useBrowserSessions";
 import { useNarratorBrowserSessionsCapability } from "../../../hooks/usePlatform";
+import { useCanOpenTerminals as useNarratorWriteAccess } from "../../../hooks/useTerminals";
 import { ApiError, authorizedFetch, getToken, readFetchError } from "../../../lib/api";
 import {
 	SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
 	SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
 	safeAreaFullscreenModalBodyStyle,
 } from "../../../lib/safe-area";
+import { CreateBrowserSessionForm } from "../ManualResourceForms";
 import {
 	type BrowserKeyInput,
 	BrowserKeyStrokeBroker,
@@ -87,6 +90,8 @@ export function BrowserPanel({
 	const expanded = chromeless || opened;
 	const enabled = browserSessionsCapability.supported !== false && expanded;
 	const { data: sessions } = useBrowserSessions(enabled ? narratorId : "");
+	const canCreate = useNarratorWriteAccess(enabled && chromeless ? narratorId : "") === true;
+	const { mutateAsync: createBrowserSession } = useCreateBrowserSession();
 	// Only the dock surface offers the load button, so skip the extra request for
 	// the embedded widget.
 	const { data: toolState } = useOptionalToolState(narratorId, "browser", enabled && chromeless);
@@ -124,6 +129,14 @@ export function BrowserPanel({
 	if (chromeless) {
 		return (
 			<Box style={{ height: "100%", overflowY: "auto", paddingTop: 8 }}>
+				{canCreate && (
+					<Box px="sm" pb="xs">
+						<CreateBrowserSessionForm
+							key={narratorId}
+							create={(data) => createBrowserSession({ narratorId, data })}
+						/>
+					</Box>
+				)}
 				{count === 0 ? (
 					toolState && !toolState.loaded ? (
 						<BrowserToolLoadPrompt

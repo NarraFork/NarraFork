@@ -1,0 +1,1 @@
+CREATE INDEX "idx_team_work_events_team_kind_created" ON "team_work_events" USING btree ("team_id","kind","created_at","id");

@@ -345,11 +345,34 @@ export const narrators = sqliteTable(
 		/** ModelTrace 舱的不透明绑定键；NULL 表示还没有收编。 */
 		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
+		/**
+		 * `slugifyTaskAlias(title)`, stored so alias occupancy can probe one candidate
+		 * name with an index. Null when the title has no slug. Writes and the startup
+		 * backfill keep it equal to the slug the resolver computes in JS, including
+		 * titles that were stored before this column existed.
+		 */
+		titleSlug: text("title_slug"),
+		/**
+		 * The persisted `subagent-alias:` selector, copied out of `traits` so a
+		 * candidate lookup is an index equality. Empty string means the row was
+		 * checked and has no alias. Null means not backfilled yet.
+		 */
+		aliasSelector: text("alias_selector"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
 			.default("fresh"),
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
+		/** Display group for ask-in-passing forks, independent of their actual fork source. */
+		askInPassingGroupId: text("ask_in_passing_group_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
+		/** Only set when a parent archive actually changed this session's status. */
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		/** Immutable actual Agent tool-call PK; retained even if its history is deleted. */
 		originToolCallId: text("origin_tool_call_id"),
 		/** Explicit creation provenance; NULL means unknown legacy origin. */
@@ -708,6 +731,8 @@ export const narrators = sqliteTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		// Startup recovery and legacy backfills look up active/legacy rows by status.
 		index("idx_narrators_status").on(table.status),
@@ -760,6 +785,17 @@ export const narrators = sqliteTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql`"is_background" = 1`),
+		// Candidate alias lookup: one parent + one slug, not a scan of every child.
+		index("idx_narrators_parent_title_slug")
+			.on(table.parentNarratorId, table.titleSlug)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "title_slug" IS NOT NULL`),
+		index("idx_narrators_parent_alias_selector")
+			.on(table.parentNarratorId, table.aliasSelector)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "alias_selector" IS NOT NULL`),
+		// Send/Await/Watch page only the addressable team, skipping archived history.
+		index("idx_narrators_addressable_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "status" IN ('idle', 'working', 'waiting')`),
 	],
 );
 
@@ -2138,6 +2174,23 @@ export const narratorToolContinuations = sqliteTable(
 );
 
 // === terminals ===
+/**
+ * Executor sessions NarraFork still has to stop and release on a device
+ * (`session.kill { release: true }`): written before a remote terminal's local
+ * close or exit is final, and removed only once the executor confirms (or reports
+ * the session unknown). Independent of the terminal row, so deleting a terminal,
+ * restarting NarraFork or an offline device can never orphan a remote shell.
+ */
+export const executorSessionCleanups = sqliteTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = sqliteTable(
 	"terminals",
 	{
@@ -2157,6 +2210,12 @@ export const terminals = sqliteTable(
 		dtachSocket: text("dtach_socket"),
 		/** Remote executor device this terminal runs on. null → local server. */
 		deviceId: text("device_id"),
+		/**
+		 * Durable executor session (`session.durable.v1`) backing a remote terminal.
+		 * Set: the shell outlives NarraFork and device reconnects, and is resumed by
+		 * id. NULL: a local terminal or a legacy `pty.open` remote terminal.
+		 */
+		executorSessionId: text("executor_session_id"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),
@@ -2309,6 +2368,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	/** Validated, previously-local presentation values only; never client scope rules. */
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -2441,6 +2502,15 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。
 	 */
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	/**
+	 * Plugin ids whose `overlay` views this user has hidden (JSON string array).
+	 *
+	 * Overlays are shown by default once an admin installs the plugin; this is the
+	 * per-person opt-out, so one colleague hiding a desktop pet does not hide it for the
+	 * whole instance. Stored per account rather than in the browser so the choice
+	 * follows the person across devices and survives a reload.
+	 */
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
@@ -2635,7 +2705,7 @@ export const userRecentTabs = sqliteTable(
 		tabKey: text("tab_key").notNull(),
 		section: text("section", { enum: ["projects", "work"] }).notNull(),
 		type: text("type", {
-			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder"],
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder", "team"],
 		}).notNull(),
 		entityId: text("entity_id").notNull(),
 		narratorId: text("narrator_id"),
@@ -2664,6 +2734,11 @@ export const userRecentTabs = sqliteTable(
 		 * not fully expanded. NULL means the client default.
 		 */
 		folderPreviewCount: integer("folder_preview_count"),
+		/**
+		 * `type = "team"` rows only: the team's project, for the team page's link. Written by the
+		 * server from `project_teams` (a team never changes project); NULL for every other type.
+		 */
+		projectId: text("project_id"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -4244,6 +4319,24 @@ export const backgroundTasks = sqliteTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		/**
+		 * Watch rows: the execution principal that registered the observation. Restart
+		 * re-attachment re-authorizes as this identity; NULL (legacy or unknown) never
+		 * re-attaches.
+		 */
+		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
+		/**
+		 * A remote background Bash running in a durable executor session
+		 * (`session.exec.v1`). Written before the session is opened, so a restarted
+		 * server can re-attach to it (or stop it) instead of reporting it lost.
+		 */
+		executorSessionJson: text("executor_session_json", { mode: "json" }).$type<{
+			deviceId: string;
+			sessionId: string;
+			/** Wall-clock budget from `startedAt`; absent means none. */
+			timeoutMs?: number;
+			startedAt: string;
+		}>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),
@@ -4256,6 +4349,7 @@ export const backgroundTasks = sqliteTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active").on(table.status).where(sql`"status" IN ('running','paused')`),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		// The transfer runner reaches the projection by the OWNING row's id (it never
@@ -4266,6 +4360,14 @@ export const backgroundTasks = sqliteTable(
 		// Without it a parent with hundreds of tasks sorts its whole history on every
 		// page request.
 		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
+		// Latest task for one alias: occupancy reads that single row, not the alias's history.
+		index("idx_bg_tasks_parent_alias")
+			.on(table.parentNarratorId, table.alias, table.createdAt)
+			.where(sql`"alias" IS NOT NULL`),
+		// In-progress aliases only, so a candidate probe never walks finished rows.
+		index("idx_bg_tasks_parent_live_alias")
+			.on(table.parentNarratorId, table.alias)
+			.where(sql`"alias" IS NOT NULL AND "status" IN ('running', 'paused')`),
 	],
 );
 
@@ -7275,6 +7377,259 @@ export const notifications = sqliteTable(
 			table.status,
 			table.createdAt,
 			table.id,
+		),
+	],
+);
+
+// === project teams (docs/PROJECT_TEAMS-PLAN.md, P1) ===
+// A team IS one coordinator narrator (`team` trait) in a project. These tables are machine-local
+// (they record git branches and worktrees of this host) and are NOT exported; clearing sessions
+// clears them first (`data-portability.ts`).
+
+/**
+ * One row per team, keyed by the coordinator's narrator id. No name column: the team's name is
+ * the coordinator's title, so renaming the session renames the team.
+ *
+ * Both foreign keys are RESTRICT on purpose. The team (and its work items) is the only record
+ * of the worktrees and branches it made, and the cleanup rule is "delete only what a record
+ * names" — a cascade from a raw narrator or project delete would erase that record and leave
+ * worktrees nothing will ever clean. The service paths delete the team row explicitly:
+ * `narratorService.remove` refuses while work is live and otherwise deletes the team in its own
+ * transaction; project deletion refuses while the project has teams.
+ */
+export const projectTeams = sqliteTable(
+	"project_teams",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "restrict" }),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "restrict" }),
+		/** The branch work merges back into (decision T2's "baseline"). */
+		baseBranch: text("base_branch").notNull(),
+		/** Shared rules for the coordinator and every subagent (≤ 4 KB UTF-8). */
+		brief: text("brief").notNull().default(""),
+		/** `TeamSettings` (≤ 16 KB UTF-8 serialized). */
+		settingsJson: text("settings_json", { mode: "json" })
+			.$type<import("@shared/project-teams").TeamSettings>()
+			.notNull()
+			.default({}),
+		/** Follows the coordinator: archiving the narrator archives the team. */
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		createdBy: text("created_by").references((): AnySQLiteColumn => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_project_teams_project_status").on(table.projectId, table.status, table.narratorId),
+		index("idx_project_teams_created_by").on(table.createdBy),
+		check("ck_project_teams_status", sql`${table.status} in ('active', 'archived')`),
+		check("ck_project_teams_brief_bytes", sql`length(cast(${table.brief} as blob)) <= 4096`),
+		check(
+			"ck_project_teams_settings_bytes",
+			sql`length(cast(${table.settingsJson} as blob)) <= 16384`,
+		),
+	],
+);
+
+/**
+ * One unit of team work: one branch and one worktree (P3 creates them). PR / CI / integration
+ * columns are deferred with the hosting and integration PRs.
+ */
+/** Communication inheritance is separate from historical parent/controller/ACL. */
+export const narratorCommunicationNodes = sqliteTable(
+	"narrator_communication_nodes",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		parentNarratorId: text("parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** Immutable birth delegator; NULL for ordinary forks and standalone primary sessions. */
+		originalParentNarratorId: text("original_parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		version: integer("version").notNull().default(1),
+	},
+	(table) => [
+		index("idx_communication_nodes_parent").on(table.parentNarratorId),
+		index("idx_communication_nodes_original_parent").on(table.originalParentNarratorId),
+		check(
+			"ck_communication_nodes_not_self",
+			sql`${table.parentNarratorId} is null or ${table.parentNarratorId} <> ${table.narratorId}`,
+		),
+		check("ck_communication_nodes_version", sql`${table.version} >= 1`),
+	],
+);
+
+/** One exact undirected contact; it never merges or transitively connects domains. */
+export const narratorCommunicationPeers = sqliteTable(
+	"narrator_communication_peers",
+	{
+		id: text("id").primaryKey(),
+		endpointLo: text("endpoint_lo")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		endpointHi: text("endpoint_hi")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		source: text("source", { enum: ["manual", "admission"] }).notNull(),
+		admissionId: text("admission_id"),
+		messageId: text("message_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_communication_peers_pair").on(table.endpointLo, table.endpointHi),
+		index("idx_communication_peers_hi").on(table.endpointHi),
+		index("idx_communication_peers_created_by").on(table.createdBy),
+		check("ck_communication_peers_canonical", sql`${table.endpointLo} < ${table.endpointHi}`),
+	],
+);
+
+export const teamWorkItems = sqliteTable(
+	"team_work_items",
+	{
+		id: text("id").primaryKey(),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		/** Denormalized for cross-team indexes and the project-level exclusive lock. */
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "restrict" }),
+		title: text("title").notNull(),
+		kind: text("kind").notNull().default("change"),
+		state: text("state", {
+			enum: ["queued", "in_progress", "in_review", "ready", "merged", "cancelled"],
+		})
+			.notNull()
+			.default("queued"),
+		branchName: text("branch_name"),
+		baseRef: text("base_ref"),
+		/** The worktree made for this item; SET NULL only when the resource row itself goes. */
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "set null" },
+		),
+		headSha: text("head_sha"),
+		/** The first-level subagent responsible for the item. */
+		workerNarratorId: text("worker_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		reviewRounds: integer("review_rounds").notNull().default(0),
+		lastReview: text("last_review", { enum: ["blocker", "clear"] }),
+		/** Paths changed relative to the merge base (≤ 2,000 entries, ≤ 128 KiB). */
+		changedPathsJson: text("changed_paths_json", { mode: "json" }).$type<string[]>(),
+		changedPathsAtSha: text("changed_paths_at_sha"),
+		/** Project-level exclusive lock key (e.g. migrations); unique per project while set. */
+		exclusiveKey: text("exclusive_key"),
+		/** Optional outline task block (after the outline lands on main). */
+		outlineSpaceId: text("outline_space_id"),
+		outlineBlockId: text("outline_block_id"),
+		createdBy: text("created_by").references((): AnySQLiteColumn => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_items_team_state").on(table.teamId, table.state, table.id),
+		index("idx_team_work_items_project_state").on(table.projectId, table.state, table.id),
+		uniqueIndex("uq_team_work_items_exclusive")
+			.on(table.projectId, table.exclusiveKey)
+			.where(sql`"exclusive_key" IS NOT NULL`),
+		// FK covering indexes (SET NULL on resource / narrator / user deletion).
+		index("idx_team_work_items_worktree").on(table.worktreeResourceId),
+		index("idx_team_work_items_worker").on(table.workerNarratorId),
+		index("idx_team_work_items_created_by").on(table.createdBy),
+		check(
+			"ck_team_work_items_state",
+			sql`${table.state} in ('queued', 'in_progress', 'in_review', 'ready', 'merged', 'cancelled')`,
+		),
+		check(
+			"ck_team_work_items_last_review",
+			sql`${table.lastReview} is null or ${table.lastReview} in ('blocker', 'clear')`,
+		),
+		check("ck_team_work_items_review_rounds", sql`${table.reviewRounds} >= 0`),
+		check(
+			"ck_team_work_items_changed_paths_bytes",
+			sql`${table.changedPathsJson} is null or length(cast(${table.changedPathsJson} as blob)) <= 131072`,
+		),
+	],
+);
+
+/**
+ * D: a work item waits for another item of the same team to merge before it may start. Deleting
+ * either item (or the team) deletes the edge. The coordinator sets an item's whole set at once
+ * (`Team` `dependsOn`): at most 20, both ends in `team_id`, no cycles — checked by the service
+ * (`teams/work-item-dependencies.ts`), since a composite key across teams does not transpile to
+ * PostgreSQL here.
+ */
+export const teamWorkItemDependencies = sqliteTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+		// Who depends on an item: the unblock check when it merges, and the drawer's dependents.
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		// FK covering index (CASCADE on team deletion).
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql`${table.itemId} <> ${table.dependsOnItemId}`),
+	],
+);
+
+/** Append-only log of team changes, each with its person or agent. */
+export const teamWorkEvents = sqliteTable(
+	"team_work_events",
+	{
+		id: text("id").primaryKey(),
+		/** Null for team-level events. */
+		workItemId: text("work_item_id").references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		actorKind: text("actor_kind", { enum: ["person", "agent", "system"] }).notNull(),
+		/** A user id (person) or narrator id (agent); not a foreign key so the log outlives both. */
+		actorId: text("actor_id"),
+		detailJson: text("detail_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_events_team_created").on(table.teamId, table.createdAt, table.id),
+		index("idx_team_work_events_item_created").on(table.workItemId, table.createdAt, table.id),
+		// The coordinator conversation's dividers read a few kinds per team since a time.
+		index("idx_team_work_events_team_kind_created").on(
+			table.teamId,
+			table.kind,
+			table.createdAt,
+			table.id,
+		),
+		check(
+			"ck_team_work_events_actor_kind",
+			sql`${table.actorKind} in ('person', 'agent', 'system')`,
+		),
+		check(
+			"ck_team_work_events_detail_bytes",
+			sql`${table.detailJson} is null or length(cast(${table.detailJson} as blob)) <= 8192`,
 		),
 	],
 );

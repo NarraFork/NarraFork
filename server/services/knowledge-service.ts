@@ -11,11 +11,7 @@ import type {
 	KnowledgeEntryRow,
 	KnowledgeEntryTitleCursor,
 } from "./knowledge/read-store";
-import {
-	knowledgeReadStore,
-	knowledgeWriteStore,
-	synchronousKnowledgeInjectionReads,
-} from "./knowledge/store";
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
 import { type KnowledgeCollectionRow, WriteConflictError } from "./knowledge/write-store";
 import {
 	type AclCollection,
@@ -786,12 +782,8 @@ export async function entryViewerCaps(
 	};
 }
 
-/**
- * `GET /entries/:id` for the UI: the full entry (with content) plus `viewerCaps`. Same read gate
- * as {@link getEntry} (unreadable or missing collection → NotFound); caps resolved once.
- */
-async function getEntryForViewer(id: string, principal: Principal) {
-	const entry = await knowledgeReadStore.getEntryById(id);
+async function requireReadableEntryAcl(id: string, principal: Principal) {
+	const entry = await knowledgeReadStore.getEntryAclById(id);
 	if (!entry) throw new NotFoundError("Knowledge entry", id);
 	const collection = await knowledgeReadStore.getCollectionById(entry.collectionId);
 	if (!collection) throw new NotFoundError("Knowledge entry", id);
@@ -801,17 +793,36 @@ async function getEntryForViewer(id: string, principal: Principal) {
 	if (!(await canRead(caps, aclEntry, aclCol))) {
 		throw new NotFoundError("Knowledge entry", id);
 	}
+	return { caps, aclEntry, aclCol };
+}
+
+/** Full entry for the UI, with capabilities from the current ACL, not the body snapshot. */
+async function getEntryForViewer(id: string, principal: Principal, signal?: AbortSignal) {
+	signal?.throwIfAborted();
+	await requireReadableEntryAcl(id, principal);
+	const entry = await knowledgeReadStore.getEntryDetailById(id, signal);
+	if (!entry) throw new NotFoundError("Knowledge entry", id);
+	signal?.throwIfAborted();
+	const { caps, aclEntry, aclCol } = await requireReadableEntryAcl(id, principal);
+	if (
+		entry.collectionId !== aclEntry.collectionId ||
+		!(await canRead(caps, toAclEntry(entry), aclCol))
+	) {
+		throw new NotFoundError("Knowledge entry", id);
+	}
 	const [owner, latest] = await Promise.all([
 		entry.ownerUserId ? knowledgeReadStore.getUsernameById(entry.ownerUserId) : null,
 		// Newest revision's metadata only (version-descending, limit 1, no body).
 		knowledgeReadStore.listRevisionMeta(entry.id, 1),
 	]);
+	const viewerCaps = await entryViewerCaps(caps, aclEntry, aclCol);
+	signal?.throwIfAborted();
 	return {
 		...entry,
 		// Display only: the owner id is already on the row; the read page shows the name.
 		ownerUsername: owner?.username ?? null,
 		currentVersion: latest[0]?.version ?? null,
-		viewerCaps: await entryViewerCaps(caps, aclEntry, aclCol),
+		viewerCaps,
 	};
 }
 
@@ -1287,8 +1298,10 @@ function parseStringArrayJson(raw: unknown): string[] {
  */
 const KEYWORD_INJECTION_CANDIDATE_LIMIT = 5000;
 
-function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
-	const rows = synchronousKnowledgeInjectionReads().listKeywordInjectionCandidates({
+async function listKeywordInjectionCandidates(
+	opts: { collectionId?: string; projectId?: string } = {},
+) {
+	const rows = await knowledgeReadStore.listKeywordInjectionCandidates({
 		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
 		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
 		limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
@@ -1316,10 +1329,10 @@ function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId
  * built Aho-Corasick matcher until this signature changes — keeping the hot passive
  * injection path off the 5000-row read + trie rebuild on every tool output.
  */
-function keywordInjectionCandidatesSignature(
+async function keywordInjectionCandidatesSignature(
 	opts: { collectionId?: string; projectId?: string } = {},
-): string {
-	return synchronousKnowledgeInjectionReads().keywordInjectionCandidatesSignature({
+): Promise<string> {
+	return knowledgeReadStore.keywordInjectionCandidatesSignature({
 		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
 		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
 	});
@@ -1337,19 +1350,19 @@ const SNIPPETS_LOOKUP_MAX = 100;
  * a small, indexed, bounded read — at most `maxInjectedEntries` (3) rows per turn.
  */
 const SNIPPET_SOURCE_CHARS = 1536;
-function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
+async function snippetsByEntryIds(entryIds: string[]): Promise<Map<string, string>> {
 	const out = new Map<string, string>();
 	const ids = entryIds.slice(0, SNIPPETS_LOOKUP_MAX);
 	if (ids.length === 0) return out;
-	const rows = synchronousKnowledgeInjectionReads().snippetsByEntryIds(ids, SNIPPET_SOURCE_CHARS);
+	const rows = await knowledgeReadStore.snippetsByEntryIds(ids, SNIPPET_SOURCE_CHARS);
 	for (const row of rows) out.set(row.id, row.snippet ?? "");
 	return out;
 }
 
 type KnowledgeInjectionSource = "user_message" | "tool_output" | "system_continuation";
 
-function listInjectedEntryIds(narratorId: string, compactSeq: number): Set<string> {
-	const ids = synchronousKnowledgeInjectionReads().listInjectedEntryIds(narratorId, compactSeq);
+async function listInjectedEntryIds(narratorId: string, compactSeq: number): Promise<Set<string>> {
+	const ids = await knowledgeReadStore.listInjectedEntryIds(narratorId, compactSeq);
 	return new Set(ids);
 }
 
@@ -1549,7 +1562,12 @@ export const knowledgeInjectionReads = {
 			.filter((row) => row.keywords.length > 0);
 	},
 	async keywordInjectionCandidatesSignature(
-		opts: { collectionId?: string; projectId?: string; userId?: string | null } = {},
+		opts: {
+			collectionId?: string;
+			projectId?: string;
+			userId?: string | null;
+			signal?: AbortSignal;
+		} = {},
 	) {
 		const global = await knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
 		const personal = opts.userId

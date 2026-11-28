@@ -137,7 +137,9 @@ export {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
@@ -198,11 +200,31 @@ export {
 	notificationMarkReadSchema,
 } from "./notifications";
 export {
+	coordinatorLimitsSchema,
+	createProjectTeamSchema,
+	listProjectTeamsQuerySchema,
+	mergeTeamPullRequestSchema,
+	releaseTeamLockSchema,
+	returnTeamWorkItemSchema,
+	teamActivityQuerySchema,
+	teamBaseBranchSchema,
+	teamBoardQuerySchema,
+	teamBriefSchema,
+	teamGithubPinSchema,
+	teamSettingsSchema,
+	teamWorkDiffQuerySchema,
+	teamWorkStatsQuerySchema,
+	updateProjectTeamSchema,
+	upgradeProjectTeamSchema,
+} from "./project-teams";
+export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
 	projectMembersSchema,
+	projectSessionsQuerySchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "./projects";
 export {
@@ -224,9 +246,12 @@ export {
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
 	createRecentTabFolderSchema,
+	MAX_HIDDEN_PLUGIN_OVERLAYS,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
+	pluginOverlayVisibilityPatchSchema,
 	recentTabSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
@@ -238,9 +263,14 @@ export {
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "./settings";
-export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
+export {
+	createProjectSkillSchema,
+	importSkillSchema,
+	updateProjectSkillSchema,
+} from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
+export { unattendedOptionsSchema } from "./unattended";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export {

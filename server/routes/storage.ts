@@ -189,6 +189,7 @@ storageRoutes.post("/database/preview", requireAdmin, async (c) => {
 	const result = await databaseCleanupService.previewCleanup(parsed.data.target, {
 		olderThanDays: parsed.data.olderThanDays,
 		sampleLimit: parsed.data.sampleLimit,
+		signal: c.req.raw.signal,
 	});
 	return c.json(result);
 });

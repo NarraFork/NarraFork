@@ -6,9 +6,12 @@
  */
 
 import { logger } from "../../lib/logger";
-import { createProxyAgent, resolveOverride } from "../../lib/net/proxy";
+import { createProxyAgent, resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, SlackConfig } from "../types";
+
+/** Slack web-api endpoint; the proxy is resolved against it so no_proxy rules apply. */
+const SLACK_API_ENDPOINT = "https://slack.com/api/";
 
 interface SlackMessageLike {
 	subtype?: string;
@@ -53,10 +56,13 @@ export class SlackAdapter extends BaseAdapter {
 			const { App } = await import("@slack/bolt");
 
 			// Route Slack web-api (REST) traffic through the resolved proxy (this
-			// platform's override, else the global policy). NOTE: the `agent`
+			// platform's override, else the global policy). The agent covers every
+			// Slack host, so it is resolved against the platform's API endpoint;
+			// that keeps `settings.proxy.noProxyRules` effective for this channel
+			// (a matching rule yields no agent at all). NOTE: the `agent`
 			// reliably applies to REST calls (chat.postMessage etc.); Socket Mode's
 			// event WebSocket does NOT honour it — see the warning below.
-			const proxy = resolveOverride(this.config.proxy);
+			const proxy = resolveProxyForUrl(SLACK_API_ENDPOINT, this.config.proxy);
 			const agent = await createProxyAgent(proxy);
 			if (proxy) {
 				logger.warn(
@@ -67,8 +73,7 @@ export class SlackAdapter extends BaseAdapter {
 				token: this.config.botToken,
 				appToken: this.config.appToken,
 				socketMode: true,
-				// biome-ignore lint/suspicious/noExplicitAny: proxy agents are real http.Agent subclasses at runtime
-				...(agent ? { agent: agent as any } : {}),
+				...(agent ? { agent } : {}),
 			}) as unknown as SlackAppLike;
 
 			// Listen for messages

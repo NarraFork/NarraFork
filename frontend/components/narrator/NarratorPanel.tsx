@@ -23,6 +23,7 @@ import { notifications } from "@mantine/notifications";
 import { parseProviderWaitInfo } from "@shared/agent-protocol/quota-exhausted";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	FileReference,
 	FileReferenceContext,
@@ -47,15 +48,12 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
-import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
-import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
-import { useAllModels } from "../../hooks/useModels";
+import { useRuntimeModel } from "../../hooks/useModelCatalog";
 import {
 	useArchiveNarrator,
 	useCreateNarrator,
@@ -74,8 +72,9 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
+import { useNarratorExecutionDevices } from "../../hooks/useNarratorExecutionDevices";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
-import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
+import { useNarratorUiSummary } from "../../hooks/useNarratorUiSummary";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
@@ -86,12 +85,16 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalance } from "../../hooks/useProviderBalance";
+import {
+	selectQuotaEntries,
+	useCommandCodeCliQuota,
+	useQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
+import { RUNTIME_SETTINGS_QUERY_KEY, useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
-import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
+	currentWorkspaceContext,
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
 	workspaceDirectoryRequiredDeviceId,
@@ -115,7 +118,6 @@ import {
 	useOutlineOpener,
 } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
-import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -132,18 +134,20 @@ import {
 import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
+import { canOfferTeamUpgrade } from "../teams/team-upgrade-eligibility";
+import { UpgradeToTeamModal } from "../teams/UpgradeToTeamModal";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
 } from "./background/BackgroundTasksDrawer";
 import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
+import { resolveCanTakeover } from "./composer/composer-action-slot";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
@@ -160,6 +164,7 @@ import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+import { NarratorTeamBadge, useNarratorTeamBadge } from "./header/NarratorTeamBadge";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
 	getNarratorStatusBarDisplay,
@@ -169,6 +174,7 @@ import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badge
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
+import { isFastModeSubagent } from "./interaction/fast-mode-state";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
@@ -185,10 +191,12 @@ import { useMessageRevertConfirm } from "./interaction/use-message-revert-confir
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
+import { runtimeSummaryToResolvedModel } from "./interaction/use-resolved-model";
+import { useSubagentSessionOpener } from "./interaction/use-subagent-session-opener";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { AgentReferenceOpenerContext } from "./markdown/AgentReferenceLink";
 import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
@@ -196,13 +204,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
-import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
-import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
-import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
-import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -212,6 +214,7 @@ import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import { OutlineDrawerHost } from "./OutlineDrawerHost";
+import { useReportPanelConnection } from "./panel-connection";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -267,11 +270,9 @@ const FilePanelContent = REMOTE_BUILD
 			})),
 		);
 
-// Flag-gated pretext virtualized list. Now the default renderer, but still lazily
-// imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
-// guard requires this dynamic import (no static import of vlist from outside the
-// vlist/ directory). The exact-layout shell is the sole Virtual renderer (the band
-// path has been retired).
+// Loaded lazily. The isolation guard requires this dynamic import (no static
+// import of vlist from outside the vlist/ directory). The exact-layout shell is
+// the sole renderer; the band path has been retired.
 const PretextExactMessageList = lazy(() =>
 	import("./vlist/PretextExactMessageList").then((module) => ({
 		default: module.PretextExactMessageList,
@@ -298,7 +299,6 @@ function NarratorPanelBody({
 	highlightMessageId,
 	highlightRequestId,
 	highlightNeedle,
-	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
@@ -317,6 +317,9 @@ function NarratorPanelBody({
 	onDetailsPropsChange,
 	specPanelOpen,
 	onToggleSpecPanel,
+	readOnlyNotice,
+	hideHeader = false,
+	onConnectionChange,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const fileDrawerVisible = useNarratorPanelVisible();
@@ -415,16 +418,34 @@ function NarratorPanelBody({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const modelMutation = useUpdateModel();
-	const {
-		visibleWithDefault: allModels,
-		groupedModels,
-		defaultModelValue,
-		summaryModelValue,
-		settingsData,
-		aggregations,
-		providerLabels,
-		nugProviderIdByPrefix,
-	} = useAllModels();
+	const { data: settingsData } = useRuntimeSettings();
+	const defaultModelValue = settingsData?.agent.defaultModel ?? "";
+	const summaryModelValue = settingsData?.agent.summaryModel;
+	const { data: modelSummary } = useRuntimeModel({
+		model: narrator ? narrator.model?.trim() || "__default__" : undefined,
+		narratorId,
+		summary: narrator?.modelSummary,
+		revision: settingsData ? String(settingsData.revision) : undefined,
+	});
+	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
+		runtimeSummaryToResolvedModel(modelSummary);
+	const allModels = useMemo(
+		() => (resolvedModelOption ? [resolvedModelOption] : []),
+		[resolvedModelOption],
+	);
+	const aggregations = useMemo(() => [], []);
+	const providerLabels = useMemo(
+		() =>
+			modelSummary?.provider ? { [modelSummary.provider.prefix]: modelSummary.provider.name } : {},
+		[modelSummary?.provider],
+	);
+	const nugProviderIdByPrefix = useMemo(
+		() =>
+			modelSummary?.provider?.quotaKind === "nug"
+				? { [modelSummary.provider.prefix]: modelSummary.provider.id }
+				: {},
+		[modelSummary?.provider],
+	);
 	const { data: currentUser } = useCurrentUser();
 	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -453,7 +474,6 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -491,34 +511,14 @@ function NarratorPanelBody({
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
-	/*
-	 * Unread count for the discussion-room toolbar entry.
-	 *
-	 * Deliberately NOT gated on `dock` any more. It used to be, on the premise that
-	 * a dock surface is "the only surface with a panel to open" — that premise is no
-	 * longer true (MobileToolPanelHost opens the room in a Drawer), and leaving the
-	 * gate would have made the mobile badge silently read zero: the room would never
-	 * resolve, so `byRoom[...]` would have nothing to look up and the entry would
-	 * claim there was nothing to read.
-	 *
-	 * Still skipped for workspace previews, which stay lightweight and offer no
-	 * tool entries at all.
-	 */
-	const userChatRoomQuery = useNarratorChatRoom(
+	// The badge never resolves/creates a room or reads every room's unread count.
+	const uiSummaryQuery = useNarratorUiSummary(
 		narratorId,
 		!isWorkspacePreview && firstScreenActivity,
 	);
-	const chatUnreadQuery = useChatUnread(firstScreenActivity);
-	const userChatRoomId = userChatRoomQuery.data?.id;
-	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
+	const userChatUnread = uiSummaryQuery.data?.discussion.unread ?? 0;
 	const qc = useQueryClient();
-	const executionDevicesQuery = useQuery({
-		queryKey: ["narratorExecutionDevices", narratorId],
-		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: !REMOTE_BUILD && !isWorkspacePreview,
-		// 设备列表变化缓慢, 60s 轮询足够
-		refetchInterval: 60_000,
-	});
+	const executionDevicesQuery = useNarratorExecutionDevices(narratorId, !isWorkspacePreview);
 	// A device with no recorded directory refuses the switch; that is a prompt, not a
 	// failure, so it opens the directory dialog instead of a red toast. The dialog is
 	// mounted here (outside the header and overflow menus) so both entry points share it.
@@ -536,9 +536,12 @@ function NarratorPanelBody({
 		notifications.show({ color: "red", message: error.message });
 	});
 	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
+		mutationFn: api.updateRuntimeSettings,
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+			void qc.invalidateQueries({ queryKey: RUNTIME_SETTINGS_QUERY_KEY });
+			void qc.invalidateQueries({ queryKey: ["model-catalog", "runtime"] });
+			void qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
 			// Only invalidate contextThresholds — settings cache is already
 			// updated via setQueryData above, no need to trigger a refetch.
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
@@ -655,178 +658,56 @@ function NarratorPanelBody({
 	// menu button: phones have no header row of their own.
 	const showMobileNav = !REMOTE_BUILD && ownsHorizontalSafeArea && isMobileViewport;
 
-	// Resolve the effective model: when following default, use the actual default
-	// model value; when using a model aggregation, resolve to a representative
-	// concrete member so capability/context-window lookups work (the backend
-	// resolves the actual member at request time). A follow-parent subagent
-	// resolves through its server-reported inheritance instead of the raw
-	// `__parent__` sentinel, which no capability lookup can parse.
-	// Only the model *resolution* stays in the panel: resolvedModel feeds the NUG
-	// quota, Kimi usage and context-threshold queries and the WS state below. The
-	// reasoning/codex/fast-mode/permission control derivations moved down into the
-	// status bar (see useStatusBarProps), which is where they are consumed.
-	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
-		useResolvedModel(
-			capabilityModelReference(
-				narrator?.model,
-				narrator?.modelInheritance?.model,
-				narrator?.runtimeModel,
-			),
-			defaultModelValue,
-			aggregations,
-			allModels,
-		);
-	// The catalog card a request for this model resolves to; feeds the reasoning tiers.
-	const { data: modelCard } = useActualResolvedModelCard(resolvedModel || undefined);
+	// The authorized runtime summary above owns the concrete provider and capabilities.
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
 		queryKey: ["contextThresholds", resolvedBareModel, resolvedProvider],
 		queryFn: () => api.getContextThresholds(resolvedBareModel, resolvedProvider),
+		enabled: !!narrator && !!modelSummary?.concreteValue && !!resolvedProvider,
 		staleTime: 5 * 60 * 1000,
 		placeholderData: DEFAULT_CONTEXT_THRESHOLDS.standard,
 	});
 
-	// NUG quota data layer (provider config + quota queries + cache writeback +
-	// derived provider info). Kept lifted here because the derived info feeds the
-	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(
-		resolvedModel,
-		settingsData?.nugProviders,
-		firstScreenActivity,
+	// NUG uses one cached-only group read tied to the authorized runtime generation.
+	const currentRuntimeProvider = modelSummary?.provider;
+	const nugProviderSettings = useMemo(
+		() => (currentRuntimeProvider?.quotaKind === "nug" ? [currentRuntimeProvider] : undefined),
+		[currentRuntimeProvider],
 	);
-	const tokenDanceConnection = settingsData?.tokendance;
-	const tokenDanceGeneration =
-		resolvedModel?.startsWith("tokendance:") &&
-		tokenDanceConnection?.connected &&
-		!tokenDanceConnection.disabled &&
-		Number.isSafeInteger(tokenDanceConnection.generation)
-			? (tokenDanceConnection.generation as number)
-			: undefined;
-	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
-	const tokenDanceQuota = tokenDanceQuotaView(
-		tokenDanceBalanceQuery.data,
-		tokenDanceGeneration,
-		currentUser?.role === "admin",
-		t,
+	const nugProviderInfo = useNugQuota(resolvedModel, nugProviderSettings, firstScreenActivity);
+	const { data: quotaSnapshots } = useQuotaSnapshots(
+		firstScreenActivity &&
+			!!modelSummary?.concreteValue &&
+			currentRuntimeProvider?.quotaKind !== "nug",
 	);
-
-	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
-	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
-	const commandCodeUsageQuery = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
-		enabled: !REMOTE_BUILD && commandCodeEnabled,
-		refetchInterval: commandCodeEnabled ? 60_000 : false,
-	});
-	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
-	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
-	// stays disabled unless the current narrator's provider is a Kimi provider,
-	// so nothing polls while Kimi is not in use.
-	const currentKimiProviderId = useMemo(() => {
+	// CLI-only accounts have no reusable server cache. Only this active consumer may
+	// request the one-shot read; ordinary snapshot readers never start CLI work.
+	useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode");
+	const currentQuotaEntries = useMemo(() => {
+		if (currentRuntimeProvider?.quotaKind === "nug") return nugProviderInfo?.entries ?? [];
 		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isKimiProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const { data: kimiUsagesData } = useQuery({
-		queryKey: ["kimi", "usages"],
-		queryFn: api.kimiGetUsages,
-		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
-		staleTime: 30_000,
-		refetchInterval: 60_000,
-	});
-
-	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
-	// generation token so an allowance fetched for a replaced account is never shown.
-	// The current window lives in the status bar; weekly/monthly are in the popover.
-	const currentOpencodeProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const opencodeGeneration = currentOpencodeProviderId
-		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
-		: undefined;
-	const opencodeUsageQuery = useOpencodeUsage(
-		currentOpencodeProviderId,
-		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
-		firstScreenActivity,
-	);
-
-	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
-	// generation so a balance fetched for a replaced account is never shown.
-	const currentDeepSeekProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (
-			(settingsData?.customApiProviders ?? []) as Array<{
-				id: string;
-				prefix?: string;
-				baseUrl?: string;
-				disabled?: boolean;
-			}>
-		).find((p) => p.prefix === prefix);
-		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
-	}, [resolvedModel, settingsData?.customApiProviders]);
-	const deepseekGeneration = currentDeepSeekProviderId
-		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
-		: undefined;
-	const deepseekBalancesQuery = useDeepSeekBalance(
-		currentDeepSeekProviderId,
-		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
-		firstScreenActivity,
-	);
-
-	const currentBalanceProviderId = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const cfg = (settingsData?.customApiProviders ?? []).find(
-			(p: { id: string; prefix?: string; disabled?: boolean }) =>
-				p.prefix === prefix && !p.disabled,
+		if (!prefix) return [];
+		return selectQuotaEntries(quotaSnapshots?.entries ?? []).filter(
+			(entry) => entry.prefix === prefix && entry.supported !== false,
 		);
-		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
-			? (cfg.id as string)
-			: null;
-	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
-	const balanceGeneration = currentBalanceProviderId
-		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
-		: undefined;
-	const providerBalanceQuery = useProviderBalance(
-		currentBalanceProviderId,
-		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
-		firstScreenActivity,
+	}, [resolvedModel, quotaSnapshots, currentRuntimeProvider, nugProviderInfo]);
+	const nugQuotaSnapshot = currentQuotaEntries.find(
+		(entry) => entry.groupId === nugProviderInfo?.providerId,
+	)?.snapshot;
+	const tokenDanceRechargeEnabled = Boolean(
+		!REMOTE_BUILD &&
+			currentRuntimeProvider?.quotaKind === "tokendance" &&
+			typeof currentRuntimeProvider.generation === "number" &&
+			currentUser?.role === "admin",
 	);
-	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
-		customApiBalanceDisplayFor({
-			providerId: currentBalanceProviderId,
-			pushedQuotas: settingsData?.customApiQuotas,
-			snapshot: providerBalanceQuery.data,
-		});
+	const tokenDanceRemaining = currentQuotaEntries[0]?.snapshot?.balances[0]?.remaining;
+	const tokenDanceBalanceKnown =
+		typeof tokenDanceRemaining === "number" && Number.isFinite(tokenDanceRemaining);
 
-	// Active terminal count for badge indicator
-	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
-	const activeTerminalCount = useMemo(
-		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
-		[narratorTerminals],
-	);
+	// Shared with the route and terminal access gate.
+	const canOpenTerminals = uiSummaryQuery.isError ? undefined : uiSummaryQuery.data?.canWrite;
+	const activeTerminalCount = uiSummaryQuery.data?.activeTerminalCount ?? 0;
 
 	// --- Message operations ---
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
@@ -855,8 +736,15 @@ function NarratorPanelBody({
 				return false;
 			}
 			try {
+				const currentWorkspace = currentWorkspaceContext(qc, narratorId);
+				if (!currentWorkspace) throw new Error(t("revertPlanReloadRequired"));
+				if (!isFileHistoryEnabledForDevice(currentWorkspace.deviceId) && !revertOpts.skipRevert)
+					throw new Error(t("revertPlanReloadRequired"));
+				const confirmedOpts = !isFileHistoryEnabledForDevice(currentWorkspace.deviceId)
+					? { skipRevert: true }
+					: revertOpts;
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
-					...revertOpts,
+					...confirmedOpts,
 					...opts,
 					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
@@ -1210,8 +1098,7 @@ function NarratorPanelBody({
 	}, [isWorkspacePreview, scrollToBottom, suppressAutoFocusOnPromote]);
 
 	// --- WebSocket + real-time state ---
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = !!(fetchedNarrator as any)?.variant?.startsWith("subagent:");
+	const isSubagent = isFastModeSubagent(narrator ?? {});
 
 	// Parse persisted substatus from narrator data to seed the WS hook's reducer
 	const narratorSubstatus = useMemo(() => {
@@ -1228,81 +1115,6 @@ function NarratorPanelBody({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-	// Resolve custom API provider info for initial generic quota balance
-	const customApiProviderInfo = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const customApiProviders: Array<{ id: string; prefix?: string }> =
-			settingsData?.customApiProviders ?? [];
-		const cfg = customApiProviders.find((p) => p.prefix === prefix);
-		if (!cfg) return null;
-		if (cfg.id === currentDeepSeekProviderId) {
-			return {
-				providerId: cfg.id,
-				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
-			};
-		}
-		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
-		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
-		// Go one would otherwise fall through to the previous account's Kimi allowance.
-		const usageSource = usageSourceFor({
-			providerId: cfg.id,
-			opencodeProviderId: currentOpencodeProviderId,
-			kimiProviderId: currentKimiProviderId,
-		});
-		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
-		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
-		// generic text-balance slot — showing both would duplicate the 5h figure.
-		if (usageSource === "opencode") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
-		if (usageSource === "kimi") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && pushedQuota) {
-			return { providerId: cfg.id, ...pushedQuota };
-		}
-		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
-			// The shared window panel owns subscription amounts, including unknown/stale
-			// placeholders. Do not duplicate them in the generic balance text slot.
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
-			return {
-				providerId: cfg.id,
-				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
-			};
-		}
-		const quotas = settingsData?.customApiQuotas as
-			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
-			| undefined;
-		const quota = quotas?.[cfg.id];
-		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
-		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quota?.quotaBalance ?? null,
-			detailedQuotaBalance,
-		};
-	}, [
-		resolvedModel,
-		settingsData?.customApiProviders,
-		settingsData?.customApiQuotas,
-		currentKimiProviderId,
-		currentOpencodeProviderId,
-		currentDeepSeekProviderId,
-		deepseekBalancesQuery.data,
-		deepseekBalancesQuery.isError,
-		currentBalanceProviderId,
-		pushedQuota,
-		sub2ApiSubscriptionSnapshot,
-		providerBalanceQuery.data,
-		providerBalanceQuery.isError,
-		balanceT,
-		t,
-	]);
-
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -1311,12 +1123,21 @@ function NarratorPanelBody({
 		isAtBottomRef,
 		isSubagent,
 		narratorSubstatus,
-		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
-		initialDetailedQuotaBalance:
-			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
-		customApiProviderId: customApiProviderInfo?.providerId,
-		nugProviderId: nugProviderInfo?.providerId,
-		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
+		quotaReadScope:
+			currentRuntimeProvider?.quotaKind === "nug"
+				? {
+						groupId: currentRuntimeProvider.id,
+						cachedOnly: true,
+						expectedGeneration: currentRuntimeProvider.generation,
+					}
+				: undefined,
+		quotaProviderKey: currentRuntimeProvider
+			? JSON.stringify([
+					currentRuntimeProvider.id,
+					currentRuntimeProvider.quotaKind,
+					currentRuntimeProvider.generation ?? null,
+				])
+			: undefined,
 		onDraftChanged: forwardDraftChanged,
 		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
@@ -1354,8 +1175,6 @@ function NarratorPanelBody({
 		activeCompactStart,
 		compactProgress,
 		compactFailure,
-		quotaBalance,
-		detailedQuotaBalance,
 		retryInfo,
 		quotaWaitInfo,
 		paymentRequired,
@@ -1367,11 +1186,12 @@ function NarratorPanelBody({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
-	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
+	// A host that hides the header (the team page) shows the 「连接断开」 badge's state itself and
+	// reconnects through the panel: the same socket, no second connection logic.
+	useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);
+	// NUG recharge derivations (flags, dialog disclosure, and the
 	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
 	const {
-		quotaDetailsText,
-		hasQuotaDetailsPopover,
 		shouldShowNugRechargeButton,
 		shouldShowNugRechargeInQuotaDetails,
 		nugRechargeOpened,
@@ -1379,8 +1199,7 @@ function NarratorPanelBody({
 		closeNugRecharge,
 	} = useNarratorQuota({
 		nugProviderInfo,
-		quotaBalance,
-		detailedQuotaBalance,
+		snapshot: nugQuotaSnapshot,
 		paymentRequired,
 		setPaymentRequired,
 		narratorSubstatus,
@@ -1600,21 +1419,14 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
+	// Hidden from read-only viewers: opening a terminal needs write access.
+	const terminalToolAvailable =
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals === true;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
 		else onToggleTerminal?.();
 	}, [dock, onToggleTerminal]);
-	// Chat → terminal "send selection": prefer the explicit prop, else bridge
-	// through the dock context (writes to the terminal panel if one is open).
-	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
-	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
-		if (REMOTE_BUILD) return undefined;
-		if (onSendToTerminal) return onSendToTerminal;
-		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
-		return undefined;
-	}, [onSendToTerminal, dock, terminalToolOpened, dockWriteTerminalStdin]);
 
 	// ── Plugin panel picker (dock surfaces only) ──
 	// Opens a plugin UI contribution as a dockview sibling panel. Params are
@@ -1711,7 +1523,13 @@ function NarratorPanelBody({
 	// tool call stays blocked. canTakeover is shown only while the subagent is
 	// running and not already taken over.
 	const isTakenOver = isSubagent && substatus.includes("taken_over");
-	const canTakeover = isSubagent && isActive && !isTakenOver && retryRecoveryAllowsInterrupt;
+	const canTakeover = resolveCanTakeover({
+		isSubagent,
+		isActive,
+		isTakenOver,
+		retryRecoveryAllowsInterrupt,
+		deliversResult: narrator?.deliversResult,
+	});
 	/**
 	 * Whether the composer may offer the cut-in (priority queue) action.
 	 *
@@ -2071,8 +1889,32 @@ function NarratorPanelBody({
 	 * is just a directory of links, which is noise in the toolbar menu.
 	 */
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
+	/**
+	 * Coordinator → team page link after the title. Decided here (not inside the badge) because
+	 * the header budgets its fixed width. Not in the Remote Access build: its router has no
+	 * team page.
+	 */
+	const teamBadge = useNarratorTeamBadge({
+		narratorId,
+		narrator,
+		projectId: compatibilityProjectId,
+		enabled: !REMOTE_BUILD && !isWorkspacePreview,
+	});
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
+	/**
+	 * "Upgrade to a team" (the overflow menu): offered for an ordinary session of a known project
+	 * (its resolved primary project, from the detail read). The dialog lives here, outside the
+	 * menu's dropdown, for the same reason as the project settings modal above.
+	 */
+	const [upgradeToTeamOpen, setUpgradeToTeamOpen] = useState(false);
+	const teamUpgradeProjectId =
+		(fetchedNarrator?.navigationSummary?.projectId as string | null | undefined) ??
+		compatibilityProjectId ??
+		null;
+	const teamUpgradeOffered =
+		!isWorkspacePreview && canOfferTeamUpgrade(narrator, teamUpgradeProjectId);
+	const openUpgradeToTeam = useCallback(() => setUpgradeToTeamOpen(true), []);
 	/**
 	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
 	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
@@ -2161,22 +2003,7 @@ function NarratorPanelBody({
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
-	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string, messageId?: string) => {
-			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId, messageId);
-				return;
-			}
-			// Standalone fallback: the narrator page reads `?scrollTo=` as its
-			// highlight target, which is the same jump the dock performs in-place.
-			navigate({
-				to: "/narrators/$narratorId",
-				params: { narratorId: subagentNarratorId },
-				search: messageId ? { scrollTo: messageId } : undefined,
-			});
-		},
-		[onViewSubagentSession, navigate],
-	);
+	const handleVlistViewSubagentSession = useSubagentSessionOpener(onViewSubagentSession);
 
 	/**
 	 * Open the Dynamic Spec panel with one file selected.
@@ -2277,7 +2104,6 @@ function NarratorPanelBody({
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
-	// Mirrors the props passed to ChunkedMessageList (same names/signatures).
 	const vlistRowHandlers = useMemo(
 		() => ({
 			onForkFromMessage: forkHandler,
@@ -2287,8 +2113,7 @@ function NarratorPanelBody({
 			onManualSummarize: compactSupported ? handleManualSummarize : undefined,
 			onDeleteBlock: handleDeleteBlock,
 			onRollbackToBlock: rollbackEditRegenerateSupported ? handleRollback : undefined,
-			// Message editing: same gating as the chunked branch below — the user
-			// flow requires provider support, the assistant text edit does not.
+			// The user flow requires provider support; the assistant text edit does not.
 			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 			resolveQueuedMessage,
 			onEditAssistantMessage: handleEditAssistantMessage,
@@ -2976,65 +2801,6 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
-	/**
-	 * Which plan the narrator is parked on, so only that provider's allowance
-	 * indicator turns red: the live event names the plan, and after a reload the
-	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
-	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
-	 */
-	const quotaWaitProvider = (() => {
-		if (!isWaitingForQuota) return undefined;
-		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
-		if (!narrator?.errorMessage) return undefined;
-		try {
-			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
-			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
-				return parsed.quotaProvider;
-			}
-		} catch {
-			// Not a waiting payload; leave the provider unknown.
-		}
-		return undefined;
-	})();
-
-	/**
-	 * Props for the OpenCode Go allowance indicator, or undefined when the current
-	 * model is not on a Go endpoint.
-	 */
-	const opencodeQuotaProps = (() => {
-		if (!currentOpencodeProviderId) return undefined;
-		const waitingForQuota = quotaWaitProvider === "opencode";
-		return {
-			usage: opencodeUsageQuery.data,
-			waitingForQuota,
-			waitingText: waitingForQuota ? quotaWaitText : null,
-		};
-	})();
-
-	/**
-	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
-	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
-	 * for, like the generic quota slot above, so a disabled query's stale entry
-	 * for a re-pointed provider is never shown.
-	 */
-	const kimiQuotaView = currentKimiProviderId
-		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
-		: null;
-	const quotaPanelProps = (() => {
-		if (currentKimiProviderId) {
-			const waitingForQuota = quotaWaitProvider === "kimi";
-			return {
-				view: kimiQuotaView,
-				waitingForQuota,
-				waitingText: waitingForQuota ? quotaWaitText : null,
-			};
-		}
-		if (commandCodeEnabled) {
-			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
-		}
-		return undefined;
-	})();
-
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3235,8 +3001,8 @@ function NarratorPanelBody({
 						<NugRechargeDialog
 							opened={nugRechargeOpened}
 							narratorId={narratorId}
-							providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
-							providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+							providerId={paymentRequired?.providerId ?? nugProviderInfo?.providerId ?? null}
+							providerName={paymentRequired?.providerPrefix ?? nugProviderInfo?.name ?? null}
 							paymentRequired={paymentRequired}
 							onClose={closeNugRecharge}
 							onPaymentRequiredChange={setPaymentRequired}
@@ -3245,138 +3011,146 @@ function NarratorPanelBody({
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
-					    fixed title @ pretext W, then only tools that fit after it. */}
-					<NarratorHeaderLayout
-						titleFullWidth={headerTitleFullWidth}
-						showBack={showLeadingChrome}
-						showMenu={showMobileNav}
-						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
-						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
-						showClose={!!onClose}
-						onHeaderPointerDown={onHeaderPointerDown}
-					>
-						{(headerLayout) => (
-							<>
-								{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
-								<div
-									style={{
-										display: "flex",
-										alignItems: "center",
-										gap: HEADER_LEADING_GAP_PX,
-										flexWrap: "nowrap",
-										flex: "0 0 auto",
-										minWidth: 0,
-										maxWidth: "100%",
-										overflow: "hidden",
-									}}
-								>
-									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
-									{showMobileNav && <MobileNavButton />}
-									{showLeadingChrome &&
-										(onBack ? (
-											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-												<IconArrowLeft size={16} />
-											</ActionIcon>
-										) : onOpenStandalonePage ? (
-											<Tooltip label={t("openStandalonePage")} position="right">
-												<ActionIcon
-													size="sm"
-													variant="subtle"
-													color="gray"
-													onClick={onOpenStandalonePage}
-												>
-													<IconExternalLink size={16} />
+					    fixed title @ pretext W, then only tools that fit after it. Left out
+					    when the host draws its own (`hideHeader`, the team page). */}
+					{!hideHeader && (
+						<NarratorHeaderLayout
+							titleFullWidth={headerTitleFullWidth}
+							showBack={showLeadingChrome}
+							showMenu={showMobileNav}
+							showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+							titleBadgeWidth={teamBadge?.width ?? 0}
+							surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
+							showClose={!!onClose}
+							onHeaderPointerDown={onHeaderPointerDown}
+						>
+							{(headerLayout) => (
+								<>
+									{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+									<div
+										style={{
+											display: "flex",
+											alignItems: "center",
+											gap: HEADER_LEADING_GAP_PX,
+											flexWrap: "nowrap",
+											flex: "0 0 auto",
+											minWidth: 0,
+											maxWidth: "100%",
+											overflow: "hidden",
+										}}
+									>
+										{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+										{showMobileNav && <MobileNavButton />}
+										{showLeadingChrome &&
+											(onBack ? (
+												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+													<IconArrowLeft size={16} />
 												</ActionIcon>
-											</Tooltip>
-										) : (
-											<NarratorPanelCompactContext.Consumer>
-												{(compact) =>
-													compact || workspaceId ? (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() =>
-																navigate({
-																	to: "/narrators/$narratorId",
-																	params: { narratorId },
-																	search: workspaceId
-																		? { from: "workspace", workspaceId }
-																		: undefined,
-																})
-															}
-														>
-															<IconExternalLink size={16} />
-														</ActionIcon>
-													) : (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() => navigate({ to: ".." })}
-														>
-															<IconArrowLeft size={16} />
-														</ActionIcon>
-													)
-												}
-											</NarratorPanelCompactContext.Consumer>
-										))}
-									{/*
-									 * `flex: 1` even when the title is suppressed: it is what pushes the
-									 * tool row to the right edge, and it hands the freed width to those
-									 * buttons instead of leaving a gap where the title used to be.
-									 *
-									 * The floor that keeps the title readable is the capacity BUDGET
-									 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
-									 * would win against the tool row's `flex-shrink: 0` only by overflowing
-									 * or wrapping a nowrap row — both worse than the truncation it would
-									 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
-									 * budgets it by policy instead of reading a width this element derives
-									 * from whatever the tool row left over.
-									 */}
-									<NarratorPanelHeaderTitle
-										narratorId={narratorId}
-										narrator={narrator}
-										hostOwnsTitle={hostOwnsTitle}
-										isWorkspacePreview={isWorkspacePreview}
-										titleFullWidth={headerLayout.titleWidth}
-									/>
-									{disconnected && !isWorkspacePreview && (
-										<Badge
-											size="xs"
-											variant="dot"
-											color="red"
-											style={{ cursor: "pointer", flex: "0 0 auto" }}
-											onClick={reconnect}
-											title={t("reconnect")}
-										>
-											{t("disconnected")}
-										</Badge>
+											) : onOpenStandalonePage ? (
+												<Tooltip label={t("openStandalonePage")} position="right">
+													<ActionIcon
+														size="sm"
+														variant="subtle"
+														color="gray"
+														onClick={onOpenStandalonePage}
+													>
+														<IconExternalLink size={16} />
+													</ActionIcon>
+												</Tooltip>
+											) : (
+												<NarratorPanelCompactContext.Consumer>
+													{(compact) =>
+														compact || workspaceId ? (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() =>
+																	navigate({
+																		to: "/narrators/$narratorId",
+																		params: { narratorId },
+																		search: workspaceId
+																			? { from: "workspace", workspaceId }
+																			: undefined,
+																	})
+																}
+															>
+																<IconExternalLink size={16} />
+															</ActionIcon>
+														) : (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() => navigate({ to: ".." })}
+															>
+																<IconArrowLeft size={16} />
+															</ActionIcon>
+														)
+													}
+												</NarratorPanelCompactContext.Consumer>
+											))}
+										{/*
+										 * `flex: 1` even when the title is suppressed: it is what pushes the
+										 * tool row to the right edge, and it hands the freed width to those
+										 * buttons instead of leaving a gap where the title used to be.
+										 *
+										 * The floor that keeps the title readable is the capacity BUDGET
+										 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+										 * would win against the tool row's `flex-shrink: 0` only by overflowing
+										 * or wrapping a nowrap row — both worse than the truncation it would
+										 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+										 * budgets it by policy instead of reading a width this element derives
+										 * from whatever the tool row left over.
+										 */}
+										<NarratorPanelHeaderTitle
+											narratorId={narratorId}
+											narrator={narrator}
+											hostOwnsTitle={hostOwnsTitle}
+											isWorkspacePreview={isWorkspacePreview}
+											titleFullWidth={headerLayout.titleWidth}
+										/>
+										{teamBadge && headerLayout.showTitleBadge && (
+											<NarratorTeamBadge target={teamBadge} />
+										)}
+										{disconnected && !isWorkspacePreview && (
+											<Badge
+												size="xs"
+												variant="dot"
+												color="red"
+												style={{ cursor: "pointer", flex: "0 0 auto" }}
+												onClick={reconnect}
+												title={t("reconnect")}
+											>
+												{t("disconnected")}
+											</Badge>
+										)}
+									</div>
+									{!isWorkspacePreview && (
+										<HeaderToolbar
+											onOpenSavedRecordings={() => setSaveDumpOpened(true)}
+											narratorId={narratorId}
+											controller={toolbarController}
+											inlineControls={toolbarInlineControls}
+											toolbarBadgeCounts={toolbarBadgeCounts}
+											headerHostCapabilities={headerHostCapabilities}
+											openArchiveConfirm={openArchiveConfirm}
+											archiveMutation={archiveMutation}
+											dock={dock}
+											mockStreamEnabled={mockStreamEnabled}
+											onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+											onOpenOutline={outlineEnabled ? openOutline : undefined}
+											onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
+											onClose={onClose}
+											visibleToolCount={headerLayout.visibleToolCount}
+											unmeasured={headerLayout.unmeasured}
+											t={t}
+										/>
 									)}
-								</div>
-								{!isWorkspacePreview && (
-									<HeaderToolbar
-										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
-										narratorId={narratorId}
-										controller={toolbarController}
-										inlineControls={toolbarInlineControls}
-										toolbarBadgeCounts={toolbarBadgeCounts}
-										headerHostCapabilities={headerHostCapabilities}
-										openArchiveConfirm={openArchiveConfirm}
-										archiveMutation={archiveMutation}
-										dock={dock}
-										mockStreamEnabled={mockStreamEnabled}
-										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
-										onOpenOutline={outlineEnabled ? openOutline : undefined}
-										onClose={onClose}
-										visibleToolCount={headerLayout.visibleToolCount}
-										unmeasured={headerLayout.unmeasured}
-										t={t}
-									/>
-								)}
-							</>
-						)}
-					</NarratorHeaderLayout>
+								</>
+							)}
+						</NarratorHeaderLayout>
+					)}
 
 					<LeakedToolCallModal
 						narratorId={narratorId}
@@ -3439,6 +3213,23 @@ function NarratorPanelBody({
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
 					/>
+
+					{upgradeToTeamOpen && teamUpgradeProjectId && (
+						<UpgradeToTeamModal
+							projectId={teamUpgradeProjectId}
+							narratorId={narratorId}
+							title={typeof narrator?.title === "string" ? narrator.title : null}
+							opened={upgradeToTeamOpen}
+							onClose={() => setUpgradeToTeamOpen(false)}
+							onUpgraded={(team) => {
+								setUpgradeToTeamOpen(false);
+								void navigate({
+									to: "/projects/$projectId/teams/$teamId",
+									params: { projectId: team.projectId, teamId: team.id },
+								});
+							}}
+						/>
+					)}
 
 					{!REMOTE_BUILD && (
 						<NarratorProjectSettingsModal
@@ -3612,14 +3403,6 @@ function NarratorPanelBody({
 							</Box>
 						)}
 
-						{effSendToTerminal && (
-							<SelectionPopover
-								containerRef={contentRef}
-								onAction={effSendToTerminal}
-								label={tt("sendToTerminal")}
-							/>
-						)}
-
 						{/* Scroll to bottom button */}
 						{!isWorkspacePreview && (
 							<Box
@@ -3673,7 +3456,11 @@ function NarratorPanelBody({
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
 						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
+						// Write access to the narrator (the terminal access read answers exactly that).
+						readOnly={canOpenTerminals === false}
+						readOnlyNotice={readOnlyNotice}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
+						pendingPermissions={wsState.pendingPermissions}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
 						attachedMedia={attachedMedia}
@@ -3760,10 +3547,11 @@ function NarratorPanelBody({
 								},
 							},
 							model: {
+								summary: modelSummary ?? undefined,
 								allModels,
 								aggregations,
 								providerLabels,
-								settingsData,
+								settingsData: undefined,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3774,26 +3562,17 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								// Structured subscription quotas are rendered by the status bar, not this text slot.
-								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
-								sub2api: sub2ApiSubscriptionSnapshot
-									? {
-											snapshot: sub2ApiSubscriptionSnapshot,
-											queryFailed: providerBalanceQuery.isError,
-										}
-									: undefined,
-								opencode: opencodeQuotaProps,
-								panel: quotaPanelProps,
+								entries: currentQuotaEntries,
+								waitingForQuota: isWaitingForQuota,
+								waitingText: isWaitingForQuota ? quotaWaitText : null,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
-								...(tokenDanceQuota
+								...(tokenDanceRechargeEnabled
 									? {
 											recharge: {
-												showButton: tokenDanceQuota.showRechargeButton,
-												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												showButton: !tokenDanceBalanceKnown || tokenDanceRemaining <= 0,
+												showInDetails: tokenDanceBalanceKnown && tokenDanceRemaining > 0,
 												onOpen: openTokenDanceRecharge,
 											},
 										}
@@ -3827,10 +3606,13 @@ function NarratorPanelBody({
 							resolvedModelOption,
 							narratorReasoningEffort: narrator.reasoningEffort,
 							settingsData,
-							modelCard,
+							modelSummary: modelSummary ?? undefined,
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
+							effectiveFastMode: narrator.effectiveFastMode,
+							fastModeSource: narrator.fastModeSource,
+							isSubagent,
 							fastModeDefault,
 							fastModeUsesTapSettings,
 							fastModeMutation,
@@ -3860,6 +3642,7 @@ function NarratorPanelBody({
 							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
+							readScope: wsState.readScope,
 							onAskSelection: askSelectionInPassing,
 							fileInputRef,
 							composerRef,
@@ -4071,7 +3854,7 @@ function NarratorPanelBody({
 			<SetGlobalModelModal
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
-				groupedModels={groupedModels}
+				groupedModels={[]}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}
@@ -4081,5 +3864,9 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
-	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
+	return (
+		<AgentReferenceOpenerContext.Provider value={handleVlistViewSubagentSession}>
+			<OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>
+		</AgentReferenceOpenerContext.Provider>
+	);
 }

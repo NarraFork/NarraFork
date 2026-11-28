@@ -43,6 +43,7 @@ import type { OutlineReportLateReason, SubagentDelegation } from "@shared/outlin
 // The row height comes from the shared row metrics, resolved at RENDER time, so it
 // tracks the reader's typography exactly as the measure side does.
 import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
+import { isNestedAgentActive, type SubagentNestedAgent } from "@shared/subagent-nested";
 import {
 	IconAlertTriangle,
 	IconBan,
@@ -54,6 +55,7 @@ import {
 	IconRobot,
 } from "@tabler/icons-react";
 import type { CSSProperties, ReactNode } from "react";
+import { useSubagentOutputCount } from "../../subagent-output-count-store";
 import {
 	BLOCK_PADDING_X,
 	badgeRowHeight,
@@ -175,6 +177,12 @@ export interface SubagentLabels {
 	/** Per-file churn qualifier: `{count}` edits. */
 	fileEdits?: string;
 	collapseFiles?: string;
+	/** Nested-helpers section title ("Helpers"): the agents this subagent launched. */
+	nestedTitle?: string;
+	/** Overflow row under the helpers: `{count}` more helpers. */
+	nestedMore?: string;
+	/** Badge on a helper whose permission request waits for a person. */
+	nestedAwaiting?: string;
 	/**
 	 * Timing popover strings for the header + recent-call rows. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
@@ -235,6 +243,9 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	countsTruncated: "counts truncated; totals are lower bounds",
 	fileEdits: "{count} edits",
 	collapseFiles: "Show fewer files",
+	nestedTitle: "Helpers",
+	nestedMore: "{count} more helpers",
+	nestedAwaiting: "Awaiting approval",
 };
 
 /**
@@ -289,6 +300,10 @@ type ResolvedSubagentLabels = Required<Omit<SubagentLabels, "timing" | "statusMa
 	Pick<SubagentLabels, "timing" | "statusMark">;
 
 interface RenderSubagentProps {
+	narratorId?: string;
+	toolUseId?: string;
+	toolCallId?: string;
+	executionAttempt?: number;
 	measured: MeasuredSubagent;
 	/** Description line text (collapsed truncate / expanded wrap). */
 	description: string;
@@ -310,6 +325,7 @@ interface RenderSubagentProps {
 	delegation?: SubagentDelegation;
 	/** The child's live reply char count — a badge on the fixed header row. */
 	liveOutputChars?: number;
+	liveOutputActive?: boolean;
 	/** Extra model badge. */
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
@@ -340,6 +356,14 @@ interface RenderSubagentProps {
 	onToggleFileChanges?: () => void;
 	/** "Open full session" click. */
 	onOpenSession?: () => void;
+	/**
+	 * The helpers this child launched (its one nested level). Painted from here; the
+	 * measure layer keeps only the row count (`measured.nestedRowCount`).
+	 */
+	nestedAgents?: SubagentNestedAgent[];
+	nestedTotal?: number;
+	/** Open one helper's own session (where its requests can also be decided). */
+	onOpenNestedSession?: (narratorId: string) => void;
 	/** Resolve-override click. */
 	onResolveOverride?: () => void;
 	/**
@@ -378,6 +402,84 @@ function SubagentStatusGlyph({ status }: { status?: string }) {
 		return <IconBan size={STATUS_ICON_SIZE} style={{ color: cssColor("orange", 6) }} />;
 	}
 	return <IconCircleCheck size={STATUS_ICON_SIZE} style={{ color: cssColor("green", 6) }} />;
+}
+
+/** The card's own status vocabulary for a helper that ended: failed → red, stopped → orange. */
+function nestedAgentGlyphStatus(agent: SubagentNestedAgent): string | undefined {
+	if (agent.ended === "failed") return "fail";
+	if (agent.ended === "stopped") return "cancelled";
+	return undefined;
+}
+
+/**
+ * One helper of the card's child: a trace-height row naming it, its status (a spinner
+ * while it runs, the status icon after) and, when its permission request waits for a
+ * person, a badge. Clicking opens the helper's own session.
+ */
+function NestedAgentRow({
+	agent,
+	labels,
+	onOpen,
+}: {
+	agent: SubagentNestedAgent;
+	labels: ResolvedSubagentLabels;
+	onOpen?: (narratorId: string) => void;
+}) {
+	const running = isNestedAgentActive(agent);
+	return (
+		<button
+			type="button"
+			className={ROW_BUTTON_CLASS}
+			data-testid="subagent-nested-row"
+			data-awaiting={agent.awaitingPermission ? "true" : undefined}
+			data-ended={agent.ended}
+			disabled={!onOpen}
+			onClick={
+				onOpen
+					? (e) => {
+							e.stopPropagation();
+							onOpen(agent.subagentNarratorId);
+						}
+					: undefined
+			}
+			style={{
+				display: "block",
+				width: "100%",
+				height: bareRowMetrics().height,
+				boxSizing: "border-box",
+				cursor: onOpen ? "pointer" : "default",
+			}}
+		>
+			<div className={ROW_FLEX_CLASS} style={{ ...rowFlexStyle(TRACE_ROW_GAP), height: "100%" }}>
+				<div style={TRACE_CHEVRON_SLOT_STYLE}>
+					<IconRobot size={TRACE_ROW_GLYPH_SIZE + 1} style={{ color: DIMMED }} aria-hidden />
+				</div>
+				<p
+					className={ROW_TEXT_CLASS}
+					data-truncate="end"
+					style={{ color: DIMMED, flex: "0 1 auto", minWidth: 0 }}
+				>
+					<span style={{ fontWeight: 600, marginRight: HEADER_CELL_GAP }}>
+						{agent.title?.trim() || agent.subagentType}
+					</span>
+					{agent.title?.trim() ? agent.subagentType : null}
+				</p>
+				{agent.awaitingPermission ? (
+					<Badge size="xs" variant="light" color="yellow" style={{ flexShrink: 0 }}>
+						{labels.nestedAwaiting}
+					</Badge>
+				) : null}
+				<div style={TRACE_ROW_STATUS_SLOT_STYLE}>
+					{running ? (
+						<Loader size={STATUS_ICON_SIZE - 2} color="blue" />
+					) : (
+						<SubagentStatusGlyph status={nestedAgentGlyphStatus(agent)} />
+					)}
+				</div>
+				<div style={{ flex: 1, minWidth: 0 }} />
+			</div>
+		</button>
+	);
 }
 
 /**
@@ -541,8 +643,16 @@ function SubagentModelBadge({
 
 export function RenderSubagent(props: RenderSubagentProps) {
 	const { measured, permissionSlot } = props;
+	const outputCount = useSubagentOutputCount(props.narratorId, props);
 	const labels = { ...DEFAULT_LABELS, ...props.labels };
-	const inner = <SubagentInner {...props} labels={labels} />;
+	const inner = (
+		<SubagentInner
+			{...props}
+			liveOutputChars={outputCount ? outputCount.count : props.liveOutputChars}
+			liveOutputActive={outputCount?.active}
+			labels={labels}
+		/>
+	);
 	const hasPermission = permissionSlot !== undefined;
 
 	// A live permission form is a relative-flow block appended below the absolutely
@@ -671,6 +781,7 @@ function SubagentInner({
 	isTakenOver,
 	delegation,
 	liveOutputChars,
+	liveOutputActive,
 	model,
 	modelInheritance,
 	reasoningEffort,
@@ -685,12 +796,17 @@ function SubagentInner({
 	onToggleFileChanges,
 	onOpenSession,
 	onResolveOverride,
+	nestedAgents = [],
+	nestedTotal,
+	onOpenNestedSession,
 	viewTargets,
 	viewControls,
 }: RenderSubagentProps & { labels: ResolvedSubagentLabels }) {
 	const active = isActive === true;
 	// Agent-type badge colour (mirrors SubagentCard.tsx agentBadgeColor).
-	const agentBadgeColor = ["explore", "plan", "general", "agent", "send"].includes(agentType)
+	const agentBadgeColor = ["explore", "plan", "general", "worker", "agent", "send"].includes(
+		agentType,
+	)
 		? "indigo"
 		: "teal";
 	let top = 0;
@@ -748,7 +864,7 @@ function SubagentInner({
 				) : null}
 				{/* Live reply counter (grey, same fixed badge row): the child's streamed
 				    output char count, ticking while it works. */}
-				{active && typeof liveOutputChars === "number" ? (
+				{(liveOutputActive ?? active) && typeof liveOutputChars === "number" ? (
 					<Badge data-testid="subagent-output-chars" size="xs" variant="light" color="gray">
 						{withCount(labels.liveOutputChars, liveOutputChars)}
 					</Badge>
@@ -961,6 +1077,64 @@ function SubagentInner({
 		top += measured.recentCallsHeight;
 	}
 
+	// ── Nested helpers (the card's one nested level) ────────────────────────────
+	let nested: React.ReactNode = null;
+	if (measured.nestedHeight > 0) {
+		nested = (
+			<div
+				key="nested"
+				data-testid="subagent-nested"
+				style={{
+					position: "absolute",
+					top,
+					left: 0,
+					right: 0,
+					height: measured.nestedHeight,
+					paddingLeft: BLOCK_PADDING_X,
+					paddingRight: BLOCK_PADDING_X,
+					paddingBottom: BLOCK_PADDING_X,
+					boxSizing: "border-box",
+				}}
+			>
+				<p
+					className={ROW_TEXT_CLASS}
+					data-truncate="end"
+					style={{
+						color: DIMMED,
+						fontWeight: 500,
+						height: typographyMetrics().line.xs,
+						marginBottom: RECENT_TITLE_MARGIN_BOTTOM,
+					}}
+				>
+					{labels.nestedTitle}
+				</p>
+				<div style={{ display: "flex", flexDirection: "column", gap: RECENT_STACK_GAP }}>
+					{nestedAgents.slice(0, measured.nestedRowCount).map((agent) => (
+						<NestedAgentRow
+							key={agent.subagentNarratorId}
+							agent={agent}
+							labels={labels}
+							onOpen={onOpenNestedSession}
+						/>
+					))}
+					{measured.hasNestedOverflowRow ? (
+						<p
+							className={ROW_TEXT_CLASS}
+							data-truncate="end"
+							style={{ color: DIMMED, height: bareRowMetrics().height }}
+						>
+							{withCount(
+								labels.nestedMore,
+								Math.max(0, (nestedTotal ?? 0) - measured.nestedRowCount),
+							)}
+						</p>
+					) : null}
+				</div>
+			</div>
+		);
+		top += measured.nestedHeight;
+	}
+
 	// ── LazyCollapse body ───────────────────────────────────────────────────────
 	let body: React.ReactNode = null;
 	if (measured.effectiveExpanded && measured.expandedHeight > 0) {
@@ -1010,6 +1184,7 @@ function SubagentInner({
 		<>
 			{header}
 			{recentCalls}
+			{nested}
 			{body}
 			{divider}
 		</>

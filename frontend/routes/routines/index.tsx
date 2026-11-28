@@ -33,6 +33,10 @@ import {
 import {
 	IconChevronDown,
 	IconChevronRight,
+	IconDownload,
+	IconEye,
+	IconKey,
+	IconPencil,
 	IconPlug,
 	IconPlus,
 	IconRefresh,
@@ -50,6 +54,7 @@ import {
 	textareaOptimizeControlsWidth,
 } from "../../components/narrator/composer/TextareaOptimizeControls";
 import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
+import { SkillLinkModal } from "../../components/project/SkillLinkModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	type CustomSubagentDef,
@@ -66,6 +71,7 @@ import {
 	useUpdateHook,
 } from "../../hooks/useHooks";
 import {
+	useAuthorizeMcpServer,
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
@@ -73,6 +79,7 @@ import {
 	useMcpServers,
 	useRefreshAllMcpServers,
 	useRefreshMcpServer,
+	useSignOutMcpServer,
 	useTestMcpConnection,
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
@@ -104,7 +111,10 @@ import {
 	useToggleGlobalSkill,
 	useUpdateGlobalSkill,
 } from "../../hooks/useSkills";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
 import {
@@ -175,6 +185,7 @@ interface SkillSummary {
 	location: string;
 	files: string[];
 	disabled?: boolean;
+	canUpdateFromUrl?: boolean;
 }
 
 // === Main Page ===
@@ -907,38 +918,83 @@ function GlobalSkillsTab() {
 		? undefined
 		: (skillsCapability.reason ?? t("globalSkillsUnsupportedDesc"));
 	const canManageGlobalSkills = skillsCapability.supported;
+	const { data: currentUser } = useCurrentUser();
+	// Link import pulls a remote file tree into the instance-wide skills directory.
+	const canLinkGlobalSkills = canManageGlobalSkills && currentUser?.role === "admin";
 	const { data: skills, isLoading } = useGlobalSkills(canManageGlobalSkills);
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
 	const refreshMutation = useGlobalSkillsRefresh();
 	const toggleMutation = useToggleGlobalSkill();
+	const [linkTarget, setLinkTarget] = useState<{ skill?: SkillSummary } | null>(null);
+	const closeLink = useCallback(() => setLinkTarget(null), []);
+	useEffect(() => {
+		if (!canLinkGlobalSkills) closeLink();
+	}, [canLinkGlobalSkills, closeLink]);
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [viewOpened, { open: openView, close: closeView }] = useDisclosure(false);
 
-	const [editingSkill, setEditingSkill] = useState<string | null>(null); // null = create
+	const editLoadSeqRef = useRef(0);
+	const draftTouchedRef = useRef(false);
+	const [editingSkill, setEditingSkill] = useState<string | null>(null);
 	const [draft, setDraft] = useState<SkillDraft>({ name: "", description: "", content: "" });
+	const [editContentLoading, setEditContentLoading] = useState(false);
 	const [deleteTarget, setDeleteTarget] = useState<string>("");
 	const [viewTarget, setViewTarget] = useState<SkillSummary | null>(null);
 
+	const handleCloseEdit = useCallback(() => {
+		editLoadSeqRef.current++;
+		draftTouchedRef.current = false;
+		setEditContentLoading(false);
+		closeEdit();
+	}, [closeEdit]);
+
+	useEffect(() => {
+		if (!canManageGlobalSkills) handleCloseEdit();
+		return () => {
+			editLoadSeqRef.current++;
+		};
+	}, [canManageGlobalSkills, handleCloseEdit]);
+
+	const updateDraft = useCallback((updater: (current: SkillDraft) => SkillDraft) => {
+		draftTouchedRef.current = true;
+		setDraft(updater);
+	}, []);
+
 	const handleCreate = useCallback(() => {
 		if (!canManageGlobalSkills) return;
+		editLoadSeqRef.current++;
+		draftTouchedRef.current = false;
+		setEditContentLoading(false);
 		setEditingSkill(null);
 		setDraft({ name: "", description: "", content: "" });
-		openEdit();
-	}, [canManageGlobalSkills, openEdit]);
+		if (canLinkGlobalSkills) setLinkTarget({});
+		else openEdit();
+	}, [canManageGlobalSkills, canLinkGlobalSkills, openEdit]);
 
 	const handleEdit = useCallback(
 		(skill: SkillSummary) => {
 			if (!canManageGlobalSkills) return;
+			const loadSeq = ++editLoadSeqRef.current;
+			draftTouchedRef.current = false;
+			setEditContentLoading(true);
 			setEditingSkill(skill.name);
 			setDraft({ name: skill.name, description: skill.description, content: "" });
-			// Fetch full content
-			api.getGlobalSkill(skill.name).then((full) => {
-				setDraft({ name: full.name, description: full.description, content: full.content });
-			});
+			api
+				.getGlobalSkill(skill.name)
+				.then((full) => {
+					if (editLoadSeqRef.current !== loadSeq) return;
+					setEditContentLoading(false);
+					if (draftTouchedRef.current) return;
+					setDraft({ name: full.name, description: full.description, content: full.content });
+				})
+				.catch(() => {
+					if (editLoadSeqRef.current === loadSeq) setEditContentLoading(false);
+					// Keep the summary fields visible; save will surface any later API error.
+				});
 			openEdit();
 		},
 		[canManageGlobalSkills, openEdit],
@@ -954,14 +1010,21 @@ function GlobalSkillsTab() {
 		if (!data.name || !data.description) return;
 
 		if (editingSkill) {
-			updateMutation.mutate(
-				{ currentName: editingSkill, ...data },
-				{ onSuccess: () => closeEdit() },
-			);
+			updateMutation.mutate({ currentName: editingSkill, ...data }, { onSuccess: handleCloseEdit });
 		} else {
-			createMutation.mutate(data, { onSuccess: () => closeEdit() });
+			createMutation.mutate(data, {
+				onSuccess: () => setLinkTarget((current) => (current === linkTarget ? null : current)),
+			});
 		}
-	}, [canManageGlobalSkills, draft, editingSkill, createMutation, updateMutation, closeEdit]);
+	}, [
+		canManageGlobalSkills,
+		draft,
+		editingSkill,
+		createMutation,
+		updateMutation,
+		handleCloseEdit,
+		linkTarget,
+	]);
 
 	const handleDelete = useCallback(
 		(name: string) => {
@@ -989,6 +1052,63 @@ function GlobalSkillsTab() {
 		refreshMutation.mutate();
 	}, [canManageGlobalSkills, refreshMutation]);
 
+	const editorForm = (
+		<Stack>
+			<TextInput
+				label={t("skillName")}
+				placeholder={t("skillNamePlaceholder")}
+				value={draft.name}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, name: val }));
+				}}
+			/>
+			<TextInput
+				label={t("skillDescription")}
+				placeholder={t("skillDescriptionPlaceholder")}
+				value={draft.description}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, description: val }));
+				}}
+			/>
+			<Textarea
+				label={t("skillContent")}
+				placeholder={t("skillContentPlaceholder")}
+				value={draft.content}
+				onChange={(e) => {
+					const val = e.currentTarget.value;
+					updateDraft((d) => ({ ...d, content: val }));
+				}}
+				autosize
+				minRows={8}
+				maxRows={20}
+			/>
+			<Group justify="flex-end" gap="xs">
+				<Button
+					variant="subtle"
+					onClick={editingSkill ? handleCloseEdit : closeLink}
+					disabled={createMutation.isPending || updateMutation.isPending}
+				>
+					{t("cancel")}
+				</Button>
+				<Button
+					onClick={handleSave}
+					disabled={
+						!canManageGlobalSkills ||
+						editContentLoading ||
+						!draft.name.trim() ||
+						!draft.description.trim()
+					}
+					loading={createMutation.isPending || updateMutation.isPending}
+					title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+				>
+					{t("save")}
+				</Button>
+			</Group>
+		</Stack>
+	);
+
 	return (
 		<Stack>
 			<Group justify="space-between">
@@ -1000,13 +1120,14 @@ function GlobalSkillsTab() {
 						{skillsUnsupportedReason}
 					</Alert>
 				)}
-				<Group gap="xs">
+				<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 					<ActionIcon
 						variant="subtle"
 						size="sm"
 						onClick={handleRefresh}
 						loading={refreshMutation.isPending}
 						disabled={!canManageGlobalSkills}
+						aria-label={t("refreshSkills")}
 						title={!canManageGlobalSkills ? skillsUnsupportedReason : t("refreshSkills")}
 					>
 						<IconRefresh size={14} />
@@ -1019,7 +1140,7 @@ function GlobalSkillsTab() {
 						disabled={!canManageGlobalSkills}
 						title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 					>
-						{t("createSkill")}
+						{t("addSkill")}
 					</Button>
 				</Group>
 			</Group>
@@ -1065,7 +1186,7 @@ function GlobalSkillsTab() {
 									{formatRoutineTextPreview(skill.description, MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS)}
 								</Text>
 							</div>
-							<Group gap={4}>
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 								<Switch
 									checked={!isDisabled}
 									onChange={(e) => {
@@ -1079,31 +1200,54 @@ function GlobalSkillsTab() {
 									disabled={!canManageGlobalSkills}
 									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 								/>
-								<Button
+								<ActionIcon
 									variant="subtle"
-									size="compact-xs"
+									size="sm"
 									onClick={() => handleView(skill)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("viewSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("viewSkill")}
 								>
-									{t("viewSkill")}
-								</Button>
-								<Button
+									<IconEye size={14} />
+								</ActionIcon>
+								<ActionIcon
 									variant="subtle"
-									size="compact-xs"
+									size="sm"
 									onClick={() => handleEdit(skill)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("editSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("editSkill")}
 								>
-									{t("editSkill")}
-								</Button>
+									<IconPencil size={14} />
+								</ActionIcon>
+								<ActionIcon
+									variant="subtle"
+									size="sm"
+									onClick={() => {
+										if (canLinkGlobalSkills && skill.canUpdateFromUrl) setLinkTarget({ skill });
+									}}
+									disabled={!canLinkGlobalSkills || !skill.canUpdateFromUrl}
+									aria-label={t("updateSkillFromLink")}
+									title={
+										!canManageGlobalSkills
+											? skillsUnsupportedReason
+											: !canLinkGlobalSkills
+												? t("skillLinkAdminOnly")
+												: !skill.canUpdateFromUrl
+													? t("skillLinkUpdateUnsupported")
+													: t("updateSkillFromLink")
+									}
+								>
+									<IconDownload size={14} />
+								</ActionIcon>
 								<ActionIcon
 									variant="subtle"
 									color="red"
 									size="sm"
 									onClick={() => handleDelete(skill.name)}
 									disabled={!canManageGlobalSkills}
-									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+									aria-label={t("deleteSkill")}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : t("deleteSkill")}
 								>
 									<IconTrash size={14} />
 								</ActionIcon>
@@ -1113,58 +1257,23 @@ function GlobalSkillsTab() {
 				);
 			})}
 
-			{/* Create / Edit Modal */}
+			<SkillLinkModal
+				opened={linkTarget !== null}
+				onClose={closeLink}
+				skill={linkTarget?.skill}
+				enabled={canLinkGlobalSkills}
+				manualForm={!linkTarget?.skill ? editorForm : undefined}
+				manualPending={createMutation.isPending}
+			/>
+
+			{/* Edit Modal */}
 			<Modal
 				opened={editOpened}
-				onClose={closeEdit}
-				title={editingSkill ? t("editSkill") : t("createSkill")}
+				onClose={handleCloseEdit}
+				title={t(editingSkill ? "editSkill" : "createSkill")}
 				size="lg"
 			>
-				<Stack>
-					<TextInput
-						label={t("skillName")}
-						placeholder={t("skillNamePlaceholder")}
-						value={draft.name}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, name: val }));
-						}}
-					/>
-					<TextInput
-						label={t("skillDescription")}
-						placeholder={t("skillDescriptionPlaceholder")}
-						value={draft.description}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, description: val }));
-						}}
-					/>
-					<Textarea
-						label={t("skillContent")}
-						placeholder={t("skillContentPlaceholder")}
-						value={draft.content}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, content: val }));
-						}}
-						autosize
-						minRows={8}
-						maxRows={20}
-					/>
-					<Group justify="flex-end" gap="xs">
-						<Button variant="subtle" onClick={closeEdit}>
-							{t("cancel")}
-						</Button>
-						<Button
-							onClick={handleSave}
-							disabled={!canManageGlobalSkills || !draft.name.trim() || !draft.description.trim()}
-							loading={createMutation.isPending || updateMutation.isPending}
-							title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
-						>
-							{t("save")}
-						</Button>
-					</Group>
-				</Stack>
+				{editorForm}
 			</Modal>
 
 			{/* Delete Confirm Modal */}
@@ -1832,6 +1941,7 @@ function ProjectSkillsTab() {
 
 			{selectedProjectId && (
 				<ProjectSkillsManager
+					key={selectedProjectId}
 					projectId={selectedProjectId}
 					enabled={skillsCapability.supported}
 					disabledReason={skillsUnsupportedReason}
@@ -1852,6 +1962,13 @@ interface McpServerDraft {
 	url: string;
 	env: McpSecretDraftEntry[];
 	headers: McpSecretDraftEntry[];
+	oauthClientId: string;
+	oauthScope: string;
+	/** New OAuth client secret; empty keeps the saved one. Never filled from the server. */
+	oauthClientSecret: string;
+	hasOAuthClientSecret: boolean;
+	/** URL and client id the saved secret belongs to; changing either drops it. */
+	oauthSecretBinding: string;
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
 	mode: McpLoadingMode;
@@ -1864,6 +1981,19 @@ interface McpToolPermissionDraft {
 	enabled?: boolean;
 }
 
+/** Whether saving keeps the stored client secret: it belongs to one URL + pre-registered client. */
+function keepsOAuthClientSecret(d: McpServerDraft): boolean {
+	return (
+		d.hasOAuthClientSecret &&
+		!!d.oauthClientId.trim() &&
+		oauthSecretBindingOf(d) === d.oauthSecretBinding
+	);
+}
+
+function oauthSecretBindingOf(d: Pick<McpServerDraft, "url" | "oauthClientId">): string {
+	return `${normalizeUrlProtocol(d.url) ?? ""}\n${d.oauthClientId.trim()}`;
+}
+
 const EMPTY_DRAFT: McpServerDraft = {
 	name: "",
 	transport: "stdio",
@@ -1873,6 +2003,11 @@ const EMPTY_DRAFT: McpServerDraft = {
 	url: "",
 	env: [],
 	headers: [],
+	oauthClientId: "",
+	oauthScope: "",
+	oauthClientSecret: "",
+	hasOAuthClientSecret: false,
+	oauthSecretBinding: "",
 	originalEnvKeys: [],
 	originalHeaderKeys: [],
 	mode: "auto",
@@ -1956,6 +2091,8 @@ function McpToolsTab() {
 	const deleteMutation = useDeleteMcpServer();
 	const connectMutation = useConnectMcpServer();
 	const refreshMutation = useRefreshMcpServer();
+	const authorizeMcp = useAuthorizeMcpServer();
+	const signOutMutation = useSignOutMcpServer();
 	const refreshAllMutation = useRefreshAllMcpServers();
 	const testMutation = useTestMcpConnection();
 
@@ -1992,7 +2129,10 @@ function McpToolsTab() {
 				return;
 			}
 			setJsonError(null);
-			setDraft(result.draft);
+			const next = result.draft;
+			// The JSON view hides the secret field, so a typed secret must not follow a new client.
+			const sameClient = oauthSecretBindingOf(next) === oauthSecretBindingOf(draft);
+			setDraft(sameClient ? next : { ...next, oauthClientSecret: "" });
 		},
 		[draft],
 	);
@@ -2088,6 +2228,8 @@ function McpToolsTab() {
 			url?: string;
 			envKeys?: string[];
 			headerKeys?: string[];
+			oauth?: { clientId?: string; scope?: string };
+			auth?: { hasClientSecret: boolean };
 			mode?: McpLoadingMode;
 			enabled?: boolean;
 			defaultBehavior?: string;
@@ -2107,6 +2249,11 @@ function McpToolsTab() {
 				url: server.url ?? "",
 				env: createPreservedMcpSecretEntries(envKeys),
 				headers: createPreservedMcpSecretEntries(headerKeys),
+				oauthClientId: server.oauth?.clientId ?? "",
+				oauthScope: server.oauth?.scope ?? "",
+				oauthClientSecret: "",
+				hasOAuthClientSecret: server.auth?.hasClientSecret ?? false,
+				oauthSecretBinding: `${server.url ?? ""}\n${server.oauth?.clientId ?? ""}`,
 				originalEnvKeys: [...envKeys],
 				originalHeaderKeys: [...headerKeys],
 				mode: resolveMcpLoadingMode(server),
@@ -2131,8 +2278,20 @@ function McpToolsTab() {
 				.map((a) => a.trim())
 				.filter(Boolean);
 			if (d.cwd.trim()) payload.cwd = d.cwd.trim();
+			if (includeClears) payload.oauth = null;
+			if (d.hasOAuthClientSecret) payload.oauthClientSecret = null;
 		} else {
 			payload.url = normalizeUrlProtocol(d.url) ?? "";
+			const clientId = d.oauthClientId.trim();
+			const scope = d.oauthScope.trim();
+			if (clientId || scope) {
+				payload.oauth = { ...(clientId && { clientId }), ...(scope && { scope }) };
+			} else if (includeClears) {
+				payload.oauth = null;
+			}
+			if (clientId && d.oauthClientSecret) payload.oauthClientSecret = d.oauthClientSecret;
+			else if (d.hasOAuthClientSecret && !keepsOAuthClientSecret(d))
+				payload.oauthClientSecret = null;
 		}
 
 		if (includeClears) {
@@ -2332,6 +2491,17 @@ function McpToolsTab() {
 									<Badge size="xs" variant="outline">
 										{server.transport}
 									</Badge>
+									{server.auth?.authorized ? (
+										<Badge size="xs" variant="light" color="teal">
+											{t("mcpOAuthAuthorized")}
+										</Badge>
+									) : (
+										server.auth?.required && (
+											<Badge size="xs" variant="light" color="orange">
+												{t("mcpOAuthRequired")}
+											</Badge>
+										)
+									)}
 									{server.status === "connected" && (
 										<Text size="xs" c="dimmed">
 											{t("mcpToolCount", { count: server.tools.length })}
@@ -2385,6 +2555,31 @@ function McpToolsTab() {
 									>
 										<IconRefresh size={14} />
 									</ActionIcon>
+									{server.auth?.supported && (
+										<Button
+											variant={server.auth.required ? "light" : "subtle"}
+											color={server.auth.required ? "orange" : undefined}
+											size="compact-xs"
+											leftSection={<IconKey size={12} />}
+											disabled={!mcpServerManagementSupported}
+											loading={authorizeMcp.isPending && authorizeMcp.pendingId === server.id}
+											onClick={() => authorizeMcp.authorize(server.id)}
+										>
+											{server.auth.authorized ? t("mcpOAuthReauthorize") : t("mcpOAuthAuthorize")}
+										</Button>
+									)}
+									{server.auth?.authorized && (
+										<Button
+											variant="subtle"
+											color="gray"
+											size="compact-xs"
+											disabled={!mcpServerManagementSupported}
+											loading={signOutMutation.isPending && signOutMutation.variables === server.id}
+											onClick={() => signOutMutation.mutate(server.id)}
+										>
+											{t("mcpOAuthSignOut")}
+										</Button>
+									)}
 									<Button
 										variant="subtle"
 										size="compact-xs"
@@ -2689,6 +2884,51 @@ function McpToolsTab() {
 												</ActionIcon>
 											</Group>
 										))}
+									</div>
+									{/* OAuth (MCP authorization) */}
+									<div>
+										<Text size="sm" fw={500}>
+											{t("mcpOAuth")}
+										</Text>
+										<Text size="xs" c="dimmed" mb={4}>
+											{t("mcpOAuthDesc")}
+										</Text>
+										<Group gap="xs" grow>
+											<TextInput
+												size="xs"
+												label={t("mcpOAuthClientId")}
+												value={draft.oauthClientId}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthClientId: val }));
+												}}
+											/>
+											<TextInput
+												size="xs"
+												label={t("mcpOAuthScope")}
+												value={draft.oauthScope}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthScope: val }));
+												}}
+											/>
+										</Group>
+										{draft.oauthClientId.trim() && (
+											<TextInput
+												size="xs"
+												mt={4}
+												type="password"
+												label={t("mcpOAuthClientSecret")}
+												placeholder={
+													keepsOAuthClientSecret(draft) ? t("mcpSecretUnchanged") : undefined
+												}
+												value={draft.oauthClientSecret}
+												onChange={(e) => {
+													const val = e.currentTarget.value;
+													setDraft((d) => ({ ...d, oauthClientSecret: val }));
+												}}
+											/>
+										)}
 									</div>
 								</>
 							)}

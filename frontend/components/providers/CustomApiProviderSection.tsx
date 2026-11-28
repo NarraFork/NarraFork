@@ -8,12 +8,14 @@ import {
 	Paper,
 	PasswordInput,
 	SegmentedControl,
+	Select,
 	Stack,
 	Switch,
 	Text,
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -23,7 +25,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalanceCapability } from "../../hooks/useProviderBalance";
+import { useProviderBalanceCapability } from "../../hooks/useProviderBalanceProbe";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";
@@ -102,6 +104,8 @@ export function isGeminiProtocol(protocol: CustomApiProtocol): boolean {
 interface CustomApiProviderSectionProps {
 	provider: CustomApiProviderState;
 	onProvidersChange: (updater: ProvidersUpdater) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (apiKey: string) => void;
 	openAIProviderModelsMap: Record<string, ModelOption[]>;
 	anthropicProviderModelsMap: Record<string, ModelOption[]>;
 	geminiProviderModelsMap: Record<string, ModelOption[]>;
@@ -129,6 +133,7 @@ function sanitizePrefix(value: string): string {
 export const CustomApiProviderSection = React.memo(function CustomApiProviderSection({
 	provider,
 	onProvidersChange,
+	onPersistedKeyChanged,
 	openAIProviderModelsMap,
 	anthropicProviderModelsMap,
 	geminiProviderModelsMap,
@@ -456,7 +461,11 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					autoComplete="off"
 					onChange={(e) => updateProvider("apiKey", e.currentTarget.value)}
 				/>
-				<ProviderKeysPanel providerId={provider.id} />
+				<ProviderKeysPanel
+					key={provider.id}
+					providerId={provider.id}
+					onFirstKeyChanged={onPersistedKeyChanged}
+				/>
 				<TextInput
 					label={t("customApiBaseUrl")}
 					placeholder={t("customApiBaseUrlPlaceholder")}
@@ -643,6 +652,22 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						onChange={(e) => updateProvider("nativeSearch", e.currentTarget.checked)}
 					/>
 				)}
+
+				<Select
+					label={t("toolResultImages")}
+					description={t("toolResultImagesDesc")}
+					size="xs"
+					data={[
+						{ value: "off", label: t("toolResultImagesOff") },
+						{ value: "inline", label: t("toolResultImagesInline") },
+						{ value: "separate", label: t("toolResultImagesSeparate") },
+					]}
+					value={provider.toolResultImages ?? "off"}
+					allowDeselect={false}
+					onChange={(value) =>
+						updateProvider("toolResultImages", (value ?? "off") as ToolResultImagesMode)
+					}
+				/>
 
 				<Divider />
 				<Group gap="xs">

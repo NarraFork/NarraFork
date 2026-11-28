@@ -9,6 +9,7 @@ import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import type { ScheduledTaskPrincipal } from "../scheduled-task-acl";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 // No real provider calls; an accidental dispatch in a missed-only test is observable.
 const realSession = { ...(await import("../narrator-session")) };
@@ -123,10 +124,14 @@ function appAs(principal: ScheduledTaskPrincipal) {
 describe("task ACL and safe projections", () => {
 	test("missing principals and forged admin flags do not grant access", async () => {
 		const row = await task();
-		await expect(scheduledTaskService.list()).rejects.toMatchObject({ statusCode: 403 });
-		await expect(
-			scheduledTaskService.detail(row.id, { ...stranger, isAdmin: true }),
-		).rejects.toMatchObject({ statusCode: 404 });
+		expect(await captureWorkerRejection(scheduledTaskService.list())).toMatchObject({
+			statusCode: 403,
+		});
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.detail(row.id, { ...stranger, isAdmin: true }),
+			),
+		).toMatchObject({ statusCode: 404 });
 		expect((await scheduledTaskService.list(stranger)).tasks).toHaveLength(0);
 	});
 	test("all mutation and history endpoints hide private task existence", async () => {
@@ -232,20 +237,28 @@ describe("approval version and task lifecycle", () => {
 			owner,
 		);
 		expect(changed.updatedAt > expectedUpdatedAt).toBe(true);
-		await expect(
-			scheduledTaskService.update(row.id, { prompt: "stale" }, owner, undefined, {
-				expectedUpdatedAt,
-			}),
-		).rejects.toMatchObject({ statusCode: 409 });
-		await expect(
-			scheduledTaskService.setEnabled(row.id, false, owner, { expectedUpdatedAt }),
-		).rejects.toMatchObject({ statusCode: 409 });
-		await expect(
-			scheduledTaskService.delete(row.id, owner, { expectedUpdatedAt }),
-		).rejects.toMatchObject({ statusCode: 409 });
-		await expect(
-			scheduledTaskService.runTask(row.id, { manual: true, principal: owner, expectedUpdatedAt }),
-		).rejects.toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.update(row.id, { prompt: "stale" }, owner, undefined, {
+					expectedUpdatedAt,
+				}),
+			),
+		).toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.setEnabled(row.id, false, owner, { expectedUpdatedAt }),
+			),
+		).toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.delete(row.id, owner, { expectedUpdatedAt }),
+			),
+		).toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.runTask(row.id, { manual: true, principal: owner, expectedUpdatedAt }),
+			),
+		).toMatchObject({ statusCode: 409 });
 		expect(dispatches).toBe(0);
 	});
 	test("only one concurrent mutation can use the same approved snapshot", async () => {
@@ -316,9 +329,14 @@ describe("approval version and task lifecycle", () => {
 	test("unfinished quota counts paused tasks too", async () => {
 		taskSettings().maxActivePerOwner = 1;
 		await task({ enabled: false });
-		await expect(
-			scheduledTaskService.create({ name: "overflow", prompt: "x", cronExpr: "0 8 * * *" }, owner),
-		).rejects.toMatchObject({ statusCode: 400 });
+		expect(
+			await captureWorkerRejection(
+				scheduledTaskService.create(
+					{ name: "overflow", prompt: "x", cronExpr: "0 8 * * *" },
+					owner,
+				),
+			),
+		).toMatchObject({ statusCode: 400 });
 	});
 });
 
@@ -380,7 +398,9 @@ describe("missed occurrences are never replayed", () => {
 			scheduleCursorAt: "2019-01-01T00:00:00.000Z",
 			nextRunAt: null,
 		});
-		await expect(scheduledTaskService.setEnabled(row.id, true, owner)).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(scheduledTaskService.setEnabled(row.id, true, owner)),
+		).toMatchObject({
 			statusCode: 400,
 		});
 		expect((await scheduledTaskService.get(row.id))?.completedAt).not.toBeNull();
@@ -418,7 +438,7 @@ describe("missed occurrences are never replayed", () => {
 			(await history(row.id)).some((run) => run.status === "skipped" && run.errorKind === "busy"),
 		).toBe(true);
 		expect(dispatches).toBe(0);
-		await expect(scheduledTaskService.delete(row.id, owner)).rejects.toMatchObject({
+		expect(await captureWorkerRejection(scheduledTaskService.delete(row.id, owner))).toMatchObject({
 			statusCode: 409,
 		});
 	});

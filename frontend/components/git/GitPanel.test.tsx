@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { type QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -22,6 +22,11 @@ import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
+import {
+	createGitChangesTestQueryClient,
+	flushGitChangesTestRender,
+	installGitChangesTestTransport,
+} from "./git-changes-list-test-fixture";
 
 // Use an ISOLATED i18next instance (not the process-global default) so shared
 // singleton mutations from other frontend suites (changeLanguage, differing
@@ -54,6 +59,7 @@ class TestResizeObserver {
 }
 
 let root: Root | undefined;
+let restoreChangesTransport: (() => void) | undefined;
 let restoreGitApi: (() => void) | undefined;
 const originalGitLineStats = api.getGitLineStats;
 // The branch bar reads its own listing; every case here needs a stub or it would
@@ -269,8 +275,8 @@ function stubInteractiveGitApi(calls: Array<{ name: string; body?: unknown }>) {
 }
 
 function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
-	const button = Array.from(container.querySelectorAll("button")).find((candidate) =>
-		candidate.textContent?.includes(text),
+	const button = Array.from(container.querySelectorAll("button")).find(
+		(candidate) => candidate.textContent?.trim() === text,
 	);
 	if (!(button instanceof HTMLButtonElement)) {
 		throw new Error(`Button not found: ${text}`);
@@ -359,12 +365,13 @@ function rowLabels(container: HTMLElement): string[] {
 }
 
 function flushRender() {
-	return new Promise((resolve) => setTimeout(resolve, 0));
+	return flushGitChangesTestRender();
 }
 
 describe("GitPanel", () => {
 	beforeEach(async () => {
 		installDom();
+		restoreChangesTransport = installGitChangesTestTransport();
 		api.getGitLineStats = async () => ({
 			files: [],
 			linesAdded: 0,
@@ -398,6 +405,8 @@ describe("GitPanel", () => {
 	});
 
 	afterEach(() => {
+		restoreChangesTransport?.();
+		restoreChangesTransport = undefined;
 		restoreGitApi?.();
 		restoreGitApi = undefined;
 		api.getGitLineStats = originalGitLineStats;
@@ -409,7 +418,7 @@ describe("GitPanel", () => {
 
 	test("renders git changes panel without crashing on TS-compatible status data", async () => {
 		const workspaceKey = "git-smoke";
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -432,7 +441,7 @@ describe("GitPanel", () => {
 				</MantineProvider>
 			</I18nextProvider>,
 		);
-		await new Promise((resolve) => setTimeout(resolve, 0));
+		await flushRender();
 		// GitCommitGraph fetches via api.getGitLog after mount; poll for the strip.
 		const deadline = Date.now() + 2000;
 		while (!container.textContent?.includes("feat: seed commit for graph strip")) {
@@ -473,7 +482,7 @@ describe("GitPanel", () => {
 		const workspaceKey = "git-tree";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		stubInteractiveGitApi(calls);
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -512,11 +521,27 @@ describe("GitPanel", () => {
 		stageFolderButton.dispatchEvent(new Event("click", { bubbles: true }));
 		await flushRender();
 		expect(calls).toEqual([
-			{ name: "stage", body: { files: ["src/new-file.ts", "src/unstaged.ts"] } },
+			{
+				name: "stage",
+				body: {
+					files: ["src/new-file.ts", "src/unstaged.ts"],
+					snapshotScope: {
+						snapshotId: "fixture:abc1234:",
+						filter: [],
+						section: "unstaged",
+						directory: "src",
+					},
+				},
+			},
 		]);
 
-		// Expanding reveals that folder's children and leaves the other section alone.
-		stageFolderRow.dispatchEvent(new Event("click", { bubbles: true }));
+		// The successful write refreshes the paged generation. Expand its current row.
+		const refreshedFolder = Array.from(
+			container.querySelectorAll('[role="button"][aria-label="Expand folder src"]'),
+		).at(-1);
+		if (!(refreshedFolder instanceof HTMLElement))
+			throw new Error("Refreshed folder row not found");
+		refreshedFolder.dispatchEvent(new Event("click", { bubbles: true }));
 		await flushRender();
 
 		expect(rowLabels(container)).toEqual([
@@ -541,7 +566,7 @@ describe("GitPanel", () => {
 		// status badge, and left the two name columns ragged. The glyph carries the
 		// "directory" signal; the equal leading width is what lines the names up.
 		const workspaceKey = "git-folder-glyph";
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -596,7 +621,7 @@ describe("GitPanel", () => {
 		// folder, which is the whole reason it now lives in sessionStorage.
 		const workspaceKey = "git-persist";
 		const makeClient = () =>
-			new QueryClient({
+			createGitChangesTestQueryClient({
 				defaultOptions: {
 					queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 					mutations: { retry: false },
@@ -685,7 +710,7 @@ describe("GitPanel", () => {
 		// `??` printed the raw question marks, and `AM` fell through to the gray
 		// fallback because the badge concatenated BOTH porcelain halves.
 		const workspaceKey = "git-added-badge";
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -742,9 +767,9 @@ describe("GitPanel", () => {
 		await flushRender();
 
 		// Open both folders so the file rows (and their badges) are rendered.
-		for (const row of Array.from(
-			container.querySelectorAll('[role="button"][aria-label="Expand folder src"]'),
-		)) {
+		for (let section = 0; section < 2; section++) {
+			const row = container.querySelector('[role="button"][aria-label="Expand folder src"]');
+			if (!row) break;
 			row.dispatchEvent(new Event("click", { bubbles: true }));
 			await flushRender();
 		}
@@ -768,7 +793,7 @@ describe("GitPanel", () => {
 
 	test("keeps deep paths to two rows so a narrow panel does not indent off-screen", async () => {
 		const workspaceKey = "git-deep";
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -809,12 +834,9 @@ describe("GitPanel", () => {
 			.filter((row) =>
 				/^(Collapse folder|View diff of) /.test(row.getAttribute("aria-label") ?? ""),
 			)
-			.map((row) => (row as HTMLElement).style.paddingLeft);
-		// Mantine rewrites numeric padding to scaled rem, so compare the rem values.
-		expect(indents).toEqual([
-			"calc(0.25rem * var(--mantine-scale))",
-			"calc(1rem * var(--mantine-scale))",
-		]);
+			.map((row) => (row as HTMLElement).style.paddingInlineStart);
+		// One compact level uses 12px, capped at a quarter of the panel width.
+		expect(indents).toEqual(["min(4px, 25%)", "min(16px, 25%)"]);
 
 		queryClient.clear();
 	});
@@ -823,7 +845,7 @@ describe("GitPanel", () => {
 		const workspaceKey = "git-interactive-smoke";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		stubInteractiveGitApi(calls);
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -955,7 +977,7 @@ describe("GitPanel", () => {
 		api.getGitLog = async () => [];
 		api.getGitStashList = async () => [];
 		restoreGitApi = () => Object.assign(api, original);
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -1119,6 +1141,89 @@ describe("GitPanel", () => {
 		queryClient.clear();
 	});
 
+	test("a recovering panel retains its subscription, refreshes the same id, and distinguishes a real denial", async () => {
+		const add = spyOn(narratorWSManager, "addListener");
+		const send = spyOn(narratorWSManager, "send");
+		try {
+			const { container, queryClient } = await renderNarratorWorkspace(readyWorkspace());
+			const listener = add.mock.calls.find(([options]) =>
+				options.types?.includes("git_workspace_error"),
+			)?.[1];
+			const subscription = send.mock.calls.find(
+				([message]) => message.type === "git_workspace_subscribe",
+			)?.[0];
+			expect(listener).toBeDefined();
+			expect(subscription).toBeDefined();
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "retryable",
+				code: "DB_READ_WORKER_UNAVAILABLE",
+				message: "Database worker read timed out",
+				version: 1000,
+				retrying: true,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.recovering"]) === true,
+			);
+			expect(container.textContent).not.toContain("Database worker");
+			expect(container.textContent).not.toContain(gitLocale["workspace.access_denied"]);
+			expect(
+				send.mock.calls.filter(([message]) => message.type === "git_workspace_unsubscribe"),
+			).toHaveLength(0);
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "retryable",
+				code: "DB_READ_WORKER_UNAVAILABLE",
+				version: 1001,
+				retrying: false,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.refresh_required"]) === true,
+			);
+			const refresh = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+				(button) => button.textContent === "Refresh",
+			);
+			expect(refresh).toBeDefined();
+			refresh?.click();
+			expect(send.mock.calls.at(-1)?.[0]).toEqual({
+				type: "git_workspace_refresh",
+				subscriptionId: subscription?.subscriptionId,
+			});
+			listener?.({
+				...subscription,
+				repositoryKey: readyWorkspace().repositoryKey,
+				type: "git_workspace_subscribed",
+				version: 1002,
+			});
+			await waitForWorkspace(() => container.textContent?.includes("Changes") === true);
+			expect(
+				new Set(
+					send.mock.calls
+						.filter(([message]) => message.type === "git_workspace_subscribe")
+						.map(([message]) => message.subscriptionId),
+				).size,
+			).toBe(1);
+			listener?.({
+				...subscription,
+				type: "git_workspace_error",
+				kind: "denied",
+				code: "GIT_WORKSPACE_ACCESS_DENIED",
+				version: 1003,
+				retrying: false,
+			});
+			await waitForWorkspace(
+				() => container.textContent?.includes(gitLocale["workspace.access_denied"]) === true,
+			);
+			expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
+			queryClient.clear();
+		} finally {
+			add.mockRestore();
+			send.mockRestore();
+		}
+	});
+
 	test("permission revocation drops private facts and unmount releases its listener", async () => {
 		const add = spyOn(narratorWSManager, "addListener");
 		const remove = spyOn(narratorWSManager, "removeListener");
@@ -1128,6 +1233,13 @@ describe("GitPanel", () => {
 				options.types?.includes("narrator_access_changed"),
 			);
 			expect(subscription).toBeDefined();
+			// Seed a previously published total; this test verifies revocation, not production.
+			queryClient.setQueryData(["gitLineStats", "local:/repo"], {
+				linesAdded: 7,
+				linesRemoved: 1,
+				files: [],
+				complete: true,
+			});
 			expect(queryClient.getQueryData(["gitLineStats", "local:/repo"])).toBeDefined();
 			api.getGitWorkspace = async () =>
 				readyWorkspace({ state: "access_denied", capabilities: { read: false, write: false } });
@@ -1149,7 +1261,7 @@ describe("GitPanel", () => {
 	});
 
 	test("workspace cache shares roots, isolates devices, and refreshes repository peers", () => {
-		const qc = new QueryClient();
+		const qc = createGitChangesTestQueryClient();
 		const target = {
 			narratorId: "n1",
 			workspaceKey: "local:/repo",
@@ -1186,7 +1298,7 @@ describe("GitPanel", () => {
 		// The bar prefers the listing's own branch over the status hint, so the stub
 		// has to agree with the branch under test.
 		api.getGitBranches = async () => makeBranches(branch);
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
@@ -1290,7 +1402,7 @@ describe("GitPanel", () => {
 
 	test("switches between the compact tree and flat file list", async () => {
 		const workspaceKey = "git-view-mode";
-		const queryClient = new QueryClient({
+		const queryClient = createGitChangesTestQueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },

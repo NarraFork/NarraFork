@@ -393,6 +393,20 @@ export const VIEW_SURFACES = [
 	"focus",
 	"settings",
 	"provider-settings",
+	/**
+	 * A transparent, full-viewport layer above the app shell — not a dock panel.
+	 *
+	 * Added for views that are decorative overlays rather than tools (a desktop pet
+	 * is the motivating case): a dock panel is a rectangle inside the layout, and no
+	 * amount of plugin CSS can draw outside it. `scope` is restricted to `global`
+	 * because there is exactly one overlay layer per app instance, so a
+	 * workspace/narrator binding would have nothing to bind to.
+	 *
+	 * The host keeps the iframe click-through and relays pointer input through a
+	 * separate hit rectangle. A host-owned dismiss control above every overlay
+	 * restores the app even if a plugin paints or requests input over the full viewport.
+	 */
+	"overlay",
 ] as const;
 export type ViewSurface = (typeof VIEW_SURFACES)[number];
 
@@ -1198,7 +1212,13 @@ function validateContributionReferences(
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
-			views: Array<{ id: string; commandId?: string; providerId?: string; surfaces: string[] }>;
+			views: Array<{
+				id: string;
+				commandId?: string;
+				providerId?: string;
+				surfaces: string[];
+				scope: string;
+			}>;
 			themes: Array<{ id: string }>;
 		};
 	},
@@ -1259,6 +1279,16 @@ function validateContributionReferences(
 				ctx,
 				["contributes", "views", index, "providerId"],
 				"view references an undeclared provider",
+			);
+		}
+		if (view.surfaces.includes("overlay") && view.scope !== "global") {
+			// There is exactly one overlay layer per app instance and the host only mounts
+			// global-scope overlay views; any other scope would parse and then silently
+			// never appear, which reads as a working declaration to the plugin author.
+			addContributionReferenceIssue(
+				ctx,
+				["contributes", "views", index, "scope"],
+				"overlay views must use global scope",
 			);
 		}
 		if (view.providerId && !isProviderSettings) {

@@ -200,12 +200,90 @@ async function openReasoningIdleTask(id: string) {
 }
 
 describe("reasoning-only idle uses the real runtime's work and input provenance", () => {
-	for (const background of ["agent", "task", "service", "none", "completed"] as const) {
+	for (const pending of ["user_input", "agent_message", "task_notice", "question"] as const) {
+		test(`${pending} permits idle until the pending wake is cleared`, async () => {
+			const { active, owner, run } = await reasoningIdleFixture("primary");
+			const inbox = await import("../agent-runtime/inbox");
+			const questions = await import("../narrator-question-service");
+			let waiting = true;
+			const realHasInboxKind = inbox.hasInboxKind;
+			const inboxSpy = spyOn(inbox, "hasInboxKind").mockImplementation(async (id, kinds) =>
+				kinds.length === 3 && pending !== "question"
+					? waiting && kinds.includes(pending)
+					: realHasInboxKind(id, kinds),
+			);
+			const questionSpy = spyOn(questions, "countOpenAsyncQuestions").mockImplementation(
+				async () => (pending === "question" && waiting ? 1 : 0),
+			);
+			try {
+				const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+					options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+					expect(await options.config.hasPendingWake?.()).toBe(true);
+					waiting = false;
+					expect(await options.config.hasPendingWake?.()).toBe(false);
+					return { ...reasoningIdleResult, reasoningOnlyIdle: false };
+				});
+				await runAgentLoopUnlocked(active, owner, "input", undefined, run);
+				expect(execute).toHaveBeenCalledTimes(1);
+			} finally {
+				inboxSpy.mockRestore();
+				questionSpy.mockRestore();
+			}
+		});
+	}
+
+	for (const kind of ["terminal", "bash", "agent", "background"] as const) {
+		test(`${kind} observation/work is visible immediately and stops permitting idle after completion`, async () => {
+			const { id, active, owner, run } = await reasoningIdleFixture("primary");
+			const { backgroundTaskService } = await import("../background-task-service");
+			const { createWatchObservation } = await import("../watch-observation");
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
+				expect(await options.config.hasPendingWake?.()).toBe(false);
+				let observation: Awaited<ReturnType<typeof createWatchObservation>> | undefined;
+				try {
+					if (kind === "background") {
+						await backgroundTaskService.createBashTask({
+							id: "pending-wake-bash",
+							parentNarratorId: id,
+							command: "bun test",
+						});
+					} else {
+						observation = await createWatchObservation({
+							narratorId: id,
+							title: "Pending observation",
+							command: `${kind} target`,
+						});
+					}
+					expect(await options.config.hasPendingWake?.()).toBe(true);
+					if (observation)
+						await observation.finish({ status: "completed", output: "done", silent: true });
+					else await backgroundTaskService.finishObservationSilently("pending-wake-bash", "done");
+					expect(await options.config.hasPendingWake?.()).toBe(false);
+				} finally {
+					observation?.release();
+				}
+				return { ...reasoningIdleResult, reasoningOnlyIdle: false };
+			});
+			await runAgentLoopUnlocked(active, owner, "input", undefined, run);
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	for (const background of [
+		"agent",
+		"legacy_agent",
+		"task",
+		"service",
+		"none",
+		"completed",
+	] as const) {
 		test(`primary / ${background}: only live background work permits idle`, async () => {
-			const expected = background === "agent" || background === "task";
+			const expected =
+				background === "agent" || background === "legacy_agent" || background === "task";
 			const fixture = await reasoningIdleFixture("primary", expected);
 			const { id, now, active, owner, run } = fixture;
-			if (background === "agent") {
+			if (background === "agent" || background === "legacy_agent") {
 				await seedNarrator({
 					id: "retry-child",
 					type: "subagent",
@@ -217,7 +295,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 					updatedAt: now,
 				});
 			}
-			if (background !== "none") {
+			if (background !== "none" && background !== "legacy_agent") {
 				await seedTask({
 					id: "reasoning-idle-background",
 					parentNarratorId: id,
@@ -234,7 +312,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
 				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
-				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
+				expect(await options.config.hasPendingWake?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
 			const outcome = await runAgentLoopUnlocked(active, owner, "input", undefined, run);
@@ -298,7 +376,7 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 				if (execute.mock.calls.length > 1) throw new Error("Idle must not restart open Spec work");
 				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
-				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(expected);
+				expect(await options.config.hasPendingWake?.()).toBe(expected);
 				return { ...reasoningIdleResult, reasoningOnlyIdle: expected };
 			});
 			const outcome = await runAgentLoopUnlocked(active, owner, "", undefined, run);
@@ -314,11 +392,11 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 
 	test("busy subagent changes mailbox provenance only when after-tools input is consumed", async () => {
 		const { active, owner, run } = await reasoningIdleFixture("subagent");
-		const consumed = mock(() => {});
+		const consumed = mock(async () => {});
 		const drain = spyOn(runtimeSession, "drainInjectionsIntoHistory");
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
 			options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
-			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+			expect(await options.config.hasPendingWake?.()).toBe(false);
 			for (const step of [
 				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
 				{ parts: [], mailbox: false, before: true, after: true },
@@ -332,16 +410,16 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				});
 				const input = await options.config.getAfterToolsInjections?.();
 				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
-				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.before);
-				input.onConsumed?.();
-				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
+				expect(await options.config.hasPendingWake?.()).toBe(step.before);
+				await input.onConsumed?.();
+				expect(await options.config.hasPendingWake?.()).toBe(step.after);
 				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
 				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
-				expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(step.after);
+				expect(await options.config.hasPendingWake?.()).toBe(step.after);
 			}
 			expect(consumed).toHaveBeenCalledTimes(3);
 			options.config.onModelInputConsumed?.(options.history.built ?? [], "a new user turn");
-			expect(await options.config.shouldIdleOnReasoningOnly?.()).toBe(false);
+			expect(await options.config.hasPendingWake?.()).toBe(false);
 			return { ...reasoningIdleResult, reasoningOnlyIdle: false };
 		});
 		const outcome = await runAgentLoopUnlocked(active, owner, "ordinary input", undefined, run);

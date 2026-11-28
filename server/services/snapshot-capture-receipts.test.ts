@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { openSchemaCopyAt } from "../../tests/sqlite-schema-image";
@@ -20,8 +21,10 @@ import { db as appDb, sqlite as template } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { assertDbReadersReady, closeReadDatabase } from "../lib/db-worker/pool";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
+import { settings } from "../lib/settings";
 import * as spawn from "../lib/spawn";
 import * as localIo from "./file-change-local-io";
 import { LocalFileChangeRuntime } from "./file-change-runtime";
@@ -34,7 +37,7 @@ import {
 	SnapshotCaptureReceiptService,
 	withSnapshotCaptureReceipts,
 } from "./snapshot-capture-receipts";
-import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 let root: string;
@@ -46,6 +49,7 @@ let runtime: LocalFileChangeRuntime;
 let receipts: SnapshotCaptureReceiptService;
 let narratorId: string;
 let userId: string;
+let readersDrained = false;
 const cleanupSpies: { mockRestore(): void }[] = [];
 const crashChild = process.env.NARRAFORK_CAPTURE_CRASH_CHILD === "1";
 
@@ -56,7 +60,10 @@ function database(client: Database) {
 beforeEach(async () => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	if (crashChild) return;
-	root = await mkdtemp(join(await realpath(tmpdir()), "nf-capture-receipt-"));
+	injectRetainedCapturePolicy();
+	readersDrained = false;
+	// Canonicalize the newly-owned root, including Windows 8.3 and macOS /var aliases.
+	root = await realpath(await mkdtemp(join(tmpdir(), "nf-capture-receipt-")));
 	workspace = join(root, "workspace");
 	privateRoot = join(root, "private");
 	await mkdir(workspace);
@@ -88,6 +95,7 @@ beforeEach(async () => {
 	// Real runtime IO establishes the source and exact local root incarnation.
 	// No hand-built scope/hash/receipt fixtures stand in for the scan lifecycle.
 	await editorWrite("seed\n");
+	await assertDbReadersReady(sqlite.filename);
 });
 
 afterEach(async () => {
@@ -103,9 +111,18 @@ afterEach(async () => {
 		.where(eq(schema.narratorMessages.narratorId, narratorId))
 		.run();
 	appDb.delete(schema.narrators).where(eq(schema.narrators.id, narratorId)).run();
-	sqlite.close();
+	if (!readersDrained) await closeReadDatabase(sqlite.filename, { timeoutMs: 5000 });
+	// Drizzle retains prepare() statements. Default close defers the real SQLite
+	// close until their GC; strict close finalizes them before Windows removes the files.
+	sqlite.close(true);
 	await rm(root, { recursive: true, force: true });
 });
+
+function injectRetainedCapturePolicy() {
+	cleanupSpies.push(
+		spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true),
+	);
+}
 
 function editorWrite(text: string) {
 	const path = join(workspace, "a.txt");
@@ -186,6 +203,7 @@ function finishNotification() {
 // isolation. Exit after real git add, before write-tree/finally: no synthetic row.
 if (crashChild) {
 	test("__capture_receipt_crash_child", async () => {
+		injectRetainedCapturePolicy();
 		const childDb = new Database(process.env.NARRAFORK_CAPTURE_CRASH_DB as string);
 		childDb.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
 		const service = new SnapshotCaptureReceiptService({
@@ -227,7 +245,7 @@ describe("actual tree-scan observation receipts", () => {
 		const legacy = appDb
 			.select()
 			.from(schema.worktreeTreeSnapshots)
-			.where(eq(schema.worktreeTreeSnapshots.worktreePath, workspace))
+			.where(eq(schema.worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(workspace)))
 			.limit(5)
 			.all();
 		expect(legacy).toHaveLength(1);
@@ -318,6 +336,13 @@ describe("actual tree-scan observation receipts", () => {
 	});
 
 	test("late warm completion persists only its own observation, not a tool before boundary", async () => {
+		const enabledBefore = settings.workspace.treeSnapshotsEnabled;
+		settings.workspace.treeSnapshotsEnabled = true;
+		cleanupSpies.push({
+			mockRestore: () => {
+				settings.workspace.treeSnapshotsEnabled = enabledBefore;
+			},
+		});
 		const delayed = gateAdd();
 		const finished = finishNotification();
 		const realHot = worktreeTreeSnapshot.tryCaptureHot.bind(worktreeTreeSnapshot);
@@ -499,7 +524,7 @@ describe("actual tree-scan observation receipts", () => {
 		const legacy = appDb
 			.select()
 			.from(schema.worktreeTreeSnapshots)
-			.where(eq(schema.worktreeTreeSnapshots.worktreePath, workspace))
+			.where(eq(schema.worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(workspace)))
 			.limit(1)
 			.get();
 		await rename(`${source}.saved`, source);
@@ -525,7 +550,7 @@ describe("actual tree-scan observation receipts", () => {
 			expect(rows()).toHaveLength(0);
 		} finally {
 			blocker.exec("ROLLBACK;");
-			blocker.close();
+			blocker.close(true);
 			sqlite.exec("PRAGMA busy_timeout = 0;");
 		}
 		await capture();
@@ -759,7 +784,7 @@ describe("actual tree-scan observation receipts", () => {
 			expect(rows()).toHaveLength(1);
 		} finally {
 			competing.exec("ROLLBACK;");
-			competing.close();
+			competing.close(true);
 		}
 		await editorWrite("writer still usable after receipt lock contention\n");
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toContain("writer still usable");
@@ -787,6 +812,32 @@ describe("actual tree-scan observation receipts", () => {
 			),
 		).not.toBeNull();
 		expect(rows()).toHaveLength(3);
+	});
+
+	test("strict fixture close finalizes retained statements before removing the real database", async () => {
+		const deferred = new Database(join(root, "evidence.db"));
+		const statement = deferred.prepare<{ value: number }, []>("SELECT 1 AS value");
+		try {
+			deferred.close();
+			// Control: default close still leaves prepare() and its underlying handle alive.
+			expect(statement.get()).toEqual({ value: 1 });
+		} finally {
+			statement.finalize();
+			deferred.close(true);
+		}
+		const retained = db
+			.select({ id: schema.fileChangeScopes.id })
+			.from(schema.fileChangeScopes)
+			.limit(1)
+			.prepare();
+		expect(retained.get()?.id).toBeDefined();
+		await closeReadDatabase(sqlite.filename, { timeoutMs: 5000 });
+		readersDrained = true;
+		sqlite.close(true);
+		// Keep the Drizzle statement alive: success must not depend on a GC cycle.
+		expect(() => retained.get()).toThrow();
+		await rm(join(root, "evidence.db"));
+		await expect(readFile(join(root, "evidence.db"))).rejects.toThrow();
 	});
 
 	test("scope lookup uses the exact incarnation index with a fixed row/metadata projection", () => {

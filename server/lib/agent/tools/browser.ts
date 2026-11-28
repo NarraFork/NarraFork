@@ -7,6 +7,7 @@ import {
 	closeSession,
 	createSession,
 	DEFAULT_SESSION_TTL_MS,
+	getAllSessionStats,
 	getSession,
 	listSessions,
 	MAX_DEVICE_SCALE_FACTOR,
@@ -552,6 +553,27 @@ function describeHeadedWindow(inUserBrowser: boolean): string {
 				"enable remote debugging at edge://inspect/#remote-debugging (chrome://inspect for Chrome) " +
 				"and allow the connection when prompted";
 }
+/** Protocols launch and navigate accept: web pages and inline `data:` documents. */
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
+
+/**
+ * Launch and navigate open only web pages and `data:` documents. `file:` would read the host's
+ * files from a page, and `chrome:`, `devtools:`, `view-source:` and `javascript:` reach the
+ * browser itself rather than a page.
+ */
+function unsupportedUrlError(url: string): ToolResult | null {
+	try {
+		const parsed = new URL(url);
+		if (ALLOWED_PROTOCOLS.has(parsed.protocol)) return null;
+		return {
+			output: `Unsupported protocol: ${parsed.protocol} — only http://, https://, and data: URLs are supported. Use the Read tool for local files.`,
+			isError: true,
+		};
+	} catch {
+		return { output: `Invalid URL: ${url}`, isError: true };
+	}
+}
+
 async function handleLaunch(
 	narratorId: string,
 	url?: string,
@@ -564,20 +586,29 @@ async function handleLaunch(
 		return { output: "url is required for launch action", isError: true };
 	}
 
-	const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
-	try {
-		const parsed = new URL(url);
-		if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
-			return {
-				output: `Unsupported protocol: ${parsed.protocol} — only http://, https://, and data: URLs are supported. Use the Read tool for local files.`,
-				isError: true,
-			};
-		}
-	} catch {
-		return { output: `Invalid URL: ${url}`, isError: true };
-	}
+	const unsupported = unsupportedUrlError(url);
+	if (unsupported) return unsupported;
 
-	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork, viewport);
+	// Subagent, team and process caps (`agent-resource-caps.ts`); over a cap the launch is
+	// refused before any tab opens.
+	const { reserveBrowserLaunch, isRetiredSubagent } = await import(
+		"../../../services/agent-resource-caps"
+	);
+	const slot = await reserveBrowserLaunch(narratorId, browserSessionCounts, { headless });
+	let session: Awaited<ReturnType<typeof createSession>>;
+	try {
+		session = await createSession(narratorId, url, headless, ttlMs, captureNetwork, viewport);
+	} finally {
+		slot.release();
+	}
+	// A subagent archived while its tab was opening closed everything it had; this one too.
+	if (await isRetiredSubagent(narratorId)) {
+		await closeSession(narratorId, session.id);
+		return {
+			output: "Browser session closed: this subagent was archived while it was opening.",
+			isError: true,
+		};
+	}
 	const { title } = await actions.getPageSnapshot(session.page);
 	return {
 		output:
@@ -592,6 +623,16 @@ async function handleLaunch(
 			`Title: ${title}`,
 		metadata: { sessionId: session.id },
 	};
+}
+
+/** Live browser sessions per narrator, from the session registry. */
+function browserSessionCounts(): Map<string, number> {
+	return new Map(
+		getAllSessionStats().narrators.map(({ narratorId, sessionCount }) => [
+			narratorId,
+			sessionCount,
+		]),
+	);
 }
 
 function handleListSessions(narratorId: string): ToolResult {
@@ -1084,6 +1125,11 @@ async function handleSessionAction(
 		case "navigate": {
 			const navDirection =
 				opts.direction === "back" || opts.direction === "forward" ? opts.direction : undefined;
+			// The same protocols as launch: a session never moves to file:, chrome: and the like.
+			if (!navDirection && opts.url) {
+				const unsupported = unsupportedUrlError(opts.url);
+				if (unsupported) return unsupported;
+			}
 			const result = await actions.navigate(session, {
 				url: opts.url,
 				direction: navDirection,

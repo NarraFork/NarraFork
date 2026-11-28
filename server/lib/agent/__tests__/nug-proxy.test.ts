@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ResolvedNugModelMeta } from "../../nug-model-cache";
-import type { NUGProviderConfig } from "../../settings";
-import { buildNugDelegateBaseConfig } from "../nug-delegate-config";
+import { buildNugDelegateBaseConfig, type NugInferenceConfig } from "../nug-delegate-config";
 
 function modelMeta(channelType: string): ResolvedNugModelMeta {
 	return {
@@ -17,7 +16,7 @@ function modelMeta(channelType: string): ResolvedNugModelMeta {
 
 describe("NUG proxy override", () => {
 	test("includes the provider override in the shared delegate configuration", () => {
-		const config: NUGProviderConfig = {
+		const config: NugInferenceConfig = {
 			id: "nug-test",
 			name: "NUG Test",
 			prefix: "nug",
@@ -25,6 +24,8 @@ describe("NUG proxy override", () => {
 			baseUrl: "https://nug.example.test",
 			defaultModel: "responses:model",
 			proxy: { mode: "custom", url: "http://proxy.example.test:8080" },
+			toolResultImages: "separate",
+			extraHeaders: { "X-Identity": "key", "x-nug-model-hash": "stale" },
 		};
 		const extraHeaders = { "x-nug-model-hash": "hash" };
 
@@ -35,8 +36,10 @@ describe("NUG proxy override", () => {
 				extraHeaders,
 			);
 			expect(delegateConfig.proxy).toEqual(config.proxy);
+			expect(delegateConfig.toolResultImages).toBe("separate");
 			expect(delegateConfig.defaultModel).toBe(`${channelType}:model`);
-			expect(delegateConfig.extraHeaders).toBe(extraHeaders);
+			expect(delegateConfig.extraHeaders).toEqual({ "X-Identity": "key", ...extraHeaders });
+			expect(config.extraHeaders?.["x-nug-model-hash"]).toBe("stale");
 		}
 	});
 });

@@ -217,7 +217,8 @@ function fixture(withPeer = true) {
 			config,
 			run,
 			http: publication.kind === "main" ? main.http : peerHttp,
-			downloadAsset: async ({ assetId, outputPath }) => {
+			downloadAsset: async ({ assetId, outputPath, signal }) => {
+				if (publication.kind === "main") return main.downloadAsset({ assetId, outputPath, signal });
 				const asset = assets.find((a) => a.id === assetId);
 				if (!asset) throw new Error("Only exact frozen peer binary assets may be downloaded");
 				await writeFile(outputPath, files.get(asset.name) as Buffer, { flag: "wx" });
@@ -261,6 +262,8 @@ describe("one successful main Release mirrors independent main and peer publicat
 			expect(result.map((r) => r.publication?.commit)).toEqual([commit, "c".repeat(40)]);
 			expect(result.map((r) => r.publication?.source.runId)).toEqual([123, 123]);
 			expect(f.main.committed?.targetVersion).toBe("1.2.0");
+			expect(f.main.committed?.schemaVersion).toBe(1);
+			expect(f.main.downloaded).toHaveLength(0);
 		}
 		expect(f.peerCommits).toBe(2);
 		expect(f.calls.every((args) => args[0] === "api" && !args.includes("-X"))).toBe(true);

@@ -531,6 +531,68 @@ export async function changeLoadedToolGroup(
 	);
 }
 
+/**
+ * A core tool just became available to a session whose current epoch cannot append it: a
+ * session turned into a team coordinator gains `Team`, and on a `replace_tools` epoch the tool
+ * would stay undeclared until the next compaction. Writes the same rebaseline notice an explicit
+ * load writes, so the next request opens a new epoch that declares it (one prompt-cache miss).
+ *
+ * Writes nothing when the epoch's strategy can append the tool (the runtime reconciles it as an
+ * ordinary `tool_loaded` notice on the next request), when the epoch already declares it, or when
+ * a rebaseline for it is already pending. Returns whether a notice was written.
+ */
+export async function requestToolDeclarationRebaseline(
+	narratorId: string,
+	toolName: string,
+	locale: Locale = "en",
+): Promise<boolean> {
+	return serializeToolChanges(narratorId, async () => {
+		const tool = toolRegistry.get(toolName);
+		if (!tool) return false;
+		const { optionalToolDescription, snapshotToolDefinitions, toolLoadingEpochOf } = await import(
+			"./narrator-epochs"
+		);
+		const { narratorService } = await import("./narrator-service");
+		const history = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		const epoch = await toolLoadingEpochOf(narratorId, history);
+		if (classifyToolAdditions(epoch, [toolName]).blocked.length === 0) return false;
+		if (rebaselineRequests(history, epoch?.markerId).has(toolName)) return false;
+		const { putPrefixToolDefinitions, withPrefixSnapshotPublication } = await import(
+			"./narrator-prefix-snapshots"
+		);
+		const definitionSnapshotRef = await putPrefixToolDefinitions(snapshotToolDefinitions([tool]));
+		const noticeLocale: Locale = locale === "zh-CN" ? "zh-CN" : "en";
+		const block = {
+			type: "tool_loaded" as const,
+			toolName,
+			toolNames: [toolName],
+			definitionSnapshotRef,
+			rebaseline: true as const,
+			text: getToolMessageWithParams("toolLoaded", noticeLocale, {
+				toolName,
+				toolDescription: optionalToolDescription(toolName, noticeLocale).slice(0, 2048),
+			}),
+		};
+		const msg = await withPrefixSnapshotPublication([definitionSnapshotRef], () =>
+			narratorStore.appendToolChange(narratorId, block, "system"),
+		);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "user",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
+		});
+		return true;
+	});
+}
+
 /** The names the provider settings' protocol picker shows (`customApiProtocol*`). */
 const PROTOCOL_LABELS: Record<ModelProtocol, Record<Locale, string>> = {
 	"anthropic-messages": { en: "Anthropic Messages", "zh-CN": "Anthropic Messages" },

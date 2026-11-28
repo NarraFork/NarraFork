@@ -7,6 +7,7 @@ import {
 	type NarratorDisplayMessage,
 	validateDisplayPageRequest,
 } from "../lib/db-worker/display-page-protocol";
+import { workerFailureDetails } from "../lib/db-worker/failure";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -186,11 +187,16 @@ function mapReadError(error: unknown): Error {
 		case "DISPLAY_PAGE_READER_UNAVAILABLE":
 			return new AppError(message, 503, code);
 		default:
-			// The client sees a generic 503; keep the real cause in the server log.
-			logger.warn("History display read failed", {
-				error: message,
-				...(code !== null && code !== undefined && { code: String(code) }),
-			});
+			// Keep a fixed failure classification, not driver text, paths or arbitrary codes.
+			try {
+				logger.warn("History display read failed", {
+					kind: "display-page",
+					outcome: "error",
+					...workerFailureDetails(error, false),
+				});
+			} catch {
+				// The public failure is unchanged when a diagnostic sink is unavailable.
+			}
 			return unavailable("read failed");
 	}
 }

@@ -63,7 +63,7 @@ export function TaskForm({
 	const [submitted, setSubmitted] = useState(false);
 	const [saveError, setSaveError] = useState<string | null>(null);
 	const { data: projects = [], isError: projectsError } = useProjects();
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 	const create = useCreateScheduledTask();
 	const update = useUpdateScheduledTask();
 	const editing = !!task && !copy;
@@ -306,6 +306,7 @@ export function TaskForm({
 											label={t("model")}
 											description={t("modelDesc")}
 											data={groupedModels}
+											filter={modelOptionsFilter}
 											searchable
 											limit={100}
 											value={draft.model || FOLLOW_DEFAULT_MODEL}

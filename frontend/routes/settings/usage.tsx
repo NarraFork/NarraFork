@@ -6,7 +6,12 @@ import { UsageStackedChart } from "@frontend/components/usage-history/UsageStack
 import { UsageStatsSummary } from "@frontend/components/usage-history/UsageStatsSummary";
 import { UserUsageIdFilter } from "@frontend/components/usage-history/UserUsageIdFilter";
 import { UserUsageTotalsSection } from "@frontend/components/usage-history/UserUsageTotalsSection";
+import { useAllModels } from "@frontend/hooks/useModels";
 import { api } from "@frontend/lib/api";
+import {
+	createProviderPrefixOptionsFilter,
+	providerPrefixDisplay,
+} from "@frontend/lib/model-search";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import { usageHistoryCsv } from "@frontend/lib/usage-history-csv";
@@ -206,6 +211,13 @@ function SettingsUsagePage() {
 		queryFn: () => usageHistoryApi.listProviders(),
 		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
+	// Recorded providers are bare prefixes; the filter value must stay the prefix
+	// (the server matches it exactly), so the display name is only searched and shown.
+	const { providerLabels } = useAllModels();
+	const providerOptionsFilter = useMemo(
+		() => createProviderPrefixOptionsFilter(providerLabels),
+		[providerLabels],
+	);
 
 	const { data: users, isError: usersLoadFailed } = useQuery({
 		queryKey: ["admin", "users"],
@@ -375,6 +387,8 @@ function SettingsUsagePage() {
 							label={t("usageHistoryProvider")}
 							placeholder={t("usageHistoryProviderPlaceholder")}
 							data={providersData?.providers ?? []}
+							filter={providerOptionsFilter}
+							renderOption={({ option }) => providerPrefixDisplay(option.value, providerLabels)}
 							value={tempFilters.provider ?? ""}
 							w={isMobile ? "100%" : 140}
 							onChange={(value) =>

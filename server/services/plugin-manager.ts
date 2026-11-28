@@ -8,6 +8,7 @@ import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
+import { hotSafe } from "@server/lib/hot-safe";
 import { generateShortId } from "@server/lib/id";
 import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
@@ -82,6 +83,7 @@ import {
 	type PluginRuntimeOptions,
 	type RuntimeDiagnostics,
 	RuntimeSupervisor,
+	reportPluginRuntimeHealth,
 } from "./plugin-runtime";
 import { checkSbomInstallPolicy, parseSbom, type SbomInstallPolicy } from "./plugin-sbom";
 import {
@@ -145,6 +147,7 @@ export interface PluginRuntimeSupervisorLike {
 	activate?(options: PluginRuntimeOptions | string, signal?: AbortSignal): Promise<RuntimeLike>;
 	disable(pluginId: string): Promise<void>;
 	drain(pluginId: string): Promise<void>;
+	stopProducers?(): void;
 	shutdown(): Promise<void>;
 	get(pluginId: string): RuntimeLike | undefined;
 	getDiagnostics(pluginId?: string): RuntimeDiagnostics[];
@@ -529,6 +532,7 @@ export class PluginManager {
 	private initializePromise?: Promise<PluginManagerStatus[]>;
 	private initialized = false;
 	private shuttingDown = false;
+	private readonly runtimeEvents = new Set<Promise<void>>();
 	/** True when the caller supplied its own catalog, so builtin roots must not be re-resolved. */
 	private readonly catalogInjected: boolean;
 
@@ -1219,12 +1223,9 @@ export class PluginManager {
 					}
 					try {
 						await this.runtimeSupervisor.disable(pluginId);
-					} catch (error) {
+					} catch {
 						this.runtimeSupervisor.quarantine(pluginId, "runtime uninstall shutdown failed");
-						logger.warn("Plugin runtime did not stop cleanly during uninstall", {
-							pluginId,
-							error: error instanceof Error ? error.message : String(error),
-						});
+						reportPluginRuntimeHealth("uninstall_stop_failed");
 					}
 					await this.packageMutex.acquire("package-store", () =>
 						this.removeInstalledPackage(pluginId),
@@ -1234,11 +1235,8 @@ export class PluginManager {
 					// failure must not leave the uninstall half-done. It is logged instead.
 					try {
 						await this.purgePluginSecrets?.(pluginId);
-					} catch (error) {
-						logger.warn("Failed to purge plugin secrets during uninstall", {
-							pluginId,
-							error: error instanceof Error ? error.message : String(error),
-						});
+					} catch {
+						reportPluginRuntimeHealth("secret_purge_failed");
 					}
 					await this.stateStore.removeState(pluginId);
 					await this.refreshCatalog("uninstall");
@@ -1391,12 +1389,9 @@ export class PluginManager {
 			// until the administrator re-authorizes.
 			try {
 				await this.runtimeSupervisor.disable(pluginId);
-			} catch (error) {
+			} catch {
 				this.runtimeSupervisor.quarantine(pluginId, "runtime reset shutdown failed");
-				logger.warn("Plugin runtime did not stop cleanly during authorization reset", {
-					pluginId,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				reportPluginRuntimeHealth("authorization_reset_stop_failed");
 			}
 			await this.stateStore.updateState(pluginId, {
 				runtimeState: "inactive",
@@ -1445,42 +1440,59 @@ export class PluginManager {
 	}
 
 	async shutdown(): Promise<void> {
-		if (!this.initialized) return;
 		this.shuttingDown = true;
-		const states = await this.stateStore.listStates();
-		const enabled = states.filter(
-			(state) =>
-				state.runtimeState !== "inactive" &&
-				state.runtimeState !== "stopped" &&
-				this.runtimeSupervisor.get(state.pluginId),
-		);
-		await Promise.allSettled(
-			enabled.map((state) =>
-				this.lifecycleMutex.acquire(state.pluginId, async () => {
-					const operation = await this.stateStore.beginOperation({
-						pluginId: state.pluginId,
-						operation: "deactivate",
-						context: { reason: "host-shutdown" },
-					});
-					await this.stateStore.updateOperation(operation.id, { status: "running" });
-					try {
-						await this.runtimeSupervisor.disable(state.pluginId);
-						await this.stateStore.updateState(state.pluginId, {
-							runtimeState: "inactive",
-						});
-						await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
-					} catch (error) {
-						await this.persistFailure(state.pluginId, error, "shutdown", false);
-						await this.failOperation(operation, error, "shutdown");
-					}
-				}),
-			),
-		);
-		await this.runtimeSupervisor.shutdown().catch((error) => {
-			logger.warn("Plugin runtime supervisor shutdown failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
+		const failures: unknown[] = [];
+		try {
+			this.runtimeSupervisor.stopProducers?.();
+			await this.initializePromise;
+			if (this.initialized) {
+				const states = await this.stateStore.listStates();
+				const enabled = states.filter(
+					(state) =>
+						state.runtimeState !== "inactive" &&
+						state.runtimeState !== "stopped" &&
+						this.runtimeSupervisor.get(state.pluginId),
+				);
+				const results = await Promise.allSettled(
+					enabled.map((state) =>
+						this.lifecycleMutex.acquire(state.pluginId, async () => {
+							const operation = await this.stateStore.beginOperation({
+								pluginId: state.pluginId,
+								operation: "deactivate",
+								context: { reason: "host-shutdown" },
+							});
+							await this.stateStore.updateOperation(operation.id, { status: "running" });
+							try {
+								await this.runtimeSupervisor.disable(state.pluginId);
+								await this.stateStore.updateState(state.pluginId, { runtimeState: "inactive" });
+								await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
+							} catch (error) {
+								failures.push(error);
+								await this.persistFailure(state.pluginId, error, "shutdown", false);
+								await this.failOperation(operation, error, "shutdown");
+							}
+						}),
+					),
+				);
+				for (const result of results)
+					if (result.status === "rejected") failures.push(result.reason);
+			}
+		} catch (error) {
+			failures.push(error);
+		}
+		// Equivalent to an unconditional finally: metadata failures and an uninitialized manager
+		// never skip actual resource stop/exit, nor writes queued by its final runtime callbacks.
+		try {
+			await this.runtimeSupervisor.shutdown();
+		} catch (error) {
+			failures.push(error);
+		}
+		while (this.runtimeEvents.size) {
+			const results = await Promise.allSettled([...this.runtimeEvents]);
+			for (const result of results) if (result.status === "rejected") failures.push(result.reason);
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length) throw new AggregateError(failures, "Plugin shutdown failed");
 	}
 
 	private async initializeInternal(): Promise<PluginManagerStatus[]> {
@@ -1497,10 +1509,8 @@ export class PluginManager {
 		const snapshot = await this.stateStore.initialize();
 		await this.permissionStore.initialize();
 		if (this.packageStore.cleanupStaging) {
-			await this.packageStore.cleanupStaging().catch((error) => {
-				logger.warn("Unable to clean stale plugin staging entries", {
-					error: error instanceof Error ? error.message : String(error),
-				});
+			await this.packageStore.cleanupStaging().catch(() => {
+				reportPluginRuntimeHealth("staging_cleanup_failed");
 			});
 		}
 		const persistenceCorrupt = snapshot.diagnostics.some((item) =>
@@ -1535,11 +1545,7 @@ export class PluginManager {
 				pointerRecovery.set(pluginId, { restored: true });
 			} catch (error) {
 				pointerRecovery.set(pluginId, { restored: false, error });
-				logger.error("Unable to compensate an interrupted plugin pointer update", {
-					pluginId,
-					operationId: pointerOperation.id,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				reportPluginRuntimeHealth("pointer_recovery_failed", "error");
 			}
 		}
 		this.catalogSnapshot = await this.catalog.scan();
@@ -1652,12 +1658,7 @@ export class PluginManager {
 						at: this.timestamp(),
 					}),
 				});
-				logger.warn("Plugin authority reconciliation failed; plugin isolated", {
-					pluginId: state.pluginId,
-					installationId:
-						state.installationId ?? authorityInstallationId(state) ?? state.current.hash,
-					error: errorMessage(error),
-				});
+				reportPluginRuntimeHealth("authority_reconciliation_failed");
 			}
 		}
 
@@ -1850,11 +1851,8 @@ export class PluginManager {
 				installed.manifest.permissions.host,
 				installed.version,
 				permissions,
-			).catch((error) => {
-				logger.warn("Failed to raise upgrade capability approval requests", {
-					pluginId: installed.pluginId,
-					error: error instanceof Error ? error.message : String(error),
-				});
+			).catch(() => {
+				reportPluginRuntimeHealth("approval_requests_failed");
 			});
 			await this.refreshCatalog("install");
 			await this.stateStore.updateOperation(journal.id, {
@@ -1882,15 +1880,12 @@ export class PluginManager {
 	 * an unreachable catalog is still a usable registration (the user can retry), and
 	 * failing activation over model discovery would be a worse outcome.
 	 */
-	private async refreshProviderCatalogs(pluginId: string): Promise<void> {
+	private async refreshProviderCatalogs(_pluginId: string): Promise<void> {
 		if (!this.providerCatalogRefresher) return;
 		try {
 			await this.providerCatalogRefresher.refreshStale();
-		} catch (error) {
-			logger.warn("Plugin provider catalog refresh failed after activation", {
-				pluginId,
-				error: error instanceof Error ? error.message : String(error),
-			});
+		} catch {
+			reportPluginRuntimeHealth("provider_catalog_refresh_failed");
 		}
 	}
 
@@ -2024,11 +2019,7 @@ export class PluginManager {
 							runtimeGeneration: diagnostics?.generation,
 						});
 					} catch (lifecycleError) {
-						logger.error("Plugin lifecycle revocation failed after activation failure", {
-							pluginId,
-							error:
-								lifecycleError instanceof Error ? lifecycleError.message : String(lifecycleError),
-						});
+						reportPluginRuntimeHealth("activation_revoke_failed", "error");
 						await this.persistFailure(pluginId, lifecycleError, "lifecycle-revoke", true);
 					}
 					await this.persistFailure(pluginId, error, "activate", quarantine);
@@ -2658,10 +2649,9 @@ export class PluginManager {
 						}
 					: state,
 			)
-			.catch((error) => {
-				logger.warn("Unable to persist plugin runtime state", {
-					pluginId,
-					error: error instanceof Error ? error.message : String(error),
+			.catch(() => {
+				reportPluginRuntimeHealth("state_persist_failed", "warn", {
+					generation: diagnostics.generation,
 				});
 			});
 	}
@@ -2696,12 +2686,8 @@ export class PluginManager {
 		);
 		try {
 			await this.refreshCatalog();
-		} catch (refreshError) {
-			logger.warn("Unable to synchronize plugin contributions after failure", {
-				pluginId,
-				phase,
-				error: refreshError instanceof Error ? refreshError.message : String(refreshError),
-			});
+		} catch {
+			reportPluginRuntimeHealth("contribution_sync_failed");
 		}
 	}
 
@@ -2733,12 +2719,8 @@ export class PluginManager {
 				status: "failed",
 				error: pluginStateError(error, { phase, at: this.timestamp() }),
 			})
-			.catch((journalError) => {
-				logger.error("Unable to persist failed plugin operation", {
-					pluginId: operation.pluginId,
-					operationId: operation.id,
-					error: journalError instanceof Error ? journalError.message : String(journalError),
-				});
+			.catch(() => {
+				reportPluginRuntimeHealth("journal_persist_failed", "error");
 			});
 	}
 
@@ -2904,12 +2886,8 @@ export class PluginManager {
 					pluginId,
 					authorityId: authority.authorityId,
 				});
-			} catch (error) {
-				logger.warn("Unable to retire legacy plugin authority", {
-					pluginId,
-					authorityId: authority.authorityId,
-					error: error instanceof Error ? error.message : String(error),
-				});
+			} catch {
+				reportPluginRuntimeHealth("authority_retirement_failed");
 			}
 		}
 	}
@@ -3024,10 +3002,17 @@ export class PluginManager {
 		return report;
 	}
 
-	private async handleRuntimeStateChange(
-		pluginId: string,
-		event: RuntimeStateEvent,
-	): Promise<void> {
+	private handleRuntimeStateChange(pluginId: string, event: RuntimeStateEvent): Promise<void> {
+		const pending = this.applyRuntimeStateChange(pluginId, event);
+		this.runtimeEvents.add(pending);
+		void pending.then(
+			() => this.runtimeEvents.delete(pending),
+			() => this.runtimeEvents.delete(pending),
+		);
+		return pending;
+	}
+
+	private async applyRuntimeStateChange(pluginId: string, event: RuntimeStateEvent): Promise<void> {
 		// Share ordering with disable/uninstall/permission mutations. Supervisor
 		// callbacks only enqueue; locked manager operations never await this queue.
 		await this.lifecycleMutex.acquire(pluginId, async () => {
@@ -3087,19 +3072,9 @@ export class PluginManager {
 		sourceError?: unknown,
 		event?: RuntimeStateEvent,
 	): Promise<void> {
-		logger.error("Plugin lifecycle revocation failed for a runtime event", {
-			pluginId,
-			runtimeState,
-			error: error instanceof Error ? error.message : String(error),
-			revokeErrors:
-				error instanceof PluginLifecycleRevokeError
-					? error.report.errors.map((failure) => ({
-							layer: failure.layer,
-							action: failure.action,
-							code: failure.code,
-							message: failure.message,
-						}))
-					: undefined,
+		reportPluginRuntimeHealth("runtime_revoke_failed", "error", {
+			quarantined: runtimeState === "quarantine",
+			failures: error instanceof PluginLifecycleRevokeError ? error.report.errors.length : 1,
 		});
 		if (event && !this.isCurrentRuntimeEvent(pluginId, event)) return;
 		if (runtimeState !== "quarantine") {
@@ -3111,11 +3086,9 @@ export class PluginManager {
 			"lifecycle-revoke",
 			true,
 			event ? { ...event, state: "quarantine" } : undefined,
-		).catch((persistError) => {
-			logger.error("Unable to persist plugin lifecycle revocation failure", {
-				pluginId,
-				error: persistError instanceof Error ? persistError.message : String(persistError),
-				sourceError: sourceError instanceof Error ? sourceError.message : undefined,
+		).catch(() => {
+			reportPluginRuntimeHealth("revoke_state_persist_failed", "error", {
+				sourceError: sourceError !== undefined,
 			});
 		});
 	}
@@ -3260,15 +3233,11 @@ export class PluginManager {
 					capability,
 					source: "upgrade",
 				});
-			} catch (error) {
+			} catch {
 				// A full pending queue (or any single rejected row) must not abort the rest:
 				// the capability stays ungranted either way, and the remaining ones still
 				// deserve a prompt.
-				logger.warn("Could not queue an upgrade capability approval request", {
-					pluginId,
-					capability,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				reportPluginRuntimeHealth("approval_request_failed");
 			}
 		}
 		if (queued.length > 0) {
@@ -3506,22 +3475,28 @@ function podmanConfigFromEnvironment(): PluginPodmanConfig | undefined {
 	return image && imageDigest ? { image, imageDigest } : undefined;
 }
 
-export const pluginManager = new PluginManager({
-	disabled: !pluginsEnabledFromEnvironment(),
-	trustPolicy: pluginTrustPolicyFromEnvironment(),
-	podman: podmanConfigFromEnvironment(),
-	runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
-	stateStore: pluginPlatformServices.stateStore,
-	permissionStore: pluginPlatformServices.permissionStore,
-	hostServices: pluginPlatformServices.hostServices,
-	contributionRegistry: pluginPlatformServices.contributionRegistry,
-	toolRegistry: pluginPlatformServices.toolRegistry,
-	agentToolBridge: pluginPlatformServices.toolBridge,
-	contributionCoordinator: pluginPlatformServices.contributionCoordinator,
-	providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
-	lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
-	restorePluginLifecycle: pluginPlatformServices.restorePlugin,
-});
+// Upgrade from the former unpinned owner requires a cold restart: an old module's processes
+// cannot be discovered from a new registry. From this version onward HMR keeps the actual owner.
+export const pluginManager = hotSafe(
+	"narrafork.pluginManager.owner",
+	() =>
+		new PluginManager({
+			disabled: !pluginsEnabledFromEnvironment(),
+			trustPolicy: pluginTrustPolicyFromEnvironment(),
+			podman: podmanConfigFromEnvironment(),
+			runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
+			stateStore: pluginPlatformServices.stateStore,
+			permissionStore: pluginPlatformServices.permissionStore,
+			hostServices: pluginPlatformServices.hostServices,
+			contributionRegistry: pluginPlatformServices.contributionRegistry,
+			toolRegistry: pluginPlatformServices.toolRegistry,
+			agentToolBridge: pluginPlatformServices.toolBridge,
+			contributionCoordinator: pluginPlatformServices.contributionCoordinator,
+			providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
+			lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: pluginPlatformServices.restorePlugin,
+		}),
+);
 
 pluginPlatformServices.publicApi.configureAdapters(
 	createCorePluginPublicApiAdapters({ db, pluginManager }),

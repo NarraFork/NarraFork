@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import puppeteer, { type Browser, type HTTPRequest, type Page } from "puppeteer-core";
@@ -29,6 +29,7 @@ const { assertSmokeInputs, createSmokeRuntime, isolatedSmokeEnvironment } = (awa
 const MAX_OUTPUT_BYTES = 32 * 1024;
 const HTTP_TIMEOUT_MS = 10_000;
 const GIT_DELAY_MS = 2_000;
+const readFanout = process.argv.includes("--read-fanout");
 const diagnosticMobile = process.argv.includes("--diagnostic-mobile");
 const diagnostic = diagnosticMobile || process.argv.includes("--diagnostic");
 const faultMode = process.argv.find((arg) => arg.startsWith("--fault="))?.split("=")[1];
@@ -61,6 +62,7 @@ interface Paint {
 		statusHeight: number;
 		innerHeight: number;
 		textarea: {
+			kind: "textarea" | "contenteditable";
 			rect: Rect;
 			clientWidth: number;
 			inlineHeight: string;
@@ -83,6 +85,7 @@ interface BrowserProbe {
 	firstViewport: Paint | null;
 	firstMessage: Paint | null;
 	viewportChanges: Paint[];
+	failure?: { message: string; frame: number };
 }
 interface ProbeWindow extends Window {
 	__loadingProbe: BrowserProbe;
@@ -133,6 +136,326 @@ export function summarize(samples: readonly number[]) {
 	const percentile = (q: number) =>
 		Math.round((ordered[Math.max(0, Math.ceil(ordered.length * q) - 1)] ?? 0) * 10) / 10;
 	return { n: ordered.length, p50Ms: percentile(0.5), p95Ms: percentile(0.95) };
+}
+// --read-fanout: browser-observed fanout per phase window. Only fixed labels, counts and
+// durations leave the observer; no URL, query, ID, header, body or WS payload is retained.
+const FANOUT_LIMITS = {
+	categories: 64,
+	wsTypes: 32,
+	windowsPerRound: 16,
+	pendingHttp: 1_024,
+	frameBytes: 64 * 1_024,
+	evidenceBytes: 4 * 1_024 * 1_024,
+};
+export const FANOUT_LATENCY_BOUNDS_MS = [5, 10, 25, 50, 100, 250, 500, 1_000, 5_000];
+// No backend read collector exists on this build, so server metrics are reported as absent.
+export const SERVER_READ_METRICS = {
+	status: "unavailable",
+	reason:
+		"No backend read-fanout collector on this build; browser observation cannot see SQL reads.",
+	blockedOn: "legacy /api/admin/diagnostics/read-fanout collector (9d9083b9e), not on main",
+	blockedMetrics: [
+		"logical SQL reads, read-pool entries and Worker dispatches per window",
+		"exact query-template repeat counts",
+		"server-side read timing histograms and background/unattributed reads",
+	],
+} as const;
+type FanoutPhase = "cold" | "A_to_B" | "B_to_A" | "idle";
+interface FanoutCounts {
+	started: number;
+	completed: number;
+	failed: number;
+}
+interface OpeningTiming {
+	startMs: number;
+	responseEndMs: number;
+}
+export interface FanoutWindow {
+	label: FanoutPhase | "between";
+	startedAtMs: number;
+	endedAtMs?: number;
+	firstVisibleMs?: number;
+	opening?: { detail: OpeningTiming | null; tail: OpeningTiming | null };
+	http: FanoutCounts & {
+		statuses: Record<string, number>;
+		categories: Record<string, FanoutCounts>;
+		durationMs: { count: number; sumMs: number; maxMs: number; buckets: number[] };
+		inflightAtStart: number;
+		inflightAtEnd?: number;
+	};
+	ws: { sent: Record<string, number>; received: number; receivedBytes: number };
+	overflow: number;
+}
+
+export function fanoutHttpCategory(url: string): string | null {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return null;
+	}
+	const group = parsed.pathname.match(/^\/api\/([^/]+)/)?.[1];
+	if (!group) return null;
+	if (group === "narrators" && parsed.pathname !== "/api/narrators")
+		return `narrators.${requestKind(url)?.kind ?? "other"}`;
+	return /^[a-z][a-z-]{0,31}$/.test(group) ? group : "unknown";
+}
+export function fanoutWsType(payload: string, opcode = 1) {
+	if (opcode !== 1) return "non-text";
+	if (Buffer.byteLength(payload) > FANOUT_LIMITS.frameBytes) return "oversized";
+	try {
+		const frame = JSON.parse(payload) as { type?: unknown; kind?: unknown } | null;
+		const type =
+			typeof frame?.type === "string" && /^[a-z][a-z_]{0,39}$/.test(frame.type)
+				? frame.type
+				: "unknown";
+		if (type !== "subscribe") return type;
+		const kind = frame?.kind ?? "messages";
+		return `subscribe:${["list", "panel", "messages", "activity"].includes(String(kind)) ? kind : "unknown"}`;
+	} catch {
+		return "invalid-json";
+	}
+}
+
+export class FanoutCounter {
+	readonly windows: FanoutWindow[] = [];
+	private readonly pending = new Map<object, { key: string; startedAtMs: number }>();
+	private readonly epoch: number;
+	constructor(private readonly clock: () => number = () => performance.now()) {
+		this.epoch = clock();
+		this.begin("between");
+	}
+	now() {
+		return Math.round((this.clock() - this.epoch) * 10) / 10;
+	}
+	get current() {
+		return this.windows[this.windows.length - 1] as FanoutWindow;
+	}
+	close() {
+		if (this.current.endedAtMs !== undefined) return;
+		this.current.endedAtMs = this.now();
+		this.current.http.inflightAtEnd = this.pending.size;
+	}
+	begin(label: FanoutWindow["label"]) {
+		if (this.windows.length) this.close();
+		if (this.windows.length >= FANOUT_LIMITS.windowsPerRound)
+			throw new Error("Fanout window budget exceeded");
+		this.windows.push({
+			label,
+			startedAtMs: this.now(),
+			http: {
+				started: 0,
+				completed: 0,
+				failed: 0,
+				statuses: {},
+				categories: {},
+				durationMs: {
+					count: 0,
+					sumMs: 0,
+					maxMs: 0,
+					buckets: Array(FANOUT_LATENCY_BOUNDS_MS.length + 1).fill(0),
+				},
+				inflightAtStart: this.pending.size,
+			},
+			ws: { sent: {}, received: 0, receivedBytes: 0 },
+			overflow: 0,
+		});
+		return this.current;
+	}
+	end(firstVisibleMs?: number) {
+		this.current.firstVisibleMs = firstVisibleMs;
+		this.begin("between");
+	}
+	private category(key: string) {
+		const categories = this.current.http.categories;
+		if (!categories[key] && Object.keys(categories).length >= FANOUT_LIMITS.categories) {
+			this.current.overflow++;
+			return undefined;
+		}
+		categories[key] ??= { started: 0, completed: 0, failed: 0 };
+		return categories[key];
+	}
+	request(token: object, url: string, method: string) {
+		const category = fanoutHttpCategory(url);
+		if (!category) return;
+		const verb = ["GET", "POST", "PUT", "PATCH", "DELETE"].includes(method) ? method : "OTHER";
+		const key = `${verb} ${category}`;
+		this.current.http.started++;
+		const counts = this.category(key);
+		if (counts) counts.started++;
+		if (this.pending.size >= FANOUT_LIMITS.pendingHttp) this.current.overflow++;
+		else this.pending.set(token, { key, startedAtMs: this.now() });
+	}
+	response(token: object, status: number) {
+		if (!this.pending.has(token)) return;
+		const statusClass = status >= 100 && status < 600 ? `${Math.floor(status / 100)}xx` : "unknown";
+		this.current.http.statuses[statusClass] = (this.current.http.statuses[statusClass] ?? 0) + 1;
+	}
+	// Completions belong to the window they finish in; inflight counts expose the carry-over.
+	finish(token: object, failed = false) {
+		const request = this.pending.get(token);
+		if (!request) return;
+		this.pending.delete(token);
+		const field = failed ? "failed" : "completed";
+		this.current.http[field]++;
+		const counts = this.category(request.key);
+		if (counts) counts[field]++;
+		const ms = Math.max(0, this.now() - request.startedAtMs);
+		const histogram = this.current.http.durationMs;
+		histogram.count++;
+		histogram.sumMs = Math.round((histogram.sumMs + ms) * 10) / 10;
+		histogram.maxMs = Math.max(histogram.maxMs, ms);
+		const bucket = FANOUT_LATENCY_BOUNDS_MS.findIndex((bound) => ms <= bound);
+		histogram.buckets[bucket < 0 ? FANOUT_LATENCY_BOUNDS_MS.length : bucket]++;
+	}
+	wsSent(payload: string, opcode = 1) {
+		const type = fanoutWsType(payload, opcode);
+		const sent = this.current.ws.sent;
+		if (!sent[type] && Object.keys(sent).length >= FANOUT_LIMITS.wsTypes) this.current.overflow++;
+		else sent[type] = (sent[type] ?? 0) + 1;
+	}
+	wsReceived(payload: string) {
+		this.current.ws.received++;
+		this.current.ws.receivedBytes += Buffer.byteLength(payload);
+	}
+}
+
+async function monitorFanout(page: Page) {
+	const counter = new FanoutCounter();
+	const cdp = await page.createCDPSession();
+	cdp.on("Network.webSocketFrameSent", ({ response }) =>
+		counter.wsSent(response.payloadData, response.opcode),
+	);
+	cdp.on("Network.webSocketFrameReceived", ({ response }) =>
+		counter.wsReceived(response.payloadData),
+	);
+	await cdp.send("Network.enable");
+	page.on("request", (request) => counter.request(request, request.url(), request.method()));
+	page.on("response", (response) => counter.response(response.request(), response.status()));
+	page.on("requestfinished", (request) => counter.finish(request));
+	page.on("requestfailed", (request) => counter.finish(request, true));
+	return {
+		counter,
+		async cleanup() {
+			counter.close();
+			await cdp.detach().catch(() => {});
+		},
+	};
+}
+// Resource Timing for the first detail/tail fetch of the cold document; the URL is not kept.
+async function openingTimings(page: Page, narratorId: string) {
+	return page.evaluate((id) => {
+		const entries = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+		const first = (path: string) => {
+			const entry = entries.find((item) => {
+				const url = new URL(item.name);
+				return (
+					url.pathname === path &&
+					!url.searchParams.has("afterSeq") &&
+					!url.searchParams.has("beforeSeq")
+				);
+			});
+			return entry
+				? {
+						startMs: Math.round(entry.startTime * 10) / 10,
+						responseEndMs: Math.round(entry.responseEnd * 10) / 10,
+					}
+				: null;
+		};
+		return {
+			detail: first(`/api/narrators/${id}`),
+			tail: first(`/api/narrators/${id}/pretext-document`),
+		};
+	}, narratorId);
+}
+
+export interface FanoutRound {
+	viewport: string;
+	iteration: number;
+	kind: "functional" | "measured" | "diagnostic";
+	windows: FanoutWindow[];
+	typing?: { growMs: number; restoreMs: number };
+}
+export function distribution(values: readonly (number | undefined)[]) {
+	const finite = values.filter((value): value is number => Number.isFinite(value));
+	if (!finite.length) return { n: 0, p50: null, p95: null, max: null };
+	const { n, p50Ms, p95Ms } = summarize(finite);
+	return { n, p50: p50Ms, p95: p95Ms, max: Math.max(...finite) };
+}
+export function summarizeFanout(rounds: readonly FanoutRound[]) {
+	const viewports = [...new Set(rounds.map((round) => round.viewport))];
+	return viewports.flatMap((viewport) =>
+		(["cold", "A_to_B", "B_to_A", "idle"] as const).flatMap((phase) => {
+			const windows = rounds
+				.filter((round) => round.viewport === viewport && round.kind === "measured")
+				.flatMap((round) => round.windows.filter((window) => window.label === phase));
+			if (!windows.length) return [];
+			const requestsByCategory: Record<string, number> = {};
+			for (const window of windows)
+				for (const [key, counts] of Object.entries(window.http.categories))
+					requestsByCategory[key] = (requestsByCategory[key] ?? 0) + counts.started;
+			const sum = (record: Record<string, number>) =>
+				Object.values(record).reduce((total, value) => total + value, 0);
+			return [
+				{
+					viewport,
+					phase,
+					windows: windows.length,
+					firstVisibleMs: distribution(windows.map((window) => window.firstVisibleMs)),
+					windowMs: distribution(
+						windows.map((window) => (window.endedAtMs ?? window.startedAtMs) - window.startedAtMs),
+					),
+					httpStarted: distribution(windows.map((window) => window.http.started)),
+					httpFailed: distribution(windows.map((window) => window.http.failed)),
+					httpInflightAtEnd: distribution(windows.map((window) => window.http.inflightAtEnd)),
+					httpMaxMs: distribution(windows.map((window) => window.http.durationMs.maxMs)),
+					wsSent: distribution(windows.map((window) => sum(window.ws.sent))),
+					wsReceived: distribution(windows.map((window) => window.ws.received)),
+					openingDetailResponseEndMs: distribution(
+						windows.map((window) => window.opening?.detail?.responseEndMs),
+					),
+					openingTailResponseEndMs: distribution(
+						windows.map((window) => window.opening?.tail?.responseEndMs),
+					),
+					requestsByCategory,
+				},
+			];
+		}),
+	);
+}
+export function fanoutCoverageComplete(rounds: readonly FanoutRound[], expectedMeasured: number) {
+	const measured = rounds.filter((round) => round.kind === "measured");
+	return (
+		measured.length === expectedMeasured &&
+		measured.every((round) =>
+			(["cold", "A_to_B", "B_to_A"] as const).every((phase) =>
+				round.windows.some(
+					(window) =>
+						window.label === phase &&
+						window.endedAtMs !== undefined &&
+						window.firstVisibleMs !== undefined,
+				),
+			),
+		) &&
+		rounds.every((round) => round.windows.every((window) => window.overflow === 0))
+	);
+}
+// Fails closed: evidence containing a fixture secret, ID, path or transcript text is not written.
+export function writePrivateEvidence(path: string, value: unknown, forbidden: readonly string[]) {
+	const text = `${JSON.stringify(value, null, "\t")}\n`;
+	if (forbidden.some((secret) => secret.length > 0 && text.includes(secret)))
+		throw new Error("Evidence privacy guard rejected sensitive fixture data");
+	if (Buffer.byteLength(text) > FANOUT_LIMITS.evidenceBytes)
+		throw new Error("Evidence byte budget exceeded");
+	writeFileSync(path, text, { mode: 0o600 });
+	chmodSync(path, 0o600);
+}
+// Labels persisted IDs/token/home in the general evidence file instead of raw values.
+export function redactEvidence(text: string, replacements: ReadonlyArray<[string, string]>) {
+	let redacted = text;
+	for (const [secret, label] of replacements)
+		if (secret) redacted = redacted.split(secret).join(label);
+	return redacted;
 }
 export function requestKind(url: string): { kind: string; narratorId: string } | null {
 	const parsed = new URL(url);
@@ -382,6 +705,8 @@ function seedMessages(home: string, ids: Record<Subject, string>) {
 function installBrowserProbe(token: string, target: string, expected: string[]) {
 	localStorage.setItem("narrafork_token", token);
 	localStorage.setItem("narrafork_lang", "en");
+	// ~250 bundle chunks would otherwise fill the default buffer before the opening API fetches.
+	performance.setResourceTimingBufferSize(1_000);
 	const host = window as unknown as ProbeWindow;
 	host.__armLoadingProbe = (nextTarget, nextExpected) => {
 		host.__loadingProbe = {
@@ -420,7 +745,7 @@ function installBrowserProbe(token: string, target: string, expected: string[]) 
 		}
 		return true;
 	};
-	const tick = () => {
+	const sample = () => {
 		const probe = host.__loadingProbe;
 		probe.frames++;
 		if (location.pathname === `/narrators/${probe.target}` && probe.frames <= 240) {
@@ -429,7 +754,8 @@ function installBrowserProbe(token: string, target: string, expected: string[]) 
 			).find(visible);
 			if (viewport) {
 				const panel = viewport.closest("[data-narrator-panel]");
-				const textarea = panel?.querySelector<HTMLTextAreaElement>("[data-narrator-composer]");
+				// The composer is a contenteditable editor; a legacy textarea is still accepted.
+				const textarea = panel?.querySelector<HTMLElement>("[data-narrator-composer]");
 				const header = panel?.querySelector("[data-narrator-header-layout]");
 				const toRect = (element: Element): Rect => {
 					const box = element.getBoundingClientRect();
@@ -471,20 +797,27 @@ function installBrowserProbe(token: string, target: string, expected: string[]) 
 					frame: probe.frames,
 					chrome: {
 						panelHeight: panel?.getBoundingClientRect().height ?? 0,
-						textareaHeight: panel?.querySelector("textarea")?.getBoundingClientRect().height ?? 0,
+						textareaHeight: textarea?.getBoundingClientRect().height ?? 0,
 						statusHeight:
 							panel?.querySelector('[data-testid="narrator-status-bar"]')?.getBoundingClientRect()
 								.height ?? 0,
 						innerHeight,
 						textarea: textarea
 							? {
+									kind: textarea instanceof HTMLTextAreaElement ? "textarea" : "contenteditable",
 									rect: toRect(textarea),
 									clientWidth: textarea.clientWidth,
 									inlineHeight: textarea.style.height,
 									inlineMinHeight: textarea.style.minHeight,
 									computedMinHeight: getComputedStyle(textarea).minHeight,
-									placeholder: textarea.placeholder,
-									valueLength: textarea.value.length,
+									placeholder:
+										textarea instanceof HTMLTextAreaElement
+											? textarea.placeholder
+											: (textarea.getAttribute("data-placeholder") ?? ""),
+									valueLength: (textarea instanceof HTMLTextAreaElement
+										? textarea.value
+										: textarea.innerText.trim()
+									).length,
 								}
 							: null,
 						containers,
@@ -522,13 +855,28 @@ function installBrowserProbe(token: string, target: string, expected: string[]) 
 				} else probe.candidateFrames = 0;
 			}
 		}
+	};
+	// A throwing sample must surface as a probe failure, not as a silent 15s paint timeout.
+	const tick = () => {
+		try {
+			sample();
+		} catch (error) {
+			host.__loadingProbe.failure = {
+				message: String(error).slice(0, 500),
+				frame: host.__loadingProbe.frames,
+			};
+			return;
+		}
 		requestAnimationFrame(tick);
 	};
 	requestAnimationFrame(tick);
 }
 async function paint(page: Page): Promise<{ firstViewport: Paint; firstMessage: Paint }> {
 	await page.waitForFunction(
-		() => !!(window as unknown as ProbeWindow).__loadingProbe.firstMessage,
+		() => {
+			const probe = (window as unknown as ProbeWindow).__loadingProbe;
+			return !!(probe.firstMessage || probe.failure);
+		},
 		{
 			timeout: 15_000,
 			polling: "raf",
@@ -536,6 +884,8 @@ async function paint(page: Page): Promise<{ firstViewport: Paint; firstMessage: 
 	);
 	return page.evaluate(() => {
 		const probe = (window as unknown as ProbeWindow).__loadingProbe;
+		if (probe.failure)
+			throw new Error(`Paint probe frame ${probe.failure.frame}: ${probe.failure.message}`);
 		if (!probe.firstViewport || !probe.firstMessage)
 			throw new Error("Missing browser paint observation");
 		return { firstViewport: probe.firstViewport, firstMessage: probe.firstMessage };
@@ -562,8 +912,11 @@ async function geometry(page: Page) {
 }
 async function navigate(page: Page, id: string, subject: Subject, mobile: boolean) {
 	if (mobile) {
-		await page.waitForSelector(".mantine-Burger-root", { visible: true, timeout: 5_000 });
-		await page.click(".mantine-Burger-root");
+		const menu = await page.waitForSelector("[data-mobile-nav-button]", {
+			visible: true,
+			timeout: 5_000,
+		});
+		await menu?.click();
 	}
 	const selector = `[data-tab-sort-id="narrator:${id}"] .mantine-NavLink-root`;
 	await page.waitForSelector(selector, { visible: true, timeout: 5_000 });
@@ -593,50 +946,69 @@ async function waitGit(page: Page, branch: string) {
 		branch,
 	);
 }
-async function exerciseDraftTextarea(page: Page) {
+export async function exerciseDraftComposer(page: Page) {
 	const selector = "[data-narrator-composer]";
-	const before = await page.$eval(selector, (element) => element.getBoundingClientRect().height);
-	const setDraft = async (text: string) =>
-		page.evaluate(
-			(value, target) => {
-				const textarea = document.querySelector<HTMLTextAreaElement>(target);
-				const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-				if (!textarea || !setter) throw new Error("Missing native textarea value setter");
-				setter.call(textarea, value);
-				textarea.dispatchEvent(new Event("input", { bubbles: true }));
-			},
-			text,
-			selector,
-		);
-	// A native input event exercises React's controlled draft path without Enter/send.
-	const multiline =
-		"SMOKE DRAFT LINE 1\nSMOKE DRAFT LINE 2\nSMOKE DRAFT LINE 3\nSMOKE DRAFT LINE 4";
-	await setDraft(multiline);
+	const before = await page.$eval(selector, (element) => {
+		const value =
+			element instanceof HTMLTextAreaElement ? element.value : (element as HTMLElement).innerText;
+		if (value.trim()) throw new Error("Draft growth fixture requires an empty composer");
+		return element.getBoundingClientRect().height;
+	});
+	// Select-all + Backspace, then CDP Input.insertText: the real editor input path, never Enter/send.
+	const setDraft = async (value: string) => {
+		await page.focus(selector);
+		await page.$eval(selector, (element) => {
+			if (element instanceof HTMLTextAreaElement) return element.select();
+			const range = document.createRange();
+			range.selectNodeContents(element);
+			getSelection()?.removeAllRanges();
+			getSelection()?.addRange(range);
+		});
+		await page.keyboard.press("Backspace");
+		if (value) await page.keyboard.sendCharacter(value);
+	};
+	const lines = [
+		"SMOKE DRAFT LINE 1",
+		"SMOKE DRAFT LINE 2",
+		"SMOKE DRAFT LINE 3",
+		"SMOKE DRAFT LINE 4",
+	];
+	const typedAt = performance.now();
+	await setDraft(lines.join("\n"));
 	await page.waitForFunction(
-		(target, text, height) => {
-			const textarea = document.querySelector<HTMLTextAreaElement>(target);
-			return textarea?.value === text && textarea.getBoundingClientRect().height >= height + 20;
-		},
-		{ timeout: 5_000, polling: "raf" },
-		selector,
-		multiline,
-		before,
-	);
-	const grown = await page.$eval(selector, (element) => element.getBoundingClientRect().height);
-	await setDraft("");
-	await page.waitForFunction(
-		(target, height) => {
-			const textarea = document.querySelector<HTMLTextAreaElement>(target);
+		(target, expected, height) => {
+			const editor = document.querySelector<HTMLElement>(target);
+			if (!editor) return false;
+			const value = editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText;
 			return (
-				textarea?.value === "" && Math.abs(textarea.getBoundingClientRect().height - height) <= 0.5
+				expected.every((line: string) => value.includes(line)) &&
+				editor.getBoundingClientRect().height >= height + 20
 			);
 		},
 		{ timeout: 5_000, polling: "raf" },
 		selector,
+		lines,
 		before,
 	);
+	const growMs = performance.now() - typedAt;
+	const grown = await page.$eval(selector, (element) => element.getBoundingClientRect().height);
+	const clearedAt = performance.now();
+	await setDraft("");
+	await page.waitForFunction(
+		(target, height) => {
+			const editor = document.querySelector<HTMLElement>(target);
+			if (!editor) return false;
+			const value = editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText;
+			return value.trim() === "" && Math.abs(editor.getBoundingClientRect().height - height) <= 0.5;
+		},
+		{ timeout: 5_000, polling: "raf" },
+		selector,
+		before,
+	);
+	const restoreMs = performance.now() - clearedAt;
 	const restored = await page.$eval(selector, (element) => element.getBoundingClientRect().height);
-	return { before, grown, restored };
+	const round = (ms: number) => Math.round(ms * 10) / 10;
+	return { before, grown, restored, growMs: round(growMs), restoreMs: round(restoreMs) };
 }
 
 async function monitor(page: Page) {
@@ -900,6 +1272,8 @@ export async function main(iterations = 10) {
 	const checks: Check[] = [];
 	const samples: Sample[] = [];
 	const details: unknown[] = [];
+	const fanoutRounds: FanoutRound[] = [];
+	const secrets: Array<[string, string]> = [[runtime.home, "<fixture-home>"]];
 	const check = (name: string, ok: boolean, detail: unknown) => {
 		checks.push({ name, ok, detail });
 		console.log(`[${ok ? "PASS" : "FAIL"}] ${name} ${JSON.stringify(detail).slice(0, 1_000)}`);
@@ -930,6 +1304,7 @@ export async function main(iterations = 10) {
 			"POST",
 			{ username: "loading_smoke_admin", password: "loading-smoke-pass-123456" },
 		);
+		secrets.push([token, "<token>"]);
 		const dirs = { A: join(runtime.home, "repo-a"), B: join(runtime.home, "repo-b") };
 		for (const dir of Object.values(dirs)) {
 			mkdirSync(dir);
@@ -943,6 +1318,7 @@ export async function main(iterations = 10) {
 					cwd: dirs[subject],
 				})
 			).id;
+			secrets.push([ids[subject], `<narrator-${subject}>`]);
 			await json(runtime.base, `/api/narrators/${ids[subject]}/title`, token, "PATCH", {
 				title: `Loading fixture ${subject}`,
 			});
@@ -980,8 +1356,17 @@ export async function main(iterations = 10) {
 				await page.setCacheEnabled(false);
 				await page.evaluateOnNewDocument(installBrowserProbe, token, ids.A, SENTINELS.A);
 				const network = await monitor(page);
+				const fanout = readFanout ? await monitorFanout(page) : undefined;
+				const fanoutRound: FanoutRound = {
+					viewport: viewport.name,
+					iteration,
+					kind:
+						diagnostic || faultMode ? "diagnostic" : iteration === 0 ? "functional" : "measured",
+					windows: fanout?.counter.windows ?? [],
+				};
 				try {
 					if (iteration === 0) network.delay(ids.A);
+					fanout?.counter.begin("cold");
 					const coldStart = performance.now();
 					await page.goto(`${runtime.base}/narrators/${ids.A}`, {
 						waitUntil: "domcontentloaded",
@@ -989,6 +1374,7 @@ export async function main(iterations = 10) {
 					});
 					const cold = await paint(page);
 					const coldPaintAt = performance.now();
+					if (fanout) fanout.counter.current.opening = await openingTimings(page, ids.A);
 					let coldCount = network.count(ids.A, 0, "tail");
 					await waitGit(page, "loading-smoke-A");
 					if (iteration === 0) {
@@ -1046,8 +1432,10 @@ export async function main(iterations = 10) {
 					const settledCold = await network.finishPhase(ids.A, 0, SENTINELS.A);
 					coldCount = network.count(ids.A, 0, "tail");
 					const coldRequests = historyRequestCounts(network.records, ids.A);
+					fanout?.counter.end(cold.firstMessage.elapsedMs);
 					network.delay();
 					const beforeB = network.records.length;
+					fanout?.counter.begin("A_to_B");
 					const switchB = await navigate(page, ids.B, "B", viewport.mobile);
 					let switchBCount = network.count(ids.B, beforeB, "tail");
 					if (viewport.name === "desktop" && iteration === 0) {
@@ -1085,12 +1473,21 @@ export async function main(iterations = 10) {
 					const settledB = await network.finishPhase(ids.B, beforeB, SENTINELS.B);
 					switchBCount = network.count(ids.B, beforeB, "tail");
 					const switchBRequests = historyRequestCounts(network.records, ids.B, beforeB);
+					fanout?.counter.end(switchB.firstMessage.elapsedMs);
 					const beforeHot = network.records.length;
 					if (faultMode) network.armFault(ids.A);
+					fanout?.counter.begin("B_to_A");
 					const hot = await navigate(page, ids.A, "A", viewport.mobile);
 					const settledHot = await network.finishPhase(ids.A, beforeHot, SENTINELS.A);
 					let hotCount = network.count(ids.A, beforeHot, "tail");
 					let hotRequests = historyRequestCounts(network.records, ids.A, beforeHot);
+					fanout?.counter.end(hot.firstMessage.elapsedMs);
+					if (fanout && iteration > 0) {
+						// Fixed 1s quiet window after the settled hot phase: background fanout only.
+						fanout.counter.begin("idle");
+						await new Promise((done) => setTimeout(done, 1_000));
+						fanout.counter.end();
+					}
 					if (iteration === 0) {
 						const first = hot.firstViewport;
 						check(
@@ -1122,7 +1519,8 @@ export async function main(iterations = 10) {
 								viewportChanges,
 							},
 						);
-						const draftGrowth = await exerciseDraftTextarea(page);
+						const draftGrowth = await exerciseDraftComposer(page);
+						fanoutRound.typing = { growMs: draftGrowth.growMs, restoreMs: draftGrowth.restoreMs };
 						check(
 							`${viewport.name}: multiline draft grows naturally and empty draft restores`,
 							draftGrowth.grown >= draftGrowth.before + 20 &&
@@ -1233,6 +1631,10 @@ export async function main(iterations = 10) {
 					throw error;
 				} finally {
 					network.cleanup();
+					if (fanout) {
+						await fanout.cleanup();
+						fanoutRounds.push(fanoutRound);
+					}
 					await context.close();
 				}
 			}
@@ -1265,6 +1667,12 @@ export async function main(iterations = 10) {
 				};
 			},
 		);
+		if (readFanout)
+			check(
+				"read-fanout windows cover every measured phase within budget",
+				fanoutCoverageComplete(fanoutRounds, 2 * (iterations - 1)),
+				{ rounds: fanoutRounds.length },
+			);
 		check(
 			"all measured cold→B→A rounds use one cold tail, no hot tail or duplicate inflight",
 			!checks.some((item) => !item.ok) && samples.length === 2 * iterations,
@@ -1291,9 +1699,25 @@ export async function main(iterations = 10) {
 		try {
 			writeFileSync(
 				join(runtime.evidenceDir, "narrator-loading.json"),
-				`${JSON.stringify({ failure, diagnostic, faultMode, result, checks, samples, details }, null, "\t")}\n`,
+				redactEvidence(
+					`${JSON.stringify({ failure, diagnostic, faultMode, result, checks, samples, details }, null, "\t")}\n`,
+					secrets,
+				),
 				{ mode: 0o600 },
 			);
+			if (readFanout)
+				writePrivateEvidence(
+					join(runtime.evidenceDir, "narrator-loading-fanout.json"),
+					{
+						schema: "narrator-loading-fanout/v1",
+						source: "browser-observed CDP HTTP/WS events, Resource Timing and rAF paint probe",
+						latencyBoundsMs: FANOUT_LATENCY_BOUNDS_MS,
+						serverReadMetrics: SERVER_READ_METRICS,
+						summary: summarizeFanout(fanoutRounds),
+						rounds: fanoutRounds,
+					},
+					[...secrets.map(([secret]) => secret), ...SENTINELS.A, ...SENTINELS.B],
+				);
 			runtime.report(
 				checks.map((item) => ({
 					name: item.name,

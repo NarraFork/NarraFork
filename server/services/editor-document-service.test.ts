@@ -32,6 +32,7 @@ import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import { EditorDocumentJobs, editorWorkerSpecifierCandidates } from "./editor-document-jobs";
 import { queryEditorOperation } from "./editor-document-runtime";
 import {
@@ -46,7 +47,7 @@ import {
 	runEditorWorker,
 } from "./editor-document-worker";
 import { type FileChangeLocalIo, fileChangeLocalIo } from "./file-change-local-io";
-import { LocalFileChangeRuntime } from "./file-change-runtime";
+import { getDefaultLocalFileChangeRuntime, LocalFileChangeRuntime } from "./file-change-runtime";
 
 let root: string, target: string, actor: EditorActor, service: EditorDocumentService;
 let runtime: LocalFileChangeRuntime, io: FileChangeLocalIo, dispatches: number, outside: boolean;
@@ -409,8 +410,8 @@ describe("large editor objects and real durable pipeline", () => {
 					statusCode: 403,
 					code: change === "revoked" ? "FORBIDDEN" : "EDITOR_IDENTITY_CHANGED",
 				});
-				expect(Reflect.get(jobs, "transfers")).toBe(0);
-				expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+				expect(jobs.diagnostics.transfer.active).toBe(0);
+				expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 				const sessions = Reflect.get(service, "sessions") as Map<string, { pins: number }>;
 				expect(sessions.get(doc.docId)?.pins).toBe(0);
 			} finally {
@@ -461,7 +462,7 @@ describe("large editor objects and real durable pipeline", () => {
 			const pending = service.commit(actor, doc.docId, uploadId, {}).catch((error) => error);
 			try {
 				await queued.promise;
-				expect((Reflect.get(jobs, "queue") as unknown[]).length).toBe(1);
+				expect(jobs.diagnostics.io.queued).toBe(1);
 				if (change === "revision") revision++;
 				else {
 					await rename(workspace, `${workspace}-old`);
@@ -528,7 +529,9 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(first.value?.byteLength).toBe(64 * 1024);
 		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
-		expect(Reflect.get(Reflect.get(service, "jobs"), "transfers")).toBe(0);
+		expect((Reflect.get(service, "jobs") as EditorDocumentJobs).diagnostics.transfer.active).toBe(
+			0,
+		);
 		controller.abort();
 		await expect(reader.read()).rejects.toThrow("cancelled");
 		await service.sweep(Date.now() + EDITOR_SESSION_IDLE_MS + 1);
@@ -551,8 +554,8 @@ describe("large editor objects and real durable pipeline", () => {
 				code: "EDITOR_SOURCE_CHANGED",
 			});
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		await service.remove(actor, doc.docId);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 	});
@@ -562,8 +565,8 @@ describe("large editor objects and real durable pipeline", () => {
 		await service.dispose();
 		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 	});
 	test("unread source response expires and releases memory, pins and permits", async () => {
@@ -597,7 +600,7 @@ describe("large editor objects and real durable pipeline", () => {
 			callback: () => void,
 			delay?: number,
 		) => {
-			if (delay === 30_000) {
+			if (delay !== undefined && delay >= 29_000 && delay <= 30_000) {
 				deadline = callback;
 				return original(() => {}, 60_000);
 			}
@@ -606,11 +609,17 @@ describe("large editor objects and real durable pipeline", () => {
 		try {
 			const stream = await service.content(actor, doc.docId, doc.versionHandle);
 			expect(timers).toHaveBeenCalled();
-			deadline();
+			const expiredAt = Date.now() + 30_001;
+			const clock = spyOn(Date, "now").mockReturnValue(expiredAt);
+			try {
+				deadline();
+			} finally {
+				clock.mockRestore();
+			}
 			await expect(new Response(stream).text()).rejects.toThrow("timed out");
 			await service.remove(actor, doc.docId);
-			expect(Reflect.get(jobs, "transfers")).toBe(0);
-			expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+			expect(jobs.diagnostics.transfer.active).toBe(0);
+			expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 			expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 		} finally {
 			timers.mockRestore();
@@ -821,7 +830,7 @@ describe("large editor objects and real durable pipeline", () => {
 				snapshotRevision: 7,
 			});
 			expect(preparations).toBe(1);
-			expect(saved).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+			expect(saved).toMatchObject({ diskOutcome: "applied", historyStatus: "disabled" });
 			expect(
 				await readFile(
 					join(privateRoot, "file-change-blobs", "sha256", blob.digest.slice(0, 2), blob.digest),
@@ -855,7 +864,7 @@ describe("large editor objects and real durable pipeline", () => {
 		"directory-sync",
 	] as const) {
 		test.skipIf(process.platform === "win32" && stage.startsWith("directory-"))(
-			`recovery ${stage} failure still saves real target bytes and keeps file history complete`,
+			`recovery ${stage} failure still saves real target bytes with local history disabled`,
 			async () => {
 				await service.dispose();
 				const jobs = new EditorDocumentJobs();
@@ -897,7 +906,7 @@ describe("large editor objects and real durable pipeline", () => {
 					expect(saved).toMatchObject({
 						status: "saved",
 						diskOutcome: "applied",
-						historyStatus: "complete",
+						historyStatus: "disabled",
 						hash: hash("saved\r\n中文🙂\r\n"),
 					});
 					expect(failures).toBe(1);
@@ -978,7 +987,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			expect(saved).toMatchObject({
 				status: "saved",
 				diskOutcome: "applied",
-				historyStatus: "complete",
+				historyStatus: "disabled",
 			});
 			expect(await readFile(target, "utf8")).toBe("after timeout");
 			expect(dispatches).toBe(1);
@@ -1015,7 +1024,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 					status: "saved",
 					operationId,
 					diskOutcome: "applied",
-					historyStatus: "complete",
+					historyStatus: "disabled",
 				});
 				expect(dispatches).toBe(1);
 				expect(await readFile(target, "utf8")).toBe("saved despite description\r\n");
@@ -1024,7 +1033,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 				expect(operations()[0].executionOutcome).toBe("succeeded");
 				expect(warnings).toHaveBeenCalledWith("Editor save recovery description unavailable", {
 					operationId,
-					error: expect.stringContaining("unreadable or incompatible"),
+					reason: "description_unavailable",
 				});
 				await service.dispose();
 				service = new EditorDocumentService({
@@ -1515,7 +1524,9 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			result: saved,
 		});
 		await expect(
-			service.operation({ ...actor, userId: "other" }, saved.operationId),
+			(
+				await settleWorkerRead(service.operation({ ...actor, userId: "other" }, saved.operationId))
+			).result(),
 		).rejects.toThrow("owned durable receipt");
 		await service.dispose();
 		await unlink(join(root, "transfers", `ed-${saved.operationId}.json`));
@@ -1526,6 +1537,80 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		});
 		expect((await service.operation(actor, saved.operationId)).status).toBe("uncertain");
 	});
+	test("local cold receipts ignore broken blob storage and authorize the recorded device", async () => {
+		const doc = await create();
+		const id = await upload(doc, "local receipt\n");
+		const saved = await service.commit(actor, doc.docId, id, {});
+		if (saved.status !== "saved") throw new Error("Expected settled save");
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) => runtime.executeEditor(request),
+			queryOperation: queryEditorOperation,
+		});
+		const queryRuntime = await getDefaultLocalFileChangeRuntime();
+		const namespace = spyOn(queryRuntime, "verifyNamespace").mockRejectedValue(
+			new Error("blob storage unavailable"),
+		);
+		let authorizations = 0;
+		actor.authorizeOperation = async (deviceId) => {
+			expect(deviceId).toBe("local");
+			authorizations++;
+		};
+		try {
+			expect(await service.operation(actor, saved.operationId)).toMatchObject({
+				status: "saved",
+				result: { diskOutcome: "applied", historyStatus: "disabled" },
+			});
+			expect(authorizations).toBeGreaterThan(0);
+			expect(namespace).not.toHaveBeenCalled();
+		} finally {
+			namespace.mockRestore();
+		}
+	});
+
+	test("local durable receipts reject a different narrator", async () => {
+		const doc = await create();
+		const id = await upload(doc, "owned receipt\n");
+		const saved = await service.commit(actor, doc.docId, id, {});
+		if (saved.status !== "saved") throw new Error("Expected settled save");
+		await expect(
+			(
+				await settleWorkerRead(
+					queryEditorOperation({ ...actor, narratorId: "wrong-narrator" }, saved.operationId),
+				)
+			).result(),
+		).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
+	});
+
+	test("local receipt queries never replace a missing or mismatched source identity", async () => {
+		const doc = await create();
+		const id = await upload(doc, "source-bound receipt\n");
+		const saved = await service.commit(actor, doc.docId, id, {});
+		if (saved.status !== "saved") throw new Error("Expected settled save");
+		const sourcePath = join(testEnvironment.narraforkHome, "file-change-source.json");
+		const retainedSource = join(root, "retained-source.json");
+		await rename(sourcePath, retainedSource);
+		try {
+			await expect(
+				(await settleWorkerRead(queryEditorOperation(actor, saved.operationId))).result(),
+			).rejects.toMatchObject({
+				code: "EDITOR_OPERATION_UNKNOWN",
+			});
+			await expect(lstat(sourcePath)).rejects.toMatchObject({ code: "ENOENT" });
+			await writeFile(sourcePath, JSON.stringify({ version: 1, id: randomUUID() }), {
+				mode: 0o600,
+			});
+			await expect(
+				(await settleWorkerRead(queryEditorOperation(actor, saved.operationId))).result(),
+			).rejects.toMatchObject({
+				code: "EDITOR_OPERATION_UNKNOWN",
+			});
+		} finally {
+			await rename(retainedSource, sourcePath);
+		}
+	});
+
 	test("an unknown local IO outcome stays uncertain after restart instead of failed", async () => {
 		const doc = await create(),
 			id = await upload(doc, "maybe written\n");
@@ -1605,12 +1690,12 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			stale.data.conflictVersionHandle as string,
 		);
 		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
-		expect(Reflect.get(jobs, "transfers")).toBe(1);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024);
+		expect(jobs.diagnostics.transfer.active).toBe(1);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(64 * 1024);
 		await service.remove(actor, doc.docId);
 		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
 		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
 		expect(await bodies()).toHaveLength(0);
 	});
@@ -1837,7 +1922,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		a.release();
 		a.release();
 		const c = await third;
-		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024 * 1024 + 1);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(64 * 1024 * 1024 + 1);
 		b.release();
 		c.release();
 		const active = await Promise.all(Array.from({ length: 8 }, () => jobs.acquireTransfer(1)));
@@ -1848,9 +1933,9 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		controller.abort();
 		expect((await failures).every((error) => error.code === "EDITOR_TIMEOUT")).toBe(true);
 		for (const permit of active) permit.release();
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
-		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
-		expect(Reflect.get(jobs, "transferQueue")).toHaveLength(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
+		expect(jobs.diagnostics.transfer.activeBytes).toBe(0);
+		expect(jobs.diagnostics.transfer.queued).toBe(0);
 	});
 	test("source transfer permit is independent of inherited IO admission", async () => {
 		const jobs = new EditorDocumentJobs();
@@ -1859,7 +1944,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			await jobs.withIo(actor.userId, async () => {});
 			permit.release();
 		});
-		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(jobs.diagnostics.transfer.active).toBe(0);
 	});
 	test("IO admission runs four users at once, one task each, and caps each user's queue", async () => {
 		const jobs = new EditorDocumentJobs(),
@@ -1930,10 +2015,22 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			expect(result).toMatchObject({
 				status: "saved",
 				diskOutcome: "applied",
-				historyStatus: "unavailable",
+				historyStatus: "disabled",
 			});
 			expect(dispatches).toBe(1);
 			expect(await readFile(target, "utf8")).toBe("mine");
+			expect(operations()[0]?.executionBindingJson).toMatchObject({ deviceId: "local" });
+			await service.dispose();
+			service = new EditorDocumentService({
+				root: join(root, "transfers"),
+				execute: (request) => runtime.executeEditor(request),
+				queryOperation: queryEditorOperation,
+			});
+			expect(await service.operation(actor, result.operationId)).toMatchObject({
+				status: "uncertain",
+				operationId: result.operationId,
+			});
+			expect(dispatches).toBe(1);
 		} finally {
 			runtime.evidence.recordEffect = prepare;
 		}

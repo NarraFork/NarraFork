@@ -20,55 +20,113 @@ export function assertWorkerBuildId(buildId: unknown): void {
 	}
 }
 
-function redact(value: string): string {
-	return value
-		.slice(0, 8192)
-		.replace(/\b(?:postgres(?:ql)?|https?):\/\/[^\s)]+/gi, "[redacted-url]")
-		.replace(
-			/\b(?:password|passwd|token|secret|authorization)\s*[:=]\s*[^\s,;]+/gi,
-			"[credential-redacted]",
-		)
-		.replace(/(["'`])[^\n]*?\1/g, "[quoted]")
-		.slice(0, 2048);
-}
+const WORKER_ERROR_TYPES = new Set([
+	"Error",
+	"TypeError",
+	"RangeError",
+	"ReferenceError",
+	"SyntaxError",
+	"URIError",
+	"EvalError",
+	"AggregateError",
+	"AbortError",
+	"TimeoutError",
+	"SystemError",
+	"SQLiteError",
+	"PostgresError",
+	"ResolveMessage",
+	"BuildMessage",
+	"DisplayPageReadError",
+	"WorkerStartupError",
+	"WorkerCleanupError",
+	"TaskQueueError",
+	"WorkerPoolError",
+	"DbReadTaskOverloadedError",
+	"DbReadTaskTimeoutError",
+	"DbReadTaskExecutionError",
+	"WorkersUnavailableError",
+]);
+const WORKER_ERROR_CODES = new Set([
+	"TIMEOUT",
+	"EXITED",
+	"ERR_WORKER_INIT_FAILED",
+	"ERR_WORKER_PATH",
+	"ERR_WORKER_OUT_OF_MEMORY",
+	"ERR_MODULE_NOT_FOUND",
+	"MODULE_NOT_FOUND",
+	"ERR_INVALID_ARG_TYPE",
+	"DB_WORKER_BUILD_MISMATCH",
+	"DB_READ_TASK_OVERLOADED",
+	"DB_READ_TASK_TIMEOUT",
+	"DISPLAY_PAGE_READER_UNAVAILABLE",
+	"TASK_QUEUE_FULL",
+	"TASK_QUEUE_TIMEOUT",
+	"TASK_QUEUE_CLOSED",
+	"WORKER_POOL_CLOSED",
+	"WORKER_POOL_UNAVAILABLE",
+	"SQLITE_ERROR",
+	"SQLITE_INTERNAL",
+	"SQLITE_PERM",
+	"SQLITE_ABORT",
+	"SQLITE_BUSY",
+	"SQLITE_BUSY_RECOVERY",
+	"SQLITE_BUSY_SNAPSHOT",
+	"SQLITE_BUSY_TIMEOUT",
+	"SQLITE_LOCKED",
+	"SQLITE_LOCKED_SHAREDCACHE",
+	"SQLITE_LOCKED_VTAB",
+	"SQLITE_NOMEM",
+	"SQLITE_READONLY",
+	"SQLITE_INTERRUPT",
+	"SQLITE_IOERR",
+	"SQLITE_CORRUPT",
+	"SQLITE_NOTFOUND",
+	"SQLITE_FULL",
+	"SQLITE_CANTOPEN",
+	"SQLITE_PROTOCOL",
+	"SQLITE_EMPTY",
+	"SQLITE_SCHEMA",
+	"SQLITE_TOOBIG",
+	"SQLITE_CONSTRAINT",
+	"SQLITE_CONSTRAINT_CHECK",
+	"SQLITE_CONSTRAINT_FOREIGNKEY",
+	"SQLITE_CONSTRAINT_NOTNULL",
+	"SQLITE_CONSTRAINT_PRIMARYKEY",
+	"SQLITE_CONSTRAINT_UNIQUE",
+	"SQLITE_CONSTRAINT_TRIGGER",
+	"SQLITE_MISMATCH",
+	"SQLITE_MISUSE",
+	"SQLITE_NOLFS",
+	"SQLITE_AUTH",
+	"SQLITE_FORMAT",
+	"SQLITE_RANGE",
+	"SQLITE_NOTADB",
+	"SQLITE_NOTICE",
+	"SQLITE_WARNING",
+]);
 
-/** Startup has no request yet. Runtime diagnostics omit driver messages and stack headers. */
-export function workerFailureDetails(error: unknown, startup: boolean) {
-	const value = error as {
-		name?: unknown;
-		message?: unknown;
-		stack?: unknown;
-		filename?: unknown;
-		lineno?: unknown;
-		colno?: unknown;
-		error?: unknown;
-	} | null;
-	const nested = value?.error;
-	const stack = nested instanceof Error ? nested.stack : value?.stack;
-	return {
-		errorType:
-			nested instanceof Error
-				? redact(nested.name)
-				: typeof value?.name === "string"
-					? redact(value.name)
-					: "WorkerError",
-		code: safeSqliteCode(error),
-		...(startup
-			? { message: redact(typeof value?.message === "string" ? value.message : String(error)) }
-			: {}),
-		file: typeof value?.filename === "string" ? redact(value.filename) : undefined,
-		line: typeof value?.lineno === "number" ? value.lineno : undefined,
-		column: typeof value?.colno === "number" ? value.colno : undefined,
-		stack:
-			typeof stack === "string"
-				? redact(
-						stack
-							.slice(0, 8192)
-							.split("\n")
-							.filter((line) => /^\s*at /.test(line))
-							.slice(0, 8)
-							.join("\n"),
-					)
-				: undefined,
-	};
+/** Project errors AND received diagnostics onto finite scalar categories; never retain raw text. */
+export function workerFailureDetails(error: unknown, _startup: boolean) {
+	try {
+		const value = error as {
+			name?: unknown;
+			errorType?: unknown;
+			code?: unknown;
+			error?: unknown;
+			cause?: unknown;
+		} | null;
+		// Compiled-worker startup wraps the last native failure in an Error cause. Inspect at
+		// most one level, without retaining/traversing nested diagnostics or error text.
+		const nested = value?.error ?? value?.cause;
+		const candidate = nested instanceof Error ? (nested as typeof value) : value;
+		const name = candidate?.name ?? candidate?.errorType;
+		const code = candidate?.code ?? value?.code;
+		return {
+			errorType: typeof name === "string" && WORKER_ERROR_TYPES.has(name) ? name : "WorkerError",
+			code: typeof code === "string" && WORKER_ERROR_CODES.has(code) ? code : undefined,
+		};
+	} catch {
+		// Diagnostic getters/proxies must not replace the original failure or prevent cleanup.
+		return { errorType: "WorkerError", code: undefined };
+	}
 }

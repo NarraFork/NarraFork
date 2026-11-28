@@ -2,14 +2,18 @@
  * Registration-code invariants: the plaintext never reaches storage or list
  * output, and a code can be redeemed exactly once.
  */
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { registrationCodes, userPreferences, users } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -75,12 +79,31 @@ beforeEach(async () => {
 	adminId = await seedAdmin();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 describe("code storage", () => {
+	test("a creator read failure does not persist an unrecoverable invitation", async () => {
+		const failure = new Error("reader unavailable");
+		const read = spyOn(workerRead, "readQueryFirst").mockRejectedValueOnce(failure);
+		let error: unknown;
+		try {
+			await registrationCodeService.createCode({ createdByUserId: adminId });
+		} catch (caught) {
+			error = caught;
+		} finally {
+			read.mockRestore();
+		}
+		expect(error).toBe(failure);
+		expect(await db.select().from(registrationCodes)).toHaveLength(0);
+		const issued = await registrationCodeService.createCode({ createdByUserId: adminId });
+		expect(issued.code).toBeTruthy();
+		expect(await db.select().from(registrationCodes)).toHaveLength(1);
+	});
+
 	test("only the hash is persisted, never the plaintext", async () => {
 		const { code, summary } = await registrationCodeService.createCode({
 			createdByUserId: adminId,
@@ -253,13 +276,17 @@ describe("management", () => {
 		});
 		const redeemerId = await seedRedeemer("alice");
 		redeem(code, "alice", redeemerId);
-		expect(registrationCodeService.revokeCode(summary.id)).rejects.toThrow("already been used");
+		expect(
+			await captureWorkerRejectionThrower(registrationCodeService.revokeCode(summary.id)),
+		).toThrow("already been used");
 	});
 
 	test("deleting removes the row", async () => {
 		const { summary } = await registrationCodeService.createCode({ createdByUserId: adminId });
 		await registrationCodeService.deleteCode(summary.id);
 		expect(await registrationCodeService.listCodes()).toHaveLength(0);
-		expect(registrationCodeService.deleteCode(summary.id)).rejects.toThrow("not found");
+		expect(
+			await captureWorkerRejectionThrower(registrationCodeService.deleteCode(summary.id)),
+		).toThrow("not found");
 	});
 });

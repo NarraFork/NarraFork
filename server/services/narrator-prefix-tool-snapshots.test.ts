@@ -9,6 +9,7 @@ import { SQL } from "bun";
 import { withPostgres } from "../../tests/db/pg-test-harness";
 import type { ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
 import * as compiledWorker from "../lib/compiled-worker";
+import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import {
 	PREFIX_TOOLS_FORMAT,
 	type PrefixToolsManifest,
@@ -314,6 +315,10 @@ function controlledQueue() {
 	const waiters: Array<(value: Dispatch) => void> = [];
 	class ControlledWorker extends EventEmitter {
 		terminated = false;
+		private resolveExit!: (code: number) => void;
+		readonly exited = new Promise<number>((resolve) => {
+			this.resolveExit = resolve;
+		});
 		ref() {
 			return this;
 		}
@@ -322,6 +327,7 @@ function controlledQueue() {
 		}
 		async terminate() {
 			this.terminated = true;
+			this.resolveExit(0);
 			return 0;
 		}
 		postMessage(request: PrefixSnapshotRequest) {
@@ -331,12 +337,15 @@ function controlledQueue() {
 			else dispatched.push(dispatch);
 		}
 	}
-	const connectSpy = spyOn(compiledWorker, "connectCompiledWorker").mockImplementation(
-		async () => ({
-			worker: new ControlledWorker() as unknown as Worker,
+	const connectSpy = spyOn(compiledWorker, "connectCompiledWorker").mockImplementation(async () => {
+		const controlled = new ControlledWorker();
+		const worker = controlled as unknown as Worker;
+		return {
+			worker,
 			specifier: "controlled-prefix-worker",
-		}),
-	);
+			handle: new WorkerHandle(worker, controlled.exited, () => controlled.terminate()),
+		};
+	});
 	const store = createPrefixSnapshotStore(
 		{ backend: "sqlite", path: "unused-controlled-worker.db" },
 		{ timeoutMs },
@@ -374,13 +383,13 @@ test("cancelling a queued text read never dispatches it", async () => {
 	const reason = new Error("cancel queued text read");
 	controller.abort(reason);
 	expect(await pending).toBe(reason);
-	first.worker.emit("message", { value: "b".repeat(64) });
+	first.worker.emit("message", { requestId: first.request.requestId, value: "b".repeat(64) });
 	await blocking;
 	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
 	const next = await nextDispatch();
 	expect(next.request.operation).toBe("putText");
 	expect(next.request.value).toBe("after cancelled read");
-	next.worker.emit("message", { value: "c".repeat(64) });
+	next.worker.emit("message", { requestId: next.request.requestId, value: "c".repeat(64) });
 	expect(await barrier).toBe("c".repeat(64));
 });
 
@@ -397,7 +406,7 @@ test("cancelling an active text read releases its worker and the queue", async (
 	const barrier = store.putPrefixText("after cancelled read").catch((error) => error);
 	const next = await nextDispatch();
 	expect(next.request.operation).toBe("putText");
-	next.worker.emit("message", { value: "b".repeat(64) });
+	next.worker.emit("message", { requestId: next.request.requestId, value: "b".repeat(64) });
 	expect(await barrier).toBe("b".repeat(64));
 });
 
@@ -417,7 +426,7 @@ test("cancelling an active tools batch dispatches no later batch or manifest", a
 	const next = await nextDispatch();
 	expect(next.request.operation).toBe("putText");
 	expect(first.worker.terminated).toBe(true);
-	next.worker.emit("message", { value: "a".repeat(64) });
+	next.worker.emit("message", { requestId: next.request.requestId, value: "a".repeat(64) });
 	await barrier;
 });
 
@@ -448,7 +457,10 @@ test("queue execution timeout starts when work starts, not while waiting behind 
 	expect(started - queuedAt).toBeGreaterThan(timeoutMs);
 	advance(timeoutMs - 1);
 	const hash = "a".repeat(64);
-	secondDispatch.worker.emit("message", { value: hash });
+	secondDispatch.worker.emit("message", {
+		requestId: secondDispatch.request.requestId,
+		value: hash,
+	});
 	expect(await second).toBe(hash);
 	expect(timers[1].cleared).toBe(true);
 });
@@ -462,7 +474,11 @@ for (const completion of ["timer", "late response"] as const) {
 		expect(dispatch.request.deadline).toBe(timers[0].started + timeoutMs);
 		advance(timeoutMs);
 		if (completion === "timer") timers[0].callback();
-		else dispatch.worker.emit("message", { value: "b".repeat(64) });
+		else
+			dispatch.worker.emit("message", {
+				requestId: dispatch.request.requestId,
+				value: "b".repeat(64),
+			});
 		const result = await pending;
 		expect(result).toBeInstanceOf(Error);
 		expect((result as Error).message).toBe("Prefix snapshot operation timed out");
@@ -474,7 +490,7 @@ for (const completion of ["timer", "late response"] as const) {
 		expect(timers).toHaveLength(2);
 		expect(recovery.request.deadline).toBe(timers[1].started + timeoutMs);
 		const hash = "c".repeat(64);
-		recovery.worker.emit("message", { value: hash });
+		recovery.worker.emit("message", { requestId: recovery.request.requestId, value: hash });
 		expect(await recovered).toBe(hash);
 	});
 }

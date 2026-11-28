@@ -1,3 +1,8 @@
+import {
+	DEFAULT_STREAM_ANIM_DURATION_MS,
+	MAX_STREAM_ANIM_DURATION_MS,
+} from "@shared/appearance-preferences";
+
 /**
  * stream-anim-duration.ts — The single owner of the streaming fade-in duration.
  *
@@ -18,7 +23,7 @@
  * boundary; `stream-token-anim.ts` re-exports these names so the render layer's
  * own imports read naturally.
  *
- * Zero imports, no DOM, no React: safe for anything to depend on.
+ * Defaults/ranges are shared with account preference validation; no DOM, API, or React dependencies.
  */
 
 /**
@@ -28,8 +33,6 @@
  * the pair, because a mismatch is invisible: it only shows up as a fade that
  * snaps, which looks like a rendering glitch rather than a wrong number.
  */
-export const DEFAULT_STREAM_ANIM_DURATION_MS = 320;
-
 /**
  * Upper bound of the user-configurable duration.
  *
@@ -48,7 +51,10 @@ export const DEFAULT_STREAM_ANIM_DURATION_MS = 320;
  * fade than the setting says. Raising the cap to "fix" this would reintroduce the
  * freeze, so it is documented rather than removed.
  */
-export const MAX_STREAM_ANIM_DURATION_MS = 5000;
+export {
+	DEFAULT_STREAM_ANIM_DURATION_MS,
+	MAX_STREAM_ANIM_DURATION_MS,
+} from "@shared/appearance-preferences";
 
 /**
  * How long one grapheme's fade-in runs. User-configurable (Settings →

@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { ProviderBalanceData } from "./provider-balance";
 
 /**
- * Wire contract of the `query-balance` tool contributed by the
+ * Wire contract of the host-internal `query-balance` command contributed by the
  * `com.narrafork.apikey-quota` plugin.
  *
  * The plugin is a separate process and mirrors this shape in plain JavaScript
@@ -12,7 +12,7 @@ import type { ProviderBalanceData } from "./provider-balance";
  * caller falls back, so a broken plugin can never write junk into the balance cache.
  */
 export const APIKEY_QUOTA_PLUGIN_ID = "com.narrafork.apikey-quota";
-export const APIKEY_QUOTA_TOOL_ID = "query-balance";
+export const APIKEY_QUOTA_COMMAND_ID = "query-balance";
 
 const amountSchema = z
 	.object({
@@ -35,7 +35,7 @@ const balanceDataSchema = z
 	})
 	.strict();
 
-export const apikeyQuotaToolOutputSchema = z.discriminatedUnion("status", [
+export const apikeyQuotaCommandOutputSchema = z.discriminatedUnion("status", [
 	z
 		.object({
 			status: z.literal("ok"),
@@ -64,9 +64,9 @@ export const apikeyQuotaToolOutputSchema = z.discriminatedUnion("status", [
 		.strict(),
 ]);
 
-export type ApikeyQuotaToolOutput = z.infer<typeof apikeyQuotaToolOutputSchema>;
+export type ApikeyQuotaCommandOutput = z.infer<typeof apikeyQuotaCommandOutputSchema>;
 
-export const apikeyQuotaToolInputSchema = z
+export const apikeyQuotaCommandInputSchema = z
 	.object({
 		mode: z.enum(["probe", "refresh"]),
 		baseUrl: z.string().max(2048),
@@ -95,11 +95,11 @@ export const apikeyQuotaToolInputSchema = z
 	})
 	.strict();
 
-export type ApikeyQuotaToolInput = z.infer<typeof apikeyQuotaToolInputSchema>;
+export type ApikeyQuotaCommandInput = z.infer<typeof apikeyQuotaCommandInputSchema>;
 
 /** Narrow the validated projection to the shared DTO the cache and routes already use. */
 export function toProviderBalanceData(
-	balance: ApikeyQuotaToolOutput & { status: "ok" },
+	balance: ApikeyQuotaCommandOutput & { status: "ok" },
 ): ProviderBalanceData {
 	return balance.balance;
 }

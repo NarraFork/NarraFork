@@ -1,13 +1,19 @@
 import type { ProviderAdapter } from "@server/lib/agent/provider";
+import {
+	captureModelOptionsArray,
+	type ModelOptionsCapture,
+	optionInput,
+} from "@server/lib/model-options-contract";
 import { isContributionId, isPluginId } from "@server/lib/plugins/manifest";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import type { SourceGroupView } from "@server/lib/sourcing/source-groups";
 
 const DEFAULT_MODEL_PAGE_SIZE = 100;
 const MAX_MODEL_PAGE_SIZE = 200;
 const MAX_MODEL_ID_BYTES = 256;
 const MAX_VALIDATION_ISSUES = 20;
 const LOCAL_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
-const HOST_RESERVED_PREFIXES = new Set([
+export const HOST_RESERVED_PREFIXES = new Set([
 	"__agg__",
 	"auto",
 	"__default__",
@@ -260,6 +266,8 @@ interface InternalProviderEntry {
 	compatible: boolean;
 	explicitUnavailableReason?: string;
 	models: Map<string, ProviderModelDescriptor>;
+	/** Immutable publication array for bounded, slice-before-projection consumers. */
+	modelOptionsArray: readonly ProviderModelDescriptor[];
 	catalogVersion?: string;
 	catalogStale: boolean;
 	lastCatalogRefresh?: string;
@@ -942,6 +950,7 @@ export class PluginProviderRegistry {
 		this.remoteProviderAdapterFactory;
 	private readonly now: () => Date;
 	private registrationSequence = 0;
+	private listingRevision = 0;
 
 	constructor(options: ProviderRegistryOptions = {}) {
 		for (const prefix of options.reservedPrefixes ?? []) {
@@ -961,6 +970,14 @@ export class PluginProviderRegistry {
 	 * constructor. Already-registered entries pick it up too, because they resolve
 	 * the fallback factory lazily inside `createAdapter()`.
 	 */
+	/**
+	 * Bumped whenever an entry is added or removed, or its prefix, name or `disabled` flag may
+	 * have changed, so readers can cache projections of `list()`.
+	 */
+	get revision(): number {
+		return this.listingRevision;
+	}
+
 	setRemoteProviderAdapterFactory(factory: RemoteProviderAdapterFactory | undefined): void {
 		this.remoteProviderAdapterFactory = factory;
 	}
@@ -1062,6 +1079,7 @@ export class PluginProviderRegistry {
 					? "provider-unavailable"
 					: undefined),
 			models,
+			modelOptionsArray: Object.freeze([...models.values()]),
 			catalogVersion: catalog?.catalogVersion ?? registration.catalogVersion,
 			catalogStale: catalog?.stale ?? registration.catalogStale ?? models.size === 0,
 			lastCatalogRefresh:
@@ -1080,6 +1098,7 @@ export class PluginProviderRegistry {
 		typeInstances.add(entry.providerInstanceId);
 		this.instancesByType.set(entry.providerTypeId, typeInstances);
 		if (entry.kind === "builtin") this.builtinReservedPrefixes.add(normalizedPrefix);
+		this.listingRevision++;
 		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
@@ -1091,6 +1110,7 @@ export class PluginProviderRegistry {
 		const typeInstances = this.instancesByType.get(entry.providerTypeId);
 		typeInstances?.delete(entry.providerInstanceId);
 		if (typeInstances?.size === 0) this.instancesByType.delete(entry.providerTypeId);
+		this.listingRevision++;
 		return true;
 	}
 
@@ -1143,6 +1163,7 @@ export class PluginProviderRegistry {
 		this.instanceByPrefix.delete(previous);
 		this.instanceByPrefix.set(normalized, entry.providerInstanceId);
 		entry.providerPrefix = prefix;
+		this.listingRevision++;
 		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
@@ -1187,6 +1208,7 @@ export class PluginProviderRegistry {
 			this.instancesByType.set(entry.providerTypeId, typeInstances);
 			restored += 1;
 		}
+		if (restored > 0) this.listingRevision++;
 		return restored;
 	}
 
@@ -1209,6 +1231,26 @@ export class PluginProviderRegistry {
 
 	get(reference: string): ProviderRegistryEntry | undefined {
 		return this.describe(reference);
+	}
+
+	get modelOptionsOwnerCount(): number {
+		return this.entriesByInstance.size;
+	}
+
+	/** Source-group discovery must not clone configuration schemas or model descriptors. */
+	listModelOptionsOwners(): Array<
+		Pick<
+			ProviderRegistryEntry,
+			"kind" | "providerInstanceId" | "providerPrefix" | "displayName" | "disabled"
+		>
+	> {
+		return [...this.entriesByInstance.values()].sort(entrySort).map((entry) => ({
+			kind: entry.kind,
+			providerInstanceId: entry.providerInstanceId,
+			providerPrefix: entry.providerPrefix,
+			displayName: entry.displayName,
+			disabled: entry.disabled,
+		}));
 	}
 
 	list(): ProviderRegistryEntry[] {
@@ -1367,6 +1409,8 @@ export class PluginProviderRegistry {
 		try {
 			const nextModels = buildModelMap(models);
 			entry.models = nextModels;
+			entry.modelOptionsArray = Object.freeze([...nextModels.values()]);
+			this.listingRevision++;
 			entry.catalogVersion = options.catalogVersion ?? entry.catalogVersion;
 			entry.catalogStale = options.stale ?? false;
 			entry.lastCatalogRefresh = options.fetchedAt ?? this.now().toISOString();
@@ -1427,6 +1471,15 @@ export class PluginProviderRegistry {
 		};
 	}
 
+	captureModelOptions(group: SourceGroupView): ModelOptionsCapture {
+		const entry = this.requireInternal(group.id);
+		return captureModelOptionsArray(
+			entry.modelOptionsArray,
+			(model) => optionInput(group, model.id, model.displayName),
+			this.listingRevision,
+		);
+	}
+
 	getModels(reference: string): ProviderModelDescriptor[] {
 		const entry = this.requireInternal(reference);
 		return [...entry.models.values()].map((model) => clone(model));
@@ -1453,6 +1506,7 @@ export class PluginProviderRegistry {
 			}
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 
@@ -1464,6 +1518,7 @@ export class PluginProviderRegistry {
 			entry.explicitUnavailableReason = reason === "plugin-disabled" ? undefined : reason;
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 
@@ -1486,6 +1541,7 @@ export class PluginProviderRegistry {
 			entry.explicitUnavailableReason = undefined;
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 

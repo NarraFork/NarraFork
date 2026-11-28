@@ -192,10 +192,12 @@ async function getCompiledMatcher(opts: {
 	userId?: string | null;
 	collectionId?: string;
 	projectId?: string;
+	signal?: AbortSignal;
 }): Promise<CompiledMatcher> {
 	const key = matcherCacheKey(opts);
 	const store = knowledgeReadStore;
 	const signature = await knowledgeInjectionReads.keywordInjectionCandidatesSignature(opts);
+	opts.signal?.throwIfAborted();
 	const cached = matcherCache.get(key);
 	if (cached?.store === store && cached.signature === signature) return cached.matcher;
 
@@ -281,23 +283,24 @@ function matchWithCompiledMatcher(
 export async function resolveInjections(
 	userId: string | null | undefined,
 	text: string,
-	opts: { collectionId?: string; projectId?: string; already?: InjectedSet } = {},
+	opts: {
+		collectionId?: string;
+		projectId?: string;
+		already?: InjectedSet;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<InjectionHit[]> {
 	const cfg = settings.knowledge;
 	if (cfg.injectMode === "off") return [];
 	const normalizedText = normalizeForKeywordMatch(text ?? "");
 	if (!normalizedText || normalizedText.length < cfg.minKeywordLen) return [];
 
-	let matcher: CompiledMatcher;
-	try {
-		matcher = await getCompiledMatcher({
-			userId,
-			collectionId: opts.collectionId,
-			projectId: opts.projectId,
-		});
-	} catch {
-		return [];
-	}
+	const matcher = await getCompiledMatcher({
+		userId,
+		collectionId: opts.collectionId,
+		projectId: opts.projectId,
+		signal: opts.signal,
+	});
 	const matched = matchWithCompiledMatcher(normalizedText, matcher);
 	if (matched.length === 0) return [];
 
@@ -365,7 +368,7 @@ export async function scanToolOutputForKnowledgeDetailed(
 	userId: string | null | undefined,
 	output: string,
 	already: InjectedSet,
-	opts: { collectionId?: string; projectId?: string } = {},
+	opts: { collectionId?: string; projectId?: string; signal?: AbortSignal } = {},
 ): Promise<ToolOutputKnowledgeScanResult | null> {
 	const cfg = settings.knowledge;
 	if (cfg.injectMode === "off" || !cfg.scanToolOutput) return null;

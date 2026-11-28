@@ -1,8 +1,9 @@
 import { normalizeLocale } from "@shared/i18n-locales";
-import { and, count, eq, inArray } from "drizzle-orm";
-import { Hono } from "hono";
+import { and, count, eq, inArray, ne } from "drizzle-orm";
+import { type Context, Hono } from "hono";
 import { db } from "../db";
 import { narrators, userPreferences, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { randomAvatarColor } from "../lib/avatar-colors";
@@ -13,6 +14,11 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getOAuthRateLimitSnapshot } from "../lib/oauth-rate-limit";
 import { getOAuthSecurityObservabilitySnapshot } from "../lib/oauth-security-observability";
+import {
+	ReadFanoutControlError,
+	startReadFanoutCapture,
+	stopReadFanoutCapture,
+} from "../lib/read-fanout-diagnostics";
 import { saveSettings, settings } from "../lib/settings";
 import type { LdapSettings, NarraForkSettings, OidcProviderConfig } from "../lib/settings/types";
 import {
@@ -32,7 +38,11 @@ import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocati
 import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
-import { previewUserScheduledTaskTransfer, releaseUserForeignKeys, transferScheduledTasksBeforeUserDeletion } from "../services/user-deletion";
+import {
+	previewUserScheduledTaskTransfer,
+	releaseUserForeignKeys,
+	transferScheduledTasksBeforeUserDeletion,
+} from "../services/user-deletion";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
 import { outlineSpecImportAdminRoutes } from "./admin-outline-spec-import";
@@ -44,17 +54,74 @@ adminRoutes.use("*", requireAuth, requireAdmin);
 // The Dynamic Spec import's admin page and its actions (outline P2 PR 12b2).
 adminRoutes.route("/outline/spec-import", outlineSpecImportAdminRoutes);
 
+/** Admin reads run on the database Worker and stop with the request. */
+function adminRead(c: Context, maxRows?: number) {
+	return {
+		executionPolicy: "worker-required" as const,
+		signal: c.req.raw.signal,
+		...(maxRows === undefined ? {} : { maxRows }),
+	};
+}
+
+function lastAdminError(action: "demote" | "delete") {
+	return new AppError(`Cannot ${action} the last administrator`, 400, "LAST_ADMIN");
+}
+
+/** Re-checked inside the write: another admin may have been demoted since the read. */
+function assertAnotherAdmin(tx: Parameters<Parameters<typeof db.transaction>[0]>[0], id: string) {
+	const other = tx
+		.select({ id: users.id })
+		.from(users)
+		.where(and(eq(users.role, "admin"), ne(users.id, id)))
+		.limit(1)
+		.get();
+	return !!other;
+}
+
+adminRoutes.post("/diagnostics/read-fanout/start", async (c) => {
+	c.header("Cache-Control", "no-store");
+	try {
+		const body = await c.req.json().catch(() => null);
+		if (!body || typeof body !== "object" || Array.isArray(body))
+			return c.json({ error: "Expected a JSON object" }, 400);
+		if (body.durationMs !== undefined && typeof body.durationMs !== "number")
+			return c.json({ error: "durationMs must be a number" }, 400);
+		return c.json(startReadFanoutCapture(body.durationMs));
+	} catch (error) {
+		if (error instanceof ReadFanoutControlError)
+			return c.json({ error: error.message }, error.status);
+		throw error;
+	}
+});
+
+adminRoutes.post("/diagnostics/read-fanout/stop", async (c) => {
+	c.header("Cache-Control", "no-store");
+	try {
+		const body = await c.req.json().catch(() => null);
+		if (!body || typeof body !== "object" || typeof body.captureId !== "string")
+			return c.json({ error: "captureId is required" }, 400);
+		return c.json(stopReadFanoutCapture(body.captureId));
+	} catch (error) {
+		if (error instanceof ReadFanoutControlError)
+			return c.json({ error: error.message }, error.status);
+		throw error;
+	}
+});
+
 adminRoutes.get("/users", async (c) => {
-	const allUsers = await db.query.users.findMany({
-		columns: {
-			id: true,
-			username: true,
-			role: true,
-			avatarColor: true,
-			avatarImageId: true,
-			createdAt: true,
-		},
-	});
+	const allUsers = await readQuery(
+		db.query.users.findMany({
+			columns: {
+				id: true,
+				username: true,
+				role: true,
+				avatarColor: true,
+				avatarImageId: true,
+				createdAt: true,
+			},
+		}),
+		adminRead(c),
+	);
 	return c.json(allUsers);
 });
 
@@ -70,10 +137,14 @@ adminRoutes.post("/users", async (c) => {
 	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
 	const { username, password, role, language } = parsed.data;
 
-	const existing = await db.query.users.findFirst({
-		where: eq(users.username, username),
-		columns: { id: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.users.findMany({
+			where: eq(users.username, username),
+			columns: { id: true },
+			limit: 1,
+		}),
+		adminRead(c, 1),
+	);
 	if (existing) throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 
 	// Hash outside the transaction: sync transactions cannot await.
@@ -138,18 +209,20 @@ adminRoutes.patch("/users/:id", async (c) => {
 
 	// Read the live role once for the last-administrator guard below.
 	const targetBefore = role
-		? await db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } })
+		? await readQueryFirst(
+				db.query.users.findMany({ where: eq(users.id, id), columns: { role: true }, limit: 1 }),
+				adminRead(c, 1),
+			)
 		: undefined;
 
-	// Prevent demoting the last administrator
-	if (role === "user" && id !== caller.sub && targetBefore?.role === "admin") {
-		const [{ value: adminCount }] = await db
-			.select({ value: count() })
-			.from(users)
-			.where(eq(users.role, "admin"));
-		if (adminCount <= 1) {
-			throw new AppError("Cannot demote the last administrator", 400, "LAST_ADMIN");
-		}
+	// Prevent demoting the last administrator (fail fast here; the write re-checks).
+	const demotesAdmin = role === "user" && id !== caller.sub;
+	if (demotesAdmin && targetBefore?.role === "admin") {
+		const [{ value: adminCount }] = await readQuery(
+			db.select({ value: count() }).from(users).where(eq(users.role, "admin")),
+			adminRead(c, 1),
+		);
+		if (adminCount <= 1) throw lastAdminError("demote");
 	}
 
 	const updates: Record<string, string> = {};
@@ -159,9 +232,14 @@ adminRoutes.patch("/users/:id", async (c) => {
 	}
 
 	if (username) {
-		const existing = await db.query.users.findFirst({
-			where: eq(users.username, username),
-		});
+		const existing = await readQueryFirst(
+			db.query.users.findMany({
+				where: eq(users.username, username),
+				columns: { id: true },
+				limit: 1,
+			}),
+			adminRead(c, 1),
+		);
 		if (existing && existing.id !== id) {
 			throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 		}
@@ -175,11 +253,18 @@ adminRoutes.patch("/users/:id", async (c) => {
 		});
 	}
 
-	const [updated] = await db
-		.update(users)
-		.set(updates)
-		.where(eq(users.id, id))
-		.returning({ id: users.id, username: users.username, role: users.role });
+	const [updated] = db.transaction((tx) => {
+		if (demotesAdmin) {
+			const current = tx.select({ role: users.role }).from(users).where(eq(users.id, id)).get();
+			if (current?.role === "admin" && !assertAnotherAdmin(tx, id)) throw lastAdminError("demote");
+		}
+		return tx
+			.update(users)
+			.set(updates)
+			.where(eq(users.id, id))
+			.returning({ id: users.id, username: users.username, role: users.role })
+			.all();
+	});
 	if (!updated) throw new AppError("User not found", 404, "NOT_FOUND");
 	// An administrator resets a password when they believe the old one is compromised, so the
 	// sessions opened with it must die too: bumping the token generation ends every one of
@@ -200,10 +285,10 @@ adminRoutes.patch("/users/:id", async (c) => {
  */
 adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 	const id = c.req.param("id");
-	const target = await db.query.users.findFirst({
-		where: eq(users.id, id),
-		columns: { id: true },
-	});
+	const target = await readQueryFirst(
+		db.query.users.findMany({ where: eq(users.id, id), columns: { id: true }, limit: 1 }),
+		adminRead(c, 1),
+	);
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	const tokenVersion = await revokeUserSessions(id);
 	logger.info("Administrator revoked all sessions for a user", {
@@ -216,7 +301,10 @@ adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 
 adminRoutes.get("/users/:id/scheduled-tasks-transfer-preview", async (c) => {
 	const id = c.req.param("id");
-	const target = await db.query.users.findFirst({ where: eq(users.id, id), columns: { id: true } });
+	const target = await readQueryFirst(
+		db.query.users.findMany({ where: eq(users.id, id), columns: { id: true }, limit: 1 }),
+		adminRead(c, 1),
+	);
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	return c.json(await previewUserScheduledTaskTransfer(id, c.req.query("cursor")));
 });
@@ -230,19 +318,17 @@ adminRoutes.delete("/users/:id", async (c) => {
 	}
 
 	// Prevent deleting the last administrator
-	const target = await db.query.users.findFirst({
-		where: eq(users.id, id),
-		columns: { role: true },
-	});
+	const target = await readQueryFirst(
+		db.query.users.findMany({ where: eq(users.id, id), columns: { role: true }, limit: 1 }),
+		adminRead(c, 1),
+	);
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	if (target.role === "admin") {
-		const [{ value: adminCount }] = await db
-			.select({ value: count() })
-			.from(users)
-			.where(eq(users.role, "admin"));
-		if (adminCount <= 1) {
-			throw new AppError("Cannot delete the last administrator", 400, "LAST_ADMIN");
-		}
+		const [{ value: adminCount }] = await readQuery(
+			db.select({ value: count() }).from(users).where(eq(users.role, "admin")),
+			adminRead(c, 1),
+		);
+		if (adminCount <= 1) throw lastAdminError("delete");
 	}
 
 	const raw = await c.req.text();
@@ -252,19 +338,34 @@ adminRoutes.delete("/users/:id", async (c) => {
 		const body: unknown = raw ? JSON.parse(raw) : {};
 		if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
 		const values = body as Record<string, unknown>;
-		if (Object.keys(values).some((key) => key !== "transferScheduledTasks") ||
-			(values.transferScheduledTasks !== undefined && typeof values.transferScheduledTasks !== "boolean")) throw new Error();
+		if (
+			Object.keys(values).some((key) => key !== "transferScheduledTasks") ||
+			(values.transferScheduledTasks !== undefined &&
+				typeof values.transferScheduledTasks !== "boolean")
+		)
+			throw new Error();
 		transferScheduledTasks = values.transferScheduledTasks === true;
 	} catch {
 		throw new AppError("Invalid user deletion confirmation", 400, "VALIDATION_ERROR");
 	}
 	// Reject before revoking OAuth grants; the transaction repeats this check against current rows.
 	if (!transferScheduledTasks && (await previewUserScheduledTaskTransfer(id)).items.length > 0) {
-		throw new AppError("Confirm scheduled-task takeover before deleting this user", 409, "TASK_TRANSFER_CONFIRMATION_REQUIRED");
+		throw new AppError(
+			"Confirm scheduled-task takeover before deleting this user",
+			409,
+			"TASK_TRANSFER_CONFIRMATION_REQUIRED",
+		);
 	}
 	await prepareOAuthUserHardDeletion(id);
 	const result = db.transaction((tx) => {
-		const transfer = transferScheduledTasksBeforeUserDeletion(tx, id, caller.sub, transferScheduledTasks);
+		const current = tx.select({ role: users.role }).from(users).where(eq(users.id, id)).get();
+		if (current?.role === "admin" && !assertAnotherAdmin(tx, id)) throw lastAdminError("delete");
+		const transfer = transferScheduledTasksBeforeUserDeletion(
+			tx,
+			id,
+			caller.sub,
+			transferScheduledTasks,
+		);
 		releaseUserForeignKeys(tx, id);
 		const deleted = tx.delete(users).where(eq(users.id, id)).returning({ id: users.id }).get();
 		if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
@@ -274,7 +375,8 @@ adminRoutes.delete("/users/:id", async (c) => {
 		eventBus.emit({ type: "narrator:access_changed", narratorId, reason: "owner_changed" });
 	}
 	if (result.taskIds.length) eventBus.emit({ type: "scheduled_task:changed" });
-	for (const taskId of result.taskIds) eventBus.emit({ type: "scheduled_task:transferred", taskId });
+	for (const taskId of result.taskIds)
+		eventBus.emit({ type: "scheduled_task:transferred", taskId });
 	// The user's sessions went with the row (cascade); tell live subscribers.
 	notifyAuthChanged(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
@@ -568,13 +670,19 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const memUsage = process.memoryUsage();
 
 	// Active narrators (working/waiting status)
-	const narratorStatusCounts = await db
-		.select({ status: narrators.status, value: count() })
-		.from(narrators)
-		.where(
-			and(inArray(narrators.status, ["working", "waiting"]), eq(narrators.hiddenFromLists, false)),
-		)
-		.groupBy(narrators.status);
+	const narratorStatusCounts = await readQuery(
+		db
+			.select({ status: narrators.status, value: count() })
+			.from(narrators)
+			.where(
+				and(
+					inArray(narrators.status, ["working", "waiting"]),
+					eq(narrators.hiddenFromLists, false),
+				),
+			)
+			.groupBy(narrators.status),
+		adminRead(c, 2),
+	);
 	const narratorCountByStatus = new Map(narratorStatusCounts.map((row) => [row.status, row.value]));
 	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
 	const waitingNarratorCount = narratorCountByStatus.get("waiting") ?? 0;

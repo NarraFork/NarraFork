@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	MIRROR_ASSET_HEADERS,
-	type MirrorSnapshotV1,
+	type MirrorSnapshot,
 	mirrorAssetLimit,
 	mirrorAssetsForTarget,
 } from "../../shared/independent-update-mirror";
@@ -23,6 +23,7 @@ import {
 	timeReleasePhase,
 } from "./ci-release-io";
 import type { GhRunner } from "./github-release";
+import { downloadMirrorPatchFromSource } from "./mirror-patch-proxy";
 import {
 	currentPublicRelease,
 	matchPublicAsset,
@@ -59,7 +60,9 @@ export {
 	verifyPreparedMainMirror,
 } from "./update-server-main-mirror-history";
 export const MAIN_MIRROR_TOTAL_TIMEOUT_MS = 25 * 60_000;
-export const MIRROR_TOTAL_BYTES = 4 * 1024 ** 3;
+/** Default and hard bound: 32GiB bidirectional, at most 16GiB of original assets. */
+export const MIRROR_TOTAL_BYTES = 32 * 1024 ** 3;
+export const MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS = 25 * 60_000;
 export interface IndependentMirrorReceipt {
 	schemaVersion: 1;
 	kind: "main" | "helpers" | "executor" | "remote-peer";
@@ -136,6 +139,9 @@ export interface MirrorPublishedOptions {
 	relay?: MirrorRelayStageOptions;
 	platforms?: string[];
 	dryRun?: boolean;
+	/** Main releases omit full binaries unless explicitly set to false. */
+	patchOnly?: boolean;
+	patchProxyOrigin?: string;
 	signal?: AbortSignal;
 	run?: GhRunner;
 	/** Test transports retain the exact production read-only contract. */
@@ -257,12 +263,20 @@ export async function mirrorPublishedMainRelease(
 				target.files.some((f) => !options.platforms?.includes(f.platform)))
 		)
 			throw new Error("Canonical snapshot requires the complete target platform projection");
-		for (const file of target.files) matchPublicAsset(remote, file); // full binaries are descriptors, never fetched
-		const assets = mirrorAssetsForTarget(snapshot.index, version);
+		for (const file of target.files) matchPublicAsset(remote, file);
+		const schemaVersion = options.patchOnly === false ? 2 : 1;
+		const assets = mirrorAssetsForTarget(snapshot.index, version, schemaVersion);
 		// Reserve source download + transport upload; assets are never downloaded back.
 		const total = 2 * assets.reduce((sum, a) => sum + a.size, 0);
 		const budget = options.maxTotalBytes ?? MIRROR_TOTAL_BYTES;
-		if (!Number.isSafeInteger(budget) || budget <= 0 || total > budget)
+		if (
+			!Number.isSafeInteger(budget) ||
+			budget <= 0 ||
+			budget > MIRROR_TOTAL_BYTES ||
+			total > budget ||
+			assets.length > 200 ||
+			assets.some((asset) => asset.size > mirrorAssetLimit(asset.kind))
+		)
 			throw new Error("Independent mirror total byte budget exceeded");
 		options.reserveAssets?.(assets);
 		for (const asset of assets) if (asset.kind !== "notes") matchPublicAsset(remote, asset);
@@ -294,7 +308,10 @@ export async function mirrorPublishedMainRelease(
 		}
 		const http = stage
 			? undefined
-			: (options.http ?? new UpdateServerMirrorHttp(options.config as UpdateServerMirrorConfig));
+			: (options.http ??
+				new UpdateServerMirrorHttp(options.config as UpdateServerMirrorConfig, {
+					requestTimeoutMs: MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS,
+				}));
 		const root = "/api/v3/products/narrafork/mirror";
 		directory = await mkdtemp(join(tmpdir(), "nf-public-mirror-"));
 		const disk = await statfs(directory);
@@ -303,7 +320,7 @@ export async function mirrorPublishedMainRelease(
 		if (
 			disk.bavail * disk.bsize <
 			mirrorUploadDiskBytes(
-				groups.map((g) => g.asset).filter((a) => a.kind === "patch"),
+				groups.map((g) => g.asset).filter((a) => a.kind === "patch" || a.kind === "main-binary"),
 				pool.concurrency,
 			)
 		)
@@ -313,25 +330,34 @@ export async function mirrorPublishedMainRelease(
 			let stream: ReadableStream<Uint8Array> | undefined;
 			let path: string | undefined;
 			try {
-				if (asset.kind === "patch") {
+				if (asset.kind === "patch" || asset.kind === "main-binary") {
 					const github = matchPublicAsset(remote, asset);
-					path = join(directory as string, `${index}-${asset.sha256}`);
+					const outputPath = join(directory as string, `${index}-${asset.sha256}`);
+					path = outputPath;
+					const download = options.downloadAsset ?? downloadReleaseAsset;
+					const request = {
+						repository: options.repository,
+						assetId: github.id,
+						size: asset.size,
+						outputPath,
+						signal,
+					};
 					await timeReleasePhase(
-						"mirror.github-patch",
+						asset.kind === "patch" ? "mirror.github-patch" : "mirror.github-binary",
 						{ inputBytes: asset.size },
 						() =>
-							(options.downloadAsset ?? downloadReleaseAsset)({
-								repository: options.repository,
-								assetId: github.id,
-								size: asset.size,
-								outputPath: path as string,
-								signal,
-							}),
+							asset.kind === "patch"
+								? downloadMirrorPatchFromSource(
+										{ ...request, tag: options.tag, name: asset.name, sha256: asset.sha256 },
+										options.patchProxyOrigin,
+										download,
+									)
+								: download(request),
 						signal,
 					);
 					const actual = await hashReleaseFile(path, mirrorAssetLimit(asset.kind), signal);
 					if (actual.size !== asset.size || actual.sha256 !== asset.sha256)
-						throw new Error("Public patch raw bytes mismatch");
+						throw new Error("Public payload raw bytes mismatch");
 					stream = Bun.file(path).stream();
 				} else {
 					const raw =
@@ -379,6 +405,7 @@ export async function mirrorPublishedMainRelease(
 						(http as UpdateServerMirrorHttp).putRaw(`${root}/assets/${asset.sha256}`, body, {
 							maxBytes: mirrorAssetLimit(asset.kind),
 							expected: asset,
+							timeoutMs: 15 * 60_000,
 							headers,
 							signal,
 						}),
@@ -439,8 +466,8 @@ export async function mirrorPublishedMainRelease(
 			if (!freshTarget || JSON.stringify(freshTarget) !== JSON.stringify(target))
 				throw new Error("Canonical target changed or left the index window before snapshot commit");
 			snapshot = fresh;
-			const projection: MirrorSnapshotV1 = {
-				schemaVersion: 1,
+			const projection: MirrorSnapshot = {
+				schemaVersion,
 				repository: options.repository,
 				...snapshot,
 				targetVersion: version,
@@ -456,7 +483,7 @@ export async function mirrorPublishedMainRelease(
 				const acknowledgement = await (http as UpdateServerMirrorHttp).postJson(
 					`${root}/snapshot`,
 					projection,
-					{ maxBytes: 320 * 1024, signal },
+					{ maxBytes: 320 * 1024, signal, timeoutMs: MAIN_MIRROR_SNAPSHOT_TIMEOUT_MS },
 				);
 				assertServerVerified(
 					acknowledgement,
@@ -477,7 +504,9 @@ export async function mirrorPublishedMainRelease(
 			}
 		}
 		receipt.snapshotCommitted = true;
-		receipt.status = assets.some((a) => a.kind === "patch") ? "MIRRORED" : "METADATA_ONLY";
+		receipt.status = assets.some((a) => a.kind === "patch" || a.kind === "main-binary")
+			? "MIRRORED"
+			: "METADATA_ONLY";
 		return receipt;
 	} catch (error) {
 		receipt.failureCode = parentSignal.aborted

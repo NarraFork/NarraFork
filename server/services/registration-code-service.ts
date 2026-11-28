@@ -23,6 +23,7 @@ import {
 	type RedeemableInvitation,
 } from "@server/services/registration/invitation-rules";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 
 /** Transaction handle as produced by `db.transaction((tx) => ...)`. */
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -128,10 +129,13 @@ async function toSummaries(rows: SummaryRow[]): Promise<RegistrationCodeSummary[
 	}
 	const usernames = new Map<string, string>();
 	if (referencedIds.size > 0) {
-		const userRows = await db
-			.select({ id: users.id, username: users.username })
-			.from(users)
-			.where(inArray(users.id, [...referencedIds]));
+		const userRows = await readQuery(
+			db
+				.select({ id: users.id, username: users.username })
+				.from(users)
+				.where(inArray(users.id, [...referencedIds])),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const user of userRows) usernames.set(user.id, user.username);
 	}
 
@@ -175,12 +179,15 @@ export const registrationCodeService = {
 			revokedAt: null,
 			createdAt: now.toISOString(),
 		};
+		const creator = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, input.createdByUserId),
+				columns: { username: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		await db.insert(registrationCodes).values(row);
-
-		const creator = await db.query.users.findFirst({
-			where: eq(users.id, input.createdByUserId),
-			columns: { username: true },
-		});
 
 		return {
 			code,
@@ -208,11 +215,14 @@ export const registrationCodeService = {
 	 * confirm a guessed code offline. There is no reason for it to leave the server.
 	 */
 	async listCodes(): Promise<RegistrationCodeSummary[]> {
-		const rows = await db
-			.select(SUMMARY_COLUMNS)
-			.from(registrationCodes)
-			.orderBy(desc(registrationCodes.createdAt))
-			.limit(LIST_LIMIT);
+		const rows = await readQuery(
+			db
+				.select(SUMMARY_COLUMNS)
+				.from(registrationCodes)
+				.orderBy(desc(registrationCodes.createdAt))
+				.limit(LIST_LIMIT),
+			{ executionPolicy: "worker-required" },
+		);
 		return toSummaries(rows);
 	},
 
@@ -224,9 +234,10 @@ export const registrationCodeService = {
 	 * is the operation for that case.
 	 */
 	async revokeCode(id: string): Promise<RegistrationCodeSummary> {
-		const existing = await db.query.registrationCodes.findFirst({
-			where: eq(registrationCodes.id, id),
-		});
+		const existing = await readQueryFirst(
+			db.query.registrationCodes.findMany({ limit: 1, where: eq(registrationCodes.id, id) }),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!existing) throw new AppError("Registration code not found", 404, "NOT_FOUND");
 		if (existing.usedAt) {
 			throw new AppError("This code has already been used", 409, "CODE_ALREADY_USED");
@@ -237,10 +248,10 @@ export const registrationCodeService = {
 				.set({ revokedAt: new Date().toISOString() })
 				.where(eq(registrationCodes.id, id));
 		}
-		const [row] = await db
-			.select(SUMMARY_COLUMNS)
-			.from(registrationCodes)
-			.where(eq(registrationCodes.id, id));
+		const [row] = await readQuery(
+			db.select(SUMMARY_COLUMNS).from(registrationCodes).where(eq(registrationCodes.id, id)),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!row) throw new AppError("Registration code not found", 404, "NOT_FOUND");
 		const [summary] = await toSummaries([row]);
 		return summary;

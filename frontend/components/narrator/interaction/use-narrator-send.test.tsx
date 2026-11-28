@@ -26,6 +26,7 @@ let options: UseNarratorSendOptions;
 let queue: BufferMessageSummary[];
 let send: ReturnType<typeof spyOn<typeof api, "sendNarratorMessage">>;
 let notify: ReturnType<typeof spyOn<typeof notifications, "show">>;
+let receipt: ReturnType<typeof spyOn<typeof api, "getNarratorSubmissionReceipt">>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
 const reference = { id: "ref", deviceId: "remote", path: "/work/a.ts", label: "a.ts" };
 
@@ -51,6 +52,9 @@ beforeEach(() => {
 	];
 	send = spyOn(api, "sendNarratorMessage").mockResolvedValue({ buffered: true, id: "replacement" });
 	notify = spyOn(notifications, "show").mockReturnValue("notification");
+	receipt = spyOn(api, "getNarratorSubmissionReceipt").mockRejectedValue(
+		new Error("receipt unavailable"),
+	);
 	const composer: NarratorComposerHandle = {
 		getText: () => "replace",
 		captureAttachmentSelection: mock(() => {}),
@@ -112,6 +116,7 @@ afterEach(async () => {
 	await act(async () => root.unmount());
 	send.mockRestore();
 	notify.mockRestore();
+	receipt.mockRestore();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -123,6 +128,52 @@ async function render(overrides: Partial<UseNarratorSendOptions> = {}) {
 	options = { ...options, ...overrides };
 	await act(async () => root.render(<Probe {...options} />));
 }
+
+describe("submission receipt integration", () => {
+	test.each([
+		true,
+		false,
+	])("lost response reconciles accepted input without a second POST or restoring a failed draft (busy=%s)", async (isActive) => {
+		send.mockRejectedValue(new Error("response lost"));
+		receipt.mockResolvedValue({
+			status: "accepted",
+			id: "accepted-old",
+			bufferedAt: "2026-01-01",
+			state: "queued",
+			messageId: null,
+			dedupeExpiresAt: "2026-01-08",
+		});
+		await render({ isActive });
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(receipt.mock.calls[0]?.slice(0, 2)).toEqual([
+			"n",
+			send.mock.calls[0]?.[10]?.clientSubmissionId,
+		]);
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(queue.some((row) => row.id === "accepted-old")).toBe(true);
+	});
+	test("unknown keeps the snapshot and only a proven safe receipt404 permits same-ID retry", async () => {
+		send.mockRejectedValueOnce(new Error("response lost"));
+		receipt.mockRejectedValue(
+			Object.assign(new Error("absent"), {
+				status: 404,
+				data: { status: "not_found", dedupeWindowMs: 604800000 },
+			}),
+		);
+		await render();
+		await act(async () => actions.handleSend());
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		const id = send.mock.calls[0]?.[10]?.clientSubmissionId;
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(2);
+		expect(receipt).toHaveBeenCalledTimes(2);
+		expect(send.mock.calls[1]?.[10]?.clientSubmissionId).toBe(id);
+		await act(async () => actions.handleSend());
+		expect(send.mock.calls[2]?.[10]?.clientSubmissionId).not.toBe(id);
+	});
+});
 
 describe("structured send snapshots", () => {
 	function richDraft() {
@@ -212,7 +263,10 @@ describe("structured send snapshots", () => {
 				await act(async () => actions.handleSend());
 				expect(send).toHaveBeenCalledTimes(1);
 				expect(send.mock.calls[0]?.[1]).toBe(projection.text);
-				expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+				expect(send.mock.calls[0]?.[10]).toEqual({
+					composerDocument: doc,
+					clientSubmissionId: expect.any(String),
+				});
 				expect(send.mock.calls[0]?.[11]).toEqual([media[1], media[0]]);
 				const uploaded = send.mock.calls[0]?.[11]?.[0];
 				if (!uploaded) throw new Error("Expected native media upload");
@@ -255,7 +309,10 @@ describe("structured send snapshots", () => {
 		expect(send.mock.calls[0]?.[2]).toEqual([images[1], images[0]]);
 		expect(send.mock.calls[0]?.[3]).toEqual(textFiles);
 		expect(send.mock.calls[0]?.[7]).toEqual(projection.fileReferences);
-		expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+		expect(send.mock.calls[0]?.[10]).toEqual({
+			composerDocument: doc,
+			clientSubmissionId: expect.any(String),
+		});
 		expect(options.composerRef.current?.noteSent).toHaveBeenCalledWith(
 			projection.text,
 			projection.fileReferences,
@@ -337,7 +394,7 @@ describe("structured send snapshots", () => {
 		expect(send.mock.calls[0]?.[1]).toBe("forwarded");
 		expect(send.mock.calls[0]?.[2]).toBeUndefined();
 		expect(send.mock.calls[0]?.[3]).toBeUndefined();
-		expect(send.mock.calls[0]?.[10]).toBeUndefined();
+		expect(send.mock.calls[0]?.[10]).toEqual({ clientSubmissionId: expect.any(String) });
 		expect(options.composerRef.current?.getText()).toBe(projection.text);
 		expect(options.composerRef.current?.getDocument?.()).toBe(doc);
 		expect(options.composerRef.current?.getFileReferences()).toEqual(projection.fileReferences);
@@ -474,7 +531,10 @@ describe("structured send snapshots", () => {
 			} else {
 				expect(send.mock.calls[0]?.[2]).toEqual([images[1], images[0]]);
 				expect(send.mock.calls[0]?.[3]).toEqual(textFiles);
-				expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+				expect(send.mock.calls[0]?.[10]).toEqual({
+					composerDocument: doc,
+					clientSubmissionId: expect.any(String),
+				});
 			}
 		});
 	}
@@ -504,6 +564,8 @@ describe("narrator interrupt send", () => {
 			[reference],
 			true,
 			"interrupt",
+			{ clientSubmissionId: expect.any(String) },
+			undefined,
 		]);
 		expect(queue.map((message) => message.id)).toEqual(["replacement", "existing"]);
 		expect(queue[0]).toMatchObject({ priority: true, fileReferences: [reference] });
@@ -534,6 +596,8 @@ describe("narrator interrupt send", () => {
 			[reference],
 			mode === "interrupt" ? true : undefined,
 			mode,
+			{ clientSubmissionId: expect.any(String) },
+			undefined,
 		]);
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(
@@ -779,9 +843,32 @@ describe("modeltrace immediate control", () => {
 		expect(options.navigateToNarrator).toHaveBeenCalledWith("trace-child");
 	});
 
-	test("arguments are rejected without any parent send or trace request", async () => {
+	test.each([
+		["--fork", true, false],
+		["--calibrate", false, true],
+		["--calibrate --fork", true, true],
+		["--fork --calibrate", true, true],
+		["-f", true, false],
+		["-c", false, true],
+		["-f -c", true, true],
+		["-c --fork", true, true],
+	] as const)("forwards %s without sending a parent message", async (flags, fork, calibrate) => {
 		await render();
-		(options.composerRef.current as NarratorComposerHandle).getText = () => "/modeltrace extra";
+		(options.composerRef.current as NarratorComposerHandle).getText = () => `/modeltrace ${flags}`;
+		await act(async () => actions.handleSend());
+		expect(start).toHaveBeenCalledWith(options.narratorId, { fork, calibrate });
+		expect(send).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		"extra",
+		"--fork --fork",
+		"-f --fork",
+		"--calibrate -c",
+		"--calibrate=3",
+	])("rejects %s without any parent send or trace request", async (args) => {
+		await render();
+		(options.composerRef.current as NarratorComposerHandle).getText = () => `/modeltrace ${args}`;
 		await act(async () => actions.handleSend());
 		expect(start).not.toHaveBeenCalled();
 		expect(send).not.toHaveBeenCalled();
@@ -893,8 +980,8 @@ describe("save_dump command discovery", () => {
 			});
 			expect(traces[0].description).toBe(
 				language === "en"
-					? "Trace the model's current task in a one-turn child session without interrupting it"
-					: "在单轮子会话中追踪模型当前任务，不中断原会话",
+					? "Sample the model fingerprint. --fork reuses the conversation prefix; --calibrate takes three samples."
+					: "采样模型指纹。--fork 复用当前会话前缀；--calibrate 采样三次。",
 			);
 			const saves = commands.filter((command) => command.name === "save_dump");
 			expect(saves).toHaveLength(1);
@@ -1212,6 +1299,10 @@ describe("new narrator attachments", () => {
 			undefined,
 			expect.any(Function),
 			expect.any(AbortSignal),
+			undefined,
+			undefined,
+			undefined,
+			{ clientSubmissionId: expect.any(String) },
 		]);
 		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
 		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
@@ -1311,7 +1402,7 @@ describe("new narrator attachments", () => {
 		expect(notify).toHaveBeenCalledWith(
 			expect.objectContaining({
 				title: "sendFailed",
-				message: `fixture ${failure} failed`,
+				message: failure === "send" ? "submissionReceipt_unknown" : `fixture ${failure} failed`,
 				color: "red",
 			}),
 		);

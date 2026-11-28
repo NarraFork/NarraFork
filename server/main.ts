@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { extname, resolve } from "node:path";
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
 // resolve the tsconfig alias, and this module is dependency-free string constants, so it adds
@@ -10,9 +10,34 @@ import {
 import { urlHost } from "../shared/server-host";
 import { MAX_IMPORT_BYTES } from "../shared/storage-transfer";
 import { app } from "./app";
+import { getDbPath } from "./db/connection";
+import { gateway } from "./gateway/gateway";
 import { createServerRequestDispatcher } from "./http-dispatcher";
 import { createServerRequestLifecycle } from "./http-request-lifecycle";
+import { sweepStagedAttachments } from "./lib/attachment-staging";
+import { startSessionCleanupTimer, stopSessionCleanupTimer } from "./lib/auth";
+import { createDatabaseReaderReadiness, databaseReadersAvailable } from "./lib/db-reader-readiness";
+import { createDatabaseReaderStartup } from "./lib/db-reader-startup";
+import {
+	assertDbReadersReady,
+	getDbWorkerAvailability,
+	shutdownDbWorkerPool,
+} from "./lib/db-worker/pool";
+import { cleanupStaleShares } from "./lib/shares";
+import { startChallengeCleanupTimer } from "./lib/webauthn";
+import { packActivationService } from "./services/knowledge-pack-activation-service";
+import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
+import {
+	closePrefixSnapshotStore,
+	startPrefixSnapshotMaintenance,
+} from "./services/narrator-prefix-snapshots";
 import { attachRemoteAccessRuntime } from "./services/remote-access-runtime";
+import {
+	isScheduledTaskTickActive,
+	startScheduledTaskScheduler,
+	stopScheduledTaskScheduler,
+} from "./services/scheduled-task-scheduler";
+import { startSkillCacheCleanupTimer } from "./services/skill-service";
 import "./db"; // Ensure DB is initialized early
 import {
 	activeDatabaseBackend,
@@ -24,14 +49,21 @@ import {
 } from "./db";
 import {
 	cancelBackgroundIntegrityCheck,
+	getIntegrityCheckShutdownSnapshot,
 	scheduleBackgroundIntegrityCheck,
 } from "./db/integrity-check";
 import { registerExternalProviderResolver } from "./lib/agent/provider";
+import { claimBrowserShutdownOwnership } from "./lib/browser/pool";
 import { getCodexManager } from "./lib/codex-manager";
+import {
+	drainContextCharacterRefreshes,
+	getContextCharacterRefreshStatus,
+	quiesceContextCharacterRefreshes,
+} from "./lib/context-characters";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
-import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { hotOnce, hotSafe } from "./lib/hot-safe";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
 import {
@@ -43,11 +75,12 @@ import {
 import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
 import { prepareMcpTools } from "./lib/mcp/tool-bridge";
-import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { getNarraforkHome } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
-import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
+import { startNugRelayOwner, stopAllNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { runPostShutdownHooks } from "./lib/post-shutdown-hooks";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
 import {
@@ -59,7 +92,12 @@ import {
 import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
-import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
+import {
+	canRunCleanShutdownHooks,
+	fenceUnattendedShutdown,
+	preservesRecoveryOnShutdown,
+	ShutdownActivityTracker,
+} from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
@@ -75,6 +113,27 @@ import {
 	nextAllowedPort,
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
+import {
+	drainCommunicationWork,
+	getCommunicationWorkStatus,
+	trackCommunicationWork,
+} from "./services/agent-runtime/async-work";
+import { stopInboxWakes } from "./services/agent-runtime/inbox";
+import { stopRuntimePublications } from "./services/agent-runtime/publication";
+import {
+	drainNarratorRunCompletions,
+	getNarratorRunShutdownSnapshot,
+	stopNarratorRunAdmission,
+} from "./services/agent-runtime/run";
+import { backgroundTaskService } from "./services/background-task-service";
+import { stopBlockBackgroundJobs } from "./services/narrator-block-backfill";
+import {
+	drainBufferedFilePreparations,
+	getBufferedFilePreparationStatus,
+	hasPendingBufferedFilePreparations,
+	stopBufferedFilePreparations,
+} from "./services/narrator-buffer";
+import { stopOutlineLiveReplay } from "./services/outline/live/replay";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginPlatformServices } from "./services/plugin-platform-services";
 import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
@@ -84,6 +143,12 @@ import {
 	composePostgresStores,
 } from "./services/postgres-composition";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
+import {
+	getResourceProtectionShutdownSnapshot,
+	stopResourceProtectionIndex,
+} from "./services/resource-protection-index";
+import { TOKEN_RECALCULATION_BATCH_TIMEOUT_MS } from "./services/token-recalculation";
+import { stopCheckpointedNarratorRuns } from "./services/update-coordinator";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -92,24 +157,33 @@ import {
 	backgroundOccupancyInitializer,
 	withBackgroundOccupancyInitialization,
 } from "./services/background-occupancy-startup";
+import { stopBackgroundOccupancy } from "./services/background-occupancy-store";
 import { ensureRootlessEnv } from "./services/container-service";
+import { cpuProfiler } from "./services/cpu-profiler";
 import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
+	drainNarratorSessionTails,
 	failUnownedStartupRecovery,
+	getNarratorSessionTailStatus,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
-import { scheduleProjectIndexRebuild } from "./services/project-index";
-import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
 	stopNotificationCenterMaintenance,
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
+import {
+	drainNotificationBackgroundWork,
+	getNotificationBackgroundWorkSnapshot,
+	stopNotificationBackgroundWork,
+} from "./services/notification-service";
+import { scheduleProjectIndexRebuild, stopProjectIndexRebuild } from "./services/project-index";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { startCommandCodeModelCatalog } from "./lib/commandcode-models";
 import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
@@ -131,13 +205,25 @@ import {
 	prepareSignalRestartRecovery,
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
+import {
+	getStorageHistoryShutdownSnapshot,
+	stopStorageHistoryRetention,
+} from "./services/storage-history-runtime";
 import { terminalService } from "./services/terminal-service";
+import { UNATTENDED_SHUTDOWN_REASON, unattendedMode } from "./services/unattended-mode";
+import { markUpdateRestarting } from "./services/update-coordinator";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
 import {
+	drainNarratorWsReadTasks,
+	hasPendingNarratorWsReadTasks,
+	quiesceNarratorWsReadTasks,
+} from "./websocket/narrator-ws";
+import {
 	closeAllConnections,
+	hasActiveWebSocketHandlers,
 	startHeartbeat,
 	stopHeartbeat,
 	waitForWebSocketActivityDrain,
@@ -172,6 +258,8 @@ await recoverProviderPrefixMigrationOnStartup().catch((error) => {
 });
 // auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
 installAutoRouteSignals();
+// Publish the real Command Code directory before unattended/recovered Auto work can run.
+const stopCommandCodeModelCatalog = await startCommandCodeModelCatalog();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
 // Runs on both backends (services/migration-db.ts picks the active handle).
@@ -291,13 +379,15 @@ import { refreshWindowsPath } from "./lib/win-env";
 	}
 }
 
-// Catch unhandled errors to prevent silent crashes
-process.on("uncaughtException", (err) => {
-	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
-});
-process.on("unhandledRejection", (reason) => {
-	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
-});
+// Catch unhandled errors once, including across --hot evaluations.
+if (hotOnce("narrafork.main.errorHooks")) {
+	process.on("uncaughtException", (err) => {
+		logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
+	});
+	process.on("unhandledRejection", (reason) => {
+		logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
+	});
+}
 
 // CLI flags: --port=XXXX --host=XXXX
 const cliPort = process.argv.find((a) => a.startsWith("--port="))?.split("=")[1];
@@ -632,6 +722,12 @@ function killOwnWindowsChildProcesses(): void {
 }
 
 const startupReadiness = createStartupReadinessGate();
+const databaseReaderReadiness = createDatabaseReaderReadiness({
+	backend: activeDatabaseBackend,
+	probe: (options) => assertDbReadersReady(getDbPath(), options),
+	availability: getDbWorkerAvailability,
+	databaseAvailability: () => getDbWorkerAvailability(getDbPath()),
+});
 
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
@@ -649,6 +745,7 @@ const fetchRequest = createServerRequestDispatcher({
 	lifecycle: httpLifecycle,
 	startupReadiness,
 	activeDatabaseBackend,
+	databaseReaderReadiness,
 });
 
 /**
@@ -934,7 +1031,7 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	const proto = getProtocol();
 	const listenUrl = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
 	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
-	// (7779); the banner and the browser open must send the user to the frontend.
+	// (7778); the banner and the browser open must send the user to the frontend.
 	const url = resolveAdvertisedAppUrl({
 		listenUrl,
 		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,
@@ -948,333 +1045,89 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	openFrontendOnce(url);
 }
 
-// Verify database integrity in the background, now that the port is bound and requests are being
-// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
-// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
-// probe now runs in a read-only subprocess and only records a repair marker; the repair itself
-// happens on the next startup, before any request is accepted.
-//
-// SQLite-only: the probe spawns a `bun:sqlite` read-only subprocess against the local database
-// file, which does not exist on the PostgreSQL backend (and `startupShutdownState.wasClean`
-// there is the "cannot skip verification" answer). A server-managed engine verifies itself.
-if (activeDatabaseBackend === "sqlite") {
-	scheduleBackgroundIntegrityCheck(startupShutdownState);
-}
+// Outline pages edited live when the previous process ended: commit what their logs hold.
+const outlineLiveDatabaseWork = hotSafe(
+	"outline.live.database-work.v1",
+	() => new Set<Promise<unknown>>(),
+);
+let outlineLiveReplay: Promise<unknown> | undefined;
 
-// Start WebSocket heartbeat (ping/pong) to detect stale connections
-startHeartbeat();
+const teamDatabaseMaintenance = hotSafe("teams.database-maintenance.v1", () => ({
+	stopped: false,
+	failed: false,
+	pending: new Set<Promise<unknown>>(),
+	started: new Set<string>(),
+	stops: new Set<() => void | Promise<void>>(),
+}));
 
-// Wire the remote-executor backend resolver + device lifecycle listeners.
-initDeviceConnectionService();
-// Wire the file-transfer chunk-frame receiver.
-initDeviceTransferService();
-// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
-// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
-await import("./services/modeltrace-compat")
-	.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
-	.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
-// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
-// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
-// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
-if (activeDatabaseBackend === "postgres") {
-	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
-} else {
-	// Narrators written before runtime registrations store their relations from now on.
-	await materializeLegacyDelegations().catch((error) =>
-		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+function trackTeamDatabaseMaintenance<T>(work: Promise<T>): Promise<T> {
+	teamDatabaseMaintenance.pending.add(work);
+	void work.then(
+		() => teamDatabaseMaintenance.pending.delete(work),
+		() => {
+			teamDatabaseMaintenance.failed = true;
+			teamDatabaseMaintenance.pending.delete(work);
+		},
 	);
-	// The server is already serving here, so a failure is logged rather than thrown. It fails
-	// closed: a grant without its authority row is rejected as invalid_grant, and a resource
-	// without its binding is not listed for the client. The next startup retries the backfill.
-	try {
-		await backfillOAuthGrantAuthoritiesOnStartup();
-		await backfillIntegrationResourceBindingsOnStartup();
-	} catch (error) {
-		logger.error("OAuth/integration startup backfill failed; affected legacy grants stay denied", {
-			error: String(error),
-		});
-	}
+	return trackCommunicationWork(work);
 }
 
-startVNetUdpRendezvous(settings.vnet).catch((err) => {
-	logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
-});
-
-try {
-	getCodexManager().startUsageRefreshScheduler();
-} catch (err) {
-	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
+function startTeamDatabaseMaintenance(
+	name: string,
+	load: () => Promise<() => () => void | Promise<void>>,
+): void {
+	void trackTeamDatabaseMaintenance(
+		load().then((start) => {
+			if (
+				teamDatabaseMaintenance.stopped ||
+				teamDatabaseMaintenance.started.has(name) ||
+				!httpLifecycle.accepting ||
+				!databaseReadersAvailable(databaseReaderReadiness.state)
+			)
+				return;
+			teamDatabaseMaintenance.stops.add(start());
+			teamDatabaseMaintenance.started.add(name);
+		}),
+	).catch((error) => logger.warn("Team maintenance failed to start", { error: String(error) }));
 }
 
-try {
-	// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-	// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
-	// refresh when provider settings change).
-	const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
-	void refreshAllKimiUsages().catch(() => {});
-} catch (err) {
-	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+function getTeamDatabaseMaintenanceStatus() {
+	return {
+		stopped: teamDatabaseMaintenance.stopped,
+		pending: teamDatabaseMaintenance.pending.size,
+		failed: teamDatabaseMaintenance.failed,
+	};
 }
 
-try {
-	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
-	// restart re-reads it rather than trusting numbers from the previous process.
-	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
-	void refreshAllOpencodeUsages().catch(() => {});
-} catch (err) {
-	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
-}
-
-try {
-	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
-	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
-	void refreshAllDeepSeekBalances().catch(() => {});
-} catch {
-	logger.warn("DeepSeek balance startup refresh failed");
-}
-
-// Mark any stale terminals from a previous run as exited
-terminalService.recoverOnStartup().catch((err) => {
-	logger.error("Terminal recovery failed", { error: String(err) });
-});
-
-// Initialize external MCP servers
-mcpManager.prepareTools = prepareMcpTools;
-mcpManager.initialize().catch((err) => {
-	logger.error("MCP server initialization failed", { error: String(err) });
-});
-
-// Initialize the plugin control plane after core services are available. Plugin
-// activation is feature-flagged and must never prevent the core server from starting.
-pluginManager
-	.initialize()
-	.then((statuses) => {
-		logger.info("Plugin manager initialized", {
-			enabled: pluginManager.isEnabled(),
-			pluginCount: statuses.length,
-		});
-	})
-	.catch((err) => {
-		logger.error("Plugin manager initialization failed", { error: String(err) });
-	});
-
-function startQuestionAnswerRecovery(): void {
-	if (!automaticResumeEnabled()) return;
-	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
-		logger.error("Pending question answer recovery failed", { error: String(error) });
-	});
-}
-
-// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
-// never compensate by scanning every narrator or interrupting another queue's live owner.
-const startupRecoveryNarratorIds = new Set<string>();
-const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
-	for (const id of ids) startupRecoveryNarratorIds.add(id);
-};
-
-// Read planned-update protection before generic cleanup can mutate process-owned rows. The
-// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
-// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
-// the background after that queue is mounted.
-withBackgroundOccupancyInitialization(
-	async () => {
-		// Before mounting ANY replay/continuation owner: scheduled business work is
-		// never automatically repeated when its previous terminal is unknown.
-		if (activeDatabaseBackend === "sqlite") {
-			const { setScheduledRunNotifier } = await import("./services/scheduled-task-run-service");
-			setScheduledRunNotifier(
-				(await import("./services/scheduled-task-notify")).notifyScheduledRunChanged,
-			);
-			await (await import("./services/scheduled-task-run-tracker")).recoverScheduledRuns();
+async function stopTeamDatabaseMaintenance(): Promise<void> {
+	teamDatabaseMaintenance.stopped = true;
+	for (const stop of teamDatabaseMaintenance.stops) {
+		try {
+			void trackTeamDatabaseMaintenance(Promise.resolve(stop())).catch(() => {});
+		} catch (error) {
+			teamDatabaseMaintenance.failed = true;
+			logger.warn("Team maintenance failed to stop", { error: String(error) });
 		}
-		const plannedUpdate = await getPlannedUpdateStartupProtection({
-			claimAuthorization: automaticResumeEnabled(),
-			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
-		});
-		for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
-		for (const target of plannedUpdate.snapshot?.narrators ?? [])
-			startupRecoveryNarratorIds.add(target.narratorId);
-		for (const source of plannedUpdate.snapshot?.sources ?? [])
-			for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
-		// The instance lock is already held. Release only previous-process mailbox claims
-		// before planned recovery mounts owners; hot reload preserves the process marker.
-		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
-			recoverInboxClaimsOnColdStartup(),
-		);
-		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
-			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
-		});
-		for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
-		for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
-			startupRecoveryNarratorIds.add(target.narratorId);
-		for (const target of ordinaryRestart.manifest?.targets ?? [])
-			startupRecoveryNarratorIds.add(target.narratorId);
-		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
-		await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
-		return { plannedUpdate, ordinaryRestart };
-	},
-	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
-)
-	.then(async ({ plannedUpdate, ordinaryRestart }) => {
-		await restorePendingModelOverrides();
-		// Browser-backed narrators must see their restored sessions before planned-update continuation
-		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
-		await import("./services/browser-session-recovery")
-			.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
-			.catch((err) => {
-				logger.error("Browser session recovery failed", {
-					error: err instanceof Error ? err.message : String(err),
-				});
-			});
-		// All sources are now registered. New preparation can reserve them without
-		// waiting for an Agent, Await, or human approval to finish (or even mount).
-		finishRecoveryDiscovery();
-		const recoveryCandidates = new Set(startupRecoveryNarratorIds);
-		const allowedRecovery =
-			activeDatabaseBackend === "sqlite"
-				? await (
-						await import("./services/scheduled-task-run-tracker")
-					).filterScheduledRecoveryNarrators(recoveryCandidates)
-				: undefined;
-		const recoveryHandles = automaticResumeEnabled()
-			? await Promise.all([
-					restoreNarratorsAfterPlannedUpdate(plannedUpdate, {
-						includedNarratorIds: allowedRecovery,
-					}),
-					restoreOrdinaryRestartRecovery(ordinaryRestart, { includedNarratorIds: allowedRecovery }),
-				])
-			: [];
-		const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
-		if (completions.length) startupReadiness.markRecovering();
-		else startupReadiness.markReady();
-		startupReadiness.settle({ ok: true });
-		// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
-		void import("./services/narrator-block-backfill")
-			.then(({ startBlockBackfill }) => startBlockBackfill())
-			.catch((err) =>
-				logger.warn("Block backfill did not start", {
-					error: err instanceof Error ? err.message : String(err),
-				}),
-			);
-		void import("./services/storage-history-runtime")
-			.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
-			.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
-		if (completions.length) {
-			Promise.all(completions)
-				.then(() => {
-					startupReadiness.markReady();
-					startQuestionAnswerRecovery();
-					logger.info("Planned-update background continuation recovery completed");
-				})
-				.catch(async (err) => {
-					const error = err instanceof Error ? err.message : String(err);
-					// The pass did not fully converge. Keep the diagnostic, but /api/health
-					// still answers 200 so this never disables unrelated UI features.
-					startupReadiness.markFailed(error);
-					logger.error("Planned-update background continuation recovery failed", { error });
-					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
-				});
-		} else {
-			startQuestionAnswerRecovery();
-		}
-	})
-	.catch(async (err) => {
-		const error = err instanceof Error ? err.message : String(err);
-		startupReadiness.markFailed(error);
-		logger.error("Narrator state recovery failed", { error });
-		startupReadiness.settle({ ok: false, error });
-		await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
-		// A recovery failure caused by an unusable provider is almost always a persisted
-		// narrator pointing at a prefix the user has since removed. Surface which narrators
-		// are affected instead of leaving the reason buried in this log line.
-		if (isProviderUnavailableError(err)) void reportBrokenModelNarrators(error);
-	});
-
-/**
- * Scan for narrators stuck on an unusable model and announce a summary.
- *
- * Only counts and provider prefixes are broadcast — the full narrator list is fetched
- * on demand through `GET /api/narrators/broken-models`, so this never pushes a large
- * payload to every connected client.
- */
-async function reportBrokenModelNarrators(recoveryError: string): Promise<void> {
-	try {
-		const { scanBrokenModelNarrators } = await import("./services/broken-model-migration-service");
-		const scan = await scanBrokenModelNarrators();
-		if (scan.totalBroken === 0 && scan.totalSuspect === 0) return;
-
-		const providerPrefixes = [
-			...new Set(
-				scan.groups
-					.filter((group) => group.reason === "provider_missing")
-					.map((group) => group.providerPrefix)
-					.filter((prefix): prefix is string => !!prefix),
-			),
-		];
-		logger.warn("Narrators are pinned to an unusable model", {
-			recoveryError,
-			totalBroken: scan.totalBroken,
-			totalSuspect: scan.totalSuspect,
-			providerPrefixes,
-			truncated: scan.truncated,
-		});
-		const { broadcastToAll } = await import("./websocket/narrator-ws");
-		broadcastToAll({
-			type: "broken_model_narrators_detected",
-			totalBroken: scan.totalBroken,
-			totalSuspect: scan.totalSuspect,
-			providerPrefixes,
-			truncated: scan.truncated,
-		});
-	} catch (scanError) {
-		logger.error("Failed to report narrators pinned to an unusable model", {
-			error: scanError instanceof Error ? scanError.message : String(scanError),
-		});
 	}
+	teamDatabaseMaintenance.stops.clear();
+	while (teamDatabaseMaintenance.pending.size)
+		await Promise.allSettled([...teamDatabaseMaintenance.pending]);
+	if (teamDatabaseMaintenance.failed)
+		throw new Error("Team maintenance did not drain successfully");
 }
 
-// Clean up leftover share directories from previous server runs
-import { cleanupStaleShares } from "./lib/shares";
-
-cleanupStaleShares();
+let stopPrefixSnapshotMaintenance = () => Promise.resolve();
 
 // Request dumps and token repair data from before request evidence unification are discarded.
-import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
-
 void removeLegacyRequestDumpDirs();
 
-// Clean up leftover pack extraction directories from previous server runs and mark any
-// still-"active" pack activations as released (their temp dirs don't survive a restart).
-import { packActivationService } from "./services/knowledge-pack-activation-service";
-
-packActivationService.cleanupStalePacks();
-
 // Periodically remove old per-directory skill summary caches.
-import { startSkillCacheCleanupTimer } from "./services/skill-service";
-
 startSkillCacheCleanupTimer();
 
-// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
-import {
-	closePrefixSnapshotStore,
-	startPrefixSnapshotMaintenance,
-} from "./services/narrator-prefix-snapshots";
-
-const stopPrefixSnapshotMaintenance = startPrefixSnapshotMaintenance();
-
 // Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
-import { startChallengeCleanupTimer } from "./lib/webauthn";
-
 startChallengeCleanupTimer();
 
-// Periodically delete expired and revoked login sessions.
-import { startSessionCleanupTimer } from "./lib/auth";
-
-startSessionCleanupTimer();
-
 // Reclaim abandoned uploads without overlapping sweeps.
-import { sweepStagedAttachments } from "./lib/attachment-staging";
-
 let attachmentSweepRunning = false;
 setInterval(
 	async () => {
@@ -1291,102 +1144,6 @@ setInterval(
 	30 * 60 * 1000,
 ).unref();
 
-// Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
-import {
-	startScheduledTaskScheduler,
-	stopScheduledTaskScheduler,
-} from "./services/scheduled-task-scheduler";
-
-void startupReadiness.barrier.then((recovery) => {
-	if (!recovery.ok) {
-		// The scheduler owns its own persisted records and skips narrators it cannot start, so a
-		// failed recovery pass must not silently disable every future scheduled task.
-		logger.warn("Starting scheduled task scheduler despite a failed startup recovery", {
-			error: recovery.error,
-		});
-	}
-	startScheduledTaskScheduler();
-	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
-	// must not keep update checkpoint scans or UI recovery cards looking "busy".
-	import("./services/abandoned-tool-cleanup")
-		.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
-		.then((result) => {
-			if (result.cleaned > 0) {
-				logger.info("Startup abandoned tool-call cleanup finished", result);
-			}
-		})
-		.catch((err) => {
-			logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
-		});
-});
-
-// Outline pages edited live when the previous process ended: commit what their logs hold.
-void startupReadiness.barrier.then(() => {
-	import("./services/outline/live/registry")
-		.then(({ startLiveReplay }) => startLiveReplay())
-		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
-	// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
-	// session was archived or deleted (on those events), and derive the in-process flag of
-	// blocks written before it existed (once, page by page).
-	import("./services/outline/tasks")
-		.then(({ startOutlineTaskLeaseJob }) => startOutlineTaskLeaseJob())
-		.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
-	import("./services/outline/in-process")
-		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
-		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
-	// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
-	// in bounded slices), and "today so far" when asked.
-	import("./services/outline/digest-job")
-		.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
-		.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
-	// Outline team events: a session is told when a task is assigned to it by name, when a
-	// prerequisite of its task ends, and when a task it created ends. The commits of the last
-	// minutes are pushed again in the background (what a stop between a commit and its rows left
-	// untold; a row written before is found and not written twice).
-	import("./services/outline/team-events")
-		.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
-			startOutlineTeamEvents();
-			return repushRecentOutlineTeamEvents();
-		})
-		.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
-	// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
-	// they are idle (a pass a minute after start, then at intervals; one session at a time).
-	import("./services/outline/spec-import/triggers")
-		.then(({ startSpecImportJob }) => startSpecImportJob())
-		.catch((err) => logger.warn("Dynamic Spec import job failed to start", { error: String(err) }));
-	// What the old Spec panel may have swallowed is looked for in the background (read-only; a
-	// pass a while after start, then at intervals) and shown to people, never repaired.
-	import("./services/outline/spec-import/loss-scan")
-		.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
-		.catch((err) => logger.warn("Swallowed-content scan failed to start", { error: String(err) }));
-	// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
-	import("./services/outline/plugin-task-events")
-		.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
-		.catch((err) =>
-			logger.warn("Outline plugin task events failed to start", { error: String(err) }),
-		);
-});
-
-// Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
-// process-wide singleton before querying the authoritative indexes.
-ensureAllRecentTabsMigrated()
-	.then(() => logger.info("RecentTabs legacy migration scan completed"))
-	.catch((err) => logger.warn("RecentTabs legacy migration scan failed", { error: String(err) }));
-
-// Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
-import { gateway } from "./gateway/gateway";
-
-void startupReadiness.barrier.then((recovery) => {
-	if (!recovery.ok) {
-		logger.warn("Starting IM Gateway despite a failed startup recovery", {
-			error: recovery.error,
-		});
-	}
-	gateway.start().catch((err) => {
-		logger.error("IM Gateway startup failed", { error: String(err) });
-	});
-});
-
 // No startup workspace cleanup: workspaces used to be deleted when no sidebar tab
 // referenced them, but the sidebar no longer lists workspaces at all (folders replaced
 // that grouping), so every workspace would look orphaned. They are deleted explicitly.
@@ -1396,38 +1153,536 @@ initKnowledgeNotify();
 // Register chat notification bridge (room messages to viewers, unread badges to the rest)
 initChatNotify();
 
-// Activity projections consume source events independently of WebSocket delivery.
-initNotificationFanout();
-startNotificationCenterMaintenance();
-
-if (activeDatabaseBackend === "sqlite") {
-	// Stop containers and release ports that removed chapters left behind.
-	retireLegacyChapterResources().catch((err) => {
-		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
-	});
-	// Re-derive which project every session belongs to, in bounded background pages.
-	void scheduleProjectIndexRebuild();
-	// Model aggregations become auto:/provider values; batched, logs and retries on failure.
-	// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
-	// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
-	void migrateAggregationsOnStartup();
+function cancelDatabaseStartup(): void {
+	const error = "SERVER_SHUTTING_DOWN";
+	startupReadiness.markFailed(error);
+	startupReadiness.settle({ ok: false, error });
 }
 
-// Establish client-egress relay channels for NUG providers configured with
-// local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
-// every settings save.
-reconcileNugRelayClients(settings.nugProviders ?? []);
-
-// One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
-const legacySnapshotsDir = getNarraforkPath("snapshots");
-if (existsSync(legacySnapshotsDir)) {
-	try {
-		rmSync(legacySnapshotsDir, { recursive: true, force: true });
-		logger.info("Removed legacy snapshot directory", { path: legacySnapshotsDir });
-	} catch (err) {
-		logger.warn("Failed to remove legacy snapshot directory", { error: String(err) });
+async function initializeDatabaseStartup(): Promise<void> {
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	// Verify database integrity in the background, now that the port is bound and requests are being
+	// served. This used to run synchronously in server/db/index.ts BEFORE Bun.serve(), where a
+	// whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
+	// probe now runs in a read-only subprocess and only records a repair marker; the repair itself
+	// happens on the next startup, before any request is accepted.
+	//
+	// SQLite-only: the probe spawns a `bun:sqlite` read-only subprocess against the local database
+	// file, which does not exist on the PostgreSQL backend (and `startupShutdownState.wasClean`
+	// there is the "cannot skip verification" answer). A server-managed engine verifies itself.
+	if (activeDatabaseBackend === "sqlite") {
+		scheduleBackgroundIntegrityCheck(startupShutdownState);
 	}
+
+	// Start WebSocket heartbeat (ping/pong) to detect stale connections
+	startHeartbeat();
+
+	// Wire the remote-executor backend resolver + device lifecycle listeners.
+	initDeviceConnectionService();
+	// Wire the file-transfer chunk-frame receiver.
+	initDeviceTransferService();
+	// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+	// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+	await import("./services/modeltrace-compat")
+		.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+		.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	// Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
+	// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
+	// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
+	if (activeDatabaseBackend === "postgres") {
+		logger.warn(
+			"OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated",
+		);
+	} else {
+		// Narrators written before runtime registrations store their relations from now on.
+		await materializeLegacyDelegations().catch((error) =>
+			logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+		);
+		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+		await import("./services/narrator-communication/initialize")
+			.then(({ initializeCommunicationNodes }) => initializeCommunicationNodes())
+			.catch((error) =>
+				logger.warn("Communication initialization failed; missing nodes remain denied", {
+					error: String(error),
+				}),
+			);
+		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+		// The server is already serving here, so a failure is logged rather than thrown. It fails
+		// closed: a grant without its authority row is rejected as invalid_grant, and a resource
+		// without its binding is not listed for the client. The next startup retries the backfill.
+		try {
+			await backfillOAuthGrantAuthoritiesOnStartup();
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+			await backfillIntegrationResourceBindingsOnStartup();
+		} catch (error) {
+			logger.error(
+				"OAuth/integration startup backfill failed; affected legacy grants stay denied",
+				{
+					error: String(error),
+				},
+			);
+		}
+	}
+
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+	startVNetUdpRendezvous(settings.vnet).catch((err) => {
+		logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
+	});
+
+	try {
+		getCodexManager().startUsageRefreshScheduler();
+	} catch (err) {
+		logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
+	}
+
+	try {
+		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
+		// demand-driven (stale-while-revalidate on GET /api/quota-snapshots, plus a
+		// refresh when provider settings change).
+		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
+		void refreshAllKimiUsages().catch(() => {});
+	} catch (err) {
+		logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	try {
+		// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+		// restart re-reads it rather than trusting numbers from the previous process.
+		const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+		void refreshAllOpencodeUsages().catch(() => {});
+	} catch (err) {
+		logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	try {
+		// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
+		const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
+		void refreshAllDeepSeekBalances().catch(() => {});
+	} catch {
+		logger.warn("DeepSeek balance startup refresh failed");
+	}
+	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+
+	// A user's template in a built-in's directory moves aside without losing its contents.
+	void import("./services/custom-subagent-service")
+		.then(({ moveAsideReservedTemplates }) => moveAsideReservedTemplates())
+		.catch((err) => logger.warn("Reserved subagent template check failed", { error: String(err) }));
+
+	// Mark any stale terminals from a previous run as exited
+	terminalService.recoverOnStartup().catch((err) => {
+		logger.error("Terminal recovery failed", { error: String(err) });
+	});
+
+	// Prepare tools before publishing each initialized MCP server's capabilities.
+	mcpManager.prepareTools = prepareMcpTools;
+	mcpManager.initialize().catch((err) => {
+		logger.error("MCP server initialization failed", { error: String(err) });
+	});
+
+	// Initialize the plugin control plane after core services are available. Plugin
+	// activation is feature-flagged and must never prevent the core server from starting.
+	pluginManager
+		.initialize()
+		.then((statuses) => {
+			logger.info("Plugin manager initialized", {
+				enabled: pluginManager.isEnabled(),
+				pluginCount: statuses.length,
+			});
+		})
+		.catch((err) => {
+			logger.error("Plugin manager initialization failed", { error: String(err) });
+		});
+
+	function startQuestionAnswerRecovery(): void {
+		if (!automaticResumeEnabled()) return;
+		void recoverPendingQuestionAnswerDeliveries().catch((error) => {
+			logger.error("Pending question answer recovery failed", { error: String(error) });
+		});
+	}
+
+	// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
+	// never compensate by scanning every narrator or interrupting another queue's live owner.
+	const startupRecoveryNarratorIds = new Set<string>();
+	const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
+		for (const id of ids) startupRecoveryNarratorIds.add(id);
+	};
+
+	// Read planned-update protection before generic cleanup can mutate process-owned rows. The
+	// admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
+	// ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
+	// the background after that queue is mounted.
+	const narratorRecovery = withBackgroundOccupancyInitialization(
+		async () => {
+			// Restore exact scheduled receipts before mounting any automatic continuation.
+			if (activeDatabaseBackend === "sqlite") {
+				const { setScheduledRunNotifier } = await import("./services/scheduled-task-run-service");
+				setScheduledRunNotifier(
+					(await import("./services/scheduled-task-notify")).notifyScheduledRunChanged,
+				);
+				await (await import("./services/scheduled-task-run-tracker")).recoverScheduledRuns();
+			}
+			const plannedUpdate = await getPlannedUpdateStartupProtection({
+				claimAuthorization: automaticResumeEnabled(),
+				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+			});
+			for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+			for (const target of plannedUpdate.snapshot?.narrators ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			for (const source of plannedUpdate.snapshot?.sources ?? [])
+				for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
+			// The instance lock is already held. Release only previous-process mailbox claims
+			// before planned recovery mounts owners; hot reload preserves the process marker.
+			await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
+				recoverInboxClaimsOnColdStartup(),
+			);
+			const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
+				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+			});
+			for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+			for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			for (const target of ordinaryRestart.manifest?.targets ?? [])
+				startupRecoveryNarratorIds.add(target.narratorId);
+			const protection = mergeStartupProtection(
+				plannedUpdate.protection,
+				ordinaryRestart.protection,
+			);
+			await recoverNarrators(protection, { heldRunIds: ordinaryRestart.heldRunIds });
+			return { plannedUpdate, ordinaryRestart };
+		},
+		activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
+	)
+		.then(async ({ plannedUpdate, ordinaryRestart }) => {
+			if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+			await restorePendingModelOverrides();
+			// Browser-backed narrators must see their restored sessions before planned-update continuation
+			// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
+			await import("./services/browser-session-recovery")
+				.then(({ restoreBrowserSessionsAfterUpdate }) => restoreBrowserSessionsAfterUpdate())
+				.catch((err) => {
+					logger.error("Browser session recovery failed", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+			// All sources are now registered. New preparation can reserve them without
+			// waiting for an Agent, Await, or human approval to finish (or even mount).
+			finishRecoveryDiscovery();
+			const allowedRecovery =
+				activeDatabaseBackend === "sqlite"
+					? await (
+							await import("./services/scheduled-task-run-tracker")
+						).filterScheduledRecoveryNarrators(new Set(startupRecoveryNarratorIds))
+					: undefined;
+			const recoveryHandles = automaticResumeEnabled()
+				? await Promise.all([
+						restoreNarratorsAfterPlannedUpdate(plannedUpdate, {
+							includedNarratorIds: allowedRecovery,
+						}),
+						restoreOrdinaryRestartRecovery(ordinaryRestart, {
+							includedNarratorIds: allowedRecovery,
+						}),
+					])
+				: [];
+			// A notice can be durable in the mailbox while its post-commit wake was lost to
+			// the previous process. Re-probe those recipients once recovery owners are mounted.
+			if (automaticResumeEnabled())
+				void import("./services/agent-runtime/inbox")
+					.then(({ wakeQueuedTaskNoticeRecipientsOnStartup }) =>
+						wakeQueuedTaskNoticeRecipientsOnStartup(),
+					)
+					.catch((err) =>
+						logger.warn("Startup task-notice wake reconciliation failed", { error: String(err) }),
+					);
+			const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
+			if (completions.length) startupReadiness.markRecovering();
+			else startupReadiness.markReady();
+			startupReadiness.settle({ ok: true });
+			// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
+			void import("./services/narrator-block-backfill")
+				.then(({ startBlockBackfill }) => startBlockBackfill())
+				.catch((err) =>
+					logger.warn("Block backfill did not start", {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+			void import("./services/storage-history-runtime")
+				.then(({ startStorageHistoryRetention }) => startStorageHistoryRetention())
+				.catch((err) => logger.warn("History retention did not start", { error: String(err) }));
+			if (completions.length) {
+				Promise.all(completions)
+					.then(() => {
+						startupReadiness.markReady();
+						startQuestionAnswerRecovery();
+						logger.info("Planned-update background continuation recovery completed");
+					})
+					.catch(async (err) => {
+						const error = err instanceof Error ? err.message : String(err);
+						startupReadiness.markFailed(error);
+						logger.error("Planned-update background continuation recovery failed", { error });
+						await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
+					});
+			} else {
+				startQuestionAnswerRecovery();
+			}
+		})
+		.catch(async (err) => {
+			const error = err instanceof Error ? err.message : String(err);
+			startupReadiness.markFailed(error);
+			logger.error("Narrator state recovery failed", { error });
+			startupReadiness.settle({ ok: false, error });
+			await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
+			// A recovery failure caused by an unusable provider is almost always a persisted
+			// narrator pointing at a prefix the user has since removed. Surface which narrators
+			// are affected instead of leaving the reason buried in this log line.
+			if (isProviderUnavailableError(err)) void reportBrokenModelNarrators(error);
+		});
+
+	/**
+	 * Scan for narrators stuck on an unusable model and announce a summary.
+	 *
+	 * Only counts and provider prefixes are broadcast — the full narrator list is fetched
+	 * on demand through `GET /api/narrators/broken-models`, so this never pushes a large
+	 * payload to every connected client.
+	 */
+	async function reportBrokenModelNarrators(recoveryError: string): Promise<void> {
+		try {
+			const { scanBrokenModelNarrators } = await import(
+				"./services/broken-model-migration-service"
+			);
+			const scan = await scanBrokenModelNarrators();
+			if (scan.totalBroken === 0 && scan.totalSuspect === 0) return;
+
+			const providerPrefixes = [
+				...new Set(
+					scan.groups
+						.filter((group) => group.reason === "provider_missing")
+						.map((group) => group.providerPrefix)
+						.filter((prefix): prefix is string => !!prefix),
+				),
+			];
+			logger.warn("Narrators are pinned to an unusable model", {
+				recoveryError,
+				totalBroken: scan.totalBroken,
+				totalSuspect: scan.totalSuspect,
+				providerPrefixes,
+				truncated: scan.truncated,
+			});
+			const { broadcastToAll } = await import("./websocket/narrator-ws");
+			broadcastToAll({
+				type: "broken_model_narrators_detected",
+				totalBroken: scan.totalBroken,
+				totalSuspect: scan.totalSuspect,
+				providerPrefixes,
+				truncated: scan.truncated,
+			});
+		} catch (scanError) {
+			logger.error("Failed to report narrators pinned to an unusable model", {
+				error: scanError instanceof Error ? scanError.message : String(scanError),
+			});
+		}
+	}
+
+	// Clean up leftover share directories from previous server runs
+	cleanupStaleShares();
+
+	// Clean up leftover pack extraction directories from previous server runs and mark any
+	// still-"active" pack activations as released (their temp dirs don't survive a restart).
+	packActivationService.cleanupStalePacks();
+
+	// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
+	stopPrefixSnapshotMaintenance = startPrefixSnapshotMaintenance();
+
+	// Periodically delete expired and revoked login sessions.
+	startSessionCleanupTimer();
+
+	// Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
+	void startupReadiness.barrier.then((recovery) => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		if (!recovery.ok) {
+			// The scheduler owns its own persisted records and skips narrators it cannot start, so a
+			// failed recovery pass must not silently disable every future scheduled task.
+			logger.warn("Starting scheduled task scheduler despite a failed startup recovery", {
+				error: recovery.error,
+			});
+		}
+		startScheduledTaskScheduler();
+		// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
+		// must not keep update checkpoint scans or UI recovery cards looking "busy".
+		import("./services/abandoned-tool-cleanup")
+			.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
+			.then((result) => {
+				if (result.cleaned > 0) {
+					logger.info("Startup abandoned tool-call cleanup finished", result);
+				}
+			})
+			.catch((err) => {
+				logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
+			});
+	});
+
+	void startupReadiness.barrier.then(() => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		outlineLiveReplay = trackOutlineLiveDatabaseWork(
+			import("./services/outline/live/registry").then(({ startLiveReplay }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				return startLiveReplay();
+			}),
+		);
+		void outlineLiveReplay.catch((err) =>
+			logger.warn("Outline live log replay failed", { error: String(err) }),
+		);
+		// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
+		// session was archived or deleted (on those events), and derive the in-process flag of
+		// blocks written before it existed (once, page by page).
+		import("./services/outline/tasks")
+			.then(({ startOutlineTaskLeaseJob }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				startOutlineTaskLeaseJob();
+			})
+			.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
+		import("./services/outline/in-process")
+			.then(({ scheduleOutlineInProcessRebuild }) => {
+				if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+					return;
+				return scheduleOutlineInProcessRebuild();
+			})
+			.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
+		// Outline reports: each person's day, made in the background (a sweep every 5 minutes,
+		// in bounded slices), and "today so far" when asked.
+		import("./services/outline/digest-job")
+			.then(({ startOutlineDigestJob }) => startOutlineDigestJob())
+			.catch((err) => logger.warn("Outline report job failed to start", { error: String(err) }));
+		// Outline team events: a session is told when a task is assigned to it by name, when a
+		// prerequisite of its task ends, and when a task it created ends. The commits of the last
+		// minutes are pushed again in the background (what a stop between a commit and its rows left
+		// untold; a row written before is found and not written twice).
+		import("./services/outline/team-events")
+			.then(({ startOutlineTeamEvents, repushRecentOutlineTeamEvents }) => {
+				startOutlineTeamEvents();
+				return repushRecentOutlineTeamEvents();
+			})
+			.catch((err) => logger.warn("Outline team events failed to start", { error: String(err) }));
+		// Sessions that still keep their tasks in Dynamic Spec are imported into the outline while
+		// they are idle (a pass a minute after start, then at intervals; one session at a time).
+		import("./services/outline/spec-import/triggers")
+			.then(({ startSpecImportJob }) => startSpecImportJob())
+			.catch((err) =>
+				logger.warn("Dynamic Spec import job failed to start", { error: String(err) }),
+			);
+		// What the old Spec panel may have swallowed is looked for in the background (read-only; a
+		// pass a while after start, then at intervals) and shown to people, never repaired.
+		import("./services/outline/spec-import/loss-scan")
+			.then(({ startSpecLossScanJob }) => startSpecLossScanJob())
+			.catch((err) =>
+				logger.warn("Swallowed-content scan failed to start", { error: String(err) }),
+			);
+		// Outline sessions' task changes, for plugins (narrafork.narrator.tasks.changed).
+		import("./services/outline/plugin-task-events")
+			.then(({ startOutlinePluginTaskEvents }) => startOutlinePluginTaskEvents())
+			.catch((err) =>
+				logger.warn("Outline plugin task events failed to start", { error: String(err) }),
+			);
+	});
+
+	// Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
+	// process-wide singleton before querying the authoritative indexes.
+	ensureAllRecentTabsMigrated()
+		.then(() => logger.info("RecentTabs legacy migration scan completed"))
+		.catch((err) => logger.warn("RecentTabs legacy migration scan failed", { error: String(err) }));
+
+	// Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
+	void startupReadiness.barrier.then((recovery) => {
+		if (!httpLifecycle.accepting || !databaseReadersAvailable(databaseReaderReadiness.state))
+			return;
+		if (!recovery.ok) {
+			logger.warn("Starting IM Gateway despite a failed startup recovery", {
+				error: recovery.error,
+			});
+		}
+		gateway.start().catch((err) => {
+			logger.error("IM Gateway startup failed", { error: String(err) });
+		});
+	});
+
+	// Activity projections consume source events independently of WebSocket delivery.
+	initNotificationFanout();
+	startNotificationCenterMaintenance();
+
+	if (activeDatabaseBackend === "sqlite") {
+		// Follow coordinator archive changes, saved-output ownership and finite work-item tails.
+		startTeamDatabaseMaintenance("status", () =>
+			import("./services/teams/team-service").then(
+				({ startTeamStatusSync }) => startTeamStatusSync,
+			),
+		);
+		startTeamDatabaseMaintenance("outputs", () =>
+			import("./services/teams/coordinator-maintenance").then(
+				({ startCoordinatorMaintenance }) => startCoordinatorMaintenance,
+			),
+		);
+		startTeamDatabaseMaintenance("work", () =>
+			import("./services/teams/work-items").then(
+				({ startTeamWorkLifecycle }) => startTeamWorkLifecycle,
+			),
+		);
+		// Keep changed paths and exclusive-path overlaps current under the same shutdown owner.
+		startTeamDatabaseMaintenance("overlap", () =>
+			import("./services/teams/team-overlap").then(
+				({ startTeamOverlapJob }) => startTeamOverlapJob,
+			),
+		);
+		// Prune private merge refs of work items no longer ready (a crash mid-merge leaves them).
+		startTeamDatabaseMaintenance("merge", () =>
+			import("./services/teams/team-merge").then(
+				({ startTeamMergeMaintenance }) => startTeamMergeMaintenance,
+			),
+		);
+		// Read ready items' pull requests on GitHub: merged by hand, closed, checks and review.
+		startTeamDatabaseMaintenance("pull-requests", () =>
+			import("./services/teams/team-merge-pr").then(({ startTeamPrPoller }) => startTeamPrPoller),
+		);
+		// Stop containers and release ports that removed chapters left behind.
+		retireLegacyChapterResources().catch((err) => {
+			logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
+		});
+		// Re-derive which project every session belongs to, in bounded background pages.
+		void scheduleProjectIndexRebuild();
+		// Model aggregations become auto:/provider values; batched, logs and retries on failure.
+		// SQLite only, like the provider prefix migration: it rewrites narrator rows through the
+		// SQLite handle. On PostgreSQL the aggregation values keep resolving as before.
+		void migrateAggregationsOnStartup();
+	}
+	await narratorRecovery;
 }
+
+const databaseStartup = createDatabaseReaderStartup({
+	readiness: databaseReaderReadiness,
+	initialize: initializeDatabaseStartup,
+	onStop: cancelDatabaseStartup,
+	onUnavailable: (result) => {
+		logger.error("Database readers unavailable; database startup work is gated", {
+			code: result.code,
+		});
+	},
+	onError: (error) => {
+		const message = error instanceof Error ? error.message : String(error);
+		startupReadiness.markFailed(message);
+		startupReadiness.settle({ ok: false, error: message });
+		logger.error("Database startup initialization failed", { error: message });
+	},
+});
+const databaseStartupPromise = databaseStartup.start();
+
+// Own client-egress relay channels before Auto routing can select NUG. Committed
+// settings and key edits are coalesced by this same owner, outside the read path.
+startNugRelayOwner();
 
 type GracefulShutdownOptions = {
 	reason: string;
@@ -1437,13 +1692,29 @@ type GracefulShutdownOptions = {
 
 type GracefulShutdownResult = {
 	success: boolean;
+	clean: boolean;
 	reason: string;
 	pid: number;
 	durationMs: number;
 };
 
-let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
-let killWindowsProcessTreeOnExit = true;
+// Keep a single shutdown owner across --hot evaluations; hooks below delegate to the latest main.
+const shutdownState = hotSafe<{
+	promise: Promise<GracefulShutdownResult> | null;
+	killWindowsProcessTreeOnExit: boolean;
+	onSignal?: () => void;
+	onExit?: () => void;
+}>("narrafork.mainShutdown", () => ({ promise: null, killWindowsProcessTreeOnExit: true }));
+
+/** Retain real ownership after a stage timeout, including delayed imports and live session writes. */
+function trackOutlineLiveDatabaseWork<T>(work: Promise<T>): Promise<T> {
+	outlineLiveDatabaseWork.add(work);
+	void work.then(
+		() => outlineLiveDatabaseWork.delete(work),
+		() => outlineLiveDatabaseWork.delete(work),
+	);
+	return trackCommunicationWork(work);
+}
 
 /**
  * Run a shutdown teardown step with a hard timeout so one hanging await can't stall the entire
@@ -1456,43 +1727,284 @@ async function shutdownStep(
 	label: string,
 	fn: () => unknown,
 	timeoutMs = 4000,
+	ownsDeadline = false,
+	globalLimitMs?: number,
 ): Promise<"ok" | "timeout" | "failed"> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		const timeout = new Promise<"timeout">((resolve) => {
-			timer = setTimeout(() => resolve("timeout"), timeoutMs);
-		});
-		const result = await Promise.race([
-			Promise.resolve()
-				.then(fn)
-				.then(() => "ok" as const)
-				.catch((err) => {
-					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
-					return "failed" as const;
-				}),
-			timeout,
-		]);
-		if (result === "timeout") {
-			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
+	const startedAt = performance.now();
+	if (timeoutMs <= 0) {
+		tracker.recordStep(label, "timeout");
+		try {
+			logger.warn("Shutdown step skipped after deadline", { step: label, timeoutMs });
+		} catch {
+			/* diagnostics cannot prevent degraded shutdown */
 		}
-		tracker.recordStep(label, result);
-		return result;
+		return "timeout";
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let expired = false;
+	try {
+		const work = Promise.resolve()
+			.then(fn)
+			.then(() => "ok" as const)
+			.catch(() => {
+				// A timed-out operation remains owned by its subsystem and final audit.
+				// Diagnostic fields are fixed scalars and cannot expose worker inputs or secrets.
+				if (!expired) {
+					try {
+						logger.warn("Shutdown step failed", { step: label, outcome: "failed" });
+					} catch {
+						/* diagnostic sinks cannot prevent recording the outcome */
+					}
+				}
+				return "failed" as const;
+			});
+		// Self-deadline work owns the business timeout. Only the later, monotonic
+		// global watchdog bounds a broken subsystem; it never races that same deadline.
+		const hardLimitMs = ownsDeadline ? globalLimitMs : timeoutMs;
+		const outcome =
+			hardLimitMs === undefined
+				? await work
+				: await Promise.race([
+						work,
+						new Promise<"timeout">((resolve) => {
+							timer = setTimeout(() => {
+								expired = true;
+								resolve("timeout");
+							}, hardLimitMs);
+						}),
+					]);
+		if (outcome === "timeout") {
+			try {
+				logger.warn("Shutdown step timed out", { step: label, outcome: "timeout", timeoutMs });
+			} catch {
+				/* diagnostic sinks cannot prevent recording the outcome */
+			}
+		}
+		tracker.recordStep(label, outcome);
+		try {
+			logger.info("Shutdown stage settled", {
+				stage: label,
+				outcome,
+				durationMs: Math.round(performance.now() - startedAt),
+			});
+		} catch {
+			/* the outcome remains authoritative when diagnostics fail */
+		}
+		return outcome;
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
 }
 
+/** One monotonic budget; epoch deadlines are converted only at subsystem boundaries. */
+function createShutdownBudget() {
+	const startedAt = performance.now();
+	const globalDeadline = startedAt + 50_000;
+	const businessDeadline = Math.min(startedAt + 30_000, globalDeadline - 10_000);
+	return {
+		businessRemaining: () => Math.max(0, businessDeadline - performance.now()),
+		globalRemaining: () => Math.max(0, globalDeadline - performance.now()),
+		readerRemaining: () => Math.min(10_000, Math.max(0, globalDeadline - performance.now())),
+	};
+}
+
+/** Derived work can enqueue another collection; reach a shared fixed point before reader closure. */
+async function drainShutdownDatabaseWork(deadlineAt: number): Promise<void> {
+	let failure: { error: unknown } | undefined;
+	let websocketFailed = false;
+	let contextFailed = false;
+	const ensureRemaining = () => {
+		if (Date.now() >= deadlineAt) {
+			throw failure?.error ?? new Error("Shutdown database work did not drain");
+		}
+	};
+	for (;;) {
+		ensureRemaining();
+		try {
+			await drainNarratorRunCompletions({ deadlineAt });
+			await drainNarratorSessionTails({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await backgroundTaskService.drainBashCollectors({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainContextCharacterRefreshes({ deadlineAt });
+		} catch (error) {
+			contextFailed = true;
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainNarratorWsReadTasks({ deadlineAt });
+		} catch (error) {
+			websocketFailed = true;
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainBufferedFilePreparations({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainCommunicationWork({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		ensureRemaining();
+		try {
+			await drainNotificationBackgroundWork({ deadlineAt });
+		} catch (error) {
+			failure ??= { error };
+		}
+		// Retained failures remain audit state, rather than work to retry in a tight loop.
+		const context = getContextCharacterRefreshStatus();
+		const contextPending =
+			context.running ||
+			context.scheduled ||
+			(context.pending > 0 && (!contextFailed || !context.failed));
+		const pending =
+			getNarratorRunShutdownSnapshot().pending > 0 ||
+			getNarratorSessionTailStatus().pending > 0 ||
+			backgroundTaskService.getBashShutdownSnapshot().pending > 0 ||
+			contextPending ||
+			getCommunicationWorkStatus().pending > 0 ||
+			getNotificationBackgroundWorkSnapshot().pending > 0 ||
+			outlineLiveDatabaseWork.size > 0 ||
+			hasPendingBufferedFilePreparations() ||
+			(!websocketFailed && hasPendingNarratorWsReadTasks());
+		if (!pending) break;
+		if (Date.now() >= deadlineAt) {
+			throw failure?.error ?? new Error("Shutdown database work did not drain");
+		}
+	}
+	if (failure) throw failure.error;
+}
+
+/** After reader closure, inspect state only: no query, new work, or renewed deadline. */
+function auditShutdownDatabaseWork(tracker: ShutdownActivityTracker): "ok" | "failed" {
+	let outcome: "ok" | "failed" = "failed";
+	try {
+		const narrator = getNarratorSessionTailStatus();
+		const runs = getNarratorRunShutdownSnapshot();
+		const bash = backgroundTaskService.getBashShutdownSnapshot();
+		const context = getContextCharacterRefreshStatus();
+		const communication = getCommunicationWorkStatus();
+		const notification = getNotificationBackgroundWorkSnapshot();
+		const storageHistory = getStorageHistoryShutdownSnapshot();
+		const teamMaintenance = getTeamDatabaseMaintenanceStatus();
+		const buffered = getBufferedFilePreparationStatus();
+		const bufferedPending = Boolean(
+			buffered.pending || buffered.active || buffered.waiting || buffered.batches,
+		);
+		const websocketPending = hasPendingNarratorWsReadTasks();
+		const outlineLivePending = outlineLiveDatabaseWork.size;
+		const maintenance = getResourceProtectionShutdownSnapshot();
+		const integrity = getIntegrityCheckShutdownSnapshot();
+		const maintenancePending =
+			!maintenance.stopped ||
+			maintenance.pendingTasks > 0 ||
+			maintenance.pendingReceiptImports > 0 ||
+			maintenance.maintenanceScheduled;
+		const integrityPending =
+			!integrity.stopped ||
+			integrity.pendingProcesses > 0 ||
+			integrity.pendingTasks > 0 ||
+			integrity.scheduled;
+		if (
+			!runs.stopped ||
+			runs.pending ||
+			runs.failed ||
+			!bash.stopped ||
+			bash.pending ||
+			bash.failed ||
+			narrator.pending ||
+			narrator.failed ||
+			context.pending ||
+			context.running ||
+			context.scheduled ||
+			context.failed ||
+			!context.quiescing ||
+			communication.pending ||
+			communication.failed ||
+			!notification.stopped ||
+			notification.pending ||
+			notification.failed ||
+			!storageHistory.stopped ||
+			storageHistory.pending ||
+			storageHistory.failed ||
+			!teamMaintenance.stopped ||
+			teamMaintenance.pending ||
+			teamMaintenance.failed ||
+			bufferedPending ||
+			buffered.failed ||
+			maintenancePending ||
+			integrityPending ||
+			databaseStartup.pending ||
+			outlineLivePending ||
+			websocketPending
+		) {
+			logger.warn("Shutdown database work is not quiescent", {
+				runs,
+				bash,
+				narratorSessionPending: narrator.pending,
+				narratorSessionFailed: narrator.failed,
+				contextPending: context.pending,
+				contextRunning: context.running,
+				contextScheduled: context.scheduled,
+				contextFailed: context.failed,
+				contextQuiescing: context.quiescing,
+				communicationPending: communication.pending,
+				communicationFailed: communication.failed,
+				notification,
+				storageHistory,
+				teamMaintenance,
+				bufferedPending,
+				bufferedPreparationPending: buffered.pending,
+				bufferedPreparationActive: buffered.active,
+				bufferedPreparationWaiting: buffered.waiting,
+				bufferedPreparationBatches: buffered.batches,
+				bufferedPreparationFailed: buffered.failed,
+				websocketPending,
+				outlineLivePending,
+				maintenance,
+				integrity,
+				databaseStartupPending: databaseStartup.pending,
+			});
+		} else {
+			outcome = "ok";
+		}
+	} catch (error) {
+		logger.warn("Shutdown database work audit failed", { error: String(error) });
+	}
+	tracker.recordStep("databaseWork.finalAudit", outcome);
+	return outcome;
+}
+
 async function performGracefulShutdown(
 	options: GracefulShutdownOptions,
 ): Promise<GracefulShutdownResult> {
-	if (shutdownPromise) return shutdownPromise;
+	if (shutdownState.promise) return shutdownState.promise;
 	const startedAt = Date.now();
+	const budget = createShutdownBudget();
 	if (options.skipWindowsProcessTreeKill) {
-		killWindowsProcessTreeOnExit = false;
+		shutdownState.killWindowsProcessTreeOnExit = false;
 	}
 
-	shutdownPromise = (async () => {
-		logger.info("Graceful shutdown started", { reason: options.reason });
+	shutdownState.promise = (async () => {
+		try {
+			logger.info("Graceful shutdown started", { reason: options.reason });
+		} catch {
+			// Observational sinks cannot prevent producers from stopping.
+		}
+		databaseStartup.stop();
 		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
@@ -1502,6 +2014,15 @@ async function performGracefulShutdown(
 		// we skip the marker and just release the lock (below), so the next startup runs its
 		// integrity check instead of trusting a shutdown we could not prove was consistent.
 		const tracker = new ShutdownActivityTracker();
+		const step = (label: string, fn: () => unknown, limit = 4_000, ownsDeadline = false) =>
+			shutdownStep(
+				tracker,
+				label,
+				fn,
+				Math.min(limit, budget.businessRemaining()),
+				ownsDeadline,
+				budget.globalRemaining(),
+			);
 
 		// Stop accepting work before teardown begins. Bun.Server.stop(true) closes the listener and
 		// terminates in-flight HTTP requests and WebSockets synchronously, so no new work can arrive
@@ -1512,41 +2033,119 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		httpLifecycle.stopAccepting();
-		await shutdownStep(tracker, "remoteAccess.stop", stopRemoteAccess, 5000);
-		httpLifecycle.abortAll();
-		if (options.reason === "signal") {
-			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+		const cpuProfilerStop = cpuProfiler.shutdown();
+		quiesceNarratorWsReadTasks();
+		const producerLabel = "databaseProducers.stop";
+		let producerFailure: { error: unknown } | undefined;
+		for (const stop of [
+			() =>
+				backgroundTaskService.stopBashCollectors({
+					preserveProcesses: options.skipBashProcessKill,
+				}),
+			stopNarratorRunAdmission,
+			stopRuntimePublications,
+			stopInboxWakes,
+			stopBufferedFilePreparations,
+			stopOutlineLiveReplay,
+			quiesceContextCharacterRefreshes,
+			stopSessionCleanupTimer,
+		]) {
+			try {
+				stop();
+			} catch (error) {
+				producerFailure ??= { error };
+			}
 		}
+		const producerOutcome = producerFailure ? "failed" : "ok";
+		tracker.recordStep(producerLabel, producerOutcome);
+		if (producerFailure)
+			logger.warn("Shutdown producer admission failed", { error: String(producerFailure.error) });
+		const ownerDeadlineAt = Date.now() + budget.businessRemaining();
+		// Freeze synchronous admission and initiate asynchronous teardown before any await below.
+		const maintenanceStop = stopResourceProtectionIndex({ deadlineAt: ownerDeadlineAt });
+		const integrityStop = cancelBackgroundIntegrityCheck({
+			permanent: true,
+			deadlineAt: ownerDeadlineAt,
+		});
+		const projectIndexStop = stopProjectIndexRebuild();
+		const blockJobsStop = stopBlockBackgroundJobs({ deadlineAt: ownerDeadlineAt });
+		const storageHistoryStop = stopStorageHistoryRetention({ deadlineAt: ownerDeadlineAt });
+		const occupancyStop = stopBackgroundOccupancy();
+		const scheduledStop = stopScheduledTaskScheduler();
+		const teamMaintenanceStop = stopTeamDatabaseMaintenance();
+		const prefixSnapshotsStop = stopPrefixSnapshotMaintenance();
+		const outlineTaskLeasesStop = Promise.all([
+			import("./services/outline/tasks").then(({ stopOutlineTaskLeaseJob }) =>
+				stopOutlineTaskLeaseJob(),
+			),
+			import("./services/outline/in-process").then(({ stopOutlineInProcessRebuild }) =>
+				stopOutlineInProcessRebuild(),
+			),
+			import("./services/outline/digest-job").then(({ stopOutlineDigestJob }) =>
+				stopOutlineDigestJob(),
+			),
+			import("./services/outline/spec-import/triggers").then(({ stopSpecImportJob }) =>
+				stopSpecImportJob(),
+			),
+			import("./services/outline/spec-import/loss-scan").then(({ stopSpecLossScanJob }) =>
+				stopSpecLossScanJob(),
+			),
+		]);
+		const fanoutStop = stopNotificationFanout();
+		const notificationMaintenanceStop = stopNotificationCenterMaintenance();
+		const notificationBackgroundStop = stopNotificationBackgroundWork({
+			deadlineAt: ownerDeadlineAt,
+		});
+		getCodexManager().stopUsageRefreshScheduler();
+		for (const stopping of [
+			maintenanceStop,
+			integrityStop,
+			projectIndexStop,
+			blockJobsStop,
+			storageHistoryStop,
+			occupancyStop,
+			scheduledStop,
+			teamMaintenanceStop,
+			prefixSnapshotsStop,
+			outlineTaskLeasesStop,
+			fanoutStop,
+			notificationMaintenanceStop,
+			notificationBackgroundStop,
+		])
+			void Promise.resolve(stopping).catch(() => {});
+		await step("remoteAccess.stop", stopRemoteAccess, 5_000);
+		httpLifecycle.abortAll();
+		let preserveAgentRuns = false;
+		if (options.reason === "signal") {
+			const prepared = await step("restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+			if (prepared === "ok") {
+				preserveAgentRuns = true;
+				// Worker teardown must not turn checkpointed runs into task failures.
+				markUpdateRestarting();
+			}
+		}
+		// Prepared maintenance runs stay parked until the gate enters restarting. Signal
+		// recovery must make that transition before checkpoint stop can unwind their tails.
+		if (producerOutcome === "ok") await step("checkpointRuns.pause", stopCheckpointedNarratorRuns);
 		const shutdownRequestId = httpRequestContext.getStore();
 		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
 		// are still open, so the editors forget it instead of replaying it after the restart.
-		await shutdownStep(
-			tracker,
-			"outlineLive.persist",
-			async () => {
-				const live = await import("./services/outline/live/registry");
-				await live.persistAllLiveSessions();
-			},
-			2_000,
+		const outlineLivePersist = trackOutlineLiveDatabaseWork(
+			import("./services/outline/live/registry").then((live) => live.persistAllLiveSessions()),
 		);
+		await step("outlineLive.persist", () => outlineLivePersist, 2_000);
+		await step("cpuProfiler.stop", () => cpuProfilerStop);
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
 		// (it never awaits stop()'s promise), so anything beyond a moment means the
 		// call itself threw or blocked, not that connections are still draining.
-		const serverStopOutcome = await shutdownStep(
-			tracker,
-			"httpServer.stop",
-			() => stopHttpListener(),
-			1_000,
-		);
-		const httpDrainOutcome = await shutdownStep(
-			tracker,
+		const serverStopOutcome = await step("httpServer.stop", () => stopHttpListener(), 1_000);
+		const httpDrainOutcome = await step(
 			"httpHandlers.drain",
 			() => waitForHttpRequestDrain(shutdownRequestId),
 			10_000,
 		);
-		const wsDrainOutcome = await shutdownStep(
-			tracker,
+		const wsDrainOutcome = await step(
 			"websocketHandlers.drain",
 			waitForWebSocketActivityDrain,
 			10_000,
@@ -1554,122 +2153,365 @@ async function performGracefulShutdown(
 		if (serverStopOutcome === "ok" && httpDrainOutcome === "ok" && wsDrainOutcome === "ok") {
 			tracker.markDrainComplete();
 		}
+		await step("databaseStartup.drain", () => databaseStartup.drain(), budget.businessRemaining());
 
-		// Outline pages being edited live: commit their text, end the sessions.
-		await shutdownStep(
-			tracker,
-			"outlineLive.close",
-			async () => {
-				const live = await import("./services/outline/live/registry");
-				await live.closeAllLiveSessions("ended");
-			},
-			5_000,
+		// Sandboxed host-tool callers stop before their outline/editor/compute dependencies.
+		await step(
+			"programmaticServices.close",
+			() =>
+				import("./lib/agent/programmatic/service").then((owner) =>
+					owner.closeProgrammaticServices(),
+				),
+			155_000,
 		);
-		await shutdownStep(
-			tracker,
-			"outlineTaskLeases.stop",
-			async () => {
-				const tasks = await import("./services/outline/tasks");
-				const inProcess = await import("./services/outline/in-process");
-				const digests = await import("./services/outline/digest-job");
-				const specImport = await import("./services/outline/spec-import/triggers");
-				const specLoss = await import("./services/outline/spec-import/loss-scan");
-				await Promise.all([
-					specImport.stopSpecImportJob(),
-					specLoss.stopSpecLossScanJob(),
-					inProcess.stopOutlineInProcessRebuild(),
-					tasks.stopOutlineTaskLeaseJob(),
-					digests.stopOutlineDigestJob(),
-				]);
-			},
-			5_000,
+
+		// Finish startup replay and commit live editor text before closing their dependencies.
+		const outlineLiveClose = trackOutlineLiveDatabaseWork(
+			(async () => {
+				try {
+					await outlineLiveReplay;
+				} finally {
+					const live = await import("./services/outline/live/registry");
+					await live.closeAllLiveSessions("ended");
+				}
+			})(),
 		);
-		getCodexManager().stopUsageRefreshScheduler();
-		stopScheduledTaskScheduler();
-		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
-		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
-		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		await step("outlineLive.close", () => outlineLiveClose, 5_000);
+		await step("outlineTaskLeases.stop", () => outlineTaskLeasesStop, 5_000);
+		await step("scheduledTasks.stop", () => scheduledStop);
+		await step("teamMaintenance.stop", () => teamMaintenanceStop, budget.businessRemaining());
+		await step("authSessions.stop", () => {});
+		await step("gateway.stop", () => gateway.shutdown());
+		await step("nugRelays.stop", () => stopAllNugRelayClients());
+		await step("prefixSnapshots.stop", () => prefixSnapshotsStop);
+		await step("notificationFanout.stop", () => fanoutStop);
+		await step("notificationMaintenance.stop", () => notificationMaintenanceStop);
+		await step(
+			"notificationBackground.stop",
+			() => notificationBackgroundStop,
+			budget.businessRemaining(),
+			true,
+		);
+		await step(
+			"outlineTextWorkers.close",
+			() =>
+				import("./services/outline/edit-text-runner").then((owner) => owner.closeEditTextWorkers()),
+			35_000,
+		);
+		// Finish an already-committing token batch through its original owner before closing helpers.
+		await step(
+			"tokenWorkers.close",
+			() =>
+				import("./services/token-recalculation-worker-client").then((owner) =>
+					owner.closeTokenRecalculationWorkers(),
+				),
+			TOKEN_RECALCULATION_BATCH_TIMEOUT_MS + 5_000,
+		);
+		await step("terminalService.shutdownAll", () => terminalService.shutdownAll());
 		// The built-in apikey-quota plugin's process is owned by the shared plugin runtime
 		// supervisor, so `pluginManager.shutdown()` below stops it along with every other
 		// plugin. Keeping a dedicated teardown step here would imply a second owner.
 		if (!options.skipBashProcessKill) {
-			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
+			await step("killAllBashProcesses", () =>
+				killAllBashProcesses({ preserveAgents: preserveAgentRuns }),
+			);
 		}
-		// The background integrity probe is a separate PROCESS holding a read-only handle on the
-		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
-		// replacement process may swap the database file (startup recovery) or rewrite it (admin
-		// VACUUM), and its verdict has no parent to report to.
-		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
-		// Read workers hold their own read-only SQLite connections; terminate them before the clean
-		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
-		await shutdownStep(tracker, "prefixSnapshots.close", closePrefixSnapshotStore);
-		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
-		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
-		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
-		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
-		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
+		await step("integrityProbe.cancel", () => integrityStop, budget.businessRemaining(), true);
+		await step(
+			"resourceProtectionIndex.stop",
+			() => maintenanceStop,
+			budget.businessRemaining(),
+			true,
+		);
+		await step("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await step("pluginPlatformProducers.stop", () =>
+			import("./services/plugin-platform-services").then((owner) =>
+				owner.stopPluginPlatformProducers(),
+			),
+		);
+		await step("pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
+		await step("commandCode.models.stop", stopCommandCodeModelCatalog);
 		unregisterExternalProviderResolver();
-		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
+		await step("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
 		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
 		// for recovery. A normal shutdown skips this and closes the browser as usual.
 		if (preservesRecoveryOnShutdown(options.reason)) {
-			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
-				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
-					persistBrowserSessionsForUpdate(),
-				),
+			await step(
+				"browserSessions.persistForUpdate",
+				() =>
+					import("./services/browser-session-recovery").then(
+						({ persistBrowserSessionsForUpdate }) => persistBrowserSessionsForUpdate(),
+					),
+				35_000,
 			);
 		}
+		// Finalize/cleanup/reply grace and real native exit precede Chrome close or preserve detach.
+		await step(
+			"browserMemoryWorkers.close",
+			() =>
+				import("./lib/browser/memory-job").then((owner) => owner.closeMemoryDiagnosticWorkers()),
+			35_000,
+		);
 		// Close browser pool if it was started. When preserve mode was set above, this disconnects
 		// from Chrome (leaving it running for the replacement process) rather than closing it.
-		await shutdownStep(tracker, "browserPool.close", () =>
+		await step("browserPool.close", () =>
 			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
 		);
 		// Close Codex WebSocket session cache — active outbound WS
 		// connections keep the event loop alive and delay exit.
-		await shutdownStep(tracker, "codexWebSocket.clear", () =>
+		await step("codexWebSocket.clear", () =>
 			import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
 				clearCodexResponsesWebSocketSessions(),
 			),
+		);
+		// Keep the existing 30s IO/ACK phases and still allow actual exit to be observed.
+		await step(
+			"editorDocuments.close",
+			() =>
+				import("./services/editor-document-runtime").then((owner) =>
+					owner.closeEditorDocumentService(),
+				),
+			70_000,
+		);
+		await step("computeWorkers.close", async () => {
+			const results = await Promise.allSettled([
+				import("./services/revert-transaction-worker").then((owner) =>
+					owner.closeRevertManifestWorkers(),
+				),
+				import("./services/revert-selection-service").then((owner) =>
+					owner.closeRevertBodyWorkers(),
+				),
+				import("./services/revert-history-commit").then((owner) =>
+					owner.closeRevertRewriteWorkers(),
+				),
+				import("./lib/share-preview-html").then((owner) => owner.closeSharePreviewHtmlWorkers()),
+				import("./lib/agent/request-json").then((owner) => owner.closeRequestJsonWorkers()),
+				import("./lib/agent/structural/worker-client").then((owner) =>
+					owner.closeStructuralWorkers(),
+				),
+				import("./services/gen-ui/compiler").then((owner) => owner.closeGenUiCompilerWorkers()),
+				import("./lib/agent/execution/local-backend").then((owner) =>
+					owner.closeLocalGlobWorkers(),
+				),
+				import("./lib/agent/image-generation-response").then((owner) =>
+					owner.closeImageGenerationResponseWorkers(),
+				),
+			]);
+			const failures = results.flatMap((result) =>
+				result.status === "rejected" ? [result.reason] : [],
+			);
+			if (failures.length) throw new AggregateError(failures, "Compute workers did not all close");
+		});
+		await step(
+			"gitWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./services/git-current-baseline").then((owner) =>
+						owner.closeGitCurrentBaselineWorkers(),
+					),
+					import("./services/git-line-stats").then((owner) => owner.closeGitLineStatsWorkers()),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Git worker helpers did not all close");
+			},
+			35_000,
+		);
+		// Preserve the existing 65s archive ACK and subsequent 120s download lease, plus cleanup.
+		await step(
+			"requestRecorderWorkers.close",
+			() => import("./lib/request-recorder").then((owner) => owner.closeRequestRecorderWorkers()),
+			200_000,
+		);
+		await step("modelHistoryWorkers.close", () =>
+			import("./services/agent-runtime/model-history-source").then((owner) =>
+				owner.closeModelHistoryWorkers(),
+			),
+		);
+		await step(
+			"toolInputHistoryWorkers.close",
+			() =>
+				import("./services/tool-input-stream-source").then((owner) =>
+					owner.closeToolInputHistoricalWorkers(),
+				),
+			15_000,
+		);
+		await step("fsScanWorkers.close", () =>
+			import("./lib/fs-scan-worker/client").then((owner) => owner.closeFsScanWorkers()),
+		);
+		// The background integrity probe is a separate PROCESS holding a read-only handle on the
+		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
+		// replacement process may swap the database file (startup recovery) or rewrite it (admin
+		// VACUUM), and its verdict has no parent to report to.
+		await step(
+			"maintenanceWorkers.close",
+			async () => {
+				const results = await Promise.allSettled([
+					import("./db/snapshot-build").then((owner) => owner.closeSnapshotBuilds()),
+					import("./services/file-change-physical-audit").then((owner) =>
+						owner.closeFileChangePhysicalAudits(),
+					),
+				]);
+				const failures = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
+				if (failures.length)
+					throw new AggregateError(failures, "Maintenance workers did not all close");
+			},
+			35_000,
 		);
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();
 		}
 
+		// All producer admission was frozen before awaiting request teardown.
+		const businessDeadlineAt = ownerDeadlineAt;
+		const remaining = budget.businessRemaining;
+		await step("backgroundOccupancy.stop", () => occupancyStop, remaining());
+		await step("projectIndex.stop", () => projectIndexStop, remaining(), true);
+		await step("blockBackgroundJobs.stop", () => blockJobsStop, remaining(), true);
+		await step("storageHistory.stop", () => storageHistoryStop, remaining(), true);
+		await step(
+			"databaseWork.drain",
+			() => drainShutdownDatabaseWork(businessDeadlineAt),
+			remaining(),
+			true,
+		);
+		// History cleanup may still be finishing its current transaction after cancellation.
+		const storageHistory = getStorageHistoryShutdownSnapshot();
+		if (storageHistory.pending) {
+			tracker.recordStep("storageHistory.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("History cleanup did not drain; retaining database ownership until exit", {
+				pending: storageHistory.pending,
+			});
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		// A timed-out live writer still owns the database. Keep its readers and instance lock
+		// until process exit rather than handing the database to a replacement while it can write.
+		if (outlineLiveDatabaseWork.size) {
+			tracker.recordStep("outlineLive.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Outline live work did not drain; retaining database ownership until exit", {
+				pending: outlineLiveDatabaseWork.size,
+			});
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		if (getTeamDatabaseMaintenanceStatus().pending) {
+			tracker.recordStep("teamMaintenance.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Team maintenance did not drain; retaining database ownership until exit");
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		if (databaseStartup.pending) {
+			tracker.recordStep("databaseStartup.quiescence", "failed");
+			auditShutdownDatabaseWork(tracker);
+			logger.warn("Startup initialization did not drain; retaining database ownership until exit");
+			return {
+				success: false,
+				clean: false,
+				reason: options.reason,
+				pid: process.pid,
+				durationMs: Date.now() - startedAt,
+			};
+		}
+		// Native reader exit owns a separate slice even when the business drain expired.
+		const readerBudget = budget.readerRemaining();
+		await shutdownStep(
+			tracker,
+			"dbWorkerPool.shutdown",
+			async () => {
+				await shutdownDbWorkerPool({ permanent: true });
+			},
+			readerBudget,
+			true,
+			budget.globalRemaining(),
+		);
+		await shutdownStep(
+			tracker,
+			"prefixSnapshots.close",
+			() => closePrefixSnapshotStore({ permanent: true }),
+			Math.min(4_000, budget.globalRemaining()),
+		);
+		await shutdownStep(
+			tracker,
+			"postgresRuntime.close",
+			() => closePostgresRuntime(),
+			Math.min(4_000, budget.globalRemaining()),
+		);
+		auditShutdownDatabaseWork(tracker);
+
 		// Decide the marker now that teardown is finished. A clean shutdown (requests drained AND
 		// every step succeeded) persists the marker and releases the lock; a degraded shutdown skips
 		// the marker but still releases the lock so an update-handoff replacement can start.
+		if (budget.globalRemaining() <= 0) tracker.recordStep("shutdown.deadline", "timeout");
 		const summary = tracker.summary();
 		const cleanMarked = summary.clean ? markDatabaseCleanShutdown() : false;
 		if (!summary.clean) {
-			logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
-				drainComplete: summary.drainComplete,
-				degradedSteps: summary.degradedSteps,
-			});
+			try {
+				logger.warn("Graceful shutdown degraded — releasing lock without clean marker", {
+					drainComplete: summary.drainComplete,
+					degradedStepCount: summary.degradedSteps.length,
+				});
+			} catch {
+				// Diagnostic failure cannot suppress the unclean lock-release path.
+			}
 			releaseDatabaseInstanceLockOnly();
 		}
 
 		const result = {
-			success: true,
+			success: !getTeamDatabaseMaintenanceStatus().failed,
+			clean: summary.clean && (activeDatabaseBackend === "postgres" || cleanMarked),
 			reason: options.reason,
 			pid: process.pid,
 			durationMs: Date.now() - startedAt,
 		};
-		logger.info("Graceful shutdown completed", { ...result, cleanMarked });
+		try {
+			logger.info("Graceful shutdown completed", {
+				...result,
+				cleanMarked,
+				outcome: cleanMarked ? "clean" : "degraded",
+				degradedSteps: summary.degradedSteps,
+			});
+		} catch {
+			// Cleanup has completed; keep its result even if diagnostics are unavailable.
+		}
 		return result;
 	})();
 
-	return shutdownPromise;
+	return shutdownState.promise;
 }
 
-registerGracefulShutdownHandler(async (request) => {
-	logger.info("Replacement server requested graceful shutdown", {
-		replacementPid: request.pid,
-		replacementVersion: request.version,
-	});
+registerGracefulShutdownHandler(async () => {
+	try {
+		logger.info("Replacement server requested graceful shutdown", {
+			phase: "replacement",
+			outcome: "requested",
+		});
+	} catch {
+		// A diagnostic sink cannot prevent the registered shutdown sequence.
+	}
 	const result = await performGracefulShutdown({
 		reason: "replacement_started",
 		skipWindowsProcessTreeKill: true,
@@ -1688,13 +2530,37 @@ registerGracefulShutdownHandler(async (request) => {
  * processes and browser sessions for the next manually started server.
  */
 registerOperatorShutdownHandler(async ({ reason }) => {
-	logger.info("Administrator requested shutdown", { reason });
+	if (reason === UNATTENDED_SHUTDOWN_REASON) {
+		let ready = false;
+		try {
+			ready = await fenceUnattendedShutdown(
+				() =>
+					shutdownState.promise !== null ||
+					httpLifecycle.activeCount > 0 ||
+					hasActiveWebSocketHandlers() ||
+					isScheduledTaskTickActive(),
+				unattendedMode.revalidateIdle,
+			);
+		} catch (error) {
+			logger.warn("Unattended shutdown revalidation failed", { error: String(error) });
+		}
+		if (!ready) {
+			unattendedMode.deferShutdown();
+			return null;
+		}
+	}
+	try {
+		logger.info("Administrator requested shutdown", { phase: "operator", outcome: "requested" });
+	} catch {
+		// Operators must still reach cleanup when diagnostics are unavailable.
+	}
 	const preserveForRecovery = preservesRecoveryOnShutdown(reason);
 	const result = await performGracefulShutdown({
 		reason,
 		skipWindowsProcessTreeKill: preserveForRecovery,
 		skipBashProcessKill: preserveForRecovery,
 	});
+	if (canRunCleanShutdownHooks(reason, result)) await runPostShutdownHooks(reason);
 	setTimeout(() => process.exit(0), 250);
 	return result;
 });
@@ -1710,8 +2576,6 @@ const safeShutdown = () => {
 		.then(() => process.exit(0))
 		.catch(() => process.exit(1));
 };
-process.on("SIGINT", safeShutdown);
-process.on("SIGTERM", safeShutdown);
 // SIGHUP fires on some Windows terminal emulators when the console window is closed, and Bun
 // may also surface Windows CTRL_CLOSE / CTRL_SHUTDOWN / CTRL_LOGOFF events as SIGHUP. Whether
 // Bun actually delivers these console-control events to JS is runtime-dependent and unverified.
@@ -1724,22 +2588,30 @@ process.on("SIGTERM", safeShutdown);
 // it cannot catch TerminateProcess either, adds FFI-callback risk at a fragile exit point, and
 // the codebase has no JSCallback precedent — so we intentionally do not use it. The startup
 // fallback (quick_check + conditional FTS rebuild) is what protects the unclean cases.
-process.on("SIGHUP", safeShutdown);
+shutdownState.onSignal = safeShutdown;
+if (hotOnce("narrafork.mainShutdown.signals")) {
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		process.on(signal, () => shutdownState.onSignal?.());
+	}
+}
+// Only the registered main sequence may decide when preserve metadata and Chrome are closed.
+// Standalone browser scripts retain their own signal cleanup until this synchronous claim.
+claimBrowserShutdownOwnership();
 // On Windows, closing the console window may not deliver SIGINT/SIGTERM.
 // "exit" fires when the event loop drains or process.exit() is called elsewhere.
 // NOTE: "exit" handlers MUST be synchronous — async work is ignored.
-process.on("exit", () => {
+shutdownState.onExit = () => {
 	try {
 		_server?.stop(true);
 	} catch {
 		// best effort
 	}
-	// On Windows, child processes (terminals, agent shells, MCP servers) may
-	// outlive the parent even after _server.stop(). Trace and kill our own live
-	// descendants while the parent PID is still meaningful, instead of guessing
-	// from stale/ghost PIDs on the next startup. During update handoff, skip this
-	// so the newly spawned replacement process is not killed as part of the old tree.
-	if (IS_WINDOWS && killWindowsProcessTreeOnExit) {
+	// The current main owns the current listener/process tree; preserve handoff intent across HMR.
+	if (IS_WINDOWS && shutdownState.killWindowsProcessTreeOnExit) {
 		killOwnWindowsChildProcesses();
 	}
-});
+};
+if (hotOnce("narrafork.mainShutdown.exit")) {
+	process.on("exit", () => shutdownState.onExit?.());
+}
+await databaseStartupPromise;

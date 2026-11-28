@@ -186,3 +186,66 @@ test("explicit LOCKED results have at most three complete attempts", async () =>
 	).rejects.toThrow("locked");
 	expect(attempts).toBe(3);
 });
+
+test("retry diagnostics keep result codes but never driver text, stack or operation paths", async () => {
+	const secret = "PRIVATE_DRIVER_TEXT /private/database.db";
+	const err = Object.assign(new TypeError(secret), { code: "SQLITE_BUSY" });
+	err.stack = `TypeError: ${secret}\n    at /private/worker-entry.ts:7:4`;
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	let attempts = 0;
+	try {
+		const result = await withDbRetry(
+			async () => {
+				if (++attempts === 1) throw err;
+				return "done";
+			},
+			{ label: "/private/request/body", retryLegacyMessages: false },
+		);
+		expect(result).toBe("done");
+		expect(attempts).toBe(2);
+		expect(warn.mock.calls[0]).toEqual([
+			"Database operation retrying",
+			{
+				operation: "db_operation",
+				attempt: 1,
+				maxAttempts: 3,
+				errorType: "TypeError",
+				code: "SQLITE_BUSY",
+			},
+		]);
+		const logged = JSON.stringify(warn.mock.calls);
+		for (const value of ["PRIVATE_DRIVER_TEXT", "/private/", "database.db", "worker-entry.ts"])
+			expect(logged).not.toContain(value);
+	} finally {
+		warn.mockRestore();
+	}
+});
+
+test.each([
+	"warn",
+	"error",
+] as const)("a throwing %s sink cannot change retry or the original failure", async (level) => {
+	const sinkFailure = new Error("diagnostic sink failed");
+	const log = spyOn(logger, level).mockImplementation(() => {
+		throw sinkFailure;
+	});
+	const original = Object.assign(new Error("private database failure"), {
+		code: level === "warn" ? "SQLITE_BUSY" : "SQLITE_ERROR",
+	});
+	let attempts = 0;
+	try {
+		const outcome = await withDbRetry(
+			async () => {
+				attempts++;
+				if (level === "error" || attempts === 1) throw original;
+				return "retried";
+			},
+			{ retryLegacyMessages: false },
+		).catch((error: unknown) => error);
+		expect(outcome).toBe(level === "warn" ? "retried" : original);
+		expect(attempts).toBe(level === "warn" ? 2 : 1);
+		expect(log).toHaveBeenCalledTimes(1);
+	} finally {
+		log.mockRestore();
+	}
+});

@@ -2,6 +2,7 @@ import type { ScheduledTaskTarget, ScheduledTaskTargetsPage } from "@shared/sche
 import { and, asc, eq, gt, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { canWriteNarrator, narratorReadableWhere } from "./narrator-acl";
 import { narratorProjectIdColumn } from "./narrator-project";
@@ -62,38 +63,41 @@ export async function listScheduledTaskTargets(
 	let scanned = 0;
 	while (scanned < SCAN_LIMIT) {
 		const batchSize = Math.min(100, SCAN_LIMIT - scanned);
-		const rows = await db
-			.select({
-				id: narrators.id,
-				title: narrators.title,
-				status: narrators.status,
-				cwd: narrators.cwd,
-				model: narrators.model,
-				projectId: narratorProjectIdColumn,
-				ownerUserId: narrators.ownerUserId,
-				visibility: narrators.visibility,
-				writeAudience: narrators.writeAudience,
-				type: narrators.type,
-				aclRootNarratorId: narrators.aclRootNarratorId,
-				contextProjectId: narrators.contextProjectId,
-			})
-			.from(narrators)
-			.where(
-				and(
-					narratorReadableWhere(live),
-					ne(narrators.status, "archived"),
-					or(eq(narrators.hiddenFromLists, false), q ? eq(narrators.id, q) : undefined),
-					position ? gt(narrators.id, position) : undefined,
-					q
-						? or(
-								eq(narrators.id, q),
-								sql`${narrators.title} LIKE ${`%${q.replace(/[\\%_]/g, "\\$&")}%`} ESCAPE '\\'`,
-							)
-						: undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(batchSize + 1);
+		const rows = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					status: narrators.status,
+					cwd: narrators.cwd,
+					model: narrators.model,
+					projectId: narratorProjectIdColumn,
+					ownerUserId: narrators.ownerUserId,
+					visibility: narrators.visibility,
+					writeAudience: narrators.writeAudience,
+					type: narrators.type,
+					aclRootNarratorId: narrators.aclRootNarratorId,
+					contextProjectId: narrators.contextProjectId,
+				})
+				.from(narrators)
+				.where(
+					and(
+						narratorReadableWhere(live),
+						ne(narrators.status, "archived"),
+						or(eq(narrators.hiddenFromLists, false), q ? eq(narrators.id, q) : undefined),
+						position ? gt(narrators.id, position) : undefined,
+						q
+							? or(
+									eq(narrators.id, q),
+									sql`${narrators.title} LIKE ${`%${q.replace(/[\\%_]/g, "\\$&")}%`} ESCAPE '\\'`,
+								)
+							: undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(batchSize + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const row of rows.slice(0, batchSize)) {
 			if (await canWriteNarrator(row, live)) {
 				if (items.length === limit) {

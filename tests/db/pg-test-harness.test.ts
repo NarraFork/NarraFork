@@ -119,6 +119,28 @@ describe("temporary PostgreSQL lifecycle", () => {
 		expect(JSON.stringify(result)).not.toContain("secret-password");
 		expect(calls.at(-1)?.[1]).toBe("rm");
 	});
+	it("waits for the final TCP server rather than the temporary Unix-socket init server", async () => {
+		let probes = 0;
+		let validations = 0;
+		const result = await withPostgres(async () => "ready", {
+			run: async (args, options) => {
+				if (args[1] === "image") return IMAGE_PRESENT;
+				if (args[1] === "port") return { code: 0, stdout: "127.0.0.1:49152\n", stderr: "" };
+				if (args.includes("pg_isready")) {
+					expect(args).toContain("127.0.0.1");
+					return { code: ++probes === 1 ? 2 : 0, stdout: "", stderr: "" };
+				}
+				if (options?.input?.startsWith("CREATE SCHEMA")) {
+					validations++;
+					expect(probes).toBe(2);
+				}
+				// A socket SELECT would succeed even while only the temporary init server is up.
+				return { code: 0, stdout: "1\n", stderr: "" };
+			},
+		});
+		expect(result).toBe("ready");
+		expect(validations).toBe(1);
+	});
 	it("blocks if PostgreSQL exec is unavailable", async () => {
 		let cleaned = false;
 		const result = await withPostgres(async () => "unexpected", {

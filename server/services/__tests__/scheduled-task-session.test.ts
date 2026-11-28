@@ -13,6 +13,8 @@ import {
 	users,
 } from "../../db/schema";
 import type { PermissionResult } from "../../lib/agent";
+import { DbReadError } from "../../lib/db-worker/errors";
+import * as readPool from "../../lib/db-worker/pool";
 import { settings } from "../../lib/settings";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import * as inbox from "../agent-runtime/inbox";
@@ -60,6 +62,7 @@ import {
 import * as runService from "../scheduled-task-run-service";
 import * as runTracker from "../scheduled-task-run-tracker";
 import * as scheduledTarget from "../scheduled-task-target";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 // Session preparation uses the real isolated DB, history writer, ACL and admissions.
 const { db, sqlite } = await import("../../db");
@@ -176,6 +179,38 @@ function own(id = TARGET, logicalRunId = `logical-${id}`) {
 	setRunControl(owner, run);
 	db.update(narrators).set({ logicalRunId }).where(eq(narrators.id, id)).run();
 	return { owner, run };
+}
+
+async function legacyInterruptFixture() {
+	await seed();
+	await seed("legacy-worker-child");
+	const root = own();
+	const child = own("legacy-worker-child");
+	const active = session();
+	active._partialMessageId = "legacy-worker-message";
+	activeNarrators.set(TARGET, active);
+	const now = new Date().toISOString();
+	await db.insert(narratorMessages).values({
+		id: active._partialMessageId,
+		narratorId: TARGET,
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await db.insert(narratorToolCalls).values({
+		id: "legacy-worker-call",
+		narratorId: TARGET,
+		messageId: active._partialMessageId,
+		toolUseId: "legacy-worker-use",
+		toolName: "Agent",
+		executionAttempt: 1,
+		status: "running",
+		createdAt: now,
+	});
+	child.run.cancelWith = { narratorId: TARGET, toolCallId: "legacy-worker-call", attempt: 1 };
+	const target = await captureScheduledInterruptTarget(TARGET);
+	if (!target) throw new Error("Expected current legacy target");
+	return { root, child, active, target };
 }
 
 /** Stop at the runtime boundary while preserving real input/history persistence. */
@@ -335,7 +370,7 @@ describe("scheduled existing session admission", () => {
 		const reg = registration({ contextPolicy: "clear" });
 		await prepareScheduledTaskSession(input(reg));
 		await db.update(narrators).set({ writeAudience: "owner" }).where(eq(narrators.id, TARGET));
-		await expect(sendScheduledTaskMessage(input(reg))).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(sendScheduledTaskMessage(input(reg)))).toThrow();
 		expect(compactCount()).toBe(0);
 		expect(reg.contextPrepared).not.toBe(true);
 	});
@@ -356,7 +391,7 @@ describe("scheduled existing session admission", () => {
 		await checked.promise;
 		unregisterScheduledRun(reg.runId);
 		release.resolve();
-		await expect(dispatch).rejects.toThrow("registration expired");
+		expect(await captureWorkerRejectionThrower(dispatch)).toThrow("registration expired");
 		expect(compactCount()).toBe(0);
 		expect(reg.contextPrepared).not.toBe(true);
 	});
@@ -413,11 +448,13 @@ describe("scheduled existing session admission", () => {
 		await seed();
 		const reg = registration({ contextPolicy: "clear", requireReport: false });
 		const { owner } = own();
-		await expect(sendScheduledTaskMessage(input(reg))).rejects.toThrow("already running");
-		owner.release();
-		await expect(sendScheduledTaskMessage({ ...input(reg), nudge: true })).rejects.toThrow(
-			"does not require",
+		expect(await captureWorkerRejectionThrower(sendScheduledTaskMessage(input(reg)))).toThrow(
+			"already running",
 		);
+		owner.release();
+		expect(
+			await captureWorkerRejectionThrower(sendScheduledTaskMessage({ ...input(reg), nudge: true })),
+		).toThrow("does not require");
 		expect(compactCount()).toBe(0);
 		reg.recoveredAt = Date.now();
 		fakeRuntime();
@@ -435,7 +472,9 @@ describe("scheduled existing session admission", () => {
 		intervening?.release();
 		expect(getLastExecutionEpoch(TARGET)).not.toBe(target.executionEpoch);
 		const reg = registration({ contextPolicy: "clear", interruptTarget: target });
-		await expect(sendScheduledTaskMessage(input(reg))).rejects.toThrow("was replaced");
+		expect(await captureWorkerRejectionThrower(sendScheduledTaskMessage(input(reg)))).toThrow(
+			"was replaced",
+		);
 		expect(compactCount()).toBe(0);
 	});
 
@@ -619,9 +658,11 @@ describe("scheduled authority across fresh passes", () => {
 			expect(getRegisteredScheduledRun(TARGET)).toBeUndefined();
 			expect(getScheduledRunMember(TARGET)).toBeUndefined();
 			expect(await runService.lookupScheduledRun(TARGET)).toBeUndefined();
-			await expect(runService.reportScheduledRun(TARGET, { outcome: "no_change" })).rejects.toThrow(
-				"no active scheduled run",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					runService.reportScheduledRun(TARGET, { outcome: "no_change" }),
+				),
+			).toThrow("no active scheduled run");
 			expect(
 				await db.query.scheduledTaskRuns.findFirst({ where: eq(scheduledTaskRuns.id, reg.runId) }),
 			).toMatchObject({
@@ -799,6 +840,70 @@ describe("precise scheduled interruption", () => {
 		expect(target.scheduledRunId).toBe(reg.runId);
 		expect(await cancelScheduledRunTarget(target, "timeout")).toBe(true);
 		expect(child.run.cancel.signal.aborted).toBe(true);
+	});
+
+	for (const replaced of ["root", "root-epoch", "child", "child-epoch"] as const) {
+		test(`a ${replaced} replaced during the legacy Worker read keeps its new run and gates`, async () => {
+			const fixture = await legacyInterruptFixture();
+			const replaceRoot = replaced.startsWith("root");
+			const replacedId = replaceRoot ? TARGET : "legacy-worker-child";
+			const prior = replaceRoot ? fixture.root : fixture.child;
+			// Legacy reservations may contain only a logical id; the runtime must still
+			// freeze the current owner before it crosses a Worker boundary.
+			if (replaced === "root-epoch") delete fixture.target.executionEpoch;
+			const gateAbort = new AbortController();
+			const read = readPool.runReadTask;
+			let replacement: ReturnType<typeof own> | undefined;
+			spyOn(readPool, "runReadTask").mockImplementation((async (path, params, options) => {
+				const result = await read(path, params, options);
+				if (
+					!replacement &&
+					(params.kind === "selectRows" || params.kind === "selectValues") &&
+					params.sql.includes("narrator_tool_calls")
+				) {
+					prior.owner.release();
+					if (replaced.endsWith("-epoch")) {
+						const owner = tryClaimExecution(replacedId, "run");
+						if (!owner) throw new Error("Expected replacement execution epoch");
+						setRunControl(owner, prior.run);
+						replacement = { owner, run: prior.run };
+					} else replacement = own(replacedId, "replacement-logical");
+					pendingPermissions.set("replacement-permission", {
+						narratorId: replacedId,
+						toolName: "Write",
+						toolUseId: "replacement-permission-use",
+						broadcastTargetId: replacedId,
+						cwd: process.cwd(),
+						locale: "en",
+						input: {},
+						signal: gateAbort.signal,
+						questionReflectionAbort: gateAbort,
+						cleanup: () => pendingPermissions.delete("replacement-permission"),
+						resolve: () => {},
+					});
+				}
+				return result;
+			}) as typeof readPool.runReadTask);
+			expect(await cancelScheduledRunTarget(fixture.target, "replace")).toBe(!replaceRoot);
+			expect(replacement).toBeDefined();
+			expect(replacement?.run.cancel.signal.aborted).toBe(false);
+			expect(fixture.child.run.cancel.signal.aborted).toBe(false);
+			expect(fixture.root.run.cancel.signal.aborted).toBe(!replaceRoot);
+			expect(gateAbort.signal.aborted).toBe(false);
+			expect(pendingPermissions.has("replacement-permission")).toBe(true);
+		});
+	}
+
+	test("legacy relation Worker failure leaves the target and all descendants running", async () => {
+		const { root, child, target } = await legacyInterruptFixture();
+		const error = new DbReadError("DB_READ_UNAVAILABLE", "Injected legacy relation read failure");
+		const worker = spyOn(readPool, "runReadTask").mockRejectedValue(error);
+		const main = spyOn(sqlite, "prepare");
+		expect(await captureWorkerRejection(cancelScheduledRunTarget(target, "replace"))).toBe(error);
+		expect(worker).toHaveBeenCalled();
+		expect(main).not.toHaveBeenCalled();
+		expect(root.run.cancel.signal.aborted).toBe(false);
+		expect(child.run.cancel.signal.aborted).toBe(false);
 	});
 
 	test("legacy foreground relations require the current caller message and tool attempt", async () => {

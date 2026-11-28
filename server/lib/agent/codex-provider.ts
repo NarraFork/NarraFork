@@ -1,5 +1,5 @@
 import type { NativeMediaInput } from "@shared/media-attachments";
-import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { reportInputCharacters } from "./input-characters";
 import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
@@ -30,10 +30,10 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
+	appendDiagnosticOpenAIInput,
 	applyOpenAIModelMetadata,
-	CODEX_DEFAULT_INSTRUCTIONS,
-	convertHistoryToResponsesApi,
-	isResponsesInputItem,
+	buildResponsesInput,
+	diagnosticTransportIdentity,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
@@ -388,7 +388,7 @@ export class CodexProvider implements ProviderAdapter {
 
 	private async runWithFailover<T>(
 		operationName: string,
-		run: (provider: OpenAIProvider) => Promise<T>,
+		run: (provider: OpenAIProvider, credentialId: string) => Promise<T>,
 	): Promise<T> {
 		const maxAttempts = this.getMaxFailoverAttempts();
 		let attempt = 0;
@@ -400,7 +400,7 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 
 			try {
-				const result = await run(provider);
+				const result = await run(provider, ctx.id);
 				this.manager.reportSuccess(ctx.id);
 				return result;
 			} catch (err) {
@@ -490,8 +490,16 @@ export class CodexProvider implements ProviderAdapter {
 		dummy.injectSystemPrompt(history, systemPrompt, model, locale);
 	}
 
+	supportsDiagnosticFork(_model: string, credentialId?: string): boolean {
+		return !!credentialId;
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
+		if (params.diagnostic) {
+			yield* this.chatDiagnostic(params);
+			return;
+		}
 		// Use WebSocket mode if enabled
 		if (this.useWebSocket) {
 			yield* this.chatWebSocket(params);
@@ -509,8 +517,13 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+				// The account is the credential; the inner adapter only knows "codex".
+				onRequestStart: () =>
+					params.onRequestStart?.({
+						credentialId: ctx.id,
+						validateDiagnosticCredential: () =>
+							this.manager.isDiagnosticCredentialCurrent(ctx.credential),
+					}),
 			};
 			let hasStreamedEvents = false;
 			let sawPolicyViolation = false;
@@ -571,6 +584,64 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex chat failed");
 	}
 
+	private async *chatDiagnostic(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		const anchorCredential = params.diagnosticFork?.credentialId;
+		if (params.diagnosticFork && !anchorCredential) {
+			throw new Error("A Codex diagnostic fork requires the parent credential");
+		}
+		const ctx = anchorCredential
+			? await this.manager.acquireDiagnosticContext(anchorCredential)
+			: await this.manager.acquireContext(params.stickySessionKey);
+		const fork = params.diagnosticFork;
+		const validateBeforeDispatch = fork
+			? () => {
+					if (
+						!this.manager.isDiagnosticCredentialCurrent(ctx.credential) ||
+						fork.validateCredential?.() === false
+					) {
+						throw new Error("The parent Codex credential is unavailable for diagnostics");
+					}
+					return true;
+				}
+			: undefined;
+		if (!this.useWebSocket) {
+			for await (const event of this.createProvider(ctx).chat({
+				...params,
+				diagnosticFork: fork && { ...fork, validateCredential: validateBeforeDispatch },
+				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
+			}))
+				yield { ...event, credentialId: ctx.id };
+			return;
+		}
+		const request = this.buildResponsesWebSocketRequest(params, ctx.credential);
+		const conversationId = diagnosticTransportIdentity(params);
+		const fingerprint = resolveCodexProviderFingerprint(conversationId, ctx.credential);
+		const sessionKey = params.transportSessionKey ?? conversationId;
+		await reportInputCharacters(params, request);
+		params.onRequestStart?.({ credentialId: ctx.id });
+		for await (const event of streamCodexResponsesWebSocket({
+			baseUrl: CODEX_BASE_URL,
+			apiKey: ctx.token,
+			authorization: ctx.authorization,
+			accountId: ctx.credential.accountId,
+			proxy: codexProxy(ctx.credential),
+			sessionKey,
+			conversationId,
+			narratorId: sessionKey,
+			credentialId: ctx.id,
+			model: params.model,
+			request,
+			signal: params.signal,
+			resetSessionBeforeRequest: true,
+			ephemeralSession: true,
+			validateBeforeDispatch,
+			userAgent: fingerprint.userAgent,
+			extraHeaders: fingerprint.headers,
+			requestDump: params.requestDump,
+		}))
+			yield { ...stampReasoningSource(event, "codex"), credentialId: ctx.id };
+	}
+
 	/** WebSocket-based chat implementation */
 	private async *chatWebSocket(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const maxAttempts = this.getMaxFailoverAttempts();
@@ -583,8 +654,7 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
 			};
 			let hasStreamedEvents = false;
 			let sawPolicyViolation = false;
@@ -594,7 +664,11 @@ export class CodexProvider implements ProviderAdapter {
 				const fingerprint = resolveCodexProviderFingerprint(params.conversationId, ctx.credential);
 
 				await reportInputCharacters(params, request);
-				params.onRequestStart?.({ credentialId: ctx.id });
+				params.onRequestStart?.({
+					credentialId: ctx.id,
+					validateDiagnosticCredential: () =>
+						this.manager.isDiagnosticCredentialCurrent(ctx.credential),
+				});
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
@@ -819,52 +893,38 @@ export class CodexProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
-		let instructions = "";
-		const inputMessages: OAIMessage[] = [];
-		for (const msg of messages) {
-			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
-			const role = (msg as any).role;
-			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
-				if (typeof msg.content === "string") {
-					instructions += (instructions ? "\n\n" : "") + msg.content;
-				}
-				continue;
-			}
-			inputMessages.push(msg);
-		}
-
-		const sanitizedInputMessages = inputMessages.filter((msg) => {
-			if (msg.role !== "assistant") return true;
-			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-			if (hasToolCalls) return true;
-			if (typeof msg.content === "string") return msg.content.length > 0;
-			if (Array.isArray(msg.content)) return msg.content.length > 0;
-			return false;
-		});
-
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
-				// Codex runs official gpt/codex ids → credential-strict replay. The
-				// reasoning source identity is the "codex" prefix shared by every
-				// provider instance this class creates.
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: "codex",
-			}),
+			input: buildResponsesInput(
+				messages,
+				{
+					// Codex runs official gpt/codex ids → credential-strict replay. The
+					// reasoning source identity is the "codex" prefix shared by every
+					// provider instance this class creates.
+					strict: hasCredentialBoundReasoning(model),
+					currentSource: "codex",
+				},
+				"codex",
+			),
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
-		const tools = withCodexNativeTools(params.tools, params.model, {
-			webSearch:
-				this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
-			imageGeneration: this.useImageGeneration,
-		});
+		const tools =
+			params.diagnostic && !params.diagnosticFork
+				? []
+				: withCodexNativeTools(params.tools, params.model, {
+						webSearch:
+							this.useWebSearch &&
+							isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
+						imageGeneration: this.useImageGeneration,
+					});
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			identity: createCodexRequestIdentity(params.conversationId, codexInstallationId(credential)),
+			identity: createCodexRequestIdentity(
+				diagnosticTransportIdentity(params),
+				codexInstallationId(credential),
+			),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {
@@ -872,6 +932,8 @@ export class CodexProvider implements ProviderAdapter {
 		}
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		appendDiagnosticOpenAIInput(request, params, true);
+		if (params.diagnosticFork) request.prompt_cache_key = params.conversationId;
 		return request;
 	}
 
@@ -891,9 +953,10 @@ export class CodexProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runWithFailover("generateWithMeta", (provider) =>
-			provider.generateWithMeta(text, model, systemInstruction, options),
-		);
+		return this.runWithFailover("generateWithMeta", async (provider, credentialId) => ({
+			...(await provider.generateWithMeta(text, model, systemInstruction, options)),
+			credentialId,
+		}));
 	}
 
 	async generateWithHistory(
@@ -920,8 +983,15 @@ export class CodexProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runWithFailover("generateWithHistoryWithMeta", (provider) =>
-			provider.generateWithHistoryWithMeta(systemInstruction, content, model, locale, options),
-		);
+		return this.runWithFailover("generateWithHistoryWithMeta", async (provider, credentialId) => ({
+			...(await provider.generateWithHistoryWithMeta(
+				systemInstruction,
+				content,
+				model,
+				locale,
+				options,
+			)),
+			credentialId,
+		}));
 	}
 }

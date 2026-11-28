@@ -247,6 +247,10 @@ export function createRemoteGitService(
 			probeSignal?: AbortSignal,
 			limits: Pick<GitWorkspaceRequest, "maxBytes" | "timeoutMs"> = {},
 		) => request(cwd, "probe", limits, probeSignal ?? signal),
+		/** Raw porcelain for the bounded paging Worker; never passes the legacy 200-file adapter. */
+		getRawStatus(cwd: string, readSignal = signal) {
+			return request(cwd, "status", { maxBytes: 1024 * 1024 }, readSignal);
+		},
 		async getStatusSummary(cwd: string, options: { ttlMs?: number } = {}) {
 			return coordinateGitStatusQuery(
 				statusKey(cwd),

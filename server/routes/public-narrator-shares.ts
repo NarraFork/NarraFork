@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { getClientIp } from "../lib/client-ip";
 import { AppError, RateLimitError } from "../lib/errors";
 import {
@@ -12,6 +13,7 @@ import {
 import { listPublicDiscussion, postPublicDiscussion } from "../services/chat-service";
 import { toBlockPage } from "../services/narrator-block-page";
 import { narratorService } from "../services/narrator-service";
+import { narratorSurfaceReadOptions } from "../services/narrator-surface-reads";
 import {
 	isPublicToolSourceAllowed,
 	projectPublicNarratorPayload,
@@ -201,10 +203,14 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	});
 	// The service guarantees the page's own revision consistency (see the narrator
 	// route's note); a second version comparison here only produced spurious 409s.
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, auth.narratorId),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, auth.narratorId),
+			columns: { id: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!narratorMeta) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	const projected = projectPublicNarratorPayload(auth.narratorId, result);

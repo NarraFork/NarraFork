@@ -1,87 +1,117 @@
-/**
- * Read-only database worker pool.
- *
- * ## Why
- *
- * `bun:sqlite` is synchronous, so every read runs on the single JS thread that also serves HTTP,
- * WebSocket, and agent sessions. A whole-database read like the storage-settings scan (measured:
- * ~4.9s over 116 tables on a 5.3 GB database) therefore freezes the entire server for its duration.
- *
- * Running the same scan in a Worker was measured to keep the main thread's worst event-loop delay at
- * 11ms — i.e. effectively unaffected — while also allowing the per-table work to be sharded across
- * several workers for real concurrency.
- *
- * ## Safety properties
- *
- * - Workers open their connection `readonly`, so they can never take the write lock.
- * - Worker code must not import `server/db/index.ts` (a test enforces this); see
- *   `storage-scan-queries.ts` for the destructive re-bootstrap that would otherwise occur.
- * - Every task has a single absolute deadline covering BOTH the wait for pool capacity and the
- *   execution itself, and it is cancellable throughout. A caller therefore always settles.
- * - A crashed worker fails only its own in-flight task.
- * - Unavailable workers fail the task. Callers must propagate the failure, pause/retry, or use an
- *   equivalent isolated worker/subprocess; they must never re-run the task on the main thread.
- * - Pool state is pinned to `globalThis` via hot-safe helpers so Bun `--hot` reloads reuse the
- *   existing workers instead of leaking a new set on every edit.
- */
-
+/** Read-only DB protocol over the shared bounded worker runtime. Never executes SQL locally. */
 import { cpus } from "node:os";
-import { compiledWorkerSpecifiers } from "../compiled-worker";
+import type { Worker } from "node:worker_threads";
+import { compiledWorkerSpecifiers, connectCompiledWorker } from "../compiled-worker";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
+import {
+	beginReadFanoutSpan,
+	countReadFanout,
+	endReadFanoutTiming,
+	failReadFanoutPost,
+	finishReadFanoutSpan,
+	isReadFanoutScopeExcluded,
+	postReadFanoutTask,
+	type ReadFanoutSpan,
+	readFanoutNow,
+	receiveReadFanoutTask,
+	recordReadFanoutSql,
+	recordReadFanoutTiming,
+	shareReadFanoutTask,
+} from "../read-fanout-diagnostics";
 import { RUNTIME_BUILD_ID } from "../runtime-target";
 import { currentSqlTraceSpan } from "../sql-trace";
+import { WorkerCleanupError, WorkerHandle } from "../worker-runtime/lifecycle";
+import {
+	type PoolWorker,
+	WorkerPool,
+	WorkerPoolError,
+	type WorkerTaskContext,
+} from "../worker-runtime/pool";
+import { TaskQueueError } from "../worker-runtime/queue";
+import {
+	assertReadDatabaseOpen,
+	closeReadDatabaseAdmission,
+	getReadDatabaseIdentity,
+	invalidateReadDatabaseReadiness,
+	peekReadDatabaseIdentity,
+	type ReadDatabaseIdentity,
+} from "./database-identity";
+import {
+	DOMAIN_READ_STREAM_TIMEOUT_MS,
+	isDomainReadStreamTask,
+	validateDomainRead,
+} from "./domain-protocol";
+import { DbReadError, errorFromWorkerFailure, readAborted } from "./errors";
 import { assertWorkerBuildId, workerFailureDetails } from "./failure";
 import {
-	DB_WORKER_PROBE_READY_TIMEOUT_MS,
+	assertSessionPreviewBudget,
 	DB_WORKER_READY_TIMEOUT_MS,
 	type DbReadTaskParams,
 	type DbWorkerOutbound,
+	SELECT_ROWS_MAX_BYTES,
+	SELECT_ROWS_MAX_ROWS,
+	SELECT_ROWS_MAX_SQL_BYTES,
+	type SelectRowsParams,
+	type SelectRowsResult,
 } from "./protocol";
+import { ReadBudgetMeter } from "./read-budget";
+import {
+	attachDbReadAbortDiagnostics,
+	boundedReadLogText,
+	type DbReadAbortDiagnostics,
+	isTaskKind,
+	logReadSqlDiagnostic,
+	type ReadPoolTaskDiagnostics,
+	type ReadTaskDiagnostics,
+	readPoolTaskLabels,
+	readPoolTaskSnapshot,
+	warnReadBudgetExceeded,
+	warnReadPoolFailure,
+	warnReadPoolTaskTimeout,
+	warnReadQueryRejected,
+	warnReadQueueFull,
+} from "./read-diagnostics";
+import {
+	classifyReadTask,
+	DB_READ_DEFAULT_MAX_QUEUED,
+	DB_READ_MAX_QUEUED_BYTES,
+	type DbReadSchedulingConfig,
+	readSchedulingConfig,
+} from "./scheduling";
+import { validateSelectDigestBatch } from "./select-digest-batch";
+import { decodeReadBinds } from "./select-extended";
+import { validateSelectRows } from "./select-rows";
+import {
+	acceptSqlDiagnosticEvent,
+	createHostSqlDiagnosticState,
+	createSqlDiagnosticConfig,
+	getSqlDiagnosticSession,
+	type SqlDiagnosticConfig,
+} from "./sql-diagnostics";
 
-/** Default task timeout. Generous: a cold cache scan of a multi-GB database can take a while. */
+let sqlDiagnosticWorkerCounter = 0;
+
 const DEFAULT_TASK_TIMEOUT_MS = 120_000;
-/** Idle workers are terminated after this long so a one-off scan does not pin threads forever. */
-const IDLE_REAP_MS = 60_000;
-const IDLE_REAP_INTERVAL_MS = 15_000;
-/** After this many consecutive spawn/ready failures, stop trying and report unavailability. */
 const MAX_SPAWN_FAILURES = 2;
-export const DB_WORKER_MAX_QUEUE = 32;
+/** Main-pool defaults; instantiated pools retain their frozen configuration. */
+export const DB_WORKER_MAX_QUEUE = DB_READ_DEFAULT_MAX_QUEUED;
+export const DB_READ_QUEUE_MAX_TASKS = DB_READ_DEFAULT_MAX_QUEUED;
+export const DB_READ_QUEUE_MAX_BYTES = DB_READ_MAX_QUEUED_BYTES;
+const COMPATIBLE_EPHEMERAL_MAX_QUEUED = 32;
+const ACTIVE_DIAGNOSTIC_LIMIT = 8;
+const QUEUE_DIAGNOSTIC_LIMIT = 32;
+const SHORT_READ_TIMEOUT_MS = 5_000;
+const SHORT_READ_MAX_QUEUE = 8;
+const SHORT_READ_MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 export class DbReadTaskOverloadedError extends Error {
 	readonly code = "DB_READ_TASK_OVERLOADED";
-	constructor() {
+	constructor(readonly reason?: TaskQueueError["reason"]) {
 		super("Database read worker queue is full");
 		this.name = "DbReadTaskOverloadedError";
 	}
 }
-
-function checkTaskDeadline(deadlineAt: number, signal?: AbortSignal): void {
-	if (signal?.aborted) throw new Error("database read task aborted");
-	if (Date.now() >= deadlineAt)
-		throw new DbReadTaskTimeoutError("database read task timed out before dispatch");
-}
-
-function logWorkerFailure(
-	pooled: Pick<PooledWorker, "specifier">,
-	phase: string,
-	error: unknown,
-): void {
-	try {
-		logger.warn("Database read worker failure", {
-			phase,
-			entry: pooled.specifier,
-			buildId: RUNTIME_BUILD_ID,
-			...workerFailureDetails(error, phase === "create" || phase === "ready"),
-		});
-	} catch {
-		/* diagnostics cannot prevent cleanup */
-	}
-}
-
-const REAPER_TIMER_KEY = "narrafork.dbWorkerPool.reaper";
-
-/** Only pool-owned queue/execution watchdogs use this code; native failures remain unclassified. */
 export class DbReadTaskTimeoutError extends Error {
 	readonly code = "DB_READ_TASK_TIMEOUT";
 	constructor(message: string) {
@@ -89,1028 +119,1498 @@ export class DbReadTaskTimeoutError extends Error {
 		this.name = "DbReadTaskTimeoutError";
 	}
 }
-
-/** The worker accepted a task and reported a query failure, not a failed entry-point probe. */
 export class DbReadTaskExecutionError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "DbReadTaskExecutionError";
 	}
 }
-
+export class WorkersUnavailableError extends Error {
+	readonly code = "DB_READ_UNAVAILABLE";
+	constructor(readonly reason: string) {
+		super(`database read workers unavailable: ${reason}`);
+		this.name = "WorkersUnavailableError";
+	}
+}
 export interface RunReadTaskOptions {
 	timeoutMs?: number;
+	deadlineAt?: number;
+	schedulingHint?: "auth-session";
 	signal?: AbortSignal;
-	/** Progress callback, invoked as the worker finishes individual tables. */
+	/** Static server-owned label, never bound values or user content. */
+	diagnosticSource?: string;
+	diagnosticContext?: ReadTaskDiagnostics;
 	onProgress?: (progress: { tableName: string; done: number; total: number }) => void;
-	/**
-	 * Coalescing key. Concurrent calls sharing a key share one execution, so two admins hitting
-	 * "scan" at the same time do not each pay the full cost.
-	 */
+	/** Coalesces execution, not subscriptions: only the last cancellation cancels SQL. */
 	dedupeKey?: string;
+	/** Consumption must settle before the worker is allowed to send another block. */
+	onChunk?: (chunk: import("./protocol").SelectChunk) => void | Promise<void>;
 }
-
-interface PendingTask {
-	requestId: string;
-	resolve: (value: unknown) => void;
-	reject: (error: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
+interface ReadRequest {
+	poolDiagnostic: ReadPoolTaskDiagnostics;
+	sqlDiagnostic?: SqlDiagnosticConfig;
+	dbPath: string;
+	identity?: ReadDatabaseIdentity;
+	params: DbReadTaskParams;
+	traceParent?: string;
+	callerSignal?: AbortSignal;
 	onProgress?: RunReadTaskOptions["onProgress"];
-	/** PG cancellation keeps the slot until native cancel/connection close acknowledges. */
-	cancellingError?: Error;
+	onChunk?: RunReadTaskOptions["onChunk"];
+	fresh: boolean;
+	taskClass: "normal" | "short";
+	profile: ReadPoolProfile;
+	compatibleEphemeral: boolean;
+	diagnostics: ReadTaskDiagnostics;
+	phase: { phase: DbReadAbortDiagnostics["phase"] };
+	fanout?: ReadFanoutSpan;
+	fanoutExcluded: boolean;
 }
-
-/**
- * Readiness bookkeeping for one worker.
- *
- * Deliberately not a bare promise: a probe (see {@link spawnReadyWorker}) may give up on a candidate
- * after a short budget and later want to wait on the SAME worker again, which a settled promise
- * cannot express. Waiters therefore time out individually while the signal itself stays pending.
- */
-interface ReadySignal {
-	state: "pending" | "ready" | "failed";
-	error: Error | null;
-	waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
+interface SharedRead {
+	request: ReadRequest;
+	controller: AbortController;
+	promise: Promise<unknown>;
+	subscribers: Set<{ progress?: RunReadTaskOptions["onProgress"] }>;
 }
-
-/** A caller parked in the queue, waiting for pool capacity. */
-interface QueueWaiter {
-	/** Let the waiter retry acquisition. */
-	release: () => void;
-	/** Reject the waiter (timeout, abort, pool shutdown). */
-	fail: (error: Error) => void;
+type ReadPoolProfile = "pool" | "ephemeral" | "shortReads";
+/** Resource bookkeeping only; WorkerPool alone owns scheduling and capacity. */
+interface ReaderOwner {
+	databaseIds: Set<string>;
+	exited: Promise<unknown>;
+	close(): Promise<void>;
+	readonly closed: boolean;
 }
-
-interface PooledWorker {
-	worker: Worker;
-	specifier: string;
-	detach: () => void;
-	readySignal: ReadySignal;
-	/** Set once a task's requestId is known; used by the idle reaper and crash accounting. */
-	busyWith: string | null;
-	/**
-	 * Claimed BEFORE `busyWith` is known.
-	 *
-	 * `acquireWorker` awaits worker readiness, and the caller then awaits more before it can post a
-	 * task, so `busyWith` alone is not enough to mark a worker as taken: concurrent callers would
-	 * all see the same freshly spawned worker as free and pile onto it. That bug made a
-	 * concurrency-4 pool run exactly one worker, serialising every task (measured: 4 concurrent
-	 * scans took 4x a single scan, a 1.00x "speedup"). This flag is set synchronously at claim time,
-	 * before any await, so it closes that window.
-	 */
-	claimed: boolean;
-	idleSince: number;
-	terminated: boolean;
-	/** Native Worker ErrorEvent text must not expose a private PG connection URL. */
-	privatePgTask: boolean;
+interface OwnedRead {
+	request: ReadRequest;
+	controller: AbortController;
+	settled: Promise<unknown>;
 }
-
 interface PoolState {
-	workers: PooledWorker[];
-	pending: Map<string, PendingTask>;
-	queue: QueueWaiter[];
-	inFlight: Map<string, Promise<unknown>>;
-	spawnFailures: number;
-	disabledReason: string | null;
+	runtimeVersion: 3;
+	config?: DbReadSchedulingConfig;
+	pool?: WorkerPool<ReadRequest, unknown>;
+	ephemeral?: WorkerPool<ReadRequest, unknown>;
+	shortReads?: WorkerPool<ReadRequest, unknown>;
+	inFlight: Map<string, SharedRead>;
+	requests: Map<string, OwnedRead>;
+	owners: Set<ReaderOwner>;
 	requestCounter: number;
-	/** Worker specifier proven to work in this runtime; skips re-probing candidates. */
-	resolvedWorkerSpecifier: string | null;
-	/**
-	 * Slots reserved synchronously while a worker is starting.
-	 *
-	 * Spawning awaits readiness, so without counting reservations every concurrent caller would pass
-	 * the `workers.length < concurrency` check and the pool would overshoot its cap.
-	 */
-	pendingSpawns: number;
-	starting: Set<PooledWorker>;
-	generation: number;
-	/**
-	 * TEST ONLY (see {@link setDbWorkerSpecifiersForTest}). Overrides the candidate list so a test can
-	 * make spawning fail for real rather than by mocking pool internals.
-	 */
+	spawnFailures: number;
+	failureReason: string | null;
 	testSpecifiers: string[] | null;
+	closing?: Promise<void>;
+	paused: boolean;
+	permanent: boolean;
+	upgrade?: Promise<void>;
+	/** A sealed legacy root remains visible only to its old module closures. */
+	replacement?: PoolState;
 }
 
+/** Retire legacy owners without exposing replacement state to their surviving closures. */
+function upgradeLegacy(s: PoolState): PoolState {
+	if (s.replacement) return upgradeLegacy(s.replacement);
+	if (s.runtimeVersion === 3) return s;
+	const next: PoolState = {
+		runtimeVersion: 3,
+		inFlight: new Map(),
+		requests: new Map(),
+		owners: new Set(),
+		requestCounter: Number.isSafeInteger(s.requestCounter) ? s.requestCounter : 0,
+		spawnFailures: s.spawnFailures ?? 0,
+		failureReason: s.failureReason ?? null,
+		testSpecifiers: s.testSpecifiers ?? null,
+		paused: s.paused ?? false,
+		permanent: s.permanent ?? false,
+	};
+	let resolveUpgrade!: () => void;
+	let rejectUpgrade!: (error: unknown) => void;
+	next.upgrade = new Promise<void>((resolve, reject) => {
+		resolveUpgrade = resolve;
+		rejectUpgrade = reject;
+	});
+	void next.upgrade.catch(() => {});
+	const previousUpgrade = s.upgrade;
+	const previousClosing = s.closing;
+	const replaced = Promise.reject<void>(new WorkersUnavailableError("pool_runtime_replaced"));
+	void replaced.catch(() => {});
+	// Old shutdown/close exports must never report that they drained replacement readers.
+	// Their in-flight finally callbacks cannot clear these sealed lifecycle barriers.
+	for (const key of ["closing", "upgrade"] as const)
+		Object.defineProperty(s, key, {
+			configurable: false,
+			enumerable: true,
+			get: () => replaced,
+			set: () => {},
+		});
+	// Publish a blocked replacement before close invokes any synchronous cancellation observers.
+	s.replacement = next;
+	s.paused = true;
+	s.permanent = true;
+	const old = s as unknown as {
+		runtimeVersion?: number;
+		pool?: WorkerPool<ReadRequest, unknown>;
+		ephemeral?: WorkerPool<ReadRequest, unknown>;
+		shortReads?: WorkerPool<ReadRequest, unknown>;
+		upgrade?: Promise<void>;
+		workers?: Array<{
+			worker: globalThis.Worker;
+			exited?: Promise<unknown>;
+			detach?: () => void;
+			readySignal?: {
+				state: string;
+				error: Error | null;
+				waiters: Array<{ reject(error: Error): void }>;
+			};
+		}>;
+		tracked?: Set<NonNullable<typeof old.workers>[number]>;
+		starting?: Set<NonNullable<typeof old.workers>[number]>;
+		queue?: Array<{ fail(error: Error): void }>;
+		pending?: Map<string, { timer: ReturnType<typeof setTimeout>; reject(error: Error): void }>;
+		generation?: number;
+		admissionClosed?: boolean;
+		disabledReason?: string | null;
+	};
+	const error = new WorkersUnavailableError("pool_shutdown");
+	const exits: Promise<unknown>[] = [
+		previousUpgrade ?? Promise.resolve(),
+		previousClosing ?? Promise.resolve(),
+	];
+	try {
+		if (old.runtimeVersion === 1 || old.runtimeVersion === 2) {
+			exits.push(
+				old.pool?.close(error) ?? Promise.resolve(),
+				old.ephemeral?.close(error) ?? Promise.resolve(),
+				old.shortReads?.close(error) ?? Promise.resolve(),
+			);
+		} else {
+			next.failureReason = old.disabledReason ?? null;
+			old.disabledReason = "pool_shutdown";
+			old.admissionClosed = true;
+			old.generation = (old.generation ?? 0) + 1;
+			hotTimerClear("narrafork.dbWorkerPool.reaper");
+			for (const waiter of old.queue?.splice(0) ?? []) waiter.fail(error);
+			for (const pending of old.pending?.values() ?? []) {
+				clearTimeout(pending.timer);
+				pending.reject(error);
+			}
+			old.pending?.clear();
+			const owners = new Set([
+				...(old.workers ?? []),
+				...(old.starting ?? []),
+				...(old.tracked ?? []),
+			]);
+			for (const owner of owners) {
+				const exited =
+					owner.exited ??
+					new Promise<number>((resolve) => {
+						owner.worker.addEventListener("close", (event) => resolve((event as CloseEvent).code), {
+							once: true,
+						});
+					});
+				const handle = new WorkerHandle(
+					owner.worker,
+					exited.then(() => 0),
+					() => owner.worker.terminate(),
+				);
+				owner.detach?.();
+				if (owner.readySignal?.state === "pending") {
+					owner.readySignal.state = "failed";
+					owner.readySignal.error = error;
+					for (const waiter of owner.readySignal.waiters.splice(0)) waiter.reject(error);
+				}
+				exits.push(handle.close());
+			}
+		}
+	} catch (error) {
+		exits.push(Promise.reject(error));
+	}
+	void Promise.all(exits).then(
+		() => {
+			if (old.workers) old.workers.length = 0;
+			old.starting?.clear();
+			old.tracked?.clear();
+			next.upgrade = undefined;
+			resolveUpgrade();
+		},
+		(error: unknown) => {
+			next.failureReason = "pool_upgrade_failed";
+			rejectUpgrade(error);
+		},
+	);
+	return next;
+}
 function state(): PoolState {
 	const s = hotSafe<PoolState>("narrafork.dbWorkerPool", () => ({
-		workers: [],
-		pending: new Map(),
-		queue: [],
+		runtimeVersion: 3,
 		inFlight: new Map(),
-		spawnFailures: 0,
-		disabledReason: null,
+		requests: new Map(),
+		owners: new Set(),
 		requestCounter: 0,
-		resolvedWorkerSpecifier: null,
-		pendingSpawns: 0,
-		starting: new Set(),
-		generation: 0,
+		spawnFailures: 0,
+		failureReason: null,
 		testSpecifiers: null,
+		paused: false,
+		permanent: false,
 	}));
-	// Source --hot can reuse a pool created before startup bookkeeping existed.
-	s.starting ??= new Set();
-	s.generation ??= 0;
-	return s;
+	return upgradeLegacy(s);
 }
-
-/** Specifiers to try, most likely first. Dev has exactly one; compiled probes every layout. */
 function workerSpecifierCandidates(): string[] {
-	const s = state();
-	if (s.testSpecifiers) return s.testSpecifiers;
-	// Once a candidate has produced a working worker, stop probing the others.
-	if (s.resolvedWorkerSpecifier) return [s.resolvedWorkerSpecifier];
-	return compiledWorkerSpecifiers(
-		"lib/db-worker/worker-entry.ts",
-		"./worker-entry.ts",
-		import.meta.url,
+	return (
+		state().testSpecifiers ??
+		compiledWorkerSpecifiers("lib/db-worker/worker-entry.ts", "./worker-entry.ts", import.meta.url)
 	);
 }
-
+let defaultConcurrency: number | undefined;
 export function getConfiguredConcurrency(): number {
 	const raw = process.env.NARRAFORK_DB_WORKER_CONCURRENCY?.trim();
 	if (raw) {
 		const parsed = Number.parseInt(raw, 10);
 		if (Number.isFinite(parsed) && parsed > 0) return Math.min(parsed, 16);
-		if (Number.isFinite(parsed) && parsed <= 0) return 0; // explicit opt-out
+		if (Number.isFinite(parsed) && parsed <= 0) return 0;
 	}
-	let cpuCount = 4;
-	try {
-		cpuCount = Math.max(1, cpus().length);
-	} catch {
-		// keep the default
-	}
-	return Math.max(1, Math.min(4, cpuCount));
-}
-
-function workersDisabled(): string | null {
-	if (process.env.NARRAFORK_DB_WORKER === "off") return "disabled_by_env";
-	if (getConfiguredConcurrency() === 0) return "concurrency_zero";
-	return state().disabledReason;
-}
-
-function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): void {
-	const s = state();
-	if (!message || typeof message !== "object") return;
-	if (message.type === "ready") return; // handled by the ready promise
-
-	const pending = s.pending.get(message.requestId);
-	if (!pending) return;
-
-	if (message.type === "progress") {
-		pending.onProgress?.({
-			tableName: message.tableName,
-			done: message.done,
-			total: message.total,
-		});
-		return;
-	}
-
-	clearTimeout(pending.timer);
-	s.pending.delete(message.requestId);
-	releaseWorker(pooled);
-
-	if (pending.cancellingError) {
-		pending.reject(pending.cancellingError);
-	} else if (message.type === "result") {
-		pending.resolve(message.result);
-	} else {
+	if (defaultConcurrency === undefined) {
+		let cpuCount = 4;
 		try {
-			logger.warn("Database read worker query failed", {
-				entry: pooled.specifier,
-				phase: "read",
-				buildId: RUNTIME_BUILD_ID,
-				...message.diagnostic,
-			});
+			cpuCount = Math.max(1, cpus().length);
 		} catch {
-			/* diagnostics must not prevent settlement */
+			/* keep default */
 		}
-		pending.reject(Object.assign(new Error(message.message), { code: message.code }));
+		defaultConcurrency = Math.max(2, Math.min(4, cpuCount));
 	}
-	drainQueue();
+	return defaultConcurrency;
 }
-
-/** Return a worker to the idle set. Must clear BOTH the claim and the task binding. */
-function releaseWorker(pooled: PooledWorker): void {
-	pooled.busyWith = null;
-	pooled.claimed = false;
-	pooled.idleSince = Date.now();
-}
-
-/** Fail every task a dead worker was running, then drop it from the pool. */
-function retireWorker(pooled: PooledWorker, reason: string): void {
+function workersDisabled(profile: ReadPoolProfile = "pool"): string | null {
 	const s = state();
-	if (pooled.terminated) return;
-	pooled.terminated = true;
-	pooled.detach?.(); // pre-upgrade source hot-state workers have no detach callback
-	s.starting.delete(pooled);
-	s.workers = s.workers.filter((candidate) => candidate !== pooled);
-	// A worker that dies before reporting ready must not leave a spawner waiting on its budget.
-	settleReady(pooled.readySignal, new Error(`database worker died (${reason})`));
-	if (pooled.busyWith) {
-		const pending = s.pending.get(pooled.busyWith);
-		if (pending) {
-			clearTimeout(pending.timer);
-			s.pending.delete(pooled.busyWith);
-			pending.reject(new Error(`database worker died (${reason})`));
-		}
-	}
-	releaseWorker(pooled);
-	try {
-		pooled.worker.terminate();
-	} catch {
-		// best effort
-	}
-	drainQueue();
-}
-
-function settleReady(signal: ReadySignal, error: Error | null): void {
-	if (signal.state !== "pending") return;
-	signal.state = error ? "failed" : "ready";
-	signal.error = error;
-	const waiters = signal.waiters.splice(0, signal.waiters.length);
-	for (const waiter of waiters) {
-		if (error) waiter.reject(error);
-		else waiter.resolve();
-	}
-}
-
-/**
- * Wait for readiness with an individual budget.
- *
- * The budget belongs to the WAITER, not the worker: a probe uses a short one, and giving up does not
- * mark the worker as failed (the caller retires it explicitly). That separation is what lets probing
- * three candidate paths cost milliseconds instead of one full ready timeout each.
- */
-function awaitReady(
-	pooled: PooledWorker,
-	timeoutMs: number,
-	deadlineAt: number,
-	abortSignal?: AbortSignal,
-): Promise<void> {
-	checkTaskDeadline(deadlineAt, abortSignal);
-	const signal = pooled.readySignal;
-	if (signal.state === "ready") return Promise.resolve();
-	if (signal.state === "failed") {
-		return Promise.reject(signal.error ?? new Error("database worker failed to start"));
-	}
-	return new Promise<void>((resolve, reject) => {
-		const cleanup = () => {
-			clearTimeout(timer);
-			abortSignal?.removeEventListener("abort", abort);
-			const index = signal.waiters.indexOf(waiter);
-			if (index >= 0) signal.waiters.splice(index, 1);
-		};
-		const waiter = {
-			resolve: () => {
-				cleanup();
-				resolve();
-			},
-			reject: (error: Error) => {
-				cleanup();
-				reject(error);
-			},
-		};
-		const abort = () => waiter.reject(new Error("database read task aborted"));
-		const remaining = Math.max(0, deadlineAt - Date.now());
-		const timer = setTimeout(
-			() => {
-				waiter.reject(
-					remaining <= timeoutMs
-						? new DbReadTaskTimeoutError("database read task timed out during worker startup")
-						: new Error(`database worker did not become ready within ${timeoutMs}ms`),
-				);
-			},
-			Math.min(timeoutMs, remaining),
-		);
-		signal.waiters.push(waiter);
-		abortSignal?.addEventListener("abort", abort, { once: true });
-		if (abortSignal?.aborted) abort();
-	});
-}
-
-/** Start a worker from one specific specifier. Its ready signal settles on the ready/error event. */
-function spawnWorkerFrom(specifier: string): PooledWorker {
-	// The global Worker accepts file: hrefs. node:worker_threads does not; those call sites
-	// pass workerEntryFromSpecifier instead.
-	const worker = new Worker(specifier);
-	const pooled: PooledWorker = {
-		worker,
-		specifier,
-		detach: () => {
-			removeReadyListeners();
-			worker.onmessage = null;
-			worker.onerror = null;
-			worker.removeEventListener("close", onClose);
-			worker.removeEventListener("messageerror", onMessageError);
-		},
-		busyWith: null,
-		claimed: false,
-		idleSince: Date.now(),
-		terminated: false,
-		privatePgTask: false,
-		readySignal: { state: "pending", error: null, waiters: [] },
-	};
-
-	// A wrong specifier fails ASYNCHRONOUSLY (ModuleNotFound on the error event). Listeners are
-	// removed as soon as readiness settles: without that, the closures — and the worker they capture —
-	// stay reachable from the worker's listener list for the rest of its life.
-	const onFirstMessage = (event: MessageEvent<DbWorkerOutbound>) => {
-		if (event.data?.type !== "ready") return;
-		removeReadyListeners();
+	if (s.upgrade)
+		return s.failureReason === "pool_upgrade_failed" ? s.failureReason : "pool_upgrading";
+	if (s.permanent || s.paused || s.closing) return "pool_shutdown";
+	if (profile !== "ephemeral" && process.env.NARRAFORK_DB_WORKER === "off")
+		return "disabled_by_env";
+	const concurrency =
+		profile === "pool"
+			? (s.config?.concurrency ?? getConfiguredConcurrency())
+			: getConfiguredConcurrency();
+	if (concurrency === 0) return "concurrency_zero";
+	if (profile !== "pool") return null;
+	if (!s.config) {
 		try {
-			assertWorkerBuildId(event.data.buildId);
-			settleReady(pooled.readySignal, null);
+			readSchedulingConfig(concurrency);
 		} catch (error) {
-			settleReady(pooled.readySignal, error as Error);
-		}
-	};
-	function removeReadyListeners(): void {
-		worker.removeEventListener("message", onFirstMessage as EventListener);
-	}
-	worker.addEventListener("message", onFirstMessage as EventListener);
-
-	worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) =>
-		handleWorkerMessage(pooled, event.data);
-	worker.onerror = (event: ErrorEvent) => {
-		logWorkerFailure(pooled, pooled.readySignal.state === "pending" ? "ready" : "run", event);
-		retireWorker(pooled, pooled.privatePgTask ? "PostgreSQL read worker failed" : "worker error");
-	};
-	const onClose = () => {
-		logWorkerFailure(pooled, "close", new Error("worker closed before completion"));
-		retireWorker(pooled, "closed");
-	};
-	const onMessageError = (event: Event) => {
-		logWorkerFailure(pooled, "message", event);
-		retireWorker(pooled, "message deserialization failed");
-	};
-	worker.addEventListener("close", onClose);
-	worker.addEventListener("messageerror", onMessageError);
-	state().starting.add(pooled);
-	ensureReaper();
-	return pooled;
-}
-
-/**
- * Spawn a ready worker, probing candidate specifiers until one works.
- *
- * Probing exists because the embedded worker path in a compiled binary depends on which entry point
- * was compiled (see compiledWorkerSpecifiers). The winning specifier is cached, so this costs at most
- * one round of failed spawns per process.
- *
- * The last candidate is not a probe: once every other shape has been ruled out, a slow-but-correct
- * worker still deserves the full ready budget. Earlier candidates get the short probe budget, which
- * is what keeps a compiled binary's first spawn from costing 3 x DB_WORKER_READY_TIMEOUT_MS.
- */
-async function spawnReadyWorker(
-	deadlineAt: number,
-	signal: AbortSignal | undefined,
-	generation: number,
-): Promise<PooledWorker> {
-	const candidates = workerSpecifierCandidates();
-	for (const [index, specifier] of candidates.entries()) {
-		checkTaskDeadline(deadlineAt, signal);
-		const isLastCandidate = index === candidates.length - 1;
-		const budget = isLastCandidate ? DB_WORKER_READY_TIMEOUT_MS : DB_WORKER_PROBE_READY_TIMEOUT_MS;
-		let pooled: PooledWorker | undefined;
-		try {
-			pooled = spawnWorkerFrom(specifier);
-			await awaitReady(pooled, budget, deadlineAt, signal);
-			checkTaskDeadline(deadlineAt, signal);
-			if (state().generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
-			state().resolvedWorkerSpecifier = specifier;
-			state().starting.delete(pooled);
-			return pooled;
-		} catch (err) {
-			if (pooled) retireWorker(pooled, "candidate rejected");
-			if (state().generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
-			checkTaskDeadline(deadlineAt, signal);
-			if (err instanceof DbReadTaskTimeoutError) throw err;
-			logWorkerFailure({ specifier }, pooled ? "ready" : "create", err);
+			return error instanceof Error ? error.message : "invalid_scheduling_config";
 		}
 	}
-	throw new Error("no usable database worker entry");
+	return s.failureReason;
 }
-
-/**
- * Outcome of trying to get a worker.
- *
- * The three cases used to collapse into `PooledWorker | null`, and conflating the last two deadlocked
- * the pool: a caller that hit a spawn FAILURE queued itself waiting for a `drainQueue` that could
- * never come, because no live worker remained to finish a task and trigger one. Capacity pressure is
- * transient and worth queueing for; a spawn failure is not.
- */
-type AcquireOutcome =
-	| { kind: "worker"; worker: PooledWorker }
-	| { kind: "at_capacity" }
-	| { kind: "spawn_failed"; reason: string };
-
-/**
- * Take an idle worker, or grow the pool.
- *
- * Claims synchronously (before the first `await`) so two concurrent callers can never be handed the
- * same worker.
- */
-async function acquireWorker(deadlineAt: number, signal?: AbortSignal): Promise<AcquireOutcome> {
-	checkTaskDeadline(deadlineAt, signal);
-	const s = state();
-	const generation = s.generation;
-	// Also checked at the `runReadTask` entry point, but a caller released from the queue re-enters
-	// here directly — without this the pool would keep paying for spawns after being declared dead.
-	const disabled = workersDisabled();
-	if (disabled) return { kind: "spawn_failed", reason: disabled };
-
-	const idle = s.workers.find(
-		(pooled) => !pooled.claimed && !pooled.busyWith && !pooled.terminated,
-	);
-	if (idle) {
-		idle.claimed = true;
-		return { kind: "worker", worker: idle };
-	}
-
-	// Reserve the slot synchronously: spawning awaits readiness, so counting only live workers would
-	// let concurrent callers overshoot the configured cap.
-	if (s.workers.length + s.pendingSpawns >= getConfiguredConcurrency())
-		return { kind: "at_capacity" };
-	s.pendingSpawns += 1;
-
+type WorkerFailurePhase = "create" | "ready" | "run" | "message" | "close" | "dispatch";
+function logWorkerFailure(phase: WorkerFailurePhase, error: unknown): void {
 	try {
-		const pooled = await spawnReadyWorker(deadlineAt, signal, generation);
-		if (s.generation !== generation || signal?.aborted || Date.now() >= deadlineAt) {
-			retireWorker(pooled, "acquisition cancelled");
-			checkTaskDeadline(deadlineAt, signal);
-			throw new WorkersUnavailableError("pool_shutdown");
+		logger.warn("Database read worker failure", {
+			phase,
+			entry: "db-read-worker",
+			buildId: RUNTIME_BUILD_ID,
+			...workerFailureDetails(error, phase === "create" || phase === "ready"),
+		});
+	} catch {
+		/* diagnostics cannot prevent cleanup */
+	}
+}
+function taskError(error: unknown): unknown {
+	if (error instanceof WorkerCleanupError)
+		return Object.assign(
+			new DbReadError("DB_READ_READER_EXIT_UNCONFIRMED", "database reader exit was not confirmed"),
+			{ reason: "worker_cleanup_failed" },
+		);
+	if (error instanceof WorkerPoolError) return new WorkersUnavailableError("worker_unavailable");
+	if (error instanceof TaskQueueError) {
+		if (error.code === "TASK_QUEUE_FULL") {
+			if (error.reason === "total-bytes" || error.reason === "normal-bytes")
+				return Object.assign(new DbReadError("DB_READ_OVERLOADED", "database read queue is full"), {
+					reason: error.reason,
+				});
+			return new DbReadTaskOverloadedError(error.reason);
 		}
-		// Claimed before returning, so a concurrent caller grows the pool rather than taking this one.
-		pooled.claimed = true;
-		s.workers.push(pooled);
-		s.spawnFailures = 0;
-		return { kind: "worker", worker: pooled };
-	} catch (err) {
-		checkTaskDeadline(deadlineAt, signal);
-		if (err instanceof DbReadTaskTimeoutError || err instanceof WorkersUnavailableError) throw err;
-		s.spawnFailures += 1;
-		if (s.spawnFailures >= MAX_SPAWN_FAILURES) {
-			s.disabledReason = "worker_unavailable";
-			logWorkerFailure({ specifier: "pool" }, "ready", err);
-		} else {
-			logWorkerFailure({ specifier: "pool" }, "ready", err);
-		}
-		return { kind: "spawn_failed", reason: "worker_spawn_failed" };
-	} finally {
-		if (s.generation === generation) s.pendingSpawns -= 1;
-		drainQueue();
+		if (error.code === "TASK_QUEUE_TIMEOUT")
+			return new DbReadTaskTimeoutError("database read task timed out");
+		if (error.code === "TASK_QUEUE_CLOSED") return new WorkersUnavailableError("pool_shutdown");
 	}
+	return error;
 }
-
-/** How many queued waiters can realistically be served right now. */
-function availableCapacity(): number {
+function cancellationError(context: WorkerTaskContext): Error {
+	const error = taskError(context.signal.reason);
+	return error instanceof WorkersUnavailableError ||
+		error instanceof DbReadTaskTimeoutError ||
+		error instanceof DbReadError
+		? error
+		: readAborted();
+}
+function trackOwner(owner: ReaderOwner, requestId?: string): void {
 	const s = state();
-	const idle = s.workers.filter(
-		(pooled) => !pooled.claimed && !pooled.busyWith && !pooled.terminated,
-	).length;
-	const growable = Math.max(0, getConfiguredConcurrency() - (s.workers.length + s.pendingSpawns));
-	return idle + growable;
+	if (requestId) requestOwners.get(requestId)?.add(owner);
+	s.owners.add(owner);
+	void owner.exited.then(
+		() => s.owners.delete(owner),
+		() => {},
+	);
 }
-
-/**
- * Release queued waiters, at most as many as there is capacity for.
- *
- * The quota matters because releasing a waiter only resolves its promise: the actual claim happens a
- * microtask later, so `availableCapacity()` would report the same value for the whole loop. The
- * previous unbounded loop therefore released the ENTIRE queue on any completion; all but one waiter
- * failed to acquire and re-queued at the tail, destroying FIFO order (starvation under load) and
- * churning through pointless dequeue/enqueue cycles.
- */
-function drainQueue(): void {
+async function createReader(
+	context: WorkerTaskContext,
+	profile: ReadPoolProfile,
+): Promise<PoolWorker<ReadRequest, unknown>> {
 	const s = state();
-	const disabled = workersDisabled();
-	if (disabled) {
-		for (const waiter of s.queue.splice(0)) waiter.fail(new WorkersUnavailableError(disabled));
-		return;
-	}
-	let quota = availableCapacity();
-	while (quota > 0 && s.queue.length > 0) {
-		const next = s.queue.shift();
-		quota -= 1;
-		next?.release();
-	}
-}
-
-function ensureReaper(): void {
-	// Not hotTimer(): that clears and recreates on every module evaluation, which would drop the
-	// interval mid-flight. We want one long-lived reaper, recreated only if it is missing.
-	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol storage survives hot reload
-	const g = globalThis as any;
-	const sym = Symbol.for(REAPER_TIMER_KEY);
-	if (g[sym]) return;
-	const timer = setInterval(() => {
-		const s = state();
-		const now = Date.now();
-		for (const pooled of [...s.workers]) {
-			// `claimed` covers the window between being handed out and receiving its task, so the
-			// reaper cannot terminate a worker that is about to be used.
-			if (pooled.claimed || pooled.busyWith || pooled.terminated) continue;
-			if (now - pooled.idleSince < IDLE_REAP_MS) continue;
-			try {
-				pooled.worker.postMessage({ type: "shutdown" });
-			} catch {
-				// fall through to terminate
+	const request = s.requests.get(context.requestId)?.request;
+	if (request) request.phase.phase = "acquiring";
+	const coldStarted = readFanoutNow(request?.fanout);
+	try {
+		await s.upgrade;
+		if (context.signal.aborted) throw cancellationError(context);
+		const disabled = workersDisabled(profile);
+		if (disabled) throw new WorkersUnavailableError(disabled);
+		if (request?.identity) assertReadDatabaseOpen(request.identity);
+		let connected: Awaited<ReturnType<typeof connectCompiledWorker>>;
+		try {
+			connected = await connectCompiledWorker(workerSpecifierCandidates(), {
+				signal: context.signal,
+				deadlineAt: Math.min(context.deadlineAt, Date.now() + DB_WORKER_READY_TIMEOUT_MS),
+				timeoutMs: DB_WORKER_READY_TIMEOUT_MS,
+				isReady(message) {
+					const ready = message as DbWorkerOutbound;
+					if (ready?.type !== "ready") return false;
+					assertWorkerBuildId(ready.buildId);
+					return true;
+				},
+			});
+		} catch (error) {
+			if (error instanceof WorkerCleanupError) {
+				trackOwner(
+					{
+						databaseIds: new Set(request?.identity ? [request.identity.id] : []),
+						exited: error.handle.exited,
+						closed: true,
+						close: async () => {
+							await error.handle.exited;
+						},
+					},
+					context.requestId,
+				);
+				// Preserve the concrete error until WorkerPool has quarantined its native slot.
+				throw error;
 			}
-			retireWorker(pooled, "idle");
+			if (context.signal.aborted) throw cancellationError(context);
+			if (Date.now() >= context.deadlineAt)
+				throw new DbReadTaskTimeoutError("database read task timed out before dispatch");
+			logWorkerFailure("ready", error);
+			// Short reads retry within their own bounded profile without poisoning ordinary reads.
+			if (profile === "pool" && ++s.spawnFailures >= MAX_SPAWN_FAILURES)
+				s.failureReason = "worker_unavailable";
+			throw new WorkersUnavailableError(
+				profile === "ephemeral" ? "ephemeral_spawn_failed" : "worker_spawn_failed",
+			);
 		}
-	}, IDLE_REAP_INTERVAL_MS);
-	timer.unref?.();
-	g[sym] = timer;
+		if (profile === "pool") s.spawnFailures = 0;
+		const reader = new ReadWorker(connected.worker, connected.handle);
+		if (request?.identity) reader.databaseIds.add(request.identity.id);
+		trackOwner(reader, context.requestId);
+		return reader;
+	} finally {
+		endReadFanoutTiming(request?.fanout, "coldStart", coldStarted);
+	}
 }
 
-/**
- * Park until the pool has capacity, or the budget/abort ends the wait.
- *
- * Queue waiting used to be unbounded and uncancellable: neither the task timeout nor the abort signal
- * was armed before a worker had been obtained, so a caller stuck here never settled (an SSE request
- * would hang until the client gave up, and shutdown then blocked on HTTP drain). Both are now armed
- * for the wait itself, and a waiter removes ITS OWN entry from the queue when it gives up so a later
- * drain does not release a dead slot.
- */
-function waitForCapacity(deadlineAt: number, signal: AbortSignal | undefined): Promise<void> {
-	checkTaskDeadline(deadlineAt, signal);
-	const s = state();
-	if (s.queue.length >= DB_WORKER_MAX_QUEUE) throw new DbReadTaskOverloadedError();
-	return new Promise<void>((resolve, reject) => {
-		const waiter: QueueWaiter = {
-			release: () => {
-				finish();
-				resolve();
-			},
-			fail: (error: Error) => {
-				finish();
-				reject(error);
-			},
-		};
-
-		const remaining = Math.max(0, deadlineAt - Date.now());
-		const timer = setTimeout(() => {
-			dequeue();
-			finish();
-			reject(
-				new DbReadTaskTimeoutError(
-					`database read task timed out after ${remaining}ms waiting for a worker`,
-				),
-			);
-		}, remaining);
-
-		const onAbort = () => {
-			dequeue();
-			finish();
-			reject(new Error("database read task aborted"));
-		};
-
-		function dequeue(): void {
-			const index = s.queue.indexOf(waiter);
-			if (index >= 0) s.queue.splice(index, 1);
-		}
-		function finish(): void {
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-		}
-
-		if (signal?.aborted) {
-			finish();
-			reject(new Error("database read task aborted"));
+class ReadWorker implements PoolWorker<ReadRequest, unknown>, ReaderOwner {
+	readonly databaseIds = new Set<string>();
+	readonly exited: Promise<number>;
+	private closing?: Promise<void>;
+	private failed = false;
+	private diagnosticWorker?: string;
+	private lastDiagnostic?: ReadPoolTaskDiagnostics;
+	private active?: {
+		request: ReadRequest;
+		requestId: string;
+		pg: boolean;
+		consumeSequence?: number;
+		nextSequence: number;
+		cancel(error: Error): void;
+		finish(error?: Error, value?: unknown): void;
+		done: Promise<void>;
+	};
+	constructor(
+		private readonly worker: Worker,
+		private readonly handle: WorkerHandle<Worker>,
+	) {
+		this.exited = handle.exited;
+		worker.on("message", this.onMessage);
+		worker.on("error", this.onError);
+		worker.on("messageerror", this.onMessageError);
+		worker.on("exit", this.onExit);
+	}
+	get closed(): boolean {
+		return this.failed || !!this.closing || this.handle.closed;
+	}
+	private onMessage = (message: DbWorkerOutbound) => {
+		const active = this.active;
+		if (!active || !message || message.type === "ready" || message.requestId !== active.requestId)
+			return;
+		const request = active.request;
+		if (message.type === "sqlDiagnostic") {
+			const sql = request.poolDiagnostic.sql;
+			if (sql) {
+				const accepted = acceptSqlDiagnosticEvent(sql, message, Date.now());
+				logReadSqlDiagnostic(
+					accepted && message.phase !== "coverageLost"
+						? message.phase === "start"
+							? "sql-start"
+							: "sql-end"
+						: "coverage-lost",
+					request.poolDiagnostic,
+				);
+			}
 			return;
 		}
-		signal?.addEventListener("abort", onAbort, { once: true });
-		s.queue.push(waiter);
-	});
-}
-
-/**
- * Post one task to a worker and await its result.
- *
- * `deadlineAt` is an absolute deadline rather than a duration so time already spent queueing is
- * charged against the same budget: the caller asked for "a result within timeoutMs", not "timeoutMs
- * of worker execution after an unbounded wait".
- */
-async function dispatch(
-	dbPath: string,
-	params: DbReadTaskParams,
-	options: RunReadTaskOptions,
-	deadlineAt: number,
-): Promise<unknown> {
-	const s = state();
-	const traceParent = currentSqlTraceSpan()?.id;
-	const generation = s.generation;
-
-	// Loop rather than recurse: a released waiter may still lose the race for the freed worker, and
-	// retrying must not grow the stack or reset the deadline.
-	let pooled: PooledWorker | null = null;
-	while (!pooled) {
-		if (s.generation !== generation) throw new WorkersUnavailableError("pool_shutdown");
-		const outcome = await acquireWorker(deadlineAt, options.signal);
-		if (outcome.kind === "worker") {
-			pooled = outcome.worker;
-			break;
-		}
-		// Spawning failed: no live worker exists to ever trigger a drain, so queueing here would wait
-		// forever. Surface the failure without allowing work to move onto the main thread.
-		if (outcome.kind === "spawn_failed") throw new WorkersUnavailableError(outcome.reason);
-		await waitForCapacity(deadlineAt, options.signal);
-	}
-	const worker = pooled;
-	try {
-		checkTaskDeadline(deadlineAt, options.signal);
-		if (worker.terminated) throw new WorkersUnavailableError("pool_shutdown");
-	} catch (error) {
-		releaseWorker(worker);
-		drainQueue();
-		throw error;
-	}
-
-	s.requestCounter += 1;
-	const requestId = `dbr-${Date.now().toString(36)}-${s.requestCounter.toString(36)}`;
-	worker.busyWith = requestId;
-	worker.privatePgTask = params.kind === "displayPageMessagesPostgres";
-
-	return new Promise<unknown>((resolve, reject) => {
-		// Local cancellation scope: aborting it detaches the caller's abort listener once the task
-		// settles, so neither `reject` nor the worker stays reachable through the signal.
-		const scope = new AbortController();
-		const remaining = Math.max(0, deadlineAt - Date.now());
-
-		const settleReject = (error: Error) => {
-			scope.abort();
-			reject(error);
-		};
-		const settleResolve = (value: unknown) => {
-			scope.abort();
-			resolve(value);
-		};
-
-		const requestCancellation = (error: Error, reason: string) => {
-			const pending = s.pending.get(requestId);
-			if (!pending || pending.cancellingError) return;
-			if (reason === "task timeout") logWorkerFailure(worker, "task-timeout", error);
-			if (params.kind === "displayPageMessagesPostgres") {
-				// PG SQL is async: let native Query.cancel() stop the remote statement and
-				// close its connection BEFORE releasing/reusing this pool slot. The outer
-				// display deadline already responds immediately to HTTP cancellation.
-				pending.cancellingError = error;
-				scope.abort();
-				pending.timer = setTimeout(() => {
-					s.pending.delete(requestId);
-					retireWorker(worker, "PG cancellation acknowledgement timeout");
-					settleReject(error);
-				}, 1000);
-				try {
-					worker.worker.postMessage({ type: "cancel", requestId });
-				} catch {
-					clearTimeout(pending.timer);
-					s.pending.delete(requestId);
-					retireWorker(worker, "PG cancellation message failed");
-					settleReject(error);
-				}
-			} else {
-				s.pending.delete(requestId);
-				retireWorker(worker, reason);
-				settleReject(error);
-			}
-		};
-		const timer = setTimeout(() => {
-			requestCancellation(
-				new DbReadTaskTimeoutError(`database read task timed out after ${remaining}ms`),
-				"task timeout",
-			);
-		}, remaining);
-		scope.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
-
-		s.pending.set(requestId, {
-			requestId,
-			resolve: settleResolve,
-			reject: settleReject,
-			timer,
-			onProgress: options.onProgress,
-		});
-
-		if (options.signal) {
-			if (options.signal.aborted) {
-				s.pending.delete(requestId);
-				releaseWorker(worker);
-				settleReject(new Error("database read task aborted"));
-				// Cancellation may have happened while this worker was starting. Wake callers
-				// that queued behind its startup reservation now that the worker is idle.
-				drainQueue();
-				return;
-			}
-			options.signal.addEventListener(
-				"abort",
-				() => requestCancellation(new Error("database read task aborted"), "aborted"),
-				{ once: true, signal: scope.signal },
-			);
-		}
-
-		try {
-			worker.worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
-		} catch (err) {
-			logWorkerFailure(worker, "dispatch", err);
-			s.pending.delete(requestId);
-			retireWorker(worker, "postMessage failed");
-			settleReject(err instanceof Error ? err : new Error(String(err)));
-		}
-	});
-}
-
-/** The pool cannot execute the task; callers must fail, pause, or use equivalent isolation. */
-export class WorkersUnavailableError extends Error {
-	constructor(public readonly reason: string) {
-		super(`database read workers unavailable: ${reason}`);
-		this.name = "WorkersUnavailableError";
-	}
-}
-
-/**
- * Run one task on a freshly spawned worker, then terminate it.
- *
- * Ignores the pool's disabled flag. The storage scan uses this when the shared pool cannot take
- * the work, so a disabled pool does not fall back to a synchronous scan on the server thread.
- * It must not be used while VACUUM has shut the pool down to clear readers.
- */
-export async function runEphemeralReadTask<T>(
-	dbPath: string,
-	params: DbReadTaskParams,
-	options: RunReadTaskOptions = {},
-): Promise<T> {
-	const specifiers = workerSpecifierCandidates();
-	const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
-	let lastError: Error | null = null;
-	for (const specifier of specifiers) {
-		try {
-			checkTaskDeadline(deadlineAt, options.signal);
-			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options, deadlineAt);
-		} catch (err) {
-			if (
-				options.signal?.aborted ||
-				err instanceof DbReadTaskTimeoutError ||
-				err instanceof DbReadTaskExecutionError
-			)
-				throw err;
-			lastError = err instanceof Error ? err : new Error(String(err));
-		}
-	}
-	throw lastError ?? new WorkersUnavailableError("ephemeral_spawn_failed");
-}
-
-function runEphemeralOnSpecifier<T>(
-	specifier: string,
-	dbPath: string,
-	params: DbReadTaskParams,
-	options: RunReadTaskOptions,
-	deadlineAt: number,
-): Promise<T> {
-	const requestId = `ephemeral-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-	const timeoutMs = Math.max(0, deadlineAt - Date.now());
-	const traceParent = currentSqlTraceSpan()?.id;
-	return new Promise<T>((resolve, reject) => {
-		const worker = new Worker(specifier);
-		let settled = false;
-		let ready = false;
-		const finish = (error?: Error, result?: T) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			clearTimeout(readyTimer);
-			worker.onmessage = null;
-			worker.onerror = null;
-			worker.removeEventListener("close", onClose);
-			worker.removeEventListener("messageerror", onMessageError);
-			options.signal?.removeEventListener("abort", onAbort);
+		if (message.type === "progress") {
 			try {
-				worker.terminate();
-			} catch {
-				// best effort
-			}
-			if (error) reject(error);
-			else resolve(result as T);
-		};
-		const onAbort = () => {
-			try {
-				worker.postMessage({ type: "cancel", requestId });
-			} catch {
-				// The worker is already gone.
-			}
-			finish(new Error("database read task aborted"));
-		};
-		const timer = setTimeout(
-			() => finish(new DbReadTaskTimeoutError(`database read task timed out after ${timeoutMs}ms`)),
-			timeoutMs,
-		);
-		const readyTimer = setTimeout(
-			() => finish(new Error("database worker did not become ready")),
-			DB_WORKER_READY_TIMEOUT_MS,
-		);
-		const onClose = () => {
-			const error = ready
-				? new DbReadTaskExecutionError("database worker closed before completion")
-				: new Error("database worker closed before readiness");
-			logWorkerFailure({ specifier }, ready ? "close" : "startup-close", error);
-			finish(error);
-		};
-		const onMessageError = () => {
-			const error = ready
-				? new DbReadTaskExecutionError("database worker message failed")
-				: new Error("database worker message failed before readiness");
-			logWorkerFailure({ specifier }, "message", error);
-			finish(error);
-		};
-		worker.addEventListener("close", onClose);
-		worker.addEventListener("messageerror", onMessageError);
-		if (options.signal) {
-			if (options.signal.aborted) {
-				finish(new Error("database read task aborted"));
-				return;
-			}
-			options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-		worker.onerror = (event: ErrorEvent) => {
-			logWorkerFailure({ specifier }, ready ? "run" : "ready", event);
-			finish(
-				ready
-					? new DbReadTaskExecutionError("database worker failed")
-					: new Error("database worker failed to start"),
-			);
-		};
-		worker.onmessage = (event: MessageEvent<DbWorkerOutbound>) => {
-			const message = event.data;
-			if (!ready) {
-				if (message?.type !== "ready") {
-					finish(new Error("database worker sent no ready handshake"));
-					return;
-				}
-				try {
-					assertWorkerBuildId(message.buildId);
-					checkTaskDeadline(deadlineAt, options.signal);
-					ready = true;
-					clearTimeout(readyTimer);
-					worker.postMessage({ type: "task", requestId, dbPath, params, traceParent });
-				} catch (err) {
-					finish(err instanceof Error ? err : new Error(String(err)));
-				}
-				return;
-			}
-			if (message?.type === "progress") {
-				options.onProgress?.({
+				request.onProgress?.({
 					tableName: message.tableName,
 					done: message.done,
 					total: message.total,
 				});
+			} catch {
+				/* observational callbacks cannot strand a permit */
+			}
+			return;
+		}
+		try {
+			request.diagnostics.meter.merge(message.diagnostics);
+			if (message.type === "result") request.diagnostics.partial = false;
+		} catch {
+			/* diagnostic metadata cannot affect delivery or ACK */
+		}
+		if (message.type === "chunk") {
+			if (
+				!request.onChunk ||
+				active.consumeSequence !== undefined ||
+				message.chunk.sequence !== active.nextSequence
+			) {
+				active.cancel(new DbReadError("DB_READ_PROTOCOL", "Invalid database read chunk"));
 				return;
 			}
-			if (message?.type === "result" && message.requestId === requestId) {
-				finish(undefined, message.result as T);
-				return;
-			}
-			if (message?.type === "error" && message.requestId === requestId) {
-				finish(
-					Object.assign(new DbReadTaskExecutionError(message.message || "database worker failed"), {
-						code: message.code,
-					}),
+			active.consumeSequence = message.chunk.sequence;
+			void new Promise<void>((resolve) => setTimeout(resolve, 0))
+				.then(() => {
+					if (this.active === active && !this.closed) return request.onChunk?.(message.chunk);
+				})
+				.then(() => {
+					if (this.active !== active || this.closed) return;
+					active.consumeSequence = undefined;
+					active.nextSequence = message.chunk.sequence + 1;
+					this.worker.postMessage({
+						type: "chunkAck",
+						requestId: active.requestId,
+						sequence: message.chunk.sequence,
+					});
+				})
+				.catch(() =>
+					active.cancel(
+						new DbReadError("DB_READ_CONSUMER_FAILED", "database read consumer failed"),
+					),
 				);
+			return;
+		}
+		receiveReadFanoutTask(
+			request.fanout,
+			message.type,
+			message.type === "result" ? message.durationMs : undefined,
+			request.fanoutExcluded,
+		);
+		if (message.type === "result") {
+			if (active.consumeSequence !== undefined)
+				active.cancel(new DbReadError("DB_READ_PROTOCOL", "Result arrived before chunk ACK"));
+			else active.finish(undefined, message.result);
+		} else {
+			if (message.code === "DB_READ_SNAPSHOT_CLEANUP_FAILED") this.failed = true;
+			try {
+				logger.warn("Database read worker query failed", {
+					entry: "db-read-worker",
+					phase: "read",
+					buildId: RUNTIME_BUILD_ID,
+					...workerFailureDetails(message.diagnostic ?? message, false),
+					...(request.poolDiagnostic.sql
+						? readPoolTaskSnapshot(
+								request.poolDiagnostic,
+								Date.now(),
+								request.poolDiagnostic.dispatchedAt,
+							)
+						: {}),
+				});
+			} catch {
+				/* diagnostics cannot prevent settlement */
 			}
+			active.finish(
+				message.code?.startsWith("DB_READ_") || message.statusCode !== undefined
+					? errorFromWorkerFailure(message)
+					: Object.assign(
+							new DbReadTaskExecutionError(message.message || "database worker query failed"),
+							{ code: message.code },
+						),
+			);
+		}
+	};
+	private fail(phase: WorkerFailurePhase, error: unknown): void {
+		this.failed = true;
+		logWorkerFailure(phase, error);
+		this.active?.finish(
+			new DbReadError("DB_READ_WORKER_EXITED", "database worker died before completion"),
+		);
+		void this.close().catch(() => {});
+	}
+	private onError = (error: Error) => this.fail("run", error);
+	private onMessageError = () =>
+		this.fail("message", new Error("worker message deserialization failed"));
+	private onExit = () => {
+		if (this.active) this.fail("close", new Error("worker closed before completion"));
+	};
+	run(request: ReadRequest, context: WorkerTaskContext): Promise<unknown> {
+		requestOwners.get(context.requestId)?.add(this);
+		if (this.closed) return Promise.reject(new WorkersUnavailableError("worker_unavailable"));
+		if (request.identity) {
+			assertReadDatabaseOpen(request.identity);
+			this.databaseIds.add(request.identity.id);
+		}
+		request.diagnostics.requestId = context.requestId;
+		request.poolDiagnostic.requestId = context.requestId;
+		request.poolDiagnostic.dispatchedAt = Date.now();
+		request.phase.phase = "dispatching";
+		this.lastDiagnostic = request.poolDiagnostic.sql ? request.poolDiagnostic : undefined;
+		if (request.poolDiagnostic.sql) {
+			this.diagnosticWorker ??= `dbw-${++sqlDiagnosticWorkerCounter}`;
+			request.poolDiagnostic.sql.worker = this.diagnosticWorker;
+			this.lastDiagnostic = request.poolDiagnostic;
+			logReadSqlDiagnostic("dispatch", request.poolDiagnostic);
+		}
+		return new Promise((resolve, reject) => {
+			let cancelled: Error | undefined;
+			let watchdog: ReturnType<typeof setTimeout> | undefined;
+			let done!: () => void;
+			const drained = new Promise<void>((accept) => {
+				done = accept;
+			});
+			const finish = (error?: Error, value?: unknown) => {
+				if (this.active !== active) return;
+				clearTimeout(watchdog);
+				context.signal.removeEventListener("abort", abort);
+				if (request.poolDiagnostic.sql) {
+					request.poolDiagnostic.sql.endedAt = Date.now();
+					request.poolDiagnostic.sql.outcome = cancelled || error ? "failed" : "completed";
+					logReadSqlDiagnostic("finish", request.poolDiagnostic);
+				}
+				this.active = undefined;
+				if (request.fresh) this.failed = true;
+				done();
+				if (cancelled || error) reject(cancelled ?? error);
+				else resolve(value);
+			};
+			const cancel = (error: Error) => {
+				if (cancelled || this.active !== active) return;
+				cancelled = error;
+				if (!active.pg) {
+					this.failed = true;
+					finish(error);
+					return;
+				}
+				// PG ACK follows native cancellation and both connection closes. Never reuse early.
+				watchdog = setTimeout(() => {
+					this.failed = true;
+					finish(error);
+				}, 1000);
+				try {
+					this.worker.postMessage({ type: "cancel", requestId: context.requestId });
+				} catch {
+					this.failed = true;
+					finish(error);
+				}
+			};
+			const abort = () => cancel(cancellationError(context));
+			const active = {
+				request,
+				requestId: context.requestId,
+				pg: request.params.kind === "displayPageMessagesPostgres",
+				nextSequence: 0,
+				cancel,
+				finish,
+				done: drained,
+			};
+			this.active = active;
+			context.signal.addEventListener("abort", abort, { once: true });
+			if (request.callerSignal?.aborted || context.signal.aborted) {
+				abort();
+				return;
+			}
+			try {
+				this.worker.postMessage({
+					type: "task",
+					requestId: context.requestId,
+					dbPath: request.dbPath,
+					databaseId: request.identity?.id,
+					deadlineAt: context.deadlineAt,
+					params: request.params,
+					traceParent: request.traceParent,
+					...(request.sqlDiagnostic ? { sqlDiagnostic: request.sqlDiagnostic } : {}),
+				});
+				postReadFanoutTask(request.fanout);
+				request.phase.phase = "running";
+			} catch (error) {
+				this.failed = true;
+				logWorkerFailure("dispatch", error);
+				failReadFanoutPost(request.fanout);
+				finish(new DbReadError("DB_READ_FAILED", "database read task dispatch failed"));
+			}
+		});
+	}
+	close(): Promise<void> {
+		if (!this.closing) {
+			const active = this.active;
+			const diagnostic = this.lastDiagnostic;
+			const closeStartedAt = diagnostic ? Date.now() : undefined;
+			logReadSqlDiagnostic("close-start", diagnostic);
+			this.closing = Promise.resolve().then(async () => {
+				if (active) {
+					active.cancel(new WorkersUnavailableError("pool_shutdown"));
+					await active.done;
+				}
+				try {
+					this.worker.postMessage({ type: "shutdown" });
+				} catch {
+					/* already gone */
+				}
+				await this.handle.close();
+				logReadSqlDiagnostic(
+					"close-complete",
+					diagnostic,
+					closeStartedAt === undefined ? undefined : Math.max(0, Date.now() - closeStartedAt),
+				);
+				this.worker.off("message", this.onMessage);
+				this.worker.off("error", this.onError);
+				this.worker.off("messageerror", this.onMessageError);
+				this.worker.off("exit", this.onExit);
+			});
+		}
+		return this.closing;
+	}
+}
+function runtime(profile: ReadPoolProfile): WorkerPool<ReadRequest, unknown> {
+	const s = state();
+	const short = profile === "shortReads";
+	if (profile === "pool") s.config ??= readSchedulingConfig(getConfiguredConcurrency());
+	const config = profile === "pool" ? s.config : undefined;
+	s[profile] ??= new WorkerPool({
+		// Short reads and the one-shot emergency scan each have their own bounded slot.
+		concurrency: config?.concurrency ?? 1,
+		maxQueued: short
+			? SHORT_READ_MAX_QUEUE
+			: (config?.maxQueued ?? COMPATIBLE_EPHEMERAL_MAX_QUEUED),
+		maxQueuedBytes: short
+			? SHORT_READ_MAX_QUEUE_BYTES
+			: (config?.maxQueuedBytes ?? DB_READ_QUEUE_MAX_BYTES),
+		...(config
+			? {
+					reservedCapacity: config.reservedCapacity,
+					normalQueue: {
+						maxQueued: config.normalMaxQueued,
+						maxQueuedBytes: config.normalMaxQueuedBytes,
+					},
+				}
+			: {}),
+		timeoutMs: short ? SHORT_READ_TIMEOUT_MS : DEFAULT_TASK_TIMEOUT_MS,
+		reuse: profile !== "ephemeral",
+		create: (context) => createReader(context, profile),
+		onTaskComplete(timing) {
+			const request = s.requests.get(timing.requestId)?.request;
+			if (!request) return;
+			recordReadFanoutTiming(request.fanout, "workerAcquire", timing.readyMs);
+			if (request.poolDiagnostic.queuedAt !== undefined)
+				recordReadFanoutTiming(request.fanout, "queueWait", timing.queueMs);
+		},
+	});
+	return s[profile];
+}
+function logQueueRejection(
+	request: ReadRequest,
+	bytes: number,
+	profile: ReadPoolProfile,
+	reason: TaskQueueError["reason"],
+): void {
+	try {
+		const s = state();
+		const stats = runtime(profile).stats;
+		warnReadQueueFull(
+			{
+				reason:
+					reason === "normal-count" || reason === "normal-bytes"
+						? reason
+						: reason === "total-bytes"
+							? "bytes"
+							: "count",
+				taskClass: request.taskClass,
+				reservedCapacity: stats.reservedCapacity,
+				normalCapacity: stats.normalCapacity,
+				normalMaxQueued: stats.normalQueue?.maxQueued,
+				normalMaxQueuedBytes: stats.normalQueue?.maxQueuedBytes,
+				activeByClass: stats.activeByClass,
+				queuedByClass: stats.queuedByClass,
+				queuedBytesByClass: stats.queuedBytesByClass,
+				reservation: stats.reservation,
+				taskKind: request.poolDiagnostic.kind,
+				queued: stats.queued,
+				queuedBytes: stats.queuedBytes,
+				incomingBytes: bytes,
+				maxQueued: stats.maxQueued,
+				maxQueuedBytes: stats.maxQueuedBytes,
+				workers: stats.workers,
+				busy: stats.active - stats.starting,
+				retiring: stats.retiring,
+				pendingSpawns: stats.starting,
+				concurrency: stats.concurrency,
+			},
+			() => {
+				const now = Date.now();
+				const active = [];
+				const queued = [];
+				let activeTotal = 0;
+				let queuedTotal = 0;
+				const activeMaxEntries = Math.min(ACTIVE_DIAGNOSTIC_LIMIT, stats.concurrency);
+				for (const owned of s.requests.values()) {
+					const item = owned.request;
+					if (item === request || item.profile !== profile) continue;
+					if (item.phase.phase === "running" || item.phase.phase === "dispatching") {
+						activeTotal++;
+						if (active.length < activeMaxEntries)
+							active.push(
+								readPoolTaskSnapshot(item.poolDiagnostic, now, item.poolDiagnostic.dispatchedAt),
+							);
+					} else if (item.phase.phase === "queued") {
+						queuedTotal++;
+						if (queued.length < QUEUE_DIAGNOSTIC_LIMIT)
+							queued.push(
+								readPoolTaskSnapshot(item.poolDiagnostic, now, item.poolDiagnostic.queuedAt),
+							);
+					}
+				}
+				return {
+					kind: request.poolDiagnostic.kind,
+					source: request.poolDiagnostic.source,
+					code: "TASK_QUEUE_FULL",
+					incomingTask: readPoolTaskSnapshot(
+						request.poolDiagnostic,
+						now,
+						request.poolDiagnostic.startedAt,
+					),
+					activeTasks: active,
+					activeTotal,
+					activeMaxEntries,
+					activeTruncated: activeTotal > active.length,
+					queuedTasks: queued,
+					queuedMaxEntries: QUEUE_DIAGNOSTIC_LIMIT,
+					queuedTruncated: queuedTotal > queued.length,
+				};
+			},
+		);
+	} catch {
+		/* pressure evidence cannot replace the admission failure */
+	}
+}
+function execute(
+	request: ReadRequest,
+	options: RunReadTaskOptions,
+	deadlineAt: number,
+	bytes: number,
+	profile: ReadPoolProfile,
+): Promise<unknown> {
+	const s = state();
+	const disabled = workersDisabled(profile);
+	if (disabled) return Promise.reject(new WorkersUnavailableError(disabled));
+	const requestId = request.poolDiagnostic.requestId;
+	if (!requestId)
+		return Promise.reject(new DbReadError("DB_READ_INVALID", "Missing database read request id"));
+	request.callerSignal = options.signal;
+	const controller = new AbortController();
+	const forwardAbort = () => {
+		const reason = options.signal?.reason;
+		controller.abort(
+			reason instanceof DbReadError ||
+				reason instanceof WorkersUnavailableError ||
+				reason instanceof DbReadTaskTimeoutError
+				? reason
+				: readAborted(),
+		);
+	};
+	options.signal?.addEventListener("abort", forwardAbort, { once: true });
+	if (options.signal?.aborted) forwardAbort();
+	const pool = runtime(profile);
+	request.phase.phase = "acquiring";
+	const owned: OwnedRead = { request, controller, settled: Promise.resolve() };
+	s.requests.set(requestId, owned);
+	owned.settled = pool
+		.run(request, {
+			requestId: requestId,
+			signal: controller.signal,
+			deadlineAt,
+			bytes,
+			fresh: request.fresh,
+			taskClass: request.taskClass,
+			onAdmission(event) {
+				request.phase.phase = event.phase === "queued" ? "queued" : "acquiring";
+				if (event.phase === "queued") {
+					request.poolDiagnostic.queuedAt = event.at;
+					request.poolDiagnostic.queueReason = event.reason;
+				}
+			},
+		})
+		.catch((error) => {
+			if (
+				error instanceof TaskQueueError &&
+				error.code !== "TASK_QUEUE_FULL" &&
+				error.code !== "TASK_QUEUE_TIMEOUT"
+			)
+				warnReadPoolFailure(request.poolDiagnostic, error.code, runtime(profile).stats);
+			if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL") {
+				logQueueRejection(request, bytes, profile, error.reason);
+			}
+			throw taskError(error);
+		})
+		.finally(() => {
+			s.requests.delete(requestId);
+			options.signal?.removeEventListener("abort", forwardAbort);
+		});
+	return owned.settled;
+}
+function subscribe(
+	shared: SharedRead,
+	options: RunReadTaskOptions,
+	deadlineAt: number,
+): Promise<unknown> {
+	return new Promise((resolve, reject) => {
+		const subscriber = { progress: options.onProgress };
+		shared.subscribers.add(subscriber);
+		let settled = false;
+		const finish = (error?: unknown, value?: unknown) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", abort);
+			shared.subscribers.delete(subscriber);
+			if (error !== undefined) reject(error);
+			else resolve(value);
 		};
+		const cancel = (error: Error) => {
+			const request = shared.request;
+			attachDbReadAbortDiagnostics(error, {
+				kind: request.params.kind,
+				domainTask: request.params.kind === "domainRead" ? request.params.task : undefined,
+				phase: request.phase.phase,
+				taskId: request.diagnostics.requestId,
+			});
+			finish(error);
+			if (shared.subscribers.size === 0) shared.controller.abort(error);
+		};
+		const abort = () => cancel(readAborted());
+		const timer = setTimeout(
+			() => cancel(new DbReadTaskTimeoutError("database read task timed out")),
+			Math.max(0, deadlineAt - Date.now()),
+		);
+		options.signal?.addEventListener("abort", abort, { once: true });
+		if (options.signal?.aborted) abort();
+		const deliver = (error?: unknown, value?: unknown) => {
+			if (settled) return;
+			if (options.signal?.aborted) return cancel(readAborted());
+			if (Date.now() >= deadlineAt)
+				return cancel(new DbReadTaskTimeoutError("database read task timed out"));
+			finish(error, value);
+		};
+		shared.promise.then(
+			(value) => deliver(undefined, value),
+			(error) => deliver(error),
+		);
 	});
 }
-
-/**
- * Run a read-only task in a worker.
- *
- * Throws {@link WorkersUnavailableError} when workers cannot be used. Failures must propagate or
- * pause the caller's job; retries must remain isolated, never run the task on the main thread.
- */
-export async function runReadTask<T>(
+export function runReadTask<T>(
 	dbPath: string,
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions = {},
 ): Promise<T> {
+	return runReadTaskInternal<T>(dbPath, params, options, false);
+}
+/** Opt-in for indexed, bounded SQLite SELECTs; does not share the ordinary read queue. */
+export function runShortReadTask(
+	dbPath: string,
+	params: SelectRowsParams,
+	options: Pick<RunReadTaskOptions, "signal" | "timeoutMs" | "diagnosticSource"> = {},
+): Promise<SelectRowsResult> {
+	return runReadTaskInternal<SelectRowsResult>(
+		dbPath,
+		params,
+		options,
+		false,
+		false,
+		undefined,
+		"shortReads",
+	);
+}
+/** Bounded one-shot isolation may bypass a disabled reusable pool, never maintenance/exit. */
+export function runEphemeralReadTask<T>(
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions = {},
+): Promise<T> {
+	return runReadTaskInternal<T>(dbPath, params, options, true, true);
+}
+export interface TrackedEphemeralReadTask<T> {
+	readonly result: Promise<T>;
+	/** Includes startup failure cleanup and actual native exit, not just a termination request. */
+	readonly released: Promise<void>;
+}
+export function runTrackedEphemeralReadTask<T>(
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions = {},
+): TrackedEphemeralReadTask<T> {
+	const owners = new Set<ReaderOwner>();
+	const result = options.dedupeKey
+		? Promise.reject<T>(
+				new DbReadError("DB_READ_INVALID", "Owned ephemeral reads cannot share executions"),
+			)
+		: runReadTaskInternal<T>(dbPath, params, options, true, false, owners);
+	const released = result
+		.then(
+			() => undefined,
+			() => undefined,
+		)
+		.then(async () => {
+			await Promise.all([...owners].map((owner) => owner.exited));
+		});
+	return { result, released };
+}
+
+function taskParameterBytes(input: unknown): number {
+	let bytes = 0;
+	const walk = (value: unknown, depth: number): void => {
+		if (depth > 32) throw new DbReadError("DB_READ_INVALID", "Invalid database read parameters");
+		if (typeof value === "string") bytes += Buffer.byteLength(value) + 8;
+		else if (value instanceof Uint8Array) bytes += value.byteLength + 32;
+		else if (value && typeof value === "object") {
+			if (Array.isArray(value)) bytes += value.length * 8;
+			for (const key in value) {
+				if (!Object.hasOwn(value, key)) continue;
+				bytes += Buffer.byteLength(key) + 8;
+				walk((value as Record<string, unknown>)[key], depth + 1);
+				if (bytes > DB_READ_QUEUE_MAX_BYTES) break;
+			}
+		} else bytes += 16;
+	};
+	walk(input, 0);
+	return bytes;
+}
+async function runReadTaskInternal<T>(
+	dbPath: string,
+	params: DbReadTaskParams,
+	options: RunReadTaskOptions,
+	fresh: boolean,
+	compatibleEphemeral = false,
+	exitTracker?: Set<ReaderOwner>,
+	profile: ReadPoolProfile = compatibleEphemeral ? "ephemeral" : "pool",
+): Promise<T> {
+	// Capture the host caller before the first asynchronous boundary.
+	const sqlSession = getSqlDiagnosticSession();
+	const sqlDiagnostic = sqlSession ? createSqlDiagnosticConfig(sqlSession) : undefined;
+	const sql = sqlDiagnostic
+		? createHostSqlDiagnosticState(sqlDiagnostic, params.kind === "displayPageMessagesPostgres")
+		: undefined;
+	const fanout = beginReadFanoutSpan("pool");
+	const fanoutExcluded = !fanout && isReadFanoutScopeExcluded();
+	if (fanout) {
+		try {
+			if ("sql" in params) recordReadFanoutSql(fanout, params.sql);
+			else countReadFanout(fanout, "poolTemplateUnknown");
+		} catch {
+			/* observations cannot change malformed-task handling */
+		}
+	}
+	let fanoutError: unknown;
+	const startedAt = Date.now();
+	const diagnostics: ReadTaskDiagnostics = { meter: new ReadBudgetMeter(), partial: true };
+	const abortContext: { phase: DbReadAbortDiagnostics["phase"] } = { phase: "admission" };
+	let poolDiagnostic: ReadPoolTaskDiagnostics | undefined;
+	let status: "completed" | "failed" = "failed";
+	let code: string | undefined;
+	let shared = false;
+	let rejected = false;
+	try {
+		if (!isTaskKind(params.kind))
+			throw new DbReadError("DB_READ_INVALID", "Unknown database read task kind");
+		const stream = isDomainReadStreamTask(params);
+		if (stream && (!fresh || !exitTracker || compatibleEphemeral))
+			throw new DbReadError("DB_READ_INVALID", "Domain streams require a tracked one-shot worker");
+		const scheduling = classifyReadTask(params, options.schedulingHint);
+		const disabled = workersDisabled(profile);
+		if (disabled) throw new WorkersUnavailableError(disabled);
+		if (options.signal?.aborted) throw readAborted();
+		const timeoutMs = stream
+			? Math.min(options.timeoutMs ?? DOMAIN_READ_STREAM_TIMEOUT_MS, DOMAIN_READ_STREAM_TIMEOUT_MS)
+			: profile === "shortReads"
+				? Math.min(options.timeoutMs ?? SHORT_READ_TIMEOUT_MS, SHORT_READ_TIMEOUT_MS)
+				: (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+			throw new DbReadTaskTimeoutError("database read task timed out");
+		if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt))
+			throw new DbReadError("DB_READ_INVALID", "Invalid database read deadline");
+		const deadlineAt = Math.min(
+			startedAt + timeoutMs,
+			options.deadlineAt ?? Number.POSITIVE_INFINITY,
+		);
+		if (deadlineAt <= Date.now())
+			throw new DbReadTaskTimeoutError("database read task timed out before admission");
+		if (params.kind === "storageScanSessionPreview") assertSessionPreviewBudget(params);
+		const identity =
+			params.kind === "displayPageMessagesPostgres" ? undefined : getReadDatabaseIdentity(dbPath);
+		if (identity) assertReadDatabaseOpen(identity);
+		if (params.kind === "domainRead") validateDomainRead(params, diagnostics.meter);
+		if (params.kind === "selectRows") validateSelectRows(params, diagnostics.meter);
+		if (params.kind === "selectDigestBatch") {
+			validateSelectDigestBatch(params, diagnostics.meter);
+			if (options.dedupeKey)
+				throw new DbReadError("DB_READ_INVALID", "SELECT digest batches cannot share executions");
+		}
+		if (params.kind === "selectValues" || params.kind === "selectChunks")
+			decodeReadBinds(params, diagnostics.meter);
+		if (
+			(params.kind === "selectChunks" || stream) &&
+			(typeof options.onChunk !== "function" || options.dedupeKey)
+		) {
+			throw new DbReadError("DB_READ_INVALID", "Chunk reads require an independent consumer");
+		}
+		const bytes = taskParameterBytes(params);
+		diagnostics.meter.observe("taskBytes", bytes, DB_READ_QUEUE_MAX_BYTES, "input");
+		const s = state();
+		const key = options.dedupeKey
+			? JSON.stringify([
+					identity?.id ?? dbPath,
+					params.kind,
+					scheduling.taskClass,
+					scheduling.shortSource,
+					compatibleEphemeral,
+					profile,
+					options.dedupeKey,
+				])
+			: undefined;
+		let existing = key ? s.inFlight.get(key) : undefined;
+		if (existing?.controller.signal.aborted) existing = undefined;
+		if (existing) {
+			shared = true;
+			shareReadFanoutTask(fanout);
+			const value = await subscribe(existing, options, deadlineAt);
+			status = "completed";
+			return value as T;
+		}
+		s.requestCounter += 1;
+		const requestId = `dbr-${Date.now().toString(36)}-${s.requestCounter.toString(36)}`;
+		poolDiagnostic = {
+			...readPoolTaskLabels(params, options),
+			...scheduling,
+			requestId,
+			startedAt,
+			...(sql ? { sql } : {}),
+		};
+		const request: ReadRequest = {
+			dbPath: identity?.path ?? dbPath,
+			identity,
+			params,
+			traceParent: currentSqlTraceSpan()?.id,
+			sqlDiagnostic,
+			onProgress: options.onProgress,
+			onChunk: options.onChunk,
+			fresh,
+			taskClass: scheduling.taskClass,
+			profile,
+			compatibleEphemeral,
+			diagnostics,
+			poolDiagnostic,
+			phase: abortContext,
+			fanout,
+			fanoutExcluded,
+		};
+		// Track exactly this request's native owner, including one quarantined during startup.
+		if (exitTracker) requestOwners.set(requestId, exitTracker);
+		let result: unknown;
+		try {
+			if (key) {
+				const controller = new AbortController();
+				const entry: SharedRead = {
+					request,
+					controller,
+					promise: Promise.resolve(),
+					subscribers: new Set(),
+				};
+				request.onProgress = (progress) => {
+					for (const subscriber of entry.subscribers) {
+						try {
+							subscriber.progress?.(progress);
+						} catch {
+							/* isolate observers */
+						}
+					}
+				};
+				entry.promise = execute(
+					request,
+					{ ...options, signal: controller.signal },
+					deadlineAt,
+					bytes,
+					profile,
+				).finally(() => {
+					if (s.inFlight.get(key) === entry) s.inFlight.delete(key);
+				});
+				s.inFlight.set(key, entry);
+				result = await subscribe(entry, options, deadlineAt);
+			} else result = await execute(request, options, deadlineAt, bytes, profile);
+		} finally {
+			requestOwners.delete(requestId);
+		}
+		status = "completed";
+		return result as T;
+	} catch (error) {
+		fanoutError = error;
+		if (!shared && poolDiagnostic && error instanceof DbReadTaskTimeoutError)
+			warnReadPoolTaskTimeout(poolDiagnostic, abortContext.phase);
+		if (!shared) {
+			try {
+				attachDbReadAbortDiagnostics(error, {
+					kind: params.kind,
+					domainTask: params.kind === "domainRead" ? params.task : undefined,
+					phase: abortContext.phase,
+					taskId: diagnostics.requestId,
+				});
+			} catch {
+				/* host diagnostics cannot replace the task failure */
+			}
+		}
+		if (error && typeof error === "object" && "code" in error && typeof error.code === "string")
+			code = error.code;
+		if (!shared && error instanceof DbReadError && error.code === "DB_READ_INVALID") {
+			rejected = true;
+			try {
+				warnReadQueryRejected(
+					error,
+					"sql" in params ? params.sql : "",
+					"params" in params ? params.params : [],
+					{
+						...options,
+						diagnosticSource:
+							options.diagnosticSource ??
+							(params.kind === "domainRead" ? params.task : params.kind),
+					},
+				);
+			} catch {
+				/* diagnostic preparation is best effort */
+			}
+		}
+		throw error;
+	} finally {
+		finishReadFanoutSpan(fanout, fanoutError);
+		if (!shared && !rejected) {
+			try {
+				if (options.diagnosticContext) {
+					const owner = options.diagnosticContext;
+					const snapshot = diagnostics.meter.snapshot();
+					owner.meter.merge(snapshot.filter((item) => item.phase === "input"));
+					for (const item of snapshot) {
+						if (item.kind === "rows") {
+							owner.meter.observe(
+								"rows",
+								(owner.observedRows ?? 0) + item.actual,
+								SELECT_ROWS_MAX_ROWS,
+								"result",
+							);
+							if (item.actual > item.threshold)
+								owner.meter.observe("queryRows", item.actual, item.threshold, item.phase);
+						}
+						if (item.kind === "resultBytes")
+							owner.meter.observe(
+								"resultBytes",
+								(owner.observedBytes ?? 0) + item.actual,
+								SELECT_ROWS_MAX_BYTES,
+								"result",
+							);
+					}
+					if (!owner.sqlTemplate && "sql" in params)
+						owner.sqlTemplate = boundedReadLogText(params.sql, SELECT_ROWS_MAX_SQL_BYTES);
+				} else
+					warnReadBudgetExceeded({
+						snapshot: diagnostics.meter.snapshot(),
+						params,
+						source: options.diagnosticSource,
+						task: params.kind === "domainRead" ? `domainRead:${params.task}` : params.kind,
+						requestId: diagnostics.requestId,
+						elapsedMs: Date.now() - startedAt,
+						partial: diagnostics.partial || status === "failed",
+						status,
+						code,
+					});
+			} catch {
+				/* diagnostics cannot turn success into failure */
+			}
+		}
+	}
+}
+/** Request-local ownership is not a second scheduler and retains no SQL or result data. */
+const requestOwners = new Map<string, Set<ReaderOwner>>();
+
+export interface ReaderDrainOptions {
+	timeoutMs?: number;
+	deadlineAt?: number;
+	signal?: AbortSignal;
+}
+function drainDeadline(options: ReaderDrainOptions): number {
+	const deadline = options.deadlineAt ?? Date.now() + (options.timeoutMs ?? 30_000);
+	if (!Number.isFinite(deadline))
+		throw new DbReadError("DB_READ_INVALID", "Invalid reader drain deadline");
+	return deadline;
+}
+async function awaitReaderDrain(
+	work: Promise<unknown>,
+	options: ReaderDrainOptions,
+): Promise<void> {
+	const deadlineAt = drainDeadline(options);
+	if (options.signal?.aborted) throw readAborted();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let abort: (() => void) | undefined;
+	try {
+		await Promise.race([
+			work,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(
+							new DbReadTaskTimeoutError(
+								"database reader exit was not confirmed before the deadline",
+							),
+						),
+					Math.max(0, deadlineAt - Date.now()),
+				);
+				if (options.signal) {
+					abort = () => reject(readAborted());
+					options.signal.addEventListener("abort", abort, { once: true });
+					if (options.signal.aborted) abort();
+				}
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+		if (abort) options.signal?.removeEventListener("abort", abort);
+	}
+}
+/** Closes one canonical generation; queued/startup work cannot reopen it after this barrier. */
+export async function closeReadDatabase(
+	path: string,
+	options: ReaderDrainOptions = {},
+): Promise<void> {
+	const deadlineAt = drainDeadline(options);
+	const identity = closeReadDatabaseAdmission(path);
+	const s = state();
+	const requests = [...s.requests.values()].filter(
+		(owned) => owned.request.identity?.id === identity.id,
+	);
+	for (const owned of requests)
+		owned.controller.abort(
+			new DbReadError("DB_READ_DATABASE_CLOSED", "database read admission is closed"),
+		);
+	const work = (async () => {
+		await s.upgrade;
+		const owners = [...s.owners].filter((owner) => owner.databaseIds.has(identity.id));
+		const closing = Promise.all(owners.map((owner) => owner.close()));
+		void closing.catch(() => {});
+		await Promise.allSettled(requests.map((owned) => owned.settled));
+		// A cancelled factory can publish its quarantined owner while unwinding.
+		const lateOwners = [...s.owners].filter((owner) => owner.databaseIds.has(identity.id));
+		await Promise.all([closing, ...lateOwners.map((owner) => owner.close())]);
+		await Promise.all([...owners, ...lateOwners].map((owner) => owner.exited));
+		identity.drained = true;
+	})();
+	await awaitReaderDrain(work, { ...options, deadlineAt });
+}
+/** Real native-exit barrier; pause/permanent admission closes synchronously before any await. */
+export function shutdownDbWorkerPool(
+	options: { permanent?: boolean; pause?: boolean } = {},
+): Promise<void> {
+	const s = state();
+	s.permanent ||= options.permanent ?? false;
+	s.paused ||= options.pause ?? false;
+	invalidateReadDatabaseReadiness();
+	if (s.closing) return s.closing;
+	const reason = new WorkersUnavailableError("pool_shutdown");
+	const pool = s.pool;
+	const ephemeral = s.ephemeral;
+	const shortReads = s.shortReads;
+	const closing = Promise.all([
+		s.upgrade,
+		pool?.close(reason),
+		ephemeral?.close(reason),
+		shortReads?.close(reason),
+	]).then(async () => {
+		await Promise.all([...s.owners].map((owner) => owner.close()));
+		if (s.pool === pool) {
+			s.pool = undefined;
+			s.config = undefined;
+		}
+		if (s.ephemeral === ephemeral) s.ephemeral = undefined;
+		if (s.shortReads === shortReads) s.shortReads = undefined;
+		s.inFlight.clear();
+		s.closing = undefined;
+	});
+	s.closing = closing;
+	void closing.catch(() => {});
+	return closing;
+}
+export async function drainDbWorkerPool(options: ReaderDrainOptions = {}): Promise<void> {
+	const deadlineAt = drainDeadline(options);
+	await awaitReaderDrain(shutdownDbWorkerPool({ pause: true }), { ...options, deadlineAt });
+}
+export function resumeDbWorkerPool(): void {
+	const s = state();
+	if (s.closing || s.upgrade || s.owners.size)
+		throw new DbReadError("DB_READ_BUSY", "database readers are still retiring");
+	if (!s.permanent) s.paused = false;
+	s.failureReason = null;
+	s.spawnFailures = 0;
+}
+export async function assertDbReadersReady(
+	dbPath: string,
+	options: Pick<RunReadTaskOptions, "timeoutMs" | "signal"> = {},
+): Promise<void> {
+	if (workersDisabled() === "worker_unavailable") resumeDbWorkerPool();
 	const disabled = workersDisabled();
 	if (disabled) throw new WorkersUnavailableError(disabled);
-
-	const s = state();
-	const key = options.dedupeKey;
-	if (key) {
-		const existing = s.inFlight.get(key);
-		if (existing) return existing as Promise<T>;
-	}
-
-	// One absolute deadline for the whole attempt (queue wait + execution), fixed here so retries
-	// after a lost capacity race cannot silently extend it.
-	const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
-	const execution = dispatch(dbPath, params, options, deadlineAt).finally(() => {
-		if (key) s.inFlight.delete(key);
-	});
-	if (key) s.inFlight.set(key, execution);
-	return execution as Promise<T>;
-}
-
-/** Terminate all workers and clear pool state. Safe to call repeatedly. */
-export function shutdownDbWorkerPool(): void {
-	const s = state();
-	s.generation += 1;
-	s.pendingSpawns = 0;
-	hotTimerClear(REAPER_TIMER_KEY);
-	// Empty the queue FIRST. Retiring a worker calls `drainQueue`, which would otherwise release a
-	// waiter mid-shutdown; that waiter then sees free capacity and spawns a brand new worker just as
-	// the pool is being torn down. Detaching the waiters before any retirement closes that window.
-	// Reject rather than drop them: a dropped waiter is a promise that never settles, which is exactly
-	// the hang this pool exists to avoid.
-	const waiters = s.queue.splice(0, s.queue.length);
-	for (const waiter of waiters) {
-		waiter.fail(new WorkersUnavailableError("pool_shutdown"));
-	}
-	for (const pooled of [...s.workers, ...s.starting]) {
-		try {
-			pooled.worker.postMessage({ type: "shutdown" });
-		} catch {
-			// fall through
+	const timeoutMs = options.timeoutMs ?? 30_000;
+	const deadlineAt = Date.now() + timeoutMs;
+	const identity = getReadDatabaseIdentity(dbPath);
+	identity.ready = false;
+	try {
+		await runReadTask(
+			identity.path,
+			{ kind: "domainRead", task: "readerProbe", input: null },
+			{ ...options, timeoutMs },
+		);
+		assertReadDatabaseOpen(identity);
+		identity.ready = true;
+	} catch (error) {
+		const retiring = [...state().owners].filter((owner) => owner.closed);
+		if (retiring.length) {
+			try {
+				await awaitReaderDrain(Promise.all(retiring.map((owner) => owner.exited)), {
+					deadlineAt,
+					signal: options.signal,
+				});
+			} catch {
+				throw new DbReadError(
+					"DB_READ_READER_EXIT_UNCONFIRMED",
+					"database reader exit was not confirmed within the readiness deadline",
+				);
+			}
 		}
-		retireWorker(pooled, "pool shutdown");
+		throw error;
 	}
-	s.workers = [];
-	s.inFlight.clear();
-	for (const pending of s.pending.values()) {
-		clearTimeout(pending.timer);
-		pending.reject(new Error("database worker pool shut down"));
-	}
-	s.pending.clear();
 }
-
-/** Test/diagnostic hook: re-enable workers after a simulated failure. */
-export function resetDbWorkerPoolForTest(): void {
+export async function resetDbWorkerPoolForTest(): Promise<void> {
 	const s = state();
-	shutdownDbWorkerPool();
+	await shutdownDbWorkerPool();
 	s.spawnFailures = 0;
-	s.disabledReason = null;
-	s.pendingSpawns = 0;
-	s.resolvedWorkerSpecifier = null;
+	s.failureReason = null;
 	s.testSpecifiers = null;
+	s.paused = false;
+	s.permanent = false;
 }
-
-/**
- * TEST ONLY: force the worker entry specifiers the pool will try.
- *
- * Exists so a test can make spawning fail the way production does — a real `new Worker` against an
- * unresolvable path — instead of stubbing internals and proving nothing about the real code path.
- * Pass `null` to restore normal resolution.
- */
 export function setDbWorkerSpecifiersForTest(specifiers: string[] | null): void {
 	state().testSpecifiers = specifiers;
 }
-
-/**
- * Whether the pool can currently take work, and why not when it cannot.
- *
- * Exists so a caller can report its own capabilities honestly WITHOUT reading pool internals or
- * having to attempt a task first. `getDbWorkerPoolStats` already exposes `disabledReason`, but it
- * also exposes worker counts and queue depth — diagnostics that a capability check has no business
- * depending on, and which would make every such caller re-derive the same `reason === null` rule.
- *
- * Deliberately does NOT spawn anything: a capability query that started a thread would make merely
- * rendering the storage page pay for a worker.
- */
-export function getDbWorkerAvailability(): { available: boolean; reason: string | null } {
-	const reason = workersDisabled();
+export function getDbWorkerAvailability(profileOrPath?: "pool" | "shortReads" | string): {
+	available: boolean;
+	reason: string | null;
+} {
+	const isProfile = profileOrPath === "pool" || profileOrPath === "shortReads";
+	const profile = isProfile ? (profileOrPath ?? "pool") : "pool";
+	const dbPath = isProfile ? undefined : profileOrPath;
+	let reason = workersDisabled(profile);
+	if (!reason && dbPath !== undefined) {
+		const identity = peekReadDatabaseIdentity(dbPath);
+		if (!identity) reason = "database_unregistered";
+		else if (!identity.open) reason = "database_closing";
+		else if (!identity.ready) reason = "database_not_ready";
+	}
 	return { available: reason === null, reason };
 }
-
-export function getDbWorkerPoolStats(): {
-	workers: number;
-	busy: number;
+/** Read-only scheduling pressure; never constructs a pool, worker or database connection. */
+export function getDbReadSchedulingPressure(): {
+	available: boolean;
+	reason: string | null;
+	shouldYield: boolean;
 	queued: number;
-	inFlight: number;
-	disabledReason: string | null;
-	concurrency: number;
-	starting: number;
-	claimed: number;
-	spawnFailures: number;
+	normalHeld: number;
+	normalCapacity: number;
 } {
 	const s = state();
+	const reason = workersDisabled();
+	const stats = s.pool?.stats;
+	const shared = stats?.reservation?.shared;
+	const queued = stats?.queued ?? 0;
+	const normalHeld = shared?.claimed ?? 0;
+	let normalCapacity = s.config?.normalCapacity ?? 0;
+	if (!reason && !s.config)
+		normalCapacity = readSchedulingConfig(getConfiguredConcurrency()).normalCapacity;
 	return {
-		workers: s.workers.length,
-		busy: s.workers.filter((pooled) => pooled.busyWith).length,
-		queued: s.queue.length,
+		available: reason === null,
+		reason,
+		queued,
+		normalHeld,
+		normalCapacity,
+		shouldYield:
+			reason === null &&
+			Boolean(
+				queued > 0 ||
+					(shared &&
+						(normalHeld >= normalCapacity || shared.retiring > 0 || shared.quarantined > 0)),
+			),
+	};
+}
+export function getDbWorkerPoolStats() {
+	const s = state();
+	const stats = s.pool?.stats;
+	const ephemeral = s.ephemeral?.stats;
+	const active = (stats?.active ?? 0) + (ephemeral?.active ?? 0);
+	const starting = (stats?.starting ?? 0) + (ephemeral?.starting ?? 0);
+	return {
+		workers: (stats?.workers ?? 0) + (ephemeral?.workers ?? 0),
+		busy: [...s.requests.values()].filter(
+			({ request }) =>
+				request.profile !== "shortReads" &&
+				(request.phase.phase === "running" || request.phase.phase === "dispatching"),
+		).length,
+		queued: (stats?.queued ?? 0) + (ephemeral?.queued ?? 0),
+		queuedBytes: (stats?.queuedBytes ?? 0) + (ephemeral?.queuedBytes ?? 0),
+		retiring: [...s.owners].filter((owner) => owner.closed).length,
+		tracked: s.owners.size,
 		inFlight: s.inFlight.size,
 		disabledReason: workersDisabled(),
-		concurrency: getConfiguredConcurrency(),
-		starting: s.pendingSpawns,
-		claimed: s.workers.filter((pooled) => pooled.claimed).length,
+		concurrency: s.config?.concurrency ?? getConfiguredConcurrency(),
+		configuration: s.config ?? null,
+		main: stats ?? null,
+		ephemeral: ephemeral ?? null,
+		shortReads: s.shortReads?.stats ?? null,
+		activeByClass: stats?.activeByClass ?? { normal: 0, short: 0 },
+		queuedByClass: stats?.queuedByClass ?? { normal: 0, short: 0 },
+		queuedBytesByClass: stats?.queuedBytesByClass ?? { normal: 0, short: 0 },
+		reservation: stats?.reservation ?? null,
+		starting,
+		claimed: active - starting,
 		spawnFailures: s.spawnFailures,
 	};
 }
-
-// Terminate workers on process exit so they never outlive the server.
 if (hotOnce("narrafork.dbWorkerPool.exitHandler")) {
 	process.on("exit", () => {
-		try {
-			shutdownDbWorkerPool();
-		} catch {
-			// best effort at exit
-		}
+		void shutdownDbWorkerPool({ permanent: true }).catch(() => {});
 	});
 }

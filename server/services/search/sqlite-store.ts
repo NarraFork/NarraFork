@@ -35,6 +35,12 @@
  */
 
 import { isEnvelopeIndexRetired } from "../../db/fts";
+import {
+	guardRecallEffectiveRefsQuery,
+	type RecallEffectiveRefs,
+	recallEffectiveRefsQueries,
+	unwrapRecallEffectiveRefsRows,
+} from "../../lib/db-worker/recall-effective-refs";
 import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
@@ -414,78 +420,112 @@ export function createSqliteSearchStore(
 	// Recall search
 	// ─────────────────────────────────────────────────────────────────────────────
 
-	function recallTimeSuffix(query: RecallSearchQuery): string {
-		if (query.createdFrom && query.createdTo) return " AND m.created_at >= ? AND m.created_at <= ?";
-		if (query.createdFrom) return " AND m.created_at >= ?";
-		if (query.createdTo) return " AND m.created_at <= ?";
-		return "";
+	/** Only placeholder shape enters the template cache; all filter values stay bound. */
+	function recallFilters(query: RecallSearchQuery): Bound {
+		let sql = "";
+		const values: string[] = [];
+		if (query.createdFrom) {
+			sql += " AND m.created_at >= ?";
+			values.push(query.createdFrom);
+		}
+		if (query.createdTo) {
+			sql += " AND m.created_at <= ?";
+			values.push(query.createdTo);
+		}
+		if (query.roles) {
+			const roles = [...new Set(query.roles)];
+			sql += roles.length ? ` AND m.role IN (${roles.map(() => "?").join(",")})` : " AND 0";
+			values.push(...roles);
+		}
+		if (query.origins) {
+			const known = [...new Set(query.origins.filter((origin) => origin !== "unknown"))];
+			const alternatives: string[] = [];
+			if (known.length) alternatives.push(`m.origin IN (${known.map(() => "?").join(",")})`);
+			if (query.origins.includes("unknown")) alternatives.push("m.origin IS NULL");
+			sql += alternatives.length ? ` AND (${alternatives.join(" OR ")})` : " AND 0";
+			values.push(...known);
+		}
+		return { sql, values };
 	}
 
-	function recallTimeKey(query: RecallSearchQuery): string {
-		if (query.createdFrom && query.createdTo) return "range";
-		if (query.createdFrom) return "from";
-		if (query.createdTo) return "to";
-		return "none";
-	}
-
-	function recallTimeParams(query: RecallSearchQuery): string[] {
-		if (query.createdFrom && query.createdTo) return [query.createdFrom, query.createdTo];
-		if (query.createdFrom) return [query.createdFrom];
-		if (query.createdTo) return [query.createdTo];
-		return [];
+	function recallOrder(query: RecallSearchQuery, rank?: string): string {
+		if (query.sort === "oldest") return "m.created_at ASC, m.id ASC";
+		if (query.sort === "newest" || !rank) return "m.created_at DESC, m.id ASC";
+		return `${rank} IS NULL, ${rank} ASC, m.created_at DESC, m.id ASC`;
 	}
 
 	/** How Recall reaches a message's narrator; see {@link recallStmt}. */
 	function recallSource(global: boolean) {
 		return {
 			source: global
-				? `JOIN narrators n ON n.id = m.narrator_id ${narratorScopeSql()}`
-				: `JOIN narrator_message_refs r ON r.message_id = m.id
-		 JOIN narrators n ON n.id = r.narrator_id ${narratorScopeSql()}`,
-			narratorIdColumn: global ? "n.id AS narrator_id" : "r.narrator_id",
-			scopeFilter: global ? "" : " AND r.narrator_id = ?",
+				? `JOIN narrators n ON n.id = COALESCE(
+					(SELECT hr.narrator_id FROM narrator_message_refs hr
+					 WHERE hr.message_id = m.id AND hr.narrator_id = m.narrator_id),
+					(SELECT MIN(n.id) FROM narrator_message_refs hr
+					 JOIN narrators n ON n.id = hr.narrator_id ${narratorScopeSql()}
+					 WHERE hr.message_id = m.id)
+				) ${narratorScopeSql()}
+				AND EXISTS (SELECT 1 FROM narrators n
+				 WHERE n.id = m.narrator_id ${narratorScopeSql()})`
+				: `JOIN effective_recall_refs r ON r.message_id = m.id
+		 JOIN narrators n ON n.id = (SELECT narrator_id FROM recall_ref_sources WHERE depth = 0) ${narratorScopeSql()}`,
+			narratorIdColumn: "n.id AS narrator_id",
+			scopeFilter: "",
 		};
 	}
 
 	/**
 	 * Recall's statement.
 	 *
-	 * Scoped mode joins `narrator_message_refs` and filters by the current narrator, so
-	 * fork-shared messages stay visible to the narrator that inherited them. Global mode joins
-	 * on the message's owning narrator, which deduplicates a fork-shared message to its origin.
+	 * Scoped mode joins the shared effective refs CTE, including lazy inherited history, and
+	 * reports the current target narrator. Global mode selects
+	 * one readable history: prefer the owner's ref, then the smallest searchable ref narrator id.
+	 * The owner remains separately reported and gated, even if rollback removed its own ref.
 	 * Terms match on their own as in global search: `likes` short-term filters follow the
 	 * MATCH, or make up the whole match on the substring path.
 	 */
 	function recallStmt(
 		strategy: "index" | "substring",
 		global: boolean,
-		timeKey: string,
-		timeSuffix: string,
+		filters: Bound,
+		order: string,
 		likes: number,
+		refs: RecallEffectiveRefs | null,
+		outerOrder: string,
 	): QueryTemplate {
-		const key = `recall:${strategy}:${global ? "global" : "scoped"}:${timeKey}:${likes}`;
-		return cached(key, () => {
+		const key = `recall:${strategy}:global:${filters.sql}:${order}:${likes}`;
+		const build = () => {
 			const { source, narratorIdColumn, scopeFilter } = recallSource(global);
 			if (strategy === "index") {
-				return `SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
-		        n.title AS narrator_title,
+				return `SELECT m.id, ${narratorIdColumn}, m.narrator_id AS owner_narrator_id, m.role, m.origin, m.created_at,
+		        n.title AS narrator_title, narrator_messages_fts.rank AS recall_rank,
 		        ${snippetCall("narrator_messages_fts", 0, RECALL_SNIPPET)} AS snippet
 		 FROM narrator_messages_fts
 		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 		 ${source}
-		 WHERE narrator_messages_fts MATCH ? ${likeSql("m.content_text", likes)}${scopeFilter}${timeSuffix}
-		 ORDER BY rank
+		 WHERE narrator_messages_fts MATCH ? ${likeSql("m.content_text", likes)}${scopeFilter}${filters.sql}
+		 ORDER BY ${order}
 		 LIMIT ?`;
 			}
-			return `SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
+			return `SELECT m.id, ${narratorIdColumn}, m.narrator_id AS owner_narrator_id, m.role, m.origin, m.created_at,
 		        n.title AS narrator_title,
 		        substr(m.content_text, 1, ?) AS snippet
 		 FROM narrator_messages m
 		 ${source}
-		 WHERE 1 = 1 ${likeSql("m.content_text", likes)}${scopeFilter}${timeSuffix}
-		 ORDER BY m.created_at DESC
+		 WHERE 1 = 1 ${likeSql("m.content_text", likes)}${scopeFilter}${filters.sql}
+		 ORDER BY ${order}
 		 LIMIT ?`;
-		});
+		};
+		// Ancestry-dependent templates bypass the fixed-shape cache.
+		if (global) return cached(key, build);
+		if (!refs) throw new Error("Scoped Recall requires effective refs");
+		const guarded = guardRecallEffectiveRefsQuery(refs, build(), [], outerOrder);
+		return {
+			all: async (options, ...params) =>
+				unwrapRecallEffectiveRefsRows(
+					await execute(guarded.sql, [...guarded.params, ...params], options),
+				),
+		};
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────
@@ -1112,28 +1152,41 @@ export function createSqliteSearchStore(
 			const global = query.narratorId === null;
 			const options = { signal: query.signal, operation: "searchRecallMessages" };
 			const { match, likes } = globalNeedles(query);
+			const filters = recallFilters(query);
+			let refs: RecallEffectiveRefs | null = null;
+			if (query.narratorId !== null) {
+				const plan = recallEffectiveRefsQueries(query.narratorId);
+				const first = plan.next();
+				if (first.done) throw new Error("Recall lineage query was not yielded");
+				const lineage = await execute(first.value.sql, first.value.params, options);
+				const effective = plan.next(lineage);
+				if (!effective.done) throw new Error("Unexpected additional Recall lineage query");
+				refs = effective.value;
+			}
 			const stmt = recallStmt(
 				match === null ? "substring" : "index",
 				global,
-				recallTimeKey(query),
-				recallTimeSuffix(query),
+				filters,
+				recallOrder(query, match === null ? undefined : "rank"),
 				likes.length,
+				refs,
+				recallOrder(query, match === null ? undefined : "recall_rank").replaceAll("m.", ""),
 			);
-			const timeParams = recallTimeParams(query);
-			const scope = global ? [] : [query.narratorId as string];
 			const toRow = (row: RawRow): RecallMessageRow => ({
 				messageId: row.id,
 				narratorId: row.narrator_id,
 				narratorTitle: row.narrator_title ?? null,
+				ownerNarratorId: row.owner_narrator_id,
 				role: row.role,
+				origin: row.origin ?? null,
 				createdAt: row.created_at,
 				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
 			});
 			if (match !== null && mode.blockOnly()) {
 				const { source, narratorIdColumn, scopeFilter } = recallSource(global);
 				const where: Bound = {
-					sql: `${scopeFilter}${recallTimeSuffix(query)}`,
-					values: [...scope, ...timeParams],
+					sql: `${scopeFilter}${filters.sql}`,
+					values: [...filters.values],
 				};
 				const hits = blockOnlyHits(query, {
 					join: { sql: source, values: [] },
@@ -1142,32 +1195,37 @@ export function createSqliteSearchStore(
 				});
 				const window = textWindowSql(query, query.previewChars, RECALL_SNIPPET);
 				const excerpt = blockExcerptSql(query);
-				const rows: RawRow[] = await execute(
-					`WITH hits AS (${hits.sql})
-					SELECT m.id, ${narratorIdColumn}, m.role, m.created_at, n.title AS narrator_title,
+				const sql = `WITH hits AS (${hits.sql})
+					SELECT m.id, ${narratorIdColumn}, m.narrator_id AS owner_narrator_id, m.role, m.origin, m.created_at, n.title AS narrator_title, hits.r AS recall_rank,
 					  ${window.sql} AS snippet, ${excerpt.sql} AS block_snippet
 					 FROM hits
 					 JOIN narrator_messages m ON m.id = hits.id
 					 ${source}
 					 LEFT JOIN narrator_blocks bb ON bb.id = hits.block_id
-					 WHERE 1 = 1 ${scopeFilter}
-					 ORDER BY hits.r IS NULL, hits.r ASC, m.created_at DESC LIMIT ?`,
-					[...hits.values, ...window.values, ...excerpt.values, ...scope, query.limit],
-					options,
-				);
-				return rows.map(toRow);
+					 WHERE 1 = 1 ${where.sql}
+					 ORDER BY ${recallOrder(query, "hits.r")} LIMIT ?`;
+				const params = [
+					...hits.values,
+					...window.values,
+					...excerpt.values,
+					...where.values,
+					query.limit,
+				];
+				const guarded = refs
+					? guardRecallEffectiveRefsQuery(
+							refs,
+							sql,
+							params,
+							recallOrder(query, "recall_rank").replaceAll("m.", ""),
+						)
+					: { sql, params };
+				const rows = await execute(guarded.sql, guarded.params, options);
+				return (refs ? unwrapRecallEffectiveRefsRows(rows) : rows).map(toRow);
 			}
 			const rows: RawRow[] =
 				match === null
-					? await stmt.all(
-							options,
-							query.previewChars,
-							...likes,
-							...scope,
-							...timeParams,
-							query.limit,
-						)
-					: await stmt.all(options, match, ...likes, ...scope, ...timeParams, query.limit);
+					? await stmt.all(options, query.previewChars, ...likes, ...filters.values, query.limit)
+					: await stmt.all(options, match, ...likes, ...filters.values, query.limit);
 			return rows.map(toRow);
 		},
 

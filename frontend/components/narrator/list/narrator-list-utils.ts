@@ -28,6 +28,8 @@ interface NarratorListSearchable {
 	cwd?: unknown;
 	model?: unknown;
 	status?: unknown;
+	/** 顺便提问子会话：它们命中时父项也要留下，否则搜出来的会话在列表里看不见。 */
+	askInPassingSessions?: unknown;
 }
 
 export const parseBool = (v: unknown) => v === true || v === "true";
@@ -76,6 +78,7 @@ export function normalizeNarratorListSearchPatch<T extends NarratorListSearchPar
 export function buildNarratorListQueryOptions(state: NarratorListState, status?: string) {
 	return {
 		...(status ? { status } : {}),
+		groupAskInPassing: true,
 		sortBy: state.sortBy,
 		sortOrder: state.sortOrder,
 		hasTerminals: state.hasTerminals || undefined,
@@ -85,17 +88,28 @@ export function buildNarratorListQueryOptions(state: NarratorListState, status?:
 	};
 }
 
+/** 没有搜索词时共用的空集合，省得每次渲染都新建一个 Set。 */
+export const NO_EXPANDED_IDS: ReadonlySet<string> = new Set();
+
 export function filterNarratorsByLocalQuery<T extends NarratorListSearchable>(
 	narrators: T[],
 	localQuery: string,
 ): T[] {
-	const normalizedQuery = normalizeSearchText(localQuery);
-	if (!normalizedQuery) return narrators;
-	return narrators.filter((narrator) =>
-		[narrator.title, narrator.id, narrator.cwd, narrator.model, narrator.status]
-			.filter(Boolean)
-			.some((value) => includesSearch(value, localQuery)),
-	);
+	if (!normalizeSearchText(localQuery)) return narrators;
+	return narrators.filter((narrator) => {
+		if (matchesNarratorSearch(narrator, localQuery)) return true;
+		const children = narrator.askInPassingSessions;
+		return (
+			Array.isArray(children) &&
+			children.some((child) => matchesNarratorSearch(child as NarratorListSearchable, localQuery))
+		);
+	});
+}
+
+export function matchesNarratorSearch(narrator: NarratorListSearchable, localQuery: string) {
+	return [narrator.title, narrator.id, narrator.cwd, narrator.model, narrator.status]
+		.filter(Boolean)
+		.some((value) => includesSearch(value as string, localQuery));
 }
 
 /** A shared mutation observer may be pending, but only for the row that started it. */
@@ -189,37 +203,71 @@ export function applyNarratorListEvent(
 	if (!old?.pages) return old;
 
 	if (event.status === "archived") {
-		let removed = false;
+		let changed = false;
 		const pages = old.pages.map((page) => {
-			const items = page.items.filter((item) => {
+			let pageChanged = false;
+			const items: NarratorListItem[] = [];
+			for (const item of page.items) {
 				if (item.id === narratorId) {
-					removed = true;
-					return false;
+					pageChanged = true;
+					continue;
 				}
-				return true;
-			});
-			return items.length === page.items.length ? page : { ...page, items };
+				// 顺便提问子会话归档只摘掉那一行，父项和它的其它子会话留在原地。
+				const children = item.askInPassingSessions;
+				if (children?.some((child) => child.id === narratorId)) {
+					pageChanged = true;
+					items.push({
+						...item,
+						askInPassingSessions: children.filter((child) => child.id !== narratorId),
+					});
+					continue;
+				}
+				items.push(item);
+			}
+			if (!pageChanged) return page;
+			changed = true;
+			return { ...page, items };
 		});
-		return removed ? { ...old, pages } : old;
+		return changed ? { ...old, pages } : old;
 	}
 
 	let changed = false;
-	const pages = old.pages.map((page) => ({
-		...page,
-		items: page.items.map((item) => {
-			if (item.id !== narratorId) return item;
-			changed = true;
-			const row = item as MutableRow;
-			return {
-				...row,
-				...(event.status !== undefined ? { status: event.status } : {}),
-				...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
-				...(event.title !== undefined ? { title: event.title } : {}),
-				...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
-				...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
-				updatedAt: new Date().toISOString(),
-			};
-		}),
-	}));
+	const pages = old.pages.map((page) => {
+		let pageChanged = false;
+		const items = page.items.map((item) => {
+			if (item.id === narratorId) {
+				pageChanged = true;
+				return patchNarratorRow(item, event);
+			}
+			const children = item.askInPassingSessions;
+			if (children?.some((child) => child.id === narratorId)) {
+				pageChanged = true;
+				return {
+					...item,
+					askInPassingSessions: children.map((child) =>
+						child.id === narratorId ? patchNarratorRow(child, event) : child,
+					),
+				};
+			}
+			return item;
+		});
+		if (!pageChanged) return page;
+		changed = true;
+		return { ...page, items };
+	});
 	return changed ? { ...old, pages } : old;
+}
+
+/** Write one list WS event onto a row; `updatedAt` keeps the sort order honest locally. */
+function patchNarratorRow(row: NarratorListItem, event: NarratorListUpdateEvent): NarratorListItem {
+	const patched: MutableRow = {
+		...row,
+		...(event.status !== undefined ? { status: event.status } : {}),
+		...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
+		...(event.title !== undefined ? { title: event.title } : {}),
+		...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
+		...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
+		updatedAt: new Date().toISOString(),
+	};
+	return patched;
 }

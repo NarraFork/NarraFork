@@ -56,11 +56,11 @@ function xmlClient(xml: string, status = 207) {
 const href = `/private/${day}/`;
 
 describe("configured streamed object budgets", () => {
-	test("rejects unbounded budgets and retains a validated 60-minute ceiling", () => {
+	test("validates the 100-minute ceiling and rejects larger budgets", () => {
 		expect(
-			validateWebDavConfig({ ...config, transferTimeoutMs: 60 * 60_000 }).transferTimeoutMs,
-		).toBe(60 * 60_000);
-		for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 60 * 60_000 + 1])
+			validateWebDavConfig({ ...config, transferTimeoutMs: 100 * 60_000 }).transferTimeoutMs,
+		).toBe(100 * 60_000);
+		for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 100 * 60_000 + 1])
 			expect(() => validateWebDavConfig({ ...config, transferTimeoutMs: value })).toThrow();
 	});
 	for (const method of ["GET", "PUT"] as const)

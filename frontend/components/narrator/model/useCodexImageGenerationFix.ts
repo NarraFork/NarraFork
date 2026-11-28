@@ -25,7 +25,8 @@ import { isCodexImageGenerationDisabledError } from "@shared/codex-image-generat
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
-import { useAllModels } from "../../../hooks/useModels";
+import { useRuntimeModel } from "../../../hooks/useModelCatalog";
+import { useModelRuntimeSettings } from "../../../hooks/useModels";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { resolveModelTestTarget } from "../../../lib/model-network-error";
 
@@ -48,11 +49,20 @@ export interface CodexImageGenerationFix {
  * selection, then the global default — the same precedence the model-test action
  * uses, because "which provider served this turn" has one answer.
  */
-export function useCodexImageGenerationFix(narratorId: string): CodexImageGenerationFix {
+export function useCodexImageGenerationFix(
+	narratorId: string,
+	enabled = true,
+): CodexImageGenerationFix {
 	const { t } = useTranslation("narrator");
 	const { data: currentUser } = useCurrentUser();
-	const { data: narrator } = useNarrator(narratorId);
-	const { defaultModelValue } = useAllModels();
+	const { data: narrator } = useNarrator(enabled ? narratorId : "");
+	const { defaultModelValue } = useModelRuntimeSettings(enabled);
+	const { data: summary } = useRuntimeModel({
+		model: typeof narrator?.model === "string" ? narrator.model : undefined,
+		narratorId,
+		summary: narrator?.modelSummary,
+		enabled: enabled && !!narrator,
+	});
 	const [busy, setBusy] = useState(false);
 	// The re-entrancy guard is a ref, not the state value: the vlist shell shares ONE
 	// hook across every visible error row, so keeping `busy` out of `run`'s deps stops
@@ -60,13 +70,13 @@ export function useCodexImageGenerationFix(narratorId: string): CodexImageGenera
 	const busyRef = useRef(false);
 
 	const narratorModel = typeof narrator?.model === "string" ? narrator.model.trim() : "";
-	const modelValue = resolveModelTestTarget(
-		narratorModel || defaultModelValue,
-		narrator?.runtimeModel,
-	);
+	const modelValue = summary
+		? (summary.concreteValue ?? "")
+		: resolveModelTestTarget(narratorModel || defaultModelValue || "", narrator?.runtimeModel);
 	// A prefix is required: without one the server cannot tell which of the
 	// possible flags to write, and guessing would hit the wrong provider.
-	const addressable = currentUser?.role === "admin" && modelValue.includes(":");
+	const addressable =
+		enabled && !!narrator && currentUser?.role === "admin" && modelValue.includes(":");
 
 	const canFix = useMemo(
 		() => (errorText: string) => addressable && isCodexImageGenerationDisabledError(errorText),

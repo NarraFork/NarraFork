@@ -1,11 +1,9 @@
 import type { MenuProps } from "@mantine/core";
 import {
-	AGG_MODEL_PREFIX,
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
 	FOLLOW_PARENT_MODEL,
 	FOLLOW_SUMMARY_MODEL,
-	isAutoModelOptionValue,
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
@@ -15,23 +13,10 @@ import {
  * Provider prefix of a concrete `provider:model` value, for the small secondary
  * line under the Default/Summary rows. Those rows sit under a role header
  * ("Default" / "Summary") rather than a provider group, so the model name alone
- * does not say who serves it.
- *
- * Returns null for empty values and meta sentinels (aggregations, follow-*),
- * which have no single provider.
+ * does not say who serves it. Lives with the shared model search rules, which
+ * match those rows by the same prefix.
  */
-export function modelProviderPrefix(value: string | null | undefined): string | null {
-	if (!value || value.startsWith(AGG_MODEL_PREFIX) || isAutoModelOptionValue(value)) return null;
-	if (
-		value === FOLLOW_DEFAULT_MODEL ||
-		value === FOLLOW_SUMMARY_MODEL ||
-		value === FOLLOW_PARENT_MODEL
-	) {
-		return null;
-	}
-	const idx = value.indexOf(":");
-	return idx > 0 ? value.slice(0, idx) : null;
-}
+export { modelProviderPrefix } from "../../../lib/model-search";
 
 /**
  * Whether a model-menu entry may be written into the instance-wide default or
