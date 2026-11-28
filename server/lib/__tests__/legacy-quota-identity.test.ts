@@ -168,6 +168,7 @@ for (const source of ["opencode", "deepseek"] as const) {
 				if (change.compatible) expect(legacy.restore(id, legacyIdentity)).toEqual(value);
 				archive.directory.sync();
 				const connection = required(archive.directory.getKey(key.id));
+				const cacheId = required(connection.cacheId);
 				const currentSource = required(
 					archive.platform.quotaRegistry
 						.listSources()
@@ -207,12 +208,10 @@ for (const source of ["opencode", "deepseek"] as const) {
 					]);
 				}
 				const persistence = createProviderQuotaPersistence();
-				const loaded = await persistence.load(connection.cacheId, connection.identity, context);
+				const loaded = await persistence.load(cacheId, connection.identity, context);
 				await persistence.flush();
 				const coldPersistence = createProviderQuotaPersistence();
-				expect(
-					await coldPersistence.load(connection.cacheId, connection.identity, context),
-				).toEqual(loaded);
+				expect(await coldPersistence.load(cacheId, connection.identity, context)).toEqual(loaded);
 				await coldPersistence.flush();
 				const service = new ProviderQuotaService({
 					directory: archive.directory,
@@ -302,27 +301,17 @@ for (const source of ["opencode", "deepseek"] as const) {
 						{ ...context, isCurrent: undefined },
 					])
 						expect(
-							await readLegacyQuotaCache(
-								connection.cacheId,
-								connection.identity,
-								undefined,
-								denied,
-							),
+							await readLegacyQuotaCache(cacheId, connection.identity, undefined, denied),
 						).toBeFalsy();
 					await expect(
-						readLegacyQuotaCache(
-							connection.cacheId,
-							connection.identity,
-							AbortSignal.abort(),
-							context,
-						),
+						readLegacyQuotaCache(cacheId, connection.identity, AbortSignal.abort(), context),
 					).rejects.toThrow();
 					const worker = spyOn(WorkerHandle, "thread").mockImplementation(() => {
 						throw new Error("worker unavailable");
 					});
 					try {
 						await expect(
-							readLegacyQuotaCache(connection.cacheId, connection.identity, undefined, context),
+							readLegacyQuotaCache(cacheId, connection.identity, undefined, context),
 						).rejects.toThrow("worker unavailable");
 					} finally {
 						worker.mockRestore();
@@ -331,12 +320,7 @@ for (const source of ["opencode", "deepseek"] as const) {
 						for (const bad of ["{broken", " ".repeat(1024 * 1024 + 1)]) {
 							await writeFile(path, bad);
 							expect(
-								await readLegacyQuotaCache(
-									connection.cacheId,
-									connection.identity,
-									undefined,
-									context,
-								),
+								await readLegacyQuotaCache(cacheId, connection.identity, undefined, context),
 							).toBeNull();
 							expect(await readFile(path, "utf8")).toBe(bad);
 						}
@@ -344,12 +328,7 @@ for (const source of ["opencode", "deepseek"] as const) {
 						oversized.entries[id].value.extra = "x".repeat(16 * 1024);
 						await writeFile(path, JSON.stringify(oversized));
 						expect(
-							await readLegacyQuotaCache(
-								connection.cacheId,
-								connection.identity,
-								undefined,
-								context,
-							),
+							await readLegacyQuotaCache(cacheId, connection.identity, undefined, context),
 						).toBeNull();
 					} finally {
 						await writeFile(path, bytes);
