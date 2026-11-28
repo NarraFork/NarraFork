@@ -215,7 +215,7 @@ describe("fetchAnthropicModels error aggregation", () => {
 });
 
 describe("model catalog identity reaches a real HTTP endpoint", () => {
-	for (const protocol of ["anthropic", "responses", "completions"] as const) {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
 		test(`${protocol} applies UA selection and case-insensitive explicit overrides`, async () => {
 			globalThis.fetch = originalFetch;
 			const captured: Headers[] = [];
@@ -235,7 +235,7 @@ describe("model catalog identity reaches a real HTTP endpoint", () => {
 					baseUrl: `${server.url.origin}/v1`,
 					userAgentMode: "custom" as const,
 					customUserAgent: "selected/1",
-					apiMode: protocol === "responses" ? "codex" : "completions",
+					apiMode: protocol === "anthropic" ? "completions" : protocol,
 					officialApi: true,
 				};
 				const fetchModels = protocol === "anthropic" ? fetchAnthropicModels : fetchOpenaiModels;

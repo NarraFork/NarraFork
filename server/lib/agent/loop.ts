@@ -5458,14 +5458,11 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						consumeSearchExecutionTurn();
 					}
-					let turnContext = config.turnContext;
-					if (!turnContext) {
-						fallbackTurnContext ??= createProviderTurnContext();
-						turnContext = fallbackTurnContext;
-					}
+					const turnContext = config.turnContext;
+					if (!turnContext) fallbackTurnContext ??= createProviderTurnContext();
 					const requestParams: import("./provider").ChatParams = {
 						conversationId: config.conversationId,
-						turnContext,
+						turnContext: turnContext ?? fallbackTurnContext,
 						content: requestContent,
 						model: effectiveModel,
 						cwd: config.cwd,

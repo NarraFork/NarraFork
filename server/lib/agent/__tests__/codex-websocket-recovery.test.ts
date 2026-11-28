@@ -165,11 +165,11 @@ async function runStream(
 	for await (const event of streamCodexResponsesWebSocket({
 		baseUrl: server.baseUrl,
 		apiKey: "sk-test",
-		sessionKey: overrides.sessionKey ?? "narrator-1",
+		sessionKey: "narrator-1",
 		conversationId: "conv-1",
 		credentialId: "cred-1",
 		model: "gpt-5.3-codex",
-		request: overrides.request ?? {
+		request: {
 			model: "gpt-5.3-codex",
 			input: (input ?? ["hello"]).map(userMessage) as never,
 			stream: true,

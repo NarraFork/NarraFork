@@ -45,7 +45,6 @@ class SseFrameDecoder {
 	private eventAtData = "";
 	private eventAfterData: string | undefined;
 	private bytesAfterData = 0;
-	private lastLineWasData = false;
 
 	private canSplit(): boolean {
 		if (this.data.length !== 1) return false;
@@ -82,7 +81,6 @@ class SseFrameDecoder {
 			this.firstLine = false;
 			if (line.startsWith("\uFEFF")) line = line.slice(1);
 		}
-		this.lastLineWasData = false;
 		if (!line) return this.flush();
 
 		const colon = line.indexOf(":");
@@ -102,7 +100,6 @@ class SseFrameDecoder {
 			this.eventAtData = this.event;
 			this.eventAfterData = undefined;
 			this.bytesAfterData = 0;
-			this.lastLineWasData = true;
 		} else {
 			if (field === "event") {
 				this.event = value;
@@ -120,7 +117,7 @@ class SseFrameDecoder {
 		// to the next event, but do count CRLF inside a still-open event.
 		if (this.eventBytes) {
 			checkSize(++this.eventBytes);
-			if (!this.lastLineWasData && this.data.length) this.bytesAfterData++;
+			if (this.bytesAfterData) this.bytesAfterData++;
 		}
 	}
 
@@ -193,10 +190,9 @@ export async function* readSseFrames(body: ReadableStream<Uint8Array>): AsyncGen
 		const finalFrame = decoder.flush();
 		if (finalFrame) yield finalFrame;
 	} finally {
-		try {
-			if (!eof) await reader.cancel().catch(() => {});
-		} finally {
-			reader.releaseLock();
-		}
+		// A source's cancellation hook may never settle; it must not block cleanup
+		// or replace a consumer error. cancel() closes the reader immediately.
+		if (!eof) void reader.cancel().catch(() => {});
+		reader.releaseLock();
 	}
 }

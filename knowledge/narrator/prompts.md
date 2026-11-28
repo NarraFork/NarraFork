@@ -47,7 +47,7 @@ keywords:
   - side-car
   - InjectionCadence
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ---
 # 提示词与注入
 
@@ -69,7 +69,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
   - `interject`：写行并请求运行中循环在下一个工具边界停下来；
   - `wakeIfIdle`：写行，叙述者空闲则起一轮，忙则退化为 `none`。`wakeIfIdle` 经 `narrator-injection.ts:resolveScheduler` 调 `narrator-session.ts:startInjectionContinuationIfPossible`，后者对空闲叙述者 `runAgentLoop(active, "")`；该函数体内未见子代理分支，源码注释所说“子代理改走 `resumeSubagent`”未核实。
 - 子代理收件人通过 `subagent` 参数指定放置位置，否则按主叙述者的顶层行写并单次广播。
-- 工具边界取出的注入批次只在成功采纳后结算一次：`orchestrator.ts:getAfterToolsInjections` 用 `consumed` 保护 `onConsumed`，重复回调不再重复消费或更新邮箱来源标记。它保留当前提供商逻辑轮次；只有采纳新用户输入的分支替换 `turnContext`。
 
 - 项目指令文件名优先级：`AGENTS.override.md`、`AGENTS.md`、`AGENT.md`、`CLAUDE.md`（`lib/global-prompt-paths.ts:PROJECT_PROMPT_FILENAMES`）；读取走带签名（dev/ino/size/mtime/ctime）的进程内缓存，只缓存指令文件字节，不缓存拼好的提示词（`lib/instruction-file-cache.ts`）。
 - 语言段：`replyInUserLanguage` 为真或 locale 不是 `en` 时才追加 `language` 段（`narrator-prompt.ts`）。这两个值来自叙述者持久化的 `narrators.reply_context`（`{ locale, replyInUserLanguage }`）：缺失时由 `ensureReplyContext` 用所有者的 `user_preferences` 补一次（CAS 写入，已有值不被覆盖；没有偏好行时：有所有者则 `replyInUserLanguage: true`，无所有者为 false），只有可信的人类入队才会 `adoptHumanReplyContext` 改写，发送者身份不算证据（`narrator-reply-context.ts`、`shared/reply-context.ts`）。HTTP 发消息时的语言偏好经 `lib/message-language-read.ts` 读，并发 1、排队 4、超时 5 秒，满则 `DbReadTaskOverloadedError`。

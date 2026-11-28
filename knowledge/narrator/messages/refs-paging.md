@@ -48,7 +48,7 @@ keywords:
   - partitionTimeline
   - resolveLazyLineage
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 消息与引用
 
@@ -63,7 +63,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 - 变更类方法（删除消息/块、更新压缩摘要、dismiss 各类提示）在 `narratorMessageQueries` 中统一包了 `admittedMutation`（`narrator-messages.ts` 末尾）。
 - 引用存储有 SQLite 与 PostgreSQL 两种实现：`narrator-refs/store.ts:getNarratorMessageRefsPort` 在绑定了 PG 端口时返回它，否则为 `undefined` 走 SQLite 路径（`assertSqliteNarratorOperation` 在 PG 下拒绝仅 SQLite 的操作）。
 - 写入层：生产者经 `narrator-store.ts:narratorStore`（`appendInput`、`appendNotice`、`openStep`、`writeStepItem`、`appendStep`、`settleTool`、`patchState` 等）写模型可见的历史，每个操作一个事务；它转调 `narrator-persistence.ts:narratorPersistence`（实现所在，体量很大）。
-- 文本检查点与追加块的输入接受 `providerMetadata`，随正文保留 Responses 的 item/part/phase 信息；这些是重放字段，不参与 refs.seq、运行回合 id 或消息分页身份的分配。具体形状见[块存储](blocks.md)。
 - 展示页读取：`narrator-display-page-reader.ts:readNarratorDisplayMessages` 只走 worker（SQLite 路径或 PG 端口），不可用时报 `DISPLAY_PAGE_READER_UNAVAILABLE`（503，“不允许主线程原始 JSON 回退”），并发 2、排队上限 32，满则 `DISPLAY_PAGE_READER_BUSY`（503）；单次最多 10000 行、原始 16 MiB、输出 4 MiB、10 秒（`DISPLAY_PAGE_LIMITS`，`lib/db-worker/display-page-protocol.ts`）。
 - 消息数：展示值来自精确引用数，详情数单个叙述者，列表只数当前页的 id（一条分组查询）；`narrators.message_count` 只是只增不减的上界，仅供 `sortBy=messageCount` 排序，不回填，更不能冒充 UI 精确计数（`narrator-message-count.ts`）。`readNarratorMessageRefCountSnapshot` 用 worker-required 的单 SQL 同时观察 `{version,count}`；精确版本缓存最多 256 个会话，旧的 number 返回 API 仍保留。
 - 状态帧计数（`narrator-status-version.ts:committedNarratorStatusPatch`）：提交投影内部取 `messageVersion`，不取上界 `messageCount` 列；按会话 id + 提交版本合并在途精确计数，settled 即删除在途项。只有 worker 快照版本与提交版本相等才附可选 `messageCount`；缺行、版本错配或读取失败省略字段，保留客户端原值，禁止回退主线程计数或上界列。完整 status/substatus 与 panel 快照共用此发布路径，list 快照不新增计数；内部 `messageVersion` 不进入状态帧。

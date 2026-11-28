@@ -141,6 +141,32 @@ describe("bounded shared SSE frames", () => {
 		expect(tracked.body.locked).toBe(false);
 	});
 
+	test.each([
+		"return",
+		"throw",
+	])("%s releases the reader even if cancellation never settles", async (exit) => {
+		let cancellations = 0;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode("data: ready\n\n"));
+			},
+			cancel() {
+				cancellations++;
+				return new Promise<void>(() => {});
+			},
+		});
+		const frames = readSseFrames(body);
+		await frames.next();
+		if (exit === "return") {
+			await expect(frames.return(undefined)).resolves.toEqual({ done: true, value: undefined });
+		} else {
+			const failure = new Error("consumer failure");
+			await expect(frames.throw(failure)).rejects.toBe(failure);
+		}
+		expect(cancellations).toBe(1);
+		expect(body.locked).toBe(false);
+	});
+
 	test("generator throw cancels, while normal EOF does not", async () => {
 		const tracked = trackedStream("data: ready\n\n");
 		const frames = readSseFrames(tracked.body);

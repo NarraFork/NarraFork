@@ -477,11 +477,7 @@ export interface RunnerStartOptions {
 	onExit?: (exitCode: number) => void;
 	spawnTimeoutMs?: number;
 	idleTimeoutMs?: number;
-	/**
-	 * Fired when the idle budget decides to reclaim this process, immediately
-	 * before it is killed. An idle reclamation is a host budget decision, not a
-	 * plugin fault, so the runtime uses this to avoid reporting it as a crash.
-	 */
+	/** Called before host idle reclamation, so it is not counted as a crash. */
 	onIdleTimeout?: () => void;
 	totalTimeoutMs?: number;
 	maxStderrBytes?: number;
@@ -1409,10 +1405,7 @@ export interface RuntimeDiagnostics {
 	stderr: string;
 	lastError?: { code?: string; message: string; phase?: string };
 	lateMessages: number;
-	/**
-	 * Cumulative supervisor recovery attempts, initialized from persisted state.
-	 * On-demand starts only advance generation and do not increment this count.
-	 */
+	/** Persisted recovery attempts; ordinary on-demand starts do not increment it. */
 	restartCount: number;
 	startedAt?: string;
 	stoppedAt?: string;
@@ -1444,12 +1437,7 @@ export class PluginRuntime {
 	private lateMessages = 0;
 	private startedAt?: string;
 	private stoppedAt?: string;
-	/**
-	 * Generation whose process the host idle budget is retiring. An idle
-	 * reclamation is a host decision, not a plugin fault: reporting it as
-	 * crashed/failed would make the supervisor "recover" a process the host
-	 * itself stopped, producing an endless kill/respawn loop for idle plugins.
-	 */
+	/** Host-retired generation; its exit must not trigger supervisor recovery. */
 	private idleReclaimedGeneration?: number;
 	private _restarts: number;
 
@@ -1574,7 +1562,9 @@ export class PluginRuntime {
 				signal,
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
-				onIdleTimeout: () => this.markIdleReclaim(generation),
+				onIdleTimeout: () => {
+					if (generation === this.generation) this.idleReclaimedGeneration = generation;
+				},
 				totalTimeoutMs: this.options.totalTimeoutMs,
 				maxInboundBodyBytes: this.options.maxFrameBytes,
 				maxOutboundBodyBytes: this.options.maxOutboundFrameBytes ?? this.options.maxFrameBytes,
@@ -2050,12 +2040,12 @@ export class PluginRuntime {
 		return this.connection.createWaiter(predicate, timeoutMs, label);
 	}
 
-	/**
-	 * Records that the host idle budget is retiring this generation's process.
-	 * Called before the transport observes the kill.
-	 */
-	private markIdleReclaim(generation: number): void {
-		if (generation === this.generation) this.idleReclaimedGeneration = generation;
+	// Host idle stops must not enter supervisor recovery.
+	private finishIdleReclaim(): void {
+		this.acceptingRequests = false;
+		this.clearSubscriptions();
+		if (this._state !== "draining") this.setState("stopped");
+		this.stoppedAt = new Date().toISOString();
 	}
 
 	private handleProcessError(error: Error, generation: number): void {
@@ -2070,15 +2060,7 @@ export class PluginRuntime {
 				: normalizeRuntimeError(error, "transport");
 		this.rejectAll(this.lastError);
 		if (this.idleReclaimedGeneration === generation) {
-			// Host-initiated idle reclamation: the process was stopped on purpose, so
-			// surfacing crashed/failed here would make the supervisor "recover" a
-			// process the host itself retired (an endless kill/respawn loop for idle
-			// provider plugins). Settle into `stopped` (mapped to inactive) instead;
-			// the next on-demand activation starts a fresh generation.
-			this.acceptingRequests = false;
-			this.clearSubscriptions();
-			if (this._state !== "draining" && this._state !== "stopped") this.setState("stopped");
-			this.stoppedAt = new Date().toISOString();
+			this.finishIdleReclaim();
 			return;
 		}
 		if (this._state !== "draining" && this._state !== "stopped") this.setState("failed");
@@ -2092,12 +2074,7 @@ export class PluginRuntime {
 		if (this._state === "draining" || this._state === "stopped" || this._state === "quarantine")
 			return;
 		if (this.idleReclaimedGeneration === generation) {
-			// Host-initiated idle reclamation is not a crash: no `crashed` state, no
-			// onCrash, no supervisor restart. See handleProcessError.
-			this.acceptingRequests = false;
-			this.clearSubscriptions();
-			this.setState("stopped");
-			this.stoppedAt = new Date().toISOString();
+			this.finishIdleReclaim();
 			return;
 		}
 		const error = new PluginRuntimeError(`Plugin process exited with code ${exitCode}`, {

@@ -535,7 +535,6 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				// The account is the credential; the inner adapter only knows "codex".
 				onRequestStart: () =>
 					params.onRequestStart?.({
 						credentialId: ctx.id,
@@ -665,11 +664,6 @@ export class CodexProvider implements ProviderAdapter {
 		while (attempt < maxAttempts) {
 			const ctx = await this.getContext(params.stickySessionKey);
 			this.refreshUsageOnUse(ctx.id);
-			const provider = this.createProvider(ctx);
-			const chatParams: ChatParams = {
-				...params,
-				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
-			};
 			let hasStreamedEvents = false;
 			let sawContentVerdict = false;
 
@@ -736,36 +730,6 @@ export class CodexProvider implements ProviderAdapter {
 				}
 
 				const expected101Decision = await this.resolveExpected101WebSocketFailure(ctx, err);
-				if (expected101Decision === "retry_sse") {
-					try {
-						for await (const event of provider.chat(chatParams)) {
-							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-							sawContentVerdict ||= isContentVerdict(event);
-							yield { ...event, credentialId: ctx.id };
-						}
-						if (!sawContentVerdict) {
-							this.manager.reportSuccess(ctx.id);
-						}
-						return;
-					} catch (fallbackErr) {
-						if (params.signal.aborted) throw fallbackErr;
-						lastError = fallbackErr;
-						attempt++;
-						if (
-							await this.shouldRetryAfterFallbackError(
-								ctx,
-								fallbackErr,
-								hasStreamedEvents,
-								attempt,
-								maxAttempts,
-								"chat",
-							)
-						) {
-							continue;
-						}
-						throw fallbackErr;
-					}
-				}
 				if (expected101Decision === "credential_unavailable") {
 					lastError = err;
 					attempt++;
@@ -782,14 +746,19 @@ export class CodexProvider implements ProviderAdapter {
 					throw err;
 				}
 
-				if (err instanceof CodexWebSocketFallbackError) {
-					logger.warn("Codex Responses WebSocket unavailable, falling back to SSE", {
-						credentialId: ctx.id,
-						status: err.status,
-						error: err.message,
-					});
+				if (expected101Decision === "retry_sse" || err instanceof CodexWebSocketFallbackError) {
+					if (expected101Decision !== "retry_sse" && err instanceof CodexWebSocketFallbackError) {
+						logger.warn("Codex Responses WebSocket unavailable, falling back to SSE", {
+							credentialId: ctx.id,
+							status: err.status,
+							error: err.message,
+						});
+					}
 					try {
-						for await (const event of provider.chat(chatParams)) {
+						for await (const event of this.createProvider(ctx).chat({
+							...params,
+							onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
+						})) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 							sawContentVerdict ||= isContentVerdict(event);
 							yield { ...event, credentialId: ctx.id };

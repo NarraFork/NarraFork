@@ -69,7 +69,7 @@ keywords:
   - installationId
   - UPDATE_SOURCE_CHANGED
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 设置与数据目录
 
@@ -95,7 +95,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 - 内置 HTTPS：证书和 CA 放在 `tls/`；`reissueBuiltinTlsOnStartup` 在绑定 HTTPS 之前执行，只处理内置证书（路径、CA 签发关系都吻合、无口令），在 SAN 变化、有效期超过 825 天或剩余不足 30 天时重签叶子证书且保留 CA；外部证书和 CA 绝不动（`lib/tls.ts`）。自定义 SAN 最多 `MAX_CUSTOM_SANS = 50`。管理接口在 `/api/settings/tls`（状态、SAN、生成、重建 CA、下载 `ca.pem`，`routes/tls.ts`），前端 `TlsSection`。
 - `installationId`/`claudeDeviceId` 存在 settings 的 `clientFingerprint` 下，首次访问时惰性生成，`regenerateInstallationId` 可轮换（`lib/installation-id.ts`）。
 - 前端设置页：`/settings` 布局（`routes/settings.tsx`）里 `useInstanceSettings` 持有整份实例设置草稿并经 Context 分发给各子页（`settings/agent|server|…`），保存走 `settingsApi.updateSettings`（`lib/api/settings.ts`）；`/admin` 与 `/admin/runtime` 只是重定向到 `/settings/providers`、`/settings/runtime`；非管理员访问管理员页面被重定向到 `/settings/profile`。
-- `OpenAIProviderConfig.dynamicHeaders` 与 `drainUntilEof` 是内部连接选项，不作为持久设置：前者发送时生成动态头，显式操作员 UA 仍优先；后者由 NUG 委托启用，允许读取原生完成后的计费尾部，见[适配器与历史构造](../agent/providers/adapters.md)。
 - 提供商密钥不落在 settings.json：保存时由 `withoutProviderKeys` 剥离，存入独立密钥库并在加载时回灌（`provider-keys-projection.ts`、`syncProviderKeys`/`hydrateProviderKeys`）；搜索头部密钥同理（`search-header-secrets.ts`）。
 - 热重载：`reloadSettings` 全有或全无——文件无效时保留运行中配置并记错误；`reloadSettingsIfChanged` 用上次读写的文本比较，跳过自己刚写的内容。
 - 密钥文件是否加密跟随 `secrets.encrypt`，变更时重写（`settings/index.ts` 监听器）。

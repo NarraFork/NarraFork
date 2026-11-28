@@ -38,5 +38,5 @@ export function runProviderTransport(
 	const finalInit = { ...init, headers };
 	// A transport retry may build fresh headers. Preserve UA at next() as well as
 	// in the request given to the hook, without replaying any other static header.
-	return transport.fetch ? transport.fetch(input, finalInit, send) : send(input, finalInit);
+	return transport.fetch ? transport.fetch(input, finalInit, send) : next(input, finalInit);
 }

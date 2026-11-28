@@ -65,8 +65,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 
 每个提供商实现 `ProviderAdapter`（`server/lib/agent/provider.ts`）：`formatTools`、`buildHistory`（DB 行转为该协议的历史）、`injectSystemPrompt`、流式 `chat`（产出 `ParsedStreamEvent`）、`generate`，以及可选的图片生成、工具加载目标等。循环只面向这个接口。本节讲通用的三大协议适配器与它们共享的历史构造、协议切换、降级；Codex 与网关类各有单独节点。
 
-本次相关实现以已同步主线 `15eb583b4a5b86d11cfc8037afcae4065e3a812b` 为核对基线；`verified_at` 记录该真实基线，以下说明对应合并后的实现。
-
 ## 关键规则
 - 显式 UA 优先级：非空 `extraHeaders` 的 User-Agent（不区分大小写）优先于已选择的 UA 模式，未选择或空 custom 回到协议默认值。`mergeExtraHeaders` 对所有头去重，后一个非空值覆盖，空值不删除默认；UA 还会 trim 与清洗。动态头和 transport 钩子执行后，最终 `next()` 发送及钩子重试仍重新钉住显式 UA；其他传输专用字段继续由传输层控制（`user-agent.ts`、`provider-transport.ts`）。
 - 托管指纹版本当前为 Claude CLI `2.1.330`、Codex CLI `0.171.0`；Anthropic CLI 形状的 Stainless package 为 `0.128.0`，runtime version 取 `process.version`。这些是代码内固定身份值，不代表完整复刻官方客户端；`mid-conversation-system` 旧 beta 不再发送，原有模型角色能力门仍生效。

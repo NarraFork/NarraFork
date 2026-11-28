@@ -394,6 +394,10 @@ describe("provider incremental tool arguments", () => {
 			{ choices: [{ delta: {}, finish_reason: "tool_calls" }] },
 		]);
 		expect(eager.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+		const eagerInput = new ToolInputStream();
+		for (const event of eager)
+			if (event.toolUseChunk?.input) eagerInput.feed(event.toolUseChunk.input);
+		expect(eagerInput.finish()).toEqual(JSON.parse(raw));
 		const invalid = await chat([
 			{
 				choices: [
@@ -480,23 +484,32 @@ describe("provider incremental tool arguments", () => {
 		expect(calls.get("one")?.finish()).toEqual({ path: "one" });
 	});
 
-	test.each([
-		"id",
-		"name",
-	] as const)("Chat identity: missing %s is a terminal diagnostic, never an executable call", async (missing) => {
-		const events = await chat([
-			chatDelta([
-				{
-					index: 0,
-					...(missing === "id" ? {} : { id: "call" }),
-					function: { ...(missing === "name" ? {} : { name: "Write" }), arguments: '{"x":1}' },
-				},
-			]),
-			chatFinish,
-		]);
-		expect(events.some((event) => event.toolUses?.length || event.toolUseChunk)).toBe(false);
-		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
-	});
+	for (const [termination, finish] of [
+		["native completion", chatFinish],
+		["compatible completion", { response: { status: "completed", output: [] } }],
+		["EOF", undefined],
+	] as const) {
+		test.each([
+			"id",
+			"name",
+		] as const)(`Chat identity: missing %s at ${termination} never becomes executable`, async (missing) => {
+			const events = await chat([
+				chatDelta([
+					{
+						index: 0,
+						...(missing === "id" ? {} : { id: "call" }),
+						function: {
+							...(missing === "name" ? {} : { name: "Write" }),
+							arguments: '{"x":1}',
+						},
+					},
+				]),
+				...(finish ? [finish] : []),
+			]);
+			expect(events.some((event) => event.toolUses?.length || event.toolUseChunk)).toBe(false);
+			expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+		});
+	}
 
 	test("Chat identity: repeated name snapshots, argument deltas and finish events complete once", async () => {
 		const call = { index: 0, id: "call", function: { name: "Write", arguments: '{"x":' } };
@@ -618,24 +631,6 @@ describe("provider incremental tool arguments", () => {
 	test("Chat identity: EOF without identity is an explicit failure, not a silent empty answer", async () => {
 		const events = await chat([chatDelta([{ index: 0, function: { arguments: "{}" } }])]);
 		expect(events.some((event) => event.toolUses?.length || event.toolUseChunk)).toBe(false);
-		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
-	});
-
-	test.each([
-		"id",
-		"name",
-	] as const)("Chat identity: compatible response completion cannot supply a missing %s", async (missing) => {
-		const events = await chat([
-			chatDelta([
-				{
-					index: 0,
-					...(missing === "id" ? {} : { id: "call" }),
-					function: { ...(missing === "name" ? {} : { name: "Write" }), arguments: "{}" },
-				},
-			]),
-			{ response: { status: "completed", output: [] } },
-		]);
-		expect(events.some((event) => event.toolUseChunk || event.toolUses?.length)).toBe(false);
 		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
 	});
 

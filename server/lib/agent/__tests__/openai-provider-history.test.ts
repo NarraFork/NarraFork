@@ -190,12 +190,12 @@ describe("native Responses message phase continuation", () => {
 			},
 			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: " first " },
 			{ type: "response.output_text.delta", output_index: 0, content_index: 1, delta: "second" },
+			{ type: "response.output_text.delta", item_id: "msg_b", content_index: 0, delta: "answer" },
 			{
 				type: "response.output_item.added",
 				output_index: 1,
 				item: { type: "message", role: "assistant", id: "msg_b", phase: "final_answer" },
 			},
-			{ type: "response.output_text.delta", item_id: "msg_b", content_index: 0, delta: "answer" },
 			{
 				type: "response.output_item.done",
 				item: { type: "message", role: "assistant", id: "msg_a", phase: "partial_answer" },
@@ -205,6 +205,9 @@ describe("native Responses message phase continuation", () => {
 		const events = frames.flatMap((frame) => parseResponsesAPIEvent(frame, tools, reasoning));
 		const late = events.filter((event) => event.textMetadata?.openai?.phase === "partial_answer");
 		expect(late.map((event) => event.textMetadata?.openai?.contentIndex)).toEqual([0, 1]);
+		expect(
+			events.flatMap((event) => (event.contentBoundary ? [event.contentBoundary.outputIndex] : [])),
+		).toEqual([0, 0, 1]);
 		expect(events.filter((event) => event.endTurn !== undefined)).toEqual([{ endTurn: false }]);
 		for (const event of events) {
 			const lane = { blockId: event.textBlockId, outputIndex: event.textOutputIndex };

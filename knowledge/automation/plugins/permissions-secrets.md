@@ -37,7 +37,7 @@ keywords:
   - 授权
   - 密钥
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
 # 插件授权与密钥
 

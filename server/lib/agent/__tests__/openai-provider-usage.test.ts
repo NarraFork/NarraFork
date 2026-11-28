@@ -25,6 +25,24 @@ const providerConfig = {
 	defaultModel: "gpt-5",
 };
 
+function openSseResponse(frames: string, cancel?: () => void): Response {
+	return new Response(
+		new ReadableStream<Uint8Array>(
+			{
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(frames));
+				},
+				pull() {
+					throw new Error("read after terminal frame");
+				},
+				cancel,
+			},
+			{ highWaterMark: 0 },
+		),
+		{ headers: { "content-type": "text/event-stream" } },
+	);
+}
+
 describe("OpenAI framed stream termination", () => {
 	for (const apiMode of ["responses", "codex", "completions"] as const) {
 		test(`${apiMode} completes and cancels a body that does not close`, async () => {
@@ -35,24 +53,9 @@ describe("OpenAI framed stream termination", () => {
 					'event: response.completed\rdata:{"response":{"status":"completed","usage":{"input_tokens":11,"output_tokens":2}}}\r\r'
 				: 'data:{\r\ndata: "choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]\r\ndata: }\r\n\r\n' +
 					'data:{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2}}\r\n\r\ndata:[DONE]\r\n\r\n';
-			globalThis.fetch = (async () =>
-				new Response(
-					new ReadableStream<Uint8Array>(
-						{
-							start(controller) {
-								controller.enqueue(new TextEncoder().encode(`\uFEFF${frames}`));
-							},
-							pull() {
-								throw new Error("read after terminal frame");
-							},
-							cancel() {
-								cancellations++;
-							},
-						},
-						{ highWaterMark: 0 },
-					),
-					{ headers: { "content-type": "text/event-stream" } },
-				)) as unknown as typeof fetch;
+			setOutboundFetchOverrideForTest(async () =>
+				openSseResponse(`\uFEFF${frames}`, () => cancellations++),
+			);
 			const provider = new OpenAIProvider({ ...providerConfig, apiMode });
 			const result = await provider.generateWithMeta("prompt", "openai:gpt-5");
 			expect(result.text).toBe("ok");
@@ -89,26 +92,12 @@ describe("OpenAI framed stream termination", () => {
 	}
 
 	test("Responses completion flushes pending tools before canceling", async () => {
-		globalThis.fetch = (async () =>
-			new Response(
-				new ReadableStream<Uint8Array>(
-					{
-						start(controller) {
-							controller.enqueue(
-								new TextEncoder().encode(
-									'data:{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}\n\n' +
-										'data:{"type":"response.completed","response":{"status":"completed"}}\n\n',
-								),
-							);
-						},
-						pull() {
-							throw new Error("read after terminal frame");
-						},
-					},
-					{ highWaterMark: 0 },
-				),
-				{ headers: { "content-type": "text/event-stream" } },
-			)) as unknown as typeof fetch;
+		setOutboundFetchOverrideForTest(async () =>
+			openSseResponse(
+				'data:{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}\n\n' +
+					'data:{"type":"response.completed","response":{"status":"completed"}}\n\n',
+			),
+		);
 		const events: ParsedStreamEvent[] = [];
 		for await (const event of new OpenAIProvider({ ...providerConfig, apiMode: "responses" }).chat(
 			chatParams(),

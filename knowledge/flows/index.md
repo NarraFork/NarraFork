@@ -8,7 +8,7 @@ anchors:
   - server/lib/agent/loop.ts
   - server/lib/agent/tool-executor.ts
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 核心流程
 

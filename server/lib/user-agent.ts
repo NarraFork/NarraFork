@@ -3,19 +3,9 @@ import { deriveCodexWindowId } from "./agent/codex-request";
 import { APP_VERSION } from "./version";
 
 export const ORIGINATOR = "narrafork";
-/**
- * Managed Claude Code identity, pinned by the 2026-11-23 audit to 2.1.330
- * (released 2026-11-20 UTC). Native build: 8c664bec500172ded713624f9ecac0eb7e714829.
- * The previously verified native distribution, not the public SDK's latest
- * version, is the CLI reference. See docs/AGENT_PROVIDERS.md for provenance.
- *
- * The existing CLI-dialect cc_version uses this same pin. Neither the version
- * nor UA proves official-client origin, and this is not a complete wire clone.
- */
+// Managed identity pins; the Claude billing cc_version shares this value.
 export const CLAUDE_CLI_VERSION = "2.1.330";
-// Managed Codex identity only; prefix/suffix and originator must stay aligned.
-// openai/codex rust-v0.171.0 (2026-11-20 UTC),
-// ccf9be8cc458bd6b8336fe84d68d8893f2691a5e.
+// Keep both Codex UA version positions and originator aligned.
 export const CODEX_CLI_VERSION = "0.171.0";
 export const ORIGINATOR_CODEX = "codex-tui";
 

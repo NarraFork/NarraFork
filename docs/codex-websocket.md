@@ -48,7 +48,6 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   里注入该 token；只有 HTTP 路径才把它作为请求头发送
 - **不发送** `x-openai-internal-codex-responses-lite`：它是正文契约，不是身份标记。固定 Codex 0.171.0 的非 lite 分支保留顶层 `tools`；lite 分支改用 `additional_tools` input 项并禁用并行工具。两种分支仅在基础指令非空时生成 developer 前缀，不使用顶层 `instructions`。NarraFork 只实现非 lite，不声明 lite；最终出口移除额外头中的该 opt-in，不靠删除工具凑合法请求。这不保证每个模型都支持非 lite。
 - 请求体：`{ type: "response.create", ...ResponsesRequestBody }`。非空基础指令为稳定 ID 的 developer `input_text` 前缀；空指令不造前缀或默认 CLI 文本。保留顶层工具、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: true`、`reasoning.summary: "auto"` 与 `text.verbosity: "low"`，非 lite 省略 `reasoning.context`，Codex 后端不发 `max_output_tokens`。`client_metadata` 保留安装/会话/window 身份，实际逻辑轮次存在时附加 `turn_id`，拿到本轮 token 后附加 `x-codex-turn-state`。
-- 源码基线：Codex **0.171.0**（2026-11-20 UTC），提交 `ccf9be8cc458bd6b8336fe84d68d8893f2691a5e`。截至 2026-11-23 核验，UA 前缀/后缀版本一致，TUI originator 为 `codex-tui`；发行标签与 SDK/CLI 区分见 [Agent Provider 版本依据](AGENT_PROVIDERS.md)。
 - 增量续写复用判定（`requestWithoutInput`）**排除 `client_metadata`**：该字段带有随请求变化的运行时值
   （尤其是 `x-codex-turn-state`），若参与比较，首个响应之后的每个请求都会被判定为「不同请求」，
   从而静默退化成全量重发并丢失 prompt cache。codex-rs 的

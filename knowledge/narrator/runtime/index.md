@@ -12,7 +12,7 @@ keywords:
   - 执行所有权
   - 运行时队列
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
 ---
 # 会话运行时
 
@@ -21,7 +21,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ## 一次运行怎么走
 - 入口只有一个：`run.ts:startNarratorRun`。用户消息、委派、Send 唤醒、继续、工具重放、重启恢复都经它。
 - 步骤：短启动准入内 `ownership.ts:tryClaimExecution` 拿执行所有权，建立 `RunControl`；随后在工作准入内 `executeRun`：读注册信息和执行主体、`prepareLogicalRun` 登记逻辑运行（有投递目标时同时预留发布槽位）、再调 `orchestrator.ts:runAgentLoopUnlocked` 跑模型回合。
-- 提供商逻辑用户轮次由内存 `turnContext` 表示，同轮恢复和工具续写共享，采纳新用户输入才轮换；它不写入运行时注册信息。细节见 [调度与执行](orchestrator.md)。
 - 回合开始前，orchestrator 经 `prepare-prefix-request.ts` 取得前缀与历史；历史由 [模型历史](model-history.md) 从只读 worker 读出、`history.ts` 投影成模型输入。
 - 回合之间、运行结束时，orchestrator 与 run 通过 [收件箱与唤醒](mailbox.md) 判断有无排队输入或未完成工作：有排队输入则同一运行继续（新一轮取新的所有权），有投递目标的运行遇到未完成的后台工作，则停靠等待（`run.ts:awaitPendingWake`）。
 - 运行结束由 `run.ts:finishRun` 提交终态：结果经 [输出发布](publication.md) 的 outbox 与 `runtimePublication` 写成通知，再转入接收方的收件箱；随后释放所有权并按需唤醒收件箱。

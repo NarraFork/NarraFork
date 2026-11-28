@@ -171,7 +171,7 @@ export class OpenAIRefusal {
 		if (choice?.message?.refusal) this.part(choice.message.refusal, "done");
 	}
 
-	event(): ParsedStreamEvent & { invalidState: NonNullable<ParsedStreamEvent["invalidState"]> } {
+	event(): OutputRefusalEvent {
 		const sorted = this.parts
 			.slice()
 			.sort(

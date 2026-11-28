@@ -108,13 +108,7 @@ import { PluginToolRegistry, type PluginToolRuntime } from "./plugin-tool-regist
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_TRUST_ARTIFACT_BYTES = 1024 * 1024;
 const HOST_API_VERSION = "1.0";
-/**
- * Quiet budget for provider plugins. Providers are silent by design between model
- * calls, so the generic 5-minute idle budget reclaimed (and then restarted) them
- * every few minutes. Six hours keeps an actively used provider warm while still
- * releasing the process after a genuinely idle stretch; the next provider call
- * activates it again on demand.
- */
+// Provider plugins stay warm between model calls; an idle stop is reactivated on demand.
 const PROVIDER_IDLE_TIMEOUT_MS = 6 * 60 * 60_000;
 
 interface RuntimeLike {

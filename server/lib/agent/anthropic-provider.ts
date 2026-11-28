@@ -2834,15 +2834,7 @@ export function parseAnthropicEvent(
 				];
 				// Early completion if args form valid JSON
 				if (toolInputStreamFor(acc).hasCompleteInput()) {
-					results.push({
-						toolUseChunk: {
-							toolUseId: acc.id,
-							name: acc.name,
-							stop: true,
-							outputIndex: acc.outputIndex,
-						},
-					});
-					acc.emitted = true;
+					results.push(finishAnthropicToolInput(acc));
 				}
 				return results;
 			}

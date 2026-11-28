@@ -19,7 +19,7 @@ keywords:
   - modelProtocols
   - tutorial
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 776dbf07e
 ---
 # 模型提供商
 
@@ -39,7 +39,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 - 引用模型却解析不出提供商时是不可重试的注册表错误，与瞬时上游失败区分，见适配器节点。
 - 适配器族与委托关系：`AnthropicProvider`、`OpenAIProvider`、`GeminiProvider`/`GeminiInteractionsProvider`、`CodexProvider`、`NugProvider`（委托 Anthropic/OpenAI）、`TokenDanceProvider`（按所选协议委托）、CommandCode（按模型选 Anthropic 或 OpenAI 适配器）。
 - 就绪状态的共享投影在 `shared/provider-readiness.ts`，设置页据此显示状态。
-- 宿主侧 `ChatParams.turnContext` 传递一个内存中的逻辑用户轮次，同轮工具调用和恢复可共用；它不等同于 `conversationId` 或仅用于传输隔离的 `transportSessionKey`。隔离和重建规则见 [Codex](codex.md) 与 [调度与执行](../../narrator/runtime/orchestrator.md)。
 
 ## 该读哪个下级
 - 历史怎么构造、图片/媒体怎么降级、拒绝某个参数后怎么办、协议怎么切换、快速模式：[适配器与历史构造](adapters.md)。

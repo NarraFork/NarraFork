@@ -21,6 +21,19 @@ import { StreamProgress } from "../stream-progress";
 
 type Captured = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
 
+function createProvider(overrides: Partial<OpenAIProviderConfig> = {}) {
+	return new OpenAIProvider({
+		id: "codex",
+		name: "Codex",
+		prefix: "codex",
+		apiKey: "sk-test-key",
+		baseUrl: "https://chatgpt.com/backend-api/codex",
+		defaultModel: "gpt-5.3-codex",
+		apiMode: "codex",
+		...overrides,
+	});
+}
+
 async function captureChat(
 	overrides: {
 		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -29,14 +42,7 @@ async function captureChat(
 		chat?: Partial<ChatParams>;
 	} = {},
 ): Promise<Captured> {
-	const provider = new OpenAIProvider({
-		id: "codex",
-		name: "Codex",
-		prefix: "codex",
-		apiKey: "sk-test-key",
-		baseUrl: "https://chatgpt.com/backend-api/codex",
-		defaultModel: "gpt-5.3-codex",
-		apiMode: "codex",
+	const provider = createProvider({
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: overrides.userAgentMode ?? "codex",
 		...overrides.config,
@@ -45,28 +51,14 @@ async function captureChat(
 	let captured: Captured | undefined;
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-		const headers: Record<string, string> = {};
-		const raw = init?.headers;
-		if (raw instanceof Headers) {
-			raw.forEach((v, k) => {
-				headers[k.toLowerCase()] = v;
-			});
-		} else if (Array.isArray(raw)) {
-			for (const [k, v] of raw) headers[String(k).toLowerCase()] = String(v);
-		} else {
-			for (const [k, v] of Object.entries((raw ?? {}) as Record<string, string>)) {
-				headers[k.toLowerCase()] = v;
-			}
-		}
 		captured = {
 			url: String(input),
-			headers,
+			headers: Object.fromEntries(new Headers(init?.headers)),
 			body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
 		};
 		const sse = 'data: {"type":"response.completed","response":{"output":[]}}\n\n';
 		return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
-		// biome-ignore lint/suspicious/noExplicitAny: fetch stub
-	}) as any;
+	}) as typeof fetch;
 
 	try {
 		for await (const _event of provider.chat({
@@ -139,15 +131,7 @@ describe("codex HTTP chat request parity", () => {
 			tools: [{ type: "function", name: "Read", parameters: { type: "object" } }],
 		};
 		const req = await captureChat({ chat });
-		const provider = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "test",
-			baseUrl: "https://example.invalid",
-			defaultModel: "gpt-5.3-codex",
-			apiMode: "codex",
-		});
+		const provider = createProvider({ apiKey: "test", baseUrl: "https://example.invalid" });
 		const ws = (
 			provider as unknown as {
 				buildCodexWebSocketRequest(params: ChatParams): CodexResponsesRequestBody;
@@ -195,15 +179,7 @@ describe("codex HTTP chat request parity", () => {
 		};
 		const dump = new ApiRequestDumpCollector(recording);
 		const streamProgress = new StreamProgress();
-		const provider = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "sk-test-key",
-			baseUrl: "https://chatgpt.com/backend-api/codex",
-			defaultModel: "gpt-5.3-codex",
-			apiMode: "codex",
-		});
+		const provider = createProvider();
 		const bytes = new TextEncoder().encode(
 			": keepalive\r\n\r\n" +
 				`event: response.metadata\ndata: ${JSON.stringify({ headers: { "X-Codex-Turn-State": token } })}\n\n` +
@@ -306,15 +282,7 @@ describe("codex HTTP chat request parity", () => {
 				{ headers: { "content-type": "text/event-stream" } },
 			)) as unknown as typeof fetch;
 		try {
-			const provider = new OpenAIProvider({
-				id: "codex",
-				name: "Codex",
-				prefix: "codex",
-				apiKey: "sk-test-key",
-				baseUrl: "https://chatgpt.com/backend-api/codex",
-				defaultModel: "gpt-5.3-codex",
-				apiMode: "codex",
-			});
+			const provider = createProvider();
 			const events = [];
 			for await (const event of provider.chat({
 				conversationId: "incomplete-metadata",

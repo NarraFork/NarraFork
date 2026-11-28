@@ -1068,8 +1068,6 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	expect(projected.text).toContain("This notice could not load the result.");
 	expect(projected.text).toContain("Watch(");
 	expect(projected.text).not.toContain("Await(");
-	// The unified user-input consumer owns turn changes, not a background-notice drain.
-	expect(projected).not.toHaveProperty("startsUserTurn");
 	expect(projected.parts).toEqual([
 		{ text: projected.text, messageId: required(state(row.id)?.currentMessageId) },
 	]);

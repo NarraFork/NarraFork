@@ -77,9 +77,7 @@ export function stripUnsupportedParameter(
 export function omitUnsupportedParameters(body: Record<string, unknown>, model: string): void {
 	const set = unsupportedParametersByModel.get(model);
 	if (!set) return;
-	for (const parameter of set) {
-		if (!outputBudgetFields.has(parameter)) delete body[parameter];
-	}
+	for (const parameter of set) delete body[parameter];
 }
 
 /** Collect human-readable provider text from an error graph (bounded depth). */

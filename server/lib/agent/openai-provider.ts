@@ -1352,7 +1352,10 @@ export class OpenAIProvider implements ProviderAdapter {
 						yield stampReasoningSource(evt, this.getActiveReasoningSource());
 					}
 				} else {
-					for await (const evt of this.parseSSEStreamWithDetection(capture.stream, params.signal)) {
+					for await (const evt of parseSSEStream(capture.stream, {
+						drainUntilEof: this.config.drainUntilEof,
+						signal: params.signal,
+					})) {
 						yieldedEvent = true;
 						yield evt;
 					}
@@ -1371,22 +1374,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			} finally {
 				capture.finish();
 			}
-		}
-	}
-
-	/**
-	 * Wrap parseSSEStream to detect Responses API format from Codex gateways.
-	 * Only relevant for "codex" mode — completions mode ignores the marker.
-	 */
-	private async *parseSSEStreamWithDetection(
-		body: ReadableStream<Uint8Array>,
-		signal?: AbortSignal,
-	): AsyncGenerator<ParsedStreamEvent> {
-		for await (const evt of parseSSEStream(body, { ...this.config, signal })) {
-			if (evt._responsesApi && this.apiMode === "codex") {
-				logger.debug("Codex gateway confirmed Responses API format");
-			}
-			yield evt;
 		}
 	}
 
@@ -2666,7 +2653,6 @@ interface ResponsesItemIdentity {
 }
 
 interface ResponsesTextLane {
-	outputIndex?: number;
 	item: ResponsesItemIdentity;
 	contentIndex: number;
 	length: number;
@@ -3019,7 +3005,6 @@ export function parseResponsesAPIEvent(
 	const emitText = (partChunk: ResponsesAPIChunk, text: string, delta: boolean) => {
 		const blockId = responsesBlockId(partChunk, "text");
 		const lane = textLanes.get(blockId) ?? {
-			outputIndex: partChunk.output_index,
 			item: identity,
 			contentIndex: partChunk.content_index ?? 0,
 			length: 0,
@@ -3040,7 +3025,6 @@ export function parseResponsesAPIEvent(
 	const textBoundary = (partChunk: ResponsesAPIChunk, phase: "checkpoint" | "complete") => {
 		const blockId = responsesBlockId(partChunk, "text");
 		const lane = textLanes.get(blockId) ?? {
-			outputIndex: partChunk.output_index,
 			item: identity,
 			contentIndex: partChunk.content_index ?? 0,
 			length: 0,
@@ -3125,7 +3109,7 @@ export function parseResponsesAPIEvent(
 							kind: "text",
 							phase: "complete",
 							blockId,
-							outputIndex: lane.outputIndex,
+							outputIndex: lane.item.outputIndex,
 						},
 					});
 				}
@@ -3629,7 +3613,7 @@ export function parseResponsesAPIEvent(
 						kind: "text",
 						phase: "complete",
 						blockId,
-						outputIndex: lane.outputIndex,
+						outputIndex: lane.item.outputIndex,
 					},
 				});
 			}
@@ -3681,8 +3665,7 @@ interface ToolAccumEntry {
 	abandoned?: boolean;
 }
 
-// NF's host and the official Chat SDK both cap per-response tool slots at 128.
-// Bound extra storage needed only while the upstream has not given us an identity.
+// Bound tool slots and arguments waiting for their upstream identity.
 const MAX_CHAT_TOOL_SLOTS = 128;
 const MAX_UNPUBLISHED_ARGUMENT_CHARS = 32 * 1024 * 1024;
 const MAX_UNPUBLISHED_ARGUMENT_FRAGMENTS = 65536;
@@ -3764,47 +3747,31 @@ function updateChatToolCall(
 	if (!acc.id || !acc.name) return [];
 	const stream = toolInputStreamFor(acc);
 	const complete = stream.hasCompleteInput();
-	const events: ParsedStreamEvent[] = [];
-	if (!acc.identityPublished) {
-		// Publish buffered arguments once, after BOTH fields become available.
-		acc.identityPublished = true;
-		acc.bufferedFragments = 0;
-		events.push({
-			toolUseChunk: {
-				toolUseId: acc.id,
-				name: acc.name,
-				input: stream.totalChars ? stream.materializeRaw() : undefined,
-				stop: complete,
-				outputIndex: acc.outputIndex,
-			},
-		});
-	} else {
-		if (delta)
-			events.push({
-				toolUseChunk: {
-					toolUseId: acc.id,
-					name: acc.name,
-					input: delta,
-					stop: false,
-					outputIndex: acc.outputIndex,
-				},
-			});
-		if (complete)
-			events.push({
-				toolUseChunk: {
-					toolUseId: acc.id,
-					name: acc.name,
-					stop: true,
-					outputIndex: acc.outputIndex,
-				},
-			});
-	}
+	if (acc.identityPublished && !delta && !complete) return [];
+	// Publish buffered arguments once, after both identity fields become available.
+	const input = acc.identityPublished
+		? delta
+		: stream.totalChars
+			? stream.materializeRaw()
+			: undefined;
+	acc.identityPublished = true;
+	acc.bufferedFragments = 0;
 	if (complete) {
 		acc.emitted = true;
 		acc.inputStream = undefined;
 		acc.args = undefined;
 	}
-	return events;
+	return [
+		{
+			toolUseChunk: {
+				toolUseId: acc.id,
+				name: acc.name,
+				input,
+				stop: complete,
+				outputIndex: acc.outputIndex,
+			},
+		},
+	];
 }
 
 async function* parseSSEStream(
@@ -3873,6 +3840,27 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 	}
 	toolAccum.clear();
 	return toolUses.length > 0 ? { toolUses } : null;
+}
+
+function completeChatToolCalls(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent[] {
+	const pending = [...toolAccum.values()].filter((acc) => !acc.emitted && !acc.abandoned);
+	// Validate the whole batch before publishing any completion.
+	if (pending.some((acc) => !acc.id || !acc.name)) {
+		return [invalidChatToolCall("The tool stream ended a call without both ID and name.")];
+	}
+	return pending.map((acc) => {
+		acc.emitted = true;
+		acc.inputStream = undefined;
+		acc.args = undefined;
+		return {
+			toolUseChunk: {
+				toolUseId: acc.id,
+				name: acc.name,
+				stop: true,
+				outputIndex: acc.outputIndex,
+			},
+		};
+	});
 }
 
 function parseSSEPayload(
@@ -4040,28 +4028,8 @@ function parseSSEPayload(
 				if (completed) results.push(completed);
 			}
 		}
-		if (
-			[...toolAccum.values()].some(
-				(acc) => !acc.emitted && !acc.abandoned && (!acc.id || !acc.name),
-			)
-		) {
-			return [
-				invalidChatToolCall("The compatible response ended a tool call without both ID and name."),
-			];
-		}
-		for (const acc of toolAccum.values()) {
-			if (acc.emitted || acc.abandoned) continue;
-			results.push({
-				toolUseChunk: {
-					toolUseId: acc.id,
-					name: acc.name,
-					stop: true,
-					outputIndex: acc.outputIndex,
-				},
-			});
-			acc.emitted = true;
-		}
-		return results;
+		const remaining = completeChatToolCalls(toolAccum);
+		return remaining.some((event) => event.invalidState) ? remaining : results.concat(remaining);
 	}
 
 	// ── Standard Chat Completions format below ──
@@ -4074,7 +4042,6 @@ function parseSSEPayload(
 	if (chunk.usage) {
 		results.push({ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) });
 	}
-	const result: ParsedStreamEvent = {};
 	refusal.chat(choice);
 	if (refusal.seen) return results;
 
@@ -4127,95 +4094,43 @@ function parseSSEPayload(
 			finishReason: choice.finish_reason,
 			accumulatedToolCalls: toolAccum.size,
 		});
-		const normalFinish = choice.finish_reason === "tool_calls" || choice.finish_reason === "stop";
-		if (normalFinish) {
-			if (
-				[...toolAccum.values()].some(
-					(acc) => !acc.emitted && !acc.abandoned && (!acc.id || !acc.name),
-				)
-			) {
-				results.push(
-					invalidChatToolCall("Chat Completions ended a tool call without both ID and name."),
-				);
-				return results;
-			}
-			for (const acc of toolAccum.values()) {
-				if (acc.emitted || acc.abandoned) continue;
-				results.push({
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				});
-				acc.emitted = true;
-				acc.inputStream = undefined;
-				acc.args = undefined;
-			}
-		} else {
-			// Truncation/filtering does not prove that an absent arguments field means {}.
-			for (const acc of toolAccum.values()) {
-				if (acc.emitted) continue;
-				acc.abandoned = true;
-				acc.inputStream = undefined;
-				acc.args = undefined;
-			}
+		if (choice.finish_reason === "tool_calls" || choice.finish_reason === "stop") {
+			return results.concat(completeChatToolCalls(toolAccum));
 		}
-		// Map non-normal finish reasons to invalidState
-		switch (choice.finish_reason) {
-			case "stop":
-			case "tool_calls":
-				// Normal completion — no action needed
+		// Truncation/filtering does not prove that an absent arguments field means {}.
+		for (const acc of toolAccum.values()) {
+			if (acc.emitted) continue;
+			acc.abandoned = true;
+			acc.inputStream = undefined;
+			acc.args = undefined;
+		}
+		let reason = choice.finish_reason;
+		let message: string;
+		switch (reason) {
+			case "length":
+				reason = "max_tokens";
+				message = "Response truncated: model reached maximum token limit.";
 				break;
-			case "length": {
-				const message = "Response truncated: model reached maximum token limit.";
-				result.invalidState = {
-					reason: "max_tokens",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "max_tokens", message },
-						{ source: "provider", phase: "finish_reason", reason: "max_tokens", message },
-					),
-				};
+			case "content_filter":
+				message = "Response blocked by content filter.";
 				break;
-			}
-			case "content_filter": {
-				const message = "Response blocked by content filter.";
-				result.invalidState = {
-					reason: "content_filter",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "content_filter", message },
-						{ source: "provider", phase: "finish_reason", reason: "content_filter", message },
-					),
-				};
+			case "model_context_window_exceeded":
+				message = "The model has reached its context window limit.";
 				break;
-			}
-			case "model_context_window_exceeded": {
-				const message = "The model has reached its context window limit.";
-				result.invalidState = {
-					reason: "model_context_window_exceeded",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "model_context_window_exceeded", message },
-						{
-							source: "provider",
-							phase: "finish_reason",
-							reason: "model_context_window_exceeded",
-							message,
-						},
-					),
-				};
-				break;
-			}
 			default:
-				logger.warn("Unknown OpenAI finish reason", { finishReason: choice.finish_reason });
+				logger.warn("Unknown OpenAI finish reason", { finishReason: reason });
+				return results;
 		}
-	}
-
-	if (result.text || result.toolUses || result.invalidState || result.reasoning) {
-		results.push(result);
+		results.push({
+			invalidState: {
+				reason,
+				message,
+				diagnostics: parseErrorDiagnostics(
+					{ reason, message },
+					{ source: "provider", phase: "finish_reason", reason, message },
+				),
+			},
+		});
 	}
 	return results;
 }

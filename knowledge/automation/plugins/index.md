@@ -32,7 +32,7 @@ keywords:
   - 插件覆盖层
   - plugin-event
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 776dbf07e
 ---
 # 插件系统
 
@@ -43,7 +43,6 @@ verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 - 清单（`lib/plugins/manifest.ts`，zod `.strict()`）是各部分共同的契约：`engine` 决定怎么运行，`permissions.host` 决定初始授权，`contributes` 决定提供什么。
 - 开关：设置 `plugins.enabled`（环境变量 `NF_PLUGINS_ENABLED`/`NARRAFORK_PLUGINS_ENABLED` 优先，默认开）；关闭时安装与生命周期等变更接口返回 503 `PLUGINS_DISABLED`。安装、启停、卸载、授权、提供商配置均要求管理员，列表与详情只要登录（`routes/plugins.ts`）。
 - 内置插件：仓库里只有一个，`server/builtin-plugins/apikey-quota`（`com.narrafork.apikey-quota`），只贡献一个 `query-balance` 命令；它走同一套清单与生命周期，只是随应用分发、首次默认启用。
-- 运行状态以 runtime diagnostics 为准：宿主空闲回收映射为 inactive，后续按需激活重新启动；`restartCount` 来自实际 restart 调用，不用 generation 推算。提供商插件的 6 小时空闲预算与故障恢复边界见[插件运行时](runtime.md)。
 - 数据位置：包与状态在 `<narrafork-home>/plugins`（`packages/`、`current.json`、`state.json`、`permissions.json`、`secrets.json`）。
 - 界面插件由 `routes/plugin-ui.ts` 的会话与资源路由承载，细节在贡献点一节；插件自己的调度器（`plugin-scheduler.ts`）与宿主定时任务无关，见[定时任务](../scheduled.md)。
 

@@ -79,7 +79,7 @@ keywords:
   - cachedOnly
   - expectedGeneration
 status: draft
-verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 
 # 供应商余额与额度

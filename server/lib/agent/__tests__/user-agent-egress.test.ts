@@ -365,56 +365,21 @@ describe("no egress ever emits two User-Agent keys", () => {
 });
 
 describe("provider defaults are overridden at the real HTTP egress", () => {
-	for (const protocol of ["anthropic", "responses", "completions"] as const) {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
 		test(`${protocol} sends one selected UA and one value for each overridden header`, async () => {
-			const captured: Headers[] = [];
-			const frames =
-				protocol === "anthropic"
-					? [
-							{
-								type: "message_start",
-								message: { id: "msg_probe", usage: { input_tokens: 1, output_tokens: 0 } },
-							},
-							{
-								type: "content_block_start",
-								index: 0,
-								content_block: { type: "text", text: "ok" },
-							},
-							{ type: "content_block_stop", index: 0 },
-							{ type: "message_stop" },
-						]
-					: protocol === "responses"
-						? [
-								{ type: "response.output_text.delta", delta: "ok", output_index: 0 },
-								{
-									type: "response.completed",
-									response: { id: "resp_probe", status: "completed", output: [] },
-								},
-							]
-						: [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
-			const server = Bun.serve({
-				hostname: "127.0.0.1",
-				port: 0,
-				fetch(request) {
-					captured.push(request.headers);
-					return new Response(
-						frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(""),
-						{ headers: { "content-type": "text/event-stream" } },
-					);
-				},
-			});
+			const { server, requests, baseUrl } = startWireCapture(protocol);
 			try {
 				const config = {
 					id: `wire-${protocol}`,
 					prefix: "wire",
 					name: "Wire probe",
 					apiKey: "default-key",
-					baseUrl: `${server.url.origin}/v1`,
+					baseUrl,
 					defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
 					userAgentMode: "custom" as const,
 					customUserAgent: "configured/1",
 					proxy: { mode: "direct" as const },
-					apiMode: protocol === "responses" ? ("codex" as const) : ("completions" as const),
+					apiMode: protocol === "anthropic" ? ("completions" as const) : protocol,
 					codexWebSocket: false,
 					codexWebSearch: false,
 					codexImageGeneration: false,
@@ -447,6 +412,7 @@ describe("provider defaults are overridden at the real HTTP egress", () => {
 						// Drain the actual transport, including successful completion.
 					}
 				}
+				const captured = requests.map((request) => request.headers);
 				expect(captured).toHaveLength(2);
 				expect(captured[0]?.get("user-agent")).toBe("configured/1");
 				expect(captured[1]?.get("user-agent")).toBe("operator/2");
@@ -464,43 +430,8 @@ describe("provider defaults are overridden at the real HTTP egress", () => {
 describe("explicit UA survives the final HTTP transport", () => {
 	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
 		test(`${protocol}: operator UA wins, transport authentication stays current`, async () => {
-			const captured: Headers[] = [];
+			const { server, requests, baseUrl } = startWireCapture(protocol);
 			const observed: Array<string | null> = [];
-			const frames =
-				protocol === "anthropic"
-					? [
-							{
-								type: "message_start",
-								message: { id: "msg_ua", usage: { input_tokens: 1, output_tokens: 0 } },
-							},
-							{
-								type: "content_block_start",
-								index: 0,
-								content_block: { type: "text", text: "ok" },
-							},
-							{ type: "content_block_stop", index: 0 },
-							{ type: "message_stop" },
-						]
-					: protocol === "completions"
-						? [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]
-						: [
-								{ type: "response.output_text.delta", delta: "ok", output_index: 0 },
-								{
-									type: "response.completed",
-									response: { id: "resp_ua", status: "completed", output: [] },
-								},
-							];
-			const server = Bun.serve({
-				hostname: "127.0.0.1",
-				port: 0,
-				fetch(request) {
-					captured.push(request.headers);
-					return new Response(
-						frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(""),
-						{ headers: { "content-type": "text/event-stream" } },
-					);
-				},
-			});
 			try {
 				let channel = 0;
 				const config = {
@@ -508,7 +439,7 @@ describe("explicit UA survives the final HTTP transport", () => {
 					prefix: "wire",
 					name: "Final UA probe",
 					apiKey: "default-key",
-					baseUrl: `${server.url.origin}/v1`,
+					baseUrl,
 					defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
 					userAgentMode: "custom" as const,
 					customUserAgent: "selected/1",
@@ -559,6 +490,7 @@ describe("explicit UA survives the final HTTP transport", () => {
 						/* Drain the real HTTP request. */
 					}
 				}
+				const captured = requests.map((request) => request.headers);
 				expect(observed).toEqual(["selected/1", "operator/2"]);
 				expect(captured.map((headers) => headers.get("user-agent"))).toEqual([
 					"selected/1",

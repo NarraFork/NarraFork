@@ -30,28 +30,14 @@ async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Ca
 		apiMode: "codex",
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: "codex",
-		// biome-ignore lint/suspicious/noExplicitAny: test config subset
-	} as any);
+	});
 
 	let captured: Captured | undefined;
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-		const headers: Record<string, string> = {};
-		const raw = init?.headers;
-		if (raw instanceof Headers) {
-			raw.forEach((v, k) => {
-				headers[k.toLowerCase()] = v;
-			});
-		} else if (Array.isArray(raw)) {
-			for (const [k, v] of raw) headers[String(k).toLowerCase()] = String(v);
-		} else {
-			for (const [k, v] of Object.entries((raw ?? {}) as Record<string, string>)) {
-				headers[k.toLowerCase()] = v;
-			}
-		}
 		captured = {
 			url: String(input),
-			headers,
+			headers: Object.fromEntries(new Headers(init?.headers)),
 			body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
 		};
 		const sse = 'data: {"type":"response.completed","response":{"output":[]}}\n\n';
@@ -59,8 +45,7 @@ async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Ca
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
 		});
-		// biome-ignore lint/suspicious/noExplicitAny: fetch stub
-	}) as any;
+	}) as typeof fetch;
 
 	try {
 		await run(provider);

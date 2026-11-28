@@ -156,7 +156,6 @@ const SENSITIVE_HEADER_PATTERNS = [
 	/^proxy-authorization$/i,
 	/^cookie$/i,
 	/^set-cookie$/i,
-	/^x-codex-turn-state$/i,
 ];
 
 function isSensitiveHeader(name: string): boolean {
