@@ -260,10 +260,7 @@ test("required balances constrain independently and unknown alternatives never p
 		quotaSnapshotView(
 			{
 				...alternatives,
-				balances: [
-					...alternatives.balances,
-					{ unit: "CNY", remaining: 5, quota: "alternative" },
-				],
+				balances: [...alternatives.balances, { unit: "CNY", remaining: 5, quota: "alternative" }],
 			},
 			"",
 			t,

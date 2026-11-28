@@ -545,7 +545,9 @@ function registerCredentialProviderSource<
 					keys[0]?.apiKey === config.apiKey &&
 					!keys[0]?.network &&
 					(owner === config.id || stored.length === 1));
+			const selectedKeyId = keys[0]?.id;
 			const selectedConfig = keys[0] ? withProviderKey(config, keys[0]) : config;
+			const selectedConfigVersion = JSON.stringify(selectedConfig);
 			const configVersion = JSON.stringify(config);
 			const proxyVersion = JSON.stringify(settings.proxy);
 			const protocolVersion = resolveModelProtocol(prefix, model);
@@ -554,7 +556,7 @@ function registerCredentialProviderSource<
 				? reportCredentialId(
 						adapterFor(prefix, model, selectedConfig),
 						config.id,
-						isCustomApiKeyOwner(owner) ? { providerId: owner, keyId: keys[0]?.id } : undefined,
+						isCustomApiKeyOwner(owner) ? { providerId: owner, keyId: selectedKeyId } : undefined,
 					)
 				: new PooledProvider(
 						owner,
@@ -575,9 +577,16 @@ function registerCredentialProviderSource<
 					return false;
 				if (!plain) return true;
 				const stored = getProviderKeyStore().list(owner);
-				return stored.length === 0
-					? keys.length === 0
-					: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
+				if (selectedKeyId === undefined) return stored.length === 0;
+				// A different key can restore the group's old secret after a reorder, but
+				// it cannot validate the key this adapter was created to use.
+				const selected = stored.find((key) => key.id === selectedKeyId);
+				return (
+					!!selected &&
+					!selected.disabled &&
+					!selected.network &&
+					JSON.stringify(withProviderKey(live, selected)) === selectedConfigVersion
+				);
 			};
 			return adapter;
 		},

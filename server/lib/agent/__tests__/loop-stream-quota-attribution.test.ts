@@ -248,6 +248,73 @@ test("a promoted plain backup keeps group billing but publishes quota only to it
 	expect(network).toHaveBeenCalledTimes(1);
 });
 
+test("a plain adapter still owns its unchanged key after a same-secret backup moves first", async () => {
+	const first = required(store.listGroup(id)[0]);
+	adapter = originalProvider.resolveProviderAndModel(`${prefix}:m`).adapter;
+	expect(adapter).not.toBeInstanceOf(PooledProvider);
+	const backup = store.add(id, { apiKey: first.apiKey });
+	store.reorder(id, [backup.id, first.id]);
+	expect(adapter.isDiagnosticConnectionCurrent?.()).toBe(true);
+	const network = spyOn(globalThis, "fetch").mockResolvedValue(quotaResponse());
+	const quotas = await run();
+	expect(network).toHaveBeenCalledTimes(1);
+	expect(quotas).toHaveLength(1);
+	expect(quotas[0]).toMatchObject({
+		credentialId: id,
+		quotaBalance: "3",
+		customApiQuotaTarget: { providerId: id, keyId: first.id },
+	});
+	expect(quotas[0]?.providerIdentity).toBeString();
+	expect(published).toHaveLength(1);
+	expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(3);
+	expect(quotaStore.peek(backup.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+});
+
+for (const change of ["key", "network", "disabled", "replacement"] as const) {
+	test(`a plain adapter created before its selected key's ${change} change cannot borrow another key's validity`, async () => {
+		const first = required(store.listGroup(id)[0]);
+		const originalSecret = first.apiKey;
+		const configVersion = JSON.stringify(settings.customApiProviders?.[0]);
+		adapter = originalProvider.resolveProviderAndModel(`${prefix}:m`).adapter;
+		expect(adapter).not.toBeInstanceOf(PooledProvider);
+		expect(adapter.isDiagnosticConnectionCurrent?.()).toBe(true);
+		if (change === "key") store.update(first.id, { apiKey: "rotated-key-A" });
+		else if (change === "network")
+			store.update(first.id, { network: { extraHeaders: { "X-Account": "rotated-account-A" } } });
+		else if (change === "disabled") store.update(first.id, { disabled: true });
+		else store.remove(first.id);
+		const backup = store.add(id, { apiKey: originalSecret });
+		store.reorder(id, [backup.id, ...(change === "replacement" ? [] : [first.id])]);
+		// Restoring the group's projected config must not restore the selected key's identity.
+		expect(JSON.stringify(settings.customApiProviders?.[0])).toBe(configVersion);
+		const authorizations: Array<string | null> = [];
+		const network = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+					authorizations.push(
+						new Headers(
+							init?.headers ?? (input instanceof Request ? input.headers : undefined),
+						).get("authorization"),
+					);
+					return quotaResponse();
+				},
+				{ preconnect: globalThis.fetch.preconnect },
+			),
+		);
+		const quotas = await run();
+		expect(network).toHaveBeenCalledTimes(1);
+		expect(authorizations).toEqual([`Bearer ${originalSecret}`]);
+		expect(quotas).toHaveLength(1);
+		expect(quotas[0]?.credentialId).toBe(id);
+		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(quotaStore.peek(backup.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(published).toEqual([]);
+		expect(quotas[0]?.customApiQuotaTarget).toBeNull();
+		expect(quotas[0]?.providerIdentity).toBeUndefined();
+		expect(adapter.isDiagnosticConnectionCurrent?.()).toBe(false);
+	});
+}
+
 for (const phase of ["preparation", "response"] as const) {
 	for (const change of ["key", "network", "baseUrl", "globalProxy", "replacement"] as const) {
 		test(`a plain stream frozen before ${phase} rejects a later ${change} change`, async () => {
@@ -280,10 +347,15 @@ for (const phase of ["preparation", "response"] as const) {
 					});
 				}
 			});
-			const network = spyOn(globalThis, "fetch").mockImplementation(async () => {
-				if (phase === "response") changeConnection();
-				return quotaResponse();
-			});
+			const network = spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(
+					async () => {
+						if (phase === "response") changeConnection();
+						return quotaResponse();
+					},
+					{ preconnect: globalThis.fetch.preconnect },
+				),
+			);
 			const quotas = await run(phase === "preparation" ? changeConnection : undefined);
 			expect(changeConnection).toHaveBeenCalledTimes(1);
 			expect(network).toHaveBeenCalledTimes(1);

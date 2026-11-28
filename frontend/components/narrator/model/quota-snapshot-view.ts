@@ -58,8 +58,7 @@ export function quotaSnapshotView(
 					? Math.max(0, Math.min(100, window.usedRatio * 100))
 					: null;
 			const rawRemainingPercent = usedPercent == null ? null : 100 - usedPercent;
-			const remainingPercent =
-				rawRemainingPercent == null ? null : Math.round(rawRemainingPercent);
+			const remainingPercent = rawRemainingPercent == null ? null : Math.round(rawRemainingPercent);
 			const limit = window.total != null && Number.isFinite(window.total) ? window.total : null;
 			const reportedRemaining =
 				window.remaining != null && Number.isFinite(window.remaining) ? window.remaining : null;
@@ -87,8 +86,7 @@ export function quotaSnapshotView(
 				...(window.unit ? { unit: window.unit } : {}),
 				resetAt: window.resetsAt,
 				level:
-					window.status === "rate-limited" ||
-					(reportedRemaining !== null && reportedRemaining <= 0)
+					window.status === "rate-limited" || (reportedRemaining !== null && reportedRemaining <= 0)
 						? "exhausted"
 						: reportedRemaining !== null &&
 								reportedRemaining > 0 &&
@@ -159,7 +157,10 @@ export function quotaSnapshotView(
 		return values;
 	});
 	if (snapshot?.scope && snapshot.scope !== "account") {
-		rows.push({ label: t("providerQuota.scope"), value: t(`providerQuota.scopes.${snapshot.scope}`) });
+		rows.push({
+			label: t("providerQuota.scope"),
+			value: t(`providerQuota.scopes.${snapshot.scope}`),
+		});
 	}
 	if (snapshot?.available === false) {
 		rows.push({
