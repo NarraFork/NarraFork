@@ -1,4 +1,4 @@
-import { and, count, eq, gte, isNotNull, ne, sql } from "drizzle-orm";
+import { and, count, eq, gte, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import {
@@ -15,6 +15,7 @@ import { projectPrincipalOf } from "../lib/project-access";
 import { narratorReadableWhere } from "../services/narrator-acl";
 import { narratorService } from "../services/narrator-service";
 import { projectReadableWhere } from "../services/project-acl";
+import { resolveTaskPrincipal, taskReadableWhere } from "../services/scheduled-task-acl";
 
 export const dashboardRoutes = new Hono();
 
@@ -97,7 +98,16 @@ dashboardRoutes.get("/summary", async (c) => {
 
 	// ── Scheduled tasks ───────────────────────────────────────────────────
 	const [enabledTaskResult] = await readQuery(
-		db.select({ c: count() }).from(scheduledTasks).where(eq(scheduledTasks.enabled, true)),
+		db
+			.select({ c: count() })
+			.from(scheduledTasks)
+			.where(
+				and(
+					eq(scheduledTasks.enabled, true),
+					isNull(scheduledTasks.completedAt),
+					taskReadableWhere(await resolveTaskPrincipal(c.get("user").sub)),
+				),
+			),
 		readOptions,
 	);
 	const enabledScheduledTaskCount = enabledTaskResult?.c ?? 0;

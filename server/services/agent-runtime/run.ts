@@ -51,6 +51,11 @@ import {
 	withNarratorStartAdmission,
 	withNarratorWorkAdmission,
 } from "../narrator-session-state";
+import {
+	getRegisteredScheduledRun,
+	getScheduledRunMember,
+	rotateScheduledRunExecutionEpoch,
+} from "../scheduled-run-registry";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
 import { freezeCheckpointStopAdmission, matchesCheckpointRun } from "./checkpoint-stop";
 import { notifyAgentInboxChanged } from "./inbox";
@@ -80,6 +85,9 @@ export interface StartNarratorRunRequest {
 	images?: ImageRef[];
 	media?: MediaRef[];
 	replyInUserLanguage?: boolean;
+	/** Trusted scheduled dispatch identity; never accepted from model/tool input. */
+	scheduledRunId?: string;
+	initiatedBy?: "person" | "system";
 	/** An already prepared session (an input path persisted the user turn into it). */
 	active?: ActiveNarrator;
 	/**
@@ -645,6 +653,23 @@ async function executeRun(
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
+		const scheduled = getRegisteredScheduledRun(id);
+		if (req.recovered && scheduled?.recoveredAt) {
+			const { finalizeScheduledRun } = await import("../scheduled-task-run-service");
+			await finalizeScheduledRun(scheduled.runId, "interrupted", {
+				errorKind: "restart",
+				error: "Scheduled runs are not replayed after restart without an exact terminal receipt",
+			});
+			await settleStatus(id, deliverTo, { ...notStarted, interrupted: true });
+			return { ...notStarted, interrupted: true };
+		}
+		const { attachScheduledRuntimeRun } = await import("../scheduled-task-run-service");
+		await attachScheduledRuntimeRun({
+			narratorId: id,
+			run,
+			scheduledRunId: req.scheduledRunId,
+			initiatedBy: req.initiatedBy,
+		});
 		if (deliverTo) {
 			const { startSubagentOutputCharCount } = await import("../narrator-event-handler");
 			startSubagentOutputCharCount(id, binding.logicalRunId);
@@ -847,10 +872,29 @@ async function executeRun(
 			// The old session finalizer has restored its temporary model. Rotate the epoch
 			// in the short admission, retaining this run, hold and all three caller promises.
 			owner = await withNarratorStartAdmission(id, async () => {
-				if (!owner.release()) throw new Error("Lost fresh-pass execution owner");
+				const previousEpoch = owner.epoch;
+				if (getRunControl(id) !== run || !owner.release())
+					throw new Error("Lost fresh-pass execution owner");
 				const next = tryClaimExecution(id, "run");
 				if (!next) throw new Error("Fresh-pass execution owner unavailable");
 				setRunControl(next, run);
+				// Keep cleanup attached to the new owner even if the receipt CAS fails.
+				owner = next;
+				// This is the same run, before any new input is adopted. Keep its
+				// scheduled receipt current; a human input below still ends that binding.
+				if (run.logicalRunId) {
+					const scheduled = getRegisteredScheduledRun(id) ?? getScheduledRunMember(id);
+					if (
+						scheduled &&
+						!rotateScheduledRunExecutionEpoch({
+							narratorId: id,
+							logicalRunId: run.logicalRunId,
+							previousEpoch,
+							executionEpoch: next.epoch,
+						})
+					)
+						throw new Error("Scheduled execution changed during fresh pass");
+				}
 				return next;
 			});
 			run.finalizing = false;
@@ -1073,7 +1117,11 @@ async function finishRun(
 	const timedOut = outcome.committedEvent ? outcome.committedEvent === "timed_out" : run.timedOut;
 	const cancelled = !timedOut && run.cancel.signal.aborted;
 	const hold = getRunHold(id);
-	const interrupted = !timedOut && (!!outcome.aborted || outcome.committedEvent === "cancelled");
+	const interrupted =
+		!timedOut &&
+		(!!outcome.aborted ||
+			outcome.committedEvent === "cancelled" ||
+			(!outcome.committedEvent && cancelled));
 	const hasError =
 		timedOut ||
 		(!interrupted &&

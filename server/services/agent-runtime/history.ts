@@ -74,6 +74,8 @@ export interface RuntimeHistoryOptions {
 	toolLoading?: {
 		managed: ReadonlySet<string>;
 		current: Iterable<string>;
+		/** Already-authorized host tools that must be declared for this exact run. */
+		required?: ReadonlySet<string>;
 		/** The request's already-materialized registry candidates; never re-read the registry. */
 		candidates?: readonly ToolDefinition[];
 		/** Captured with candidates before any asynchronous work. */

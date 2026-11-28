@@ -26,7 +26,7 @@
 
 /**
  * Whitelisted input keys, chosen to cover every tool whose row is worth
- * labelling while keeping the payload small (10 keys × 200 chars worst case).
+ * labelling while keeping the payload small (12 keys × 200 chars worst case).
  *
  * Deliberately omitted: `path`/`glob` (only decorate a search summary with
  * `in <dir>`), `wait_for_text`, `task_id`, and anything nested such as
@@ -44,6 +44,8 @@ export const SUBAGENT_SUMMARY_INPUT_KEYS = [
 	"mode",
 	"query",
 	"subagent_type",
+	"action",
+	"outcome",
 ] as const;
 
 export type SubagentSummaryInputKey = (typeof SUBAGENT_SUMMARY_INPUT_KEYS)[number];

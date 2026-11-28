@@ -38,6 +38,14 @@ import type {
 	OutlineDigestStored,
 } from "@shared/outline-digest";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
+import type { TaskSchedule } from "@shared/scheduled-task-schedule";
+import type {
+	RunAutoHandled,
+	RunStats,
+	ScheduledRunInterruptTarget,
+	TaskCreatorSnapshot,
+	TaskModifiedBy,
+} from "@shared/scheduled-task-status";
 import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
@@ -6581,18 +6589,58 @@ export const outlineSpecLossScans = sqliteTable("outline_spec_loss_scans", {
 });
 
 // === scheduled tasks ===
-// A scheduled task periodically starts a narrator with a preset prompt. The schedule is
-// always stored as a cron expression (the UI may generate it from friendly presets). At
-// each fire the scheduler either spawns a fresh standalone/project narrator or reuses an
-// existing one, then injects `prompt` to auto-start its agent loop (unattended).
+// A scheduled task starts a narrator with a preset prompt at the moments its schedule
+// names. At each fire the scheduler either spawns a fresh standalone/project narrator or
+// reuses an existing one, then injects `prompt` to auto-start its agent loop (unattended).
+// Design and rationale: docs/SCHEDULED_TASKS_REDESIGN_PLAN.md.
 export const scheduledTasks = sqliteTable(
 	"scheduled_tasks",
 	{
 		id: text("id").primaryKey(),
 		name: text("name").notNull(),
 		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
-		// Cron expression (5 or 6 fields). Friendly UI presets are compiled to cron client-side.
+		/**
+		 * @deprecated Superseded by `schedule`. Still written, as the single cron expression
+		 * equal to the schedule when one exists and an empty string when none does, so that
+		 * a reader of this column never sees a stale cadence. Never read back to decide when
+		 * a task fires, except for a row whose `schedule` has not been filled in yet.
+		 */
 		cronExpr: text("cron_expr").notNull(),
+		/**
+		 * When the task fires: specific date-times, a repeat rule with an end condition, or
+		 * a cron expression. NULL only on a row written before structured schedules, until
+		 * startup normalization derives it from `cronExpr`.
+		 */
+		schedule: text("schedule", { mode: "json" }).$type<TaskSchedule>(),
+		/** `schedule.kind`, denormalized so lists can filter without parsing JSON in SQL. */
+		scheduleKind: text("schedule_kind", { enum: ["at", "repeat", "cron"] }),
+		/**
+		 * Scheduled occurrences consumed in the current series: dispatched, skipped or
+		 * missed alike. A count-limited schedule ends when this reaches its count, which is
+		 * why a missed occurrence still uses one up. Restarts at 0 when the cadence is edited.
+		 */
+		firedCount: integer("fired_count").notNull().default(0),
+		/** CAS generation: an old tick cannot consume an occurrence from an edited schedule. */
+		scheduleRevision: integer("schedule_revision").notNull().default(0),
+		/** Last consumed occurrence; missed batches resume here instead of dropping overflow. */
+		scheduleCursorAt: text("schedule_cursor_at"),
+		/** Durable admission for one active run per task, not a process-local mutex alone. */
+		activeRunId: text("active_run_id"),
+		/**
+		 * When the task ended: its schedule ran out and no run was still in flight. NULL
+		 * while it may still fire. Distinct from `enabled`, which a person switches.
+		 */
+		completedAt: text("completed_at"),
+		/**
+		 * Why `enabled` is false. NULL with `enabled` false means a person paused it before
+		 * this column existed.
+		 */
+		pauseReason: text("pause_reason", { enum: ["user", "circuit_breaker"] }),
+		/**
+		 * Runs in a row that failed, for the circuit breaker. Persisted because a counter
+		 * kept in memory forgave every broken task at each restart.
+		 */
+		consecutiveFailures: integer("consecutive_failures").notNull().default(0),
 		// IANA timezone (e.g. "Asia/Shanghai"); null = server local time.
 		timezone: text("timezone"),
 		// The prompt injected into the narrator on each run.
@@ -6614,10 +6662,22 @@ export const scheduledTasks = sqliteTable(
 		cwd: text("cwd"),
 		// project mode: target project.
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		// Whether to spawn a fresh narrator each run or reuse the same one.
-		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
+		// Spawn a fresh narrator, reuse a task-created one, or explicitly target an existing one.
+		narratorMode: text("narrator_mode", { enum: ["new", "reuse", "existing"] })
 			.notNull()
 			.default("new"),
+		// An explicit target is a reference, never a transfer of ownership or creation provenance.
+		targetNarratorId: text("target_narrator_id").references((): AnySQLiteColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		contextPolicy: text("context_policy", { enum: ["keep", "clear"] })
+			.notNull()
+			.default("keep"),
+		onBusy: text("on_busy", { enum: ["skip", "wait", "interrupt"] })
+			.notNull()
+			.default("skip"),
+		busyWaitMinutes: integer("busy_wait_minutes").notNull().default(30),
+		requireReport: integer("require_report", { mode: "boolean" }).notNull().default(true),
 		/** Opt-in, task-scoped destructive retention. Existing tasks remain unchanged. */
 		cleanupPolicy: text("cleanup_policy", { mode: "json" })
 			.$type<ScheduledTaskCleanupPolicy>()
@@ -6629,14 +6689,76 @@ export const scheduledTasks = sqliteTable(
 			(): any => narrators.id,
 			{ onDelete: "set null" },
 		),
-		// User who created the task (used as sendMessage userId + ACL provenance).
+		/**
+		 * How `model` applies to a session the task reuses: leave it (`follow`), switch for
+		 * the run and restore (`temporary`), or set it before each run and leave it (`sync`).
+		 * Rows that predate the column keep `follow`, which is what they always did.
+		 */
+		modelPolicy: text("model_policy", { enum: ["follow", "temporary", "sync"] })
+			.notNull()
+			.default("follow"),
+		/**
+		 * What a run does on reaching something only a person can settle: carry on without
+		 * one (`auto`), or mark itself blocked and wait `blockedWaitMinutes` (`wait`).
+		 */
+		onBlocked: text("on_blocked", { enum: ["auto", "wait"] })
+			.notNull()
+			.default("auto"),
+		blockedWaitMinutes: integer("blocked_wait_minutes").notNull().default(30),
+		/** A run still going after this long is interrupted and recorded as timed out. */
+		maxRunMinutes: integer("max_run_minutes").notNull().default(60),
+		/** Failures, stalls and timeouts always notify the owner; successes only when set. */
+		notifyOnSuccess: integer("notify_on_success", { mode: "boolean" }).notNull().default(false),
+		/**
+		 * Who the task runs as and who may edit it. Transferable, and reassigned to the
+		 * acting administrator when its user is deleted. NULL on a row that predates the
+		 * column and whose creator was already gone.
+		 */
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		/**
+		 * The person accountable for creating the task: the user themself, or for a task a
+		 * narrator created, whoever drove that turn. Provenance only — authority is
+		 * `ownerUserId`. Never rewritten after creation.
+		 */
 		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		/** Whether a person or a narrator created the task. Rows that predate it are `user`. */
+		creatorKind: text("creator_kind", { enum: ["user", "narrator"] })
+			.notNull()
+			.default("user"),
+		// Where a narrator created it: the session, the message and the tool call. Plain text
+		// with no foreign keys, so the record outlives what it names.
+		creatorNarratorId: text("creator_narrator_id"),
+		creatorMessageId: text("creator_message_id"),
+		creatorToolCallId: text("creator_tool_call_id"),
+		creatorToolUseId: text("creator_tool_use_id"),
+		/** Names as they were at creation, for display once the user or session is gone. */
+		creatorSnapshot: text("creator_snapshot", { mode: "json" }).$type<TaskCreatorSnapshot>(),
+		/** Who last changed the task, and how. */
+		lastModifiedBy: text("last_modified_by", { mode: "json" }).$type<TaskModifiedBy>(),
 		// Scheduling state.
 		lastRunAt: text("last_run_at"),
 		nextRunAt: text("next_run_at"),
 		lastNarratorId: text("last_narrator_id"),
-		lastStatus: text("last_status", { enum: ["success", "failed", "skipped"] }),
+		lastRunId: text("last_run_id"),
+		/** Status of the latest run. `success` is legacy and means only "dispatched". */
+		lastStatus: text("last_status", {
+			enum: [
+				"waiting",
+				"running",
+				"blocked",
+				"completed",
+				"failed",
+				"interrupted",
+				"timed_out",
+				"skipped",
+				"missed",
+				"success",
+			],
+		}),
 		lastError: text("last_error"),
+		/** What the model reported about the latest run, and the head of its summary. */
+		lastOutcome: text("last_outcome", { enum: ["done", "partial", "blocked", "no_change"] }),
+		lastSummary: text("last_summary"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -6646,14 +6768,17 @@ export const scheduledTasks = sqliteTable(
 		index("idx_scheduled_tasks_project").on(table.projectId),
 		// FK covering indexes for user / narrator deletion.
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
+		index("idx_scheduled_tasks_owner").on(table.ownerUserId),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_target_narrator").on(table.targetNarratorId),
 		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 	],
 );
 
 // === scheduled_task_runs (per-run history) ===
-// One row per task execution (scheduled tick or manual trigger). Enables the task
-// detail page to list every run with its outcome and the narrator it dispatched.
+// One row per occurrence a task consumed and per manual trigger. A dispatched run is
+// written `running` and brought to a terminal status once the narrator's loop settles;
+// occurrences that never started (`skipped`, `missed`) are written terminal.
 export const scheduledTaskRuns = sqliteTable(
 	"scheduled_task_runs",
 	{
@@ -6664,12 +6789,84 @@ export const scheduledTaskRuns = sqliteTable(
 		// The narrator this run created/used. Plain text (no FK) so archiving/deleting a
 		// narrator never cascades into run history; the UI tolerates a missing narrator.
 		narratorId: text("narrator_id"),
-		status: text("status", { enum: ["success", "failed", "skipped"] }).notNull(),
+		/**
+		 * What the server observed. `success` is legacy: rows written when a run was
+		 * recorded at dispatch, where it meant only that the prompt was delivered.
+		 */
+		status: text("status", {
+			enum: [
+				"waiting",
+				"running",
+				"blocked",
+				"completed",
+				"failed",
+				"interrupted",
+				"timed_out",
+				"skipped",
+				"missed",
+				"success",
+			],
+		}).notNull(),
 		error: text("error"),
+		errorKind: text("error_kind", {
+			enum: [
+				"dispatch",
+				"provider",
+				"timeout",
+				"blocked_timeout",
+				"restart",
+				"acl",
+				"busy",
+				"busy_timeout",
+				"scheduled_interrupt",
+				"cancelled",
+				"target_missing",
+				"user_interrupt",
+			],
+		}),
 		// Run environment snapshot at dispatch time.
 		runContext: text("run_context", { enum: ["standalone", "project"] }).notNull(),
-		// Whether this run was triggered manually ("Run now") vs the cron schedule.
+		/** The occurrence this run is for; NULL for a manual trigger. */
+		scheduledFor: text("scheduled_for"),
+		trigger: text("trigger", { enum: ["schedule", "manual"] })
+			.notNull()
+			.default("schedule"),
+		/** @deprecated Mirror of `trigger === "manual"`, kept for readers of the old column. */
 		manual: integer("manual", { mode: "boolean" }).notNull().default(false),
+		/**
+		 * The user message that carried the prompt. Joins the run to its `narrator_turns`
+		 * row, and is where "open this run" lands in a session that many runs share.
+		 */
+		triggerMessageId: text("trigger_message_id"),
+		/** Exact runtime execution identity; unrelated later turns cannot settle this run. */
+		logicalRunId: text("logical_run_id"),
+		/** The model the run was dispatched with. */
+		model: text("model"),
+		blockReason: text("block_reason", {
+			enum: ["question", "plan", "permission", "provider_wait"],
+		}),
+		blockedAt: text("blocked_at"),
+		/** What the model reported about its own work; NULL when it reported nothing. */
+		outcome: text("outcome", { enum: ["done", "partial", "blocked", "no_change"] }),
+		outcomeSummary: text("outcome_summary"),
+		outcomeReportedAt: text("outcome_reported_at"),
+		/** What an unattended run settled without a person. */
+		autoHandled: text("auto_handled", { mode: "json" }).$type<RunAutoHandled>(),
+		/** Frozen on acceptance: later task edits cannot change a run's reporting contract. */
+		requireReport: integer("require_report", { mode: "boolean" }).notNull().default(true),
+		/** A fixed deadline while waiting for the target; execution time starts after admission. */
+		busyDeadlineAt: text("busy_deadline_at"),
+		/** A non-null value reserves the next scheduled start for this exact interruption. */
+		interruptTarget: text("interrupt_target", {
+			mode: "json",
+		}).$type<ScheduledRunInterruptTarget>(),
+		/** The one reminder to report an outcome has been sent. */
+		nudged: integer("nudged", { mode: "boolean" }).notNull().default(false),
+		/** Occurrences one `missed` row stands for, when an outage skipped several. */
+		missedCount: integer("missed_count"),
+		/** When the watchdog gives up on the run. */
+		deadlineAt: text("deadline_at"),
+		stats: text("stats", { mode: "json" }).$type<RunStats>(),
 		startedAt: text("started_at"),
 		finishedAt: text("finished_at"),
 		durationMs: integer("duration_ms"),
@@ -6677,7 +6874,24 @@ export const scheduledTaskRuns = sqliteTable(
 	},
 	(table) => [
 		index("idx_scheduled_task_runs_task").on(table.taskId, table.createdAt),
+		// Completion and association probes must not walk a task's accumulated history.
+		index("idx_scheduled_task_runs_task_status").on(table.taskId, table.status),
 		index("idx_scheduled_task_runs_narrator").on(table.narratorId),
+		index("idx_scheduled_task_runs_narrator_task").on(table.narratorId, table.taskId),
+		index("idx_scheduled_task_runs_wait_queue").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+		uniqueIndex("idx_scheduled_task_runs_one_waiting")
+			.on(table.taskId)
+			.where(sql`${table.status} = 'waiting'`),
+		uniqueIndex("idx_scheduled_task_runs_one_interrupt")
+			.on(table.narratorId)
+			.where(sql`${table.status} = 'waiting' AND ${table.interruptTarget} IS NOT NULL`),
+		// The tracker sweeps in-flight runs every tick; they are a handful among many rows.
+		index("idx_scheduled_task_runs_status").on(table.status, table.createdAt),
 	],
 );
 
@@ -7136,7 +7350,9 @@ export const notifications = sqliteTable(
 		userId: text("user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
-		kind: text("kind", { enum: ["chat_message", "permission_request"] }).notNull(),
+		kind: text("kind", {
+			enum: ["chat_message", "permission_request", "scheduled_task"],
+		}).notNull(),
 		/** Best-effort denormalized filter; null when the source has no project. */
 		projectId: text("project_id"),
 		/** Required for permission_request; chat_message may leave this null. */

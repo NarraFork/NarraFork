@@ -5,7 +5,11 @@ import {
 } from "@shared/notification-center";
 import { z } from "zod";
 
-export const notificationKindSchema = z.enum(["chat_message", "permission_request"]);
+export const notificationKindSchema = z.enum([
+	"chat_message",
+	"permission_request",
+	"scheduled_task",
+]);
 
 export const notificationListQuerySchema = z.object({
 	kind: notificationKindSchema.optional(),

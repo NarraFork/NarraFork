@@ -1,110 +1,134 @@
 import { Hono } from "hono";
-import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
+import { bodyLimit } from "hono/body-limit";
+import { z } from "zod";
+import { ForbiddenError, ValidationError } from "../lib/errors";
+import { narratorPrincipalOf } from "../lib/narrator-access";
 import {
 	createScheduledTaskSchema,
+	scheduledTaskAssociationsQuerySchema,
+	scheduledTaskFiltersSchema,
+	scheduledTaskPreviewSchema,
+	scheduledTaskTargetsQuerySchema,
 	toggleScheduledTaskSchema,
 	updateScheduledTaskSchema,
-} from "../lib/validators";
+} from "../lib/validators/scheduled-tasks";
+import { listNarratorScheduledTasks } from "../services/scheduled-task-associations";
 import { cleanupScheduledTaskNarrators } from "../services/scheduled-task-cleanup";
 import { scheduledTaskService } from "../services/scheduled-task-service";
+import { listScheduledTaskTargets } from "../services/scheduled-task-targets";
 
 export const scheduledTaskRoutes = new Hono();
+scheduledTaskRoutes.use("*", bodyLimit({ maxSize: 256 * 1024 }));
+function parse<T>(schema: z.ZodType<T>, input: unknown): T {
+	const result = schema.safeParse(input);
+	if (!result.success) throw new ValidationError(result.error.message);
+	return result.data;
+}
 
-/**
- * List scheduled tasks.
- *
- * Returns a bare array, which is the shape the UI has always consumed. The service's
- * `truncated` flag is surfaced as a header rather than by wrapping the body in an
- * object: changing the body shape would break every existing client for a signal that
- * only fires above 500 tasks, and a header is readable by the ones that care.
- */
 scheduledTaskRoutes.get("/", async (c) => {
-	const { tasks, truncated } = await scheduledTaskService.list();
+	const filters = parse(scheduledTaskFiltersSchema, c.req.query());
+	const { tasks, truncated } = await scheduledTaskService.list(narratorPrincipalOf(c), filters);
 	if (truncated) c.header("X-NarraFork-Truncated", "1");
 	return c.json(tasks);
 });
 
-/** Get a single scheduled task. */
-scheduledTaskRoutes.get("/:id", async (c) => {
-	const id = c.req.param("id");
-	const task = await scheduledTaskService.get(id);
-	if (!task) throw new NotFoundError("ScheduledTask", id);
-	return c.json(task);
+scheduledTaskRoutes.post("/preview-schedule", async (c) => {
+	return c.json(
+		scheduledTaskService.preview(parse(scheduledTaskPreviewSchema, await c.req.json())),
+	);
 });
 
-/** Create a scheduled task. */
+scheduledTaskRoutes.get("/targets", async (c) =>
+	c.json(
+		await listScheduledTaskTargets(
+			narratorPrincipalOf(c),
+			parse(scheduledTaskTargetsQuerySchema, c.req.query()),
+		),
+	),
+);
+
+scheduledTaskRoutes.get("/for-narrator/:narratorId", async (c) =>
+	c.json(
+		await listNarratorScheduledTasks(
+			c.req.param("narratorId"),
+			narratorPrincipalOf(c),
+			parse(scheduledTaskAssociationsQuerySchema, c.req.query()),
+		),
+	),
+);
+
+scheduledTaskRoutes.get("/:id", async (c) =>
+	c.json(await scheduledTaskService.detail(c.req.param("id"), narratorPrincipalOf(c))),
+);
+
 scheduledTaskRoutes.post("/", async (c) => {
-	const body = await c.req.json();
-	const parsed = createScheduledTaskSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const createdBy = c.get("user").sub;
-	const task = await scheduledTaskService.create({ ...parsed.data, createdBy });
-	return c.json(task, 201);
+	const principal = narratorPrincipalOf(c);
+	const task = await scheduledTaskService.create(
+		parse(createScheduledTaskSchema, await c.req.json()),
+		principal,
+		{ kind: "user" },
+	);
+	return c.json(await scheduledTaskService.detail(task.id, principal), 201);
 });
 
-/** Update a scheduled task. */
 scheduledTaskRoutes.put("/:id", async (c) => {
-	const id = c.req.param("id");
-	const body = await c.req.json();
-	const parsed = updateScheduledTaskSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	if (parsed.data.cleanupPolicy !== undefined) {
-		const existing = await scheduledTaskService.get(id);
-		if (!existing) throw new NotFoundError("ScheduledTask", id);
-		const user = c.get("user");
-		if (existing.createdBy !== user.sub && user.role !== "admin") throw new ForbiddenError();
-	}
-	const task = await scheduledTaskService.update(id, parsed.data);
-	return c.json(task);
+	const principal = narratorPrincipalOf(c);
+	const task = await scheduledTaskService.update(
+		c.req.param("id"),
+		parse(updateScheduledTaskSchema, await c.req.json()),
+		principal,
+		{ kind: "user" },
+	);
+	return c.json(await scheduledTaskService.detail(task.id, principal));
 });
 
-/** Enable/disable a scheduled task. */
 scheduledTaskRoutes.post("/:id/toggle", async (c) => {
-	const id = c.req.param("id");
-	const body = await c.req.json();
-	const parsed = toggleScheduledTaskSchema.safeParse(body);
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const task = await scheduledTaskService.setEnabled(id, parsed.data.enabled);
-	return c.json(task);
+	const principal = narratorPrincipalOf(c);
+	const { enabled } = parse(toggleScheduledTaskSchema, await c.req.json());
+	await scheduledTaskService.setEnabled(c.req.param("id"), enabled, principal);
+	return c.json(await scheduledTaskService.detail(c.req.param("id"), principal));
 });
 
-/** Trigger a task immediately (out of schedule). */
 scheduledTaskRoutes.post("/:id/run", async (c) => {
-	const id = c.req.param("id");
-	const existing = await scheduledTaskService.get(id);
-	if (!existing) throw new NotFoundError("ScheduledTask", id);
-	await scheduledTaskService.runTask(id, { manual: true });
-	const task = await scheduledTaskService.get(id);
-	return c.json(task);
+	const principal = narratorPrincipalOf(c);
+	await scheduledTaskService.runTask(c.req.param("id"), { manual: true, principal });
+	return c.json(await scheduledTaskService.detail(c.req.param("id"), principal));
 });
 
-/** List a task's run history (newest first, cursor-paginated). */
 scheduledTaskRoutes.get("/:id/runs", async (c) => {
-	const id = c.req.param("id");
-	const existing = await scheduledTaskService.get(id);
-	if (!existing) throw new NotFoundError("ScheduledTask", id);
-	const limitRaw = Number(c.req.query("limit"));
-	const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
-	const cursor = c.req.query("cursor") || null;
-	const result = await scheduledTaskService.listRuns(id, { limit, cursor });
-	return c.json(result);
+	const query = parse(
+		z.object({
+			limit: z.coerce.number().int().min(1).max(200).optional(),
+			cursor: z.string().max(300).optional(),
+			result: scheduledTaskFiltersSchema.shape.result,
+		}),
+		c.req.query(),
+	);
+	return c.json(
+		await scheduledTaskService.listRuns(c.req.param("id"), {
+			...query,
+			principal: narratorPrincipalOf(c),
+		}),
+	);
 });
 
-/** Apply the saved retention policy to one bounded batch (none is a no-op). */
 scheduledTaskRoutes.post("/:id/cleanup", async (c) => {
-	const id = c.req.param("id");
-	const task = await scheduledTaskService.get(id);
-	if (!task) throw new NotFoundError("ScheduledTask", id);
-	const user = c.get("user");
-	if (task.createdBy !== user.sub && user.role !== "admin") throw new ForbiddenError();
-	return c.json(await cleanupScheduledTaskNarrators(id));
+	const task = await scheduledTaskService.detail(c.req.param("id"), narratorPrincipalOf(c));
+	if (!task.capabilities.canEdit) throw new ForbiddenError();
+	return c.json(await cleanupScheduledTaskNarrators(task.id));
 });
 
-/** Delete a scheduled task. */
+scheduledTaskRoutes.post("/:id/transfer", async (c) => {
+	const { ownerUserId } = parse(
+		z.object({ ownerUserId: z.string().min(1).max(100) }),
+		await c.req.json(),
+	);
+	return c.json(
+		await scheduledTaskService.transfer(c.req.param("id"), ownerUserId, narratorPrincipalOf(c)),
+	);
+});
+
 scheduledTaskRoutes.delete("/:id", async (c) => {
-	const id = c.req.param("id");
-	const existing = await scheduledTaskService.get(id);
-	if (!existing) throw new NotFoundError("ScheduledTask", id);
-	await scheduledTaskService.delete(id);
+	await scheduledTaskService.delete(c.req.param("id"), narratorPrincipalOf(c));
 	return c.json({ ok: true });
 });

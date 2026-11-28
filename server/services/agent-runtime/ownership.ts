@@ -103,6 +103,18 @@ const records = hotSafe<Map<string, RuntimeRecord>>(
 	() => new Map(),
 );
 
+// An idle record may be pruned, but a takeover must still notice an intervening
+// execution that started and ended. Eviction fails closed for old reservations.
+const recentExecutionEpochs = hotSafe<Map<string, string>>(
+	"narrafork.agentRuntime.recentExecutionEpochs",
+	() => new Map(),
+);
+const RECENT_EXECUTION_EPOCH_LIMIT = 10_000;
+
+export function getLastExecutionEpoch(narratorId: string): string | undefined {
+	return records.get(narratorId)?.owner?.epoch ?? recentExecutionEpochs.get(narratorId);
+}
+
 function recordFor(narratorId: string): RuntimeRecord {
 	let record = records.get(narratorId);
 	if (!record) {
@@ -151,6 +163,12 @@ export function tryClaimExecution(narratorId: string, kind: ExecutionKind): Exec
 		},
 	};
 	record.owner = owner;
+	recentExecutionEpochs.delete(narratorId);
+	recentExecutionEpochs.set(narratorId, owner.epoch);
+	if (recentExecutionEpochs.size > RECENT_EXECUTION_EPOCH_LIMIT) {
+		const oldest = recentExecutionEpochs.keys().next().value;
+		if (oldest !== undefined) recentExecutionEpochs.delete(oldest);
+	}
 	publishRuntimeLiveness(narratorId);
 	return owner;
 }

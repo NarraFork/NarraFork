@@ -43,6 +43,7 @@ import {
 	getRecentTabUserIdsForNarrator,
 	getRecentTabUserIdsForNarratorByRecency,
 } from "./recent-tabs-service";
+import { notifyScheduledTaskTransferred } from "./scheduled-task-notify";
 import { readTeamMemberIds } from "./teams/team-members";
 import { teamIdOfNarrator } from "./teams/team-membership";
 
@@ -321,10 +322,13 @@ async function resolveTeamRecipients(teamId: string, row: NarratorAclRow): Promi
 	if (tabs.length > 0) {
 		const admins = new Set(
 			(
-				await db
-					.select({ id: users.id })
-					.from(users)
-					.where(and(eq(users.role, "admin"), inArray(users.id, tabs)))
+				await readQuery(
+					db
+						.select({ id: users.id })
+						.from(users)
+						.where(and(eq(users.role, "admin"), inArray(users.id, tabs))),
+					{ executionPolicy: "worker-required" },
+				)
 			).map((u) => u.id),
 		);
 		// One batch judgement for all of them (a handful of queries), not one check per user.
@@ -477,11 +481,16 @@ export function initNotificationFanout(): void {
 			}
 		});
 	};
+	const scheduledTransfer = (event: { taskId: string }) => {
+		guard("scheduled_task:transferred", () => notifyScheduledTaskTransferred(event.taskId));
+	};
+	eventBus.on("scheduled_task:transferred", scheduledTransfer);
 	eventBus.on("chat:message_created", created);
 	eventBus.on("chat:room_read", read);
 	eventBus.on("chat:message_deleted", deleted);
 	eventBus.on("narrator:permission_request", permission);
 	subscriptions.dispose = () => {
+		eventBus.off("scheduled_task:transferred", scheduledTransfer);
 		eventBus.off("chat:message_created", created);
 		eventBus.off("chat:room_read", read);
 		eventBus.off("chat:message_deleted", deleted);

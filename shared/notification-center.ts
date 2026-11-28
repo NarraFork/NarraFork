@@ -1,5 +1,5 @@
 /** Activity history is not the authority for human decisions. See shared/human-attention.ts. */
-export type NotificationKind = "chat_message" | "permission_request";
+export type NotificationKind = "chat_message" | "permission_request" | "scheduled_task";
 /** Kept in storage for compatibility; clients use readAt instead. */
 export type NotificationPersistentStatus = "unread" | "read";
 export type NotificationSourceState = "active" | "resolved" | "gone";
@@ -7,6 +7,7 @@ export type NotificationSourceState = "active" | "resolved" | "gone";
 export type NotificationLink =
 	| { type: "chat_room"; roomId: string }
 	| { type: "narrator"; narratorId: string }
+	| { type: "scheduled_task"; taskId: string; runId?: string }
 	| { type: "unavailable" };
 
 export interface NotificationListItem {

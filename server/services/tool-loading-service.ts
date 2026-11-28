@@ -23,6 +23,7 @@ import {
 	ADMIN_ONLY_LOAD_TOOLS,
 	mcpServerMarker,
 	mcpToolMarker,
+	normalizePersistedToolSelections,
 	parseMcpServerMarker,
 	parseMcpToolMarker,
 } from "./tool-load-markers";
@@ -296,8 +297,10 @@ async function normalizePersistedToolState(
 	const persisted = Array.isArray(catalog.narrator.enabledTools)
 		? catalog.narrator.enabledTools.filter((name): name is string => typeof name === "string")
 		: [];
-	const current = new Set(persisted.filter((name) => !name.startsWith("mcp__")));
-	if (current.size !== persisted.length) {
+	const current = new Set(
+		normalizePersistedToolSelections(persisted).filter((name) => !name.startsWith("mcp__")),
+	);
+	if (current.size !== persisted.length || persisted.some((name) => !current.has(name))) {
 		context?.signal.throwIfAborted();
 		context?.assertFinalExecutionPermission?.();
 		await db

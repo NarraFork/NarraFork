@@ -176,6 +176,36 @@ describe("account preference invalidation", () => {
 	});
 });
 
+describe("Scheduled task global invalidation", () => {
+	it("coalesces private task changes to one data-free frame for authenticated users only", async () => {
+		const first = openFakeWs({ userId: "task-user-a" });
+		const second = openFakeWs({ userId: "task-user-b" });
+		const anonymous = openFakeWs();
+		anonymous.ws.data.userId = undefined;
+		const shared = openFakeWs();
+		shared.ws.data.publicShare = {} as NonNullable<typeof shared.ws.data.publicShare>;
+		for (let i = 0; i < 20; i++) eventBus.emit({ type: "scheduled_task:changed" });
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		const changed = (sent: SentMessage[]) =>
+			sent.filter((message) => message.type === "scheduled_tasks_changed");
+		expect(changed(first.sent)).toEqual([{ type: "scheduled_tasks_changed" }]);
+		expect(changed(second.sent)).toEqual([{ type: "scheduled_tasks_changed" }]);
+		expect(changed(anonymous.sent)).toEqual([]);
+		expect(changed(shared.sent)).toEqual([]);
+	});
+
+	it("disconnects a backpressured client rather than accumulating refresh frames", async () => {
+		const { ws, sent } = openFakeWs();
+		ws.getBufferedAmount = () => 256 * 1024 + 1;
+		ws.close = mock(() => {});
+		eventBus.emit({ type: "scheduled_task:changed" });
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(ws.close).toHaveBeenCalledWith(1013, "Scheduled task backpressure; reconnect");
+		expect(getNarratorConnections().has(ws)).toBe(false);
+		expect(sent.some((message) => message.type === "scheduled_tasks_changed")).toBe(false);
+	});
+});
+
 describe("HumanAttention global invalidation", () => {
 	it("reaches authenticated clients without any narrator subscription and carries no source data", async () => {
 		const first = openFakeWs({ userId: "attention-user-a" });

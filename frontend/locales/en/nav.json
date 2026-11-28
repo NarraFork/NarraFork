@@ -97,6 +97,8 @@
 	"notificationFilterAll": "All",
 	"notificationFilterMessages": "Messages",
 	"notificationFilterPermissions": "Permissions",
+	"notificationFilterScheduledTasks": "Scheduled tasks",
+	"notificationKindScheduledTask": "Scheduled task",
 	"notificationGone": "Source unavailable",
 	"notificationResolved": "Resolved",
 	"notificationLoadMore": "Load more",

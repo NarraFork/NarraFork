@@ -1,7 +1,8 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { getFileTestDb } from "../../../tests/setup";
 import {
@@ -285,14 +286,25 @@ function frozenTarget(
 		selectionSource?: ToolExecutionTarget["selectionSource"];
 	} = {},
 ): PendingExecutionTarget {
-	const cwd = input.cwd ?? backend.defaultCwd ?? "/workspace";
-	const path = input.path;
+	const cwd =
+		backend.kind === "local"
+			? resolve(input.cwd ?? backend.defaultCwd ?? "/workspace")
+			: backend.paths.resolve(
+					backend.defaultCwd ?? "/workspace",
+					input.cwd ?? backend.defaultCwd ?? "/workspace",
+				);
+	const path = input.path
+		? backend.kind === "local"
+			? resolve(cwd, input.path)
+			: backend.paths.resolve(cwd, input.path)
+		: undefined;
+	const canonicalPath = path;
 	return {
 		deviceId: backend.deviceId,
 		backendKind: backend.kind,
 		cwd,
 		pathFlavor: backend.pathFlavor ?? backend.paths.flavor,
-		...(path ? { lexicalPath: path, canonicalPath: path, resolvedFilePath: path } : {}),
+		...(path ? { lexicalPath: path, canonicalPath, resolvedFilePath: canonicalPath } : {}),
 		runtimeGeneration: backend.runtimeGeneration ?? 0,
 		selectionSource:
 			input.selectionSource ?? (backend.kind === "local" ? "local_default" : "session_default"),
@@ -579,7 +591,7 @@ describe("working-directory switch danger reflection", () => {
 	// Folding the switch into creation must not become a cheaper path past the gates a
 	// separate SwitchWorkingDirectory call goes through.
 	test("a creation that also switches still needs approval, and still reflects in bypass", async () => {
-		const root = mkdtempSync(join(tmpdir(), "narrafork-worktree-switch-gate-"));
+		const root = await realpath(mkdtempSync(join(tmpdir(), "narrafork-worktree-switch-gate-")));
 		mkdirSync(join(root, ".worktrees"));
 		const createInput = {
 			branchName: "fix/new",
@@ -699,7 +711,7 @@ describe(".git internal review routing", () => {
 		const result = await permissionPromise;
 		expect(result.behavior).toBe("dangerReflection");
 		if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
-		expect(result.danger.details?.join("\n")).toContain(".git/refs/heads/main");
+		expect(result.danger.details?.join("\n").replace(/\\/g, "/")).toContain(".git/refs/heads/main");
 		expect(await confirmDangerReflection(callId, "Verified the ref update")).toBe(true);
 		expect(await result.decision).toMatchObject({ behavior: "allow" });
 	});
@@ -1365,7 +1377,7 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		const toolInput = { file_path: "docs/findings.md", content: "x" };
 		// A real writable cwd keeps this inside the worktree; an out-of-cwd write would
 		// pause for reflection and test the danger path rather than path resolution.
-		const cwd = mkdtempSync(join(tmpdir(), "narrafork-subagent-write-"));
+		const cwd = await realpath(mkdtempSync(join(tmpdir(), "narrafork-subagent-write-")));
 		await seedPermissionRequest({
 			narratorId: id,
 			messageId: "spec-redirect-subagent-fs-message",
@@ -1393,6 +1405,7 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 					}),
 				},
 			);
+			if (result.behavior !== "allow") throw new Error(JSON.stringify(result));
 			expect(result.behavior).toBe("allow");
 			if (result.behavior === "allow") {
 				expect(result.updatedInput?.file_path).toBe("docs/findings.md");
@@ -2463,7 +2476,15 @@ describe("device-scoped permission rules", () => {
 					permMode: "acceptEdits",
 					cwd: "/workspace",
 					blacklistDirs: [
-						{ path: "/secret", denyLevel: "denyAll", enabled: true, deviceScope: null },
+						{
+							path:
+								deviceId === "local"
+									? localBackend.paths.resolve(process.cwd(), "/secret")
+									: "/secret",
+							denyLevel: "denyAll",
+							enabled: true,
+							deviceScope: null,
+						},
 					],
 					executionContext: staticExecutionContext(deviceId),
 				}),
@@ -2498,7 +2519,12 @@ describe("device-scoped permission rules", () => {
 				permMode: "acceptEdits" as const,
 				cwd: "/workspace",
 				blacklistDirs: [
-					{ path: "/etc", denyLevel: "denyAll", enabled: true, deviceScope: "local" },
+					{
+						path: localBackend.paths.resolve(process.cwd(), "/etc"),
+						denyLevel: "denyAll",
+						enabled: true,
+						deviceScope: "local",
+					},
 				],
 				executionContext: staticExecutionContext(deviceId),
 			}) satisfies Parameters<typeof resolvePermissionDecision>[0];

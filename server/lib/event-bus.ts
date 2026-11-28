@@ -2,7 +2,10 @@ import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import type { GitStagingListsChanged } from "@shared/git-workspace-events";
-import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import type {
+	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
+	NotificationKind,
+} from "@shared/notification-center";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
@@ -45,6 +48,15 @@ export type NarraForkEvent =
 	 * those people's inboxes are concerned (an outline question's recipients).
 	 */
 	| { type: "human_attention:changed"; userIds?: string[] }
+	/** Data-free invalidation; clients re-fetch through the task ACL. */
+	| { type: "scheduled_task:changed" }
+	/** Internal delivery intent; never forwarded to WebSocket clients. */
+	| {
+			type: "scheduled_task:notify_run";
+			runId: string;
+			kind: "blocked" | "failed" | "completed" | "circuit_breaker";
+	  }
+	| { type: "scheduled_task:transferred"; taskId: string }
 	/**
 	 * Who may read or drive a narrator changed: its audiences, its grants, its owner, or a
 	 * public share link. Ids only. Server-side holders of access decisions about the narrator
@@ -83,7 +95,7 @@ export type NarraForkEvent =
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
 			userId: string;
 			/** Optional kind hints only; never titles/previews/ids of rows. */
-			kinds?: Array<"chat_message" | "permission_request">;
+			kinds?: NotificationKind[];
 	  }
 	// Fast-mode facts changed after commit; listeners synchronously discard cached facts.
 	| { type: "narrator:fast_mode_changed"; narratorId: string }

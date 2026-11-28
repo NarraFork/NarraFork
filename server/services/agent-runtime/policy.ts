@@ -55,6 +55,8 @@ const READ_TOOLS = Object.freeze([
 	"Watch",
 	"Stop",
 	"Question",
+	// A report is bound server-side to this execution, not an arbitrary task mutation.
+	"ScheduledTaskReport",
 	"ContextAsk",
 	"Send",
 	// Only show passes a read-only execution policy; create remains gated.
@@ -178,6 +180,8 @@ const SEARCH_TOOLS = Object.freeze([
 	"TeamStatus",
 	"Watch",
 	"Question",
+	// A report is bound server-side to this execution, not an arbitrary task mutation.
+	"ScheduledTaskReport",
 	"ContextAsk",
 	"Send",
 ]);

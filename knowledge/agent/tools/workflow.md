@@ -6,6 +6,12 @@ anchors:
   - server/lib/agent/tools/plan-mode.ts
   - server/lib/agent/tools/scheduled-task.ts
   - server/lib/agent/tools/scheduled-task-actions.ts
+  - server/lib/agent/tools/scheduled-task-schema.ts
+  - server/lib/agent/tools/scheduled-task-policy.ts
+  - server/lib/agent/tools/scheduled-task-report.ts
+  - server/services/scheduled-task-targets.ts
+  - server/services/scheduled-task-run-service.ts
+  - server/services/scheduled-task-run-tracker.ts
   - server/lib/agent/tools/skill.ts
   - server/lib/agent/tools/pack.ts
   - server/lib/agent/tools/team.ts
@@ -39,6 +45,9 @@ keywords:
   - EnterPlanMode
   - ExitPlanMode
   - ScheduledTask
+  - ScheduledTaskReport
+  - reportOnly
+  - targetNarratorId
   - Skill
   - PackActivate
   - Team
@@ -55,7 +64,7 @@ keywords:
   - expectedRevision
   - missing_working_directory
 status: draft
-verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
+verified_at: 1f5b09796829c69a6a4f145446bbfc07f6cc5f5d
 ---
 # 流程与协作工具
 
@@ -64,7 +73,11 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ## 关键规则
 - 计划模式（`plan-mode.ts`）：`EnterPlanMode` 带可选 `plan_name`，计划文件落在工作目录 `.narrafork/plans/`（`lib/plan-file-path.ts:PLAN_DIR_REL`）；outline 会话改在会话空间里建或恢复计划根，不写文件（`services/outline-plan-mode`）。
 - `ExitPlanMode` 必填 `mode`：`inline`、`file`、`outline`。声明 `inline` 却无正文即报错，不会去读计划文件；`inline` 还要 `settings.agent.planModeAllowInlinePlan` 开启，内容像路径引用也不算正文。严格计划模式下已有计划文件时拒绝 inline 提交；只有宽松计划模式才采用 `plan_file_path`。缺 `mode` 的旧调用退回按字段推断（`narrator-permission.ts:resolveExitPlanModeInputWithBackend`）。`allowedPrompts` 已退役，不授予任何权限。`ExitPlanMode` 挂在审批卡上等人时还可按需触发计划反思，由权限层处理（`narrator-permission.ts:reflectPendingExitPlanMode`，见 [反思门](../../security/tool-permissions/reflection.md)）。
-- `ScheduledTask`：actions 为 list/get/create/update/enable/disable/delete/run_now/runs，`runs` 单页最多 50 条、默认 10；create 必填 name/cronExpr/prompt，校验 cron 与项目上下文，任务以当前用户身份创建。读动作只有 list/get/runs，其余一律视为写：判定在 `narrator-permission.ts`，位于 bypassPermissions 快捷路径之上，所以绕过模式也要确认，readOnly/dontAsk 直接拒绝。
+- `ScheduledTask`：读动作是 list/targets/get/runs/preview；写动作是 create/update/enable/disable/delete/run_now。create 必填 `task.name`、`task.prompt` 及 `task.schedule` 或 `task.cronExpr`，两种调度输入不能同时提供；结构化调度支持 at/repeat/cron 和有限结束条件。update 仅修改给定字段；run_now 只是请求手动派发，不证明完成（`scheduled-task-actions.ts`、`scheduled-task-schema.ts`）。
+- `targets` 按 `q` 查当前用户可写的会话，使用不透明 `cursor`，每页默认 30、最多 100；`runs` 默认 10、最多 50。new/reuse 创建默认沿用调用会话目录、项目、模型与权限模式；`existing` 必须提供 `targetNarratorId`，保留目标自己的目录、项目、系统提示、权限和计划状态，模型策略默认 follow；`contextPolicy` 默认 keep，`onBusy` 默认 skip，也可选择有界等待或按正常控制权限精确中断（`scheduled-task-policy.ts`）。
+- 普通 `ScheduledTask` 写动作在 bypassPermissions 模式下也要人工批准，readOnly/dontAsk/严格计划模式直接拒绝；审批预览由服务端解析，执行时再核对角色、任务 ACL、版本和目标配置指纹。OAuth、设备、工具/能力限制及会话/项目拒绝规则不能借任务委派抹去；扩大软权限须明确审批，审批不是硬能力授权（`scheduled-task-policy.ts`、`narrator-permission.ts`）。
+- 已绑定的活动计划任务执行只可 get/runs 自己的任务、disable 自己及调用 `ScheduledTaskReport`；不能列举其他任务、发现目标或创建下一层任务。自身 disable 可将普通审批的 ask 转为自动批准，但不覆盖 readOnly/dontAsk/严格计划等拒绝。尚在 waiting 的记录没有活动运行或报告身份（`resolveScheduledTaskApproval`、`lookupScheduledRun`）。
+- `ScheduledTaskReport` 只收 `outcome=done/partial/blocked/no_change` 和 1–2000 字符摘要，不接受 taskId/runId；服务端绑定当前运行并在写入前重验，报告不结束运行、不修改调度。必需报告缺失时最多补发一次 reportOnly 轮次，权限层与最终执行检查只允许报告工具，不能重试业务；`requireReport=false` 不补报。系统 completed 且未报告不冒充成功，详见[计划任务](../../automation/scheduled.md)。
 - `Skill`：按名字（`skill` 或 `name`）加载技能全文，返回 `<skill_content>`、技能目录与附带文件列表；被 trait 屏蔽（`blockedSkills`）的技能报错。可用技能清单以 `<available_skills>` 注入提示词，不含 disabled 与 `allowImplicitInvocation: false` 的技能；清单缓存按技能上下文键存放，会话创建时预热。
 - 知识包 `PackList`/`PackActivate`/`PackDeactivate`：激活把包解压到隔离目录并作为读写白名单登记，与激活记录在同一次存储操作里完成；`settings.knowledge.packActivateRequiresPermission`（默认 true）为真时激活要用户批准。停用删除目录并撤销白名单，没激活也安全。
 - `Team`：仅团队协调者会话可见（`agent-runtime/orchestrator.ts` 过滤）。actions 为 work.list/create/update/review/ready/sync/cancel、brief、checkin、cleanup、decision（`work.update` 只替换 queued 项的 `dependsOn`）。权限逐动作判定，位于绕过与 dontAsk 快捷路径之上：读动作放行；`cleanup` 删除目录，永远要人批准，readOnly、dontAsk、计划模式下直接拒绝；其余写动作在 readOnly 下拒绝，其他模式放行（审查只读会话另有拦截，未逐项核实）。出错时结果是 `{ error: { code, message }, details? }`，`details` 照搬 `AppError.details`（例如 `work.ready` 被知识检查拒绝时列出的节点与文件），见 [工作项](../../collaboration/teams/work-items.md)。
@@ -86,12 +99,13 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ## 从哪读起
 - `server/lib/agent/tools/index.ts`：这些工具属于 core 还是 optional。
 - `server/services/narrator-permission.ts`：`ScheduledTask`、`Team`、`Recall` 的判定分支。
-- 测试：`lib/agent/tools/__tests__/scheduled-task.test.ts`、`switch-device.test.ts`、`worktree-intent.test.ts`、`image-gen.test.ts`
+- 测试：`lib/agent/tools/__tests__/scheduled-task.test.ts`、`scheduled-task-policy.test.ts`、`scheduled-task-targets.test.ts`、`scheduled-task-report.test.ts`、`switch-device.test.ts`、`worktree-intent.test.ts`、`image-gen.test.ts`
 - 生图的响应处理：`image-generation-api.ts` 构造请求体，响应体解析与落盘在工作线程池里完成（`image-generation-response*.ts`，目录 `image-generation-responses/`，响应 id 限 `[A-Za-z0-9_-]{1,100}`），图片存成叙述者上传文件；`image-generation.ts` 对 base64 做严格的规范再编码校验。
 - `recall-tool-summary.ts`：为卡片与列表生成 Recall 等工具调用的单行摘要；`scheduled-task-actions.ts` 是 `ScheduledTask` 动作表的无依赖叶子模块（权限层据此分读写，避免引入工具的懒加载服务）。
 
 ## 改它时
-- 给 `ScheduledTask`、`Team`、`Recall` 加动作：动作名先进各自的叶子清单（`scheduled-task-actions.ts`、`team.ts` 的读动作判定、`recall.ts`），再到 `services/narrator-permission.ts` 归类读/写；`ScheduledTask` 的读动作只有 list/get/runs，其余一律按写处理，`scheduled-task.test.ts`、`team-permission.test.ts` 覆盖。
+- 给 `ScheduledTask`、`Team`、`Recall` 加动作：动作名先进各自的叶子清单（`scheduled-task-actions.ts`、`team.ts` 的读动作判定、`recall.ts`），再到 `services/narrator-permission.ts` 归类读/写；`ScheduledTask` 的读白名单为 list/targets/get/runs/preview，新增未分类动作按写处理，还要同步 schema、服务端审批预览和执行重验。`scheduled-task.test.ts`、`scheduled-task-policy.test.ts`、`team-permission.test.ts` 覆盖。
+- 改计划任务报告要一起看 `scheduled-task-report.ts`、`scheduled-task-run-service.ts` 和 `scheduled-task-run-tracker.ts`；保留当前运行绑定、单次补报与 reportOnly 的最终执行限制，`scheduled-task-report.test.ts`、`scheduled-task-unattended.test.ts` 覆盖。
 - 改计划模式出口：`ExitPlanMode` 的 `mode` 判定集中在 `narrator-permission.ts:resolveExitPlanModeInputWithBackend`，改 inline/file/outline 规则要同时看严格/宽松计划模式。
 - 新增切换类工具（设备、目录、worktree）要登记为串行屏障（`shared/tool-parallel-groups.ts`），成功切换目录会结束当前一轮。
 - 生图的响应处理保持工作线程隔离，线程池失败时不得在主线程解析；已付费响应本地失败只能用 `response_id` 恢复，不得重新发起生成（`image-gen.test.ts`、`image-generation-response*.test.ts`）。

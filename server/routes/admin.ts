@@ -8,6 +8,7 @@ import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { randomAvatarColor } from "../lib/avatar-colors";
 import { AppError, formatZodError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -37,7 +38,11 @@ import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocati
 import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
-import { releaseUserForeignKeys } from "../services/user-deletion";
+import {
+	previewUserScheduledTaskTransfer,
+	releaseUserForeignKeys,
+	transferScheduledTasksBeforeUserDeletion,
+} from "../services/user-deletion";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
 import { outlineSpecImportAdminRoutes } from "./admin-outline-spec-import";
@@ -294,6 +299,16 @@ adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 	return c.json({ ok: true });
 });
 
+adminRoutes.get("/users/:id/scheduled-tasks-transfer-preview", async (c) => {
+	const id = c.req.param("id");
+	const target = await readQueryFirst(
+		db.query.users.findMany({ where: eq(users.id, id), columns: { id: true }, limit: 1 }),
+		adminRead(c, 1),
+	);
+	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
+	return c.json(await previewUserScheduledTaskTransfer(id, c.req.query("cursor")));
+});
+
 adminRoutes.delete("/users/:id", async (c) => {
 	const id = c.req.param("id");
 	const caller = c.get("user");
@@ -316,16 +331,52 @@ adminRoutes.delete("/users/:id", async (c) => {
 		if (adminCount <= 1) throw lastAdminError("delete");
 	}
 
+	const raw = await c.req.text();
+	let transferScheduledTasks = false;
+	try {
+		if (raw.length > 256) throw new Error();
+		const body: unknown = raw ? JSON.parse(raw) : {};
+		if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
+		const values = body as Record<string, unknown>;
+		if (
+			Object.keys(values).some((key) => key !== "transferScheduledTasks") ||
+			(values.transferScheduledTasks !== undefined &&
+				typeof values.transferScheduledTasks !== "boolean")
+		)
+			throw new Error();
+		transferScheduledTasks = values.transferScheduledTasks === true;
+	} catch {
+		throw new AppError("Invalid user deletion confirmation", 400, "VALIDATION_ERROR");
+	}
+	// Reject before revoking OAuth grants; the transaction repeats this check against current rows.
+	if (!transferScheduledTasks && (await previewUserScheduledTaskTransfer(id)).items.length > 0) {
+		throw new AppError(
+			"Confirm scheduled-task takeover before deleting this user",
+			409,
+			"TASK_TRANSFER_CONFIRMATION_REQUIRED",
+		);
+	}
 	await prepareOAuthUserHardDeletion(id);
-	// 没有级联的外键必须先释放，否则删除会以 FOREIGN KEY constraint failed 失败；
-	// 两步放在同一个同步事务里，避免清理成功而删除失败留下的半成品。
-	const deleted = db.transaction((tx) => {
+	const result = db.transaction((tx) => {
 		const current = tx.select({ role: users.role }).from(users).where(eq(users.id, id)).get();
 		if (current?.role === "admin" && !assertAnotherAdmin(tx, id)) throw lastAdminError("delete");
+		const transfer = transferScheduledTasksBeforeUserDeletion(
+			tx,
+			id,
+			caller.sub,
+			transferScheduledTasks,
+		);
 		releaseUserForeignKeys(tx, id);
-		return tx.delete(users).where(eq(users.id, id)).returning().all();
-	})[0];
-	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
+		const deleted = tx.delete(users).where(eq(users.id, id)).returning({ id: users.id }).get();
+		if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
+		return transfer;
+	});
+	for (const narratorId of result.narratorIds) {
+		eventBus.emit({ type: "narrator:access_changed", narratorId, reason: "owner_changed" });
+	}
+	if (result.taskIds.length) eventBus.emit({ type: "scheduled_task:changed" });
+	for (const taskId of result.taskIds)
+		eventBus.emit({ type: "scheduled_task:transferred", taskId });
 	// The user's sessions went with the row (cascade); tell live subscribers.
 	notifyAuthChanged(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).

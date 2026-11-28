@@ -437,7 +437,18 @@ export const authApi = {
 
 	// Admin
 	listUsers: () => request<ApiEntity[]>("/admin/users"),
-	deleteUser: (id: string) => request<ApiEntity>(`/admin/users/${id}`, { method: "DELETE" }),
+	previewUserScheduledTaskTransfer: (id: string, cursor?: string | null) =>
+		request<{
+			items: Array<{ id: string; name: string; enabled: boolean; completedAt: string | null }>;
+			nextCursor: string | null;
+		}>(
+			`/admin/users/${encodeURIComponent(id)}/scheduled-tasks-transfer-preview${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+		),
+	deleteUser: (id: string, options?: { transferScheduledTasks?: boolean }) =>
+		request<ApiEntity>(`/admin/users/${id}`, {
+			method: "DELETE",
+			body: JSON.stringify(options ?? {}),
+		}),
 	updateUser: (
 		id: string,
 		data: { username?: string; password?: string; role?: "admin" | "user" },

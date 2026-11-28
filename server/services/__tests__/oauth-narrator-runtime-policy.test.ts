@@ -247,6 +247,58 @@ afterAll(async () => {
 });
 
 describe("OAuth narrator runtime policy", () => {
+	test("legacy scheduled task preferences cannot widen the OAuth tool allowlist", async () => {
+		const { registerCoreTools } = await import("../../lib/agent/tools/index");
+		const { settings } = await import("../../lib/settings");
+		const { changeLoadedToolGroup, getToolSearchCandidates } = await import(
+			"../tool-loading-service"
+		);
+		registerCoreTools();
+		const routines = settings.routines;
+		const persistedTools = ["ScheduledTaskAdmin", "ScheduledTaskReport"];
+		const original = await db.query.narrators.findFirst({
+			where: eq(narrators.id, ids.narratorV2),
+		});
+		try {
+			settings.routines = {
+				enabledRoutines: [],
+				disabledRoutines: [],
+				toolModes: { scheduled_task_admin: "auto" },
+			};
+			await db
+				.update(narrators)
+				.set({ enabledTools: persistedTools })
+				.where(eq(narrators.id, ids.narratorV2));
+			const runtime = await resolveOAuthNarratorRuntimePolicy(ids.narratorV2, ids.user);
+			const groups = await getToolSearchCandidates(ids.narratorV2, ids.user);
+			for (const [id, toolName] of [
+				["scheduled_task", "ScheduledTask"],
+				["scheduled_task_report", "ScheduledTaskReport"],
+			] as const) {
+				expect(runtime?.allowedTools.has(toolName)).toBe(false);
+				expect(groups.some((group) => group.toolNames.includes(toolName))).toBe(false);
+				expect(
+					await changeLoadedToolGroup(
+						ids.narratorV2,
+						{ id, description: "Scheduled tasks", toolNames: [toolName] },
+						true,
+						ids.user,
+					),
+				).toBe("denied");
+			}
+			expect(
+				(await db.query.narrators.findFirst({ where: eq(narrators.id, ids.narratorV2) }))
+					?.enabledTools,
+			).toEqual(persistedTools);
+		} finally {
+			settings.routines = routines;
+			await db
+				.update(narrators)
+				.set({ enabledTools: original?.enabledTools ?? null })
+				.where(eq(narrators.id, ids.narratorV2));
+		}
+	});
+
 	test("request read budgets reach narrator, provenance, authority, client and device workers", async () => {
 		const request = new AbortController();
 		const deadlineAt = Date.now() + 10_000;
@@ -281,6 +333,7 @@ describe("OAuth narrator runtime policy", () => {
 			reads.mockRestore();
 		}
 	});
+
 	test("uses bindings despite empty or tampered legacy ownership columns", async () => {
 		const policy = await resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user);
 		expect(policy).toMatchObject({

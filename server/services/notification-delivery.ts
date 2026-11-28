@@ -104,6 +104,8 @@ export async function deliverNotification(input: {
 	title: string;
 	message: string;
 	signal?: AbortSignal;
+	/** Recheck a source ACL after waiting for a delivery slot, immediately before fetch. */
+	beforeSend?: () => boolean;
 	source: "narrator" | "automatic" | "test";
 	narratorId?: string;
 	userId?: string;
@@ -126,7 +128,8 @@ export async function deliverNotification(input: {
 			controller.abort();
 		}, input.timeoutMs ?? NOTIFICATION_TIMEOUT_MS);
 		release = await acquire(controller.signal);
-		if (controller.signal.aborted) throw new DeliveryError("cancelled");
+		if (controller.signal.aborted || input.beforeSend?.() === false)
+			throw new DeliveryError("cancelled");
 		let url = input.webhook;
 		let body: Record<string, unknown>;
 		if (input.channel === "dingtalk") {

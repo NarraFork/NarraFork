@@ -1316,6 +1316,14 @@ async function initializeDatabaseStartup(): Promise<void> {
 	// the background after that queue is mounted.
 	const narratorRecovery = withBackgroundOccupancyInitialization(
 		async () => {
+			// Restore exact scheduled receipts before mounting any automatic continuation.
+			if (activeDatabaseBackend === "sqlite") {
+				const { setScheduledRunNotifier } = await import("./services/scheduled-task-run-service");
+				setScheduledRunNotifier(
+					(await import("./services/scheduled-task-notify")).notifyScheduledRunChanged,
+				);
+				await (await import("./services/scheduled-task-run-tracker")).recoverScheduledRuns();
+			}
 			const plannedUpdate = await getPlannedUpdateStartupProtection({
 				claimAuthorization: automaticResumeEnabled(),
 				onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
@@ -1362,10 +1370,20 @@ async function initializeDatabaseStartup(): Promise<void> {
 			// All sources are now registered. New preparation can reserve them without
 			// waiting for an Agent, Await, or human approval to finish (or even mount).
 			finishRecoveryDiscovery();
+			const allowedRecovery =
+				activeDatabaseBackend === "sqlite"
+					? await (
+							await import("./services/scheduled-task-run-tracker")
+						).filterScheduledRecoveryNarrators(new Set(startupRecoveryNarratorIds))
+					: undefined;
 			const recoveryHandles = automaticResumeEnabled()
 				? await Promise.all([
-						restoreNarratorsAfterPlannedUpdate(plannedUpdate),
-						restoreOrdinaryRestartRecovery(ordinaryRestart),
+						restoreNarratorsAfterPlannedUpdate(plannedUpdate, {
+							includedNarratorIds: allowedRecovery,
+						}),
+						restoreOrdinaryRestartRecovery(ordinaryRestart, {
+							includedNarratorIds: allowedRecovery,
+						}),
 					])
 				: [];
 			// A notice can be durable in the mailbox while its post-commit wake was lost to

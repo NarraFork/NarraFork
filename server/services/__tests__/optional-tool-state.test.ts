@@ -25,10 +25,17 @@ import {
 } from "../../lib/narrator-custom-traits";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
-import { resolveOptionalToolState } from "../narrator-session";
+import {
+	ensureNarrator,
+	loadOptionalTool,
+	resolveOptionalToolState,
+	unloadOptionalTool,
+} from "../narrator-session";
+import { activeNarrators } from "../narrator-session-state";
+import { normalizePersistedToolSelections } from "../tool-load-markers";
 
 async function createStandaloneNarrator() {
-	return narratorService.create({ locale: "en" });
+	return narratorService.create({ locale: "en", model: "openai:test-model" });
 }
 
 const createdProjects: string[] = [];
@@ -79,6 +86,12 @@ async function createNarratorInProject(projectId: string): Promise<string> {
 afterEach(async () => {
 	setGlobalToolMode("browser", null);
 	setGlobalToolMode("outline_edit", null);
+	setGlobalToolMode("scheduled_task", null);
+	setGlobalToolMode("scheduled_task_admin", null);
+	for (const id of createdNarrators) {
+		activeNarrators.get(id)?.abortController.abort();
+		activeNarrators.delete(id);
+	}
 	// Narrators reference the project via contextProjectId, so they go first or
 	// the project delete trips the foreign key.
 	if (createdNarrators.length > 0) {
@@ -204,6 +217,91 @@ describe("resolveOptionalToolState — routine modes", () => {
 
 		const result = await resolveOptionalToolState(narrator.id, "Browser");
 		expect(result.state).toBe("disabled_by_trait");
+	});
+});
+
+describe("retired scheduled task load selections", () => {
+	test("normalizes stored selections without changing other names or mutating input", () => {
+		const stored = [
+			"ScheduledTaskAdmin",
+			"ScheduledTask",
+			"Browser",
+			"mcp-server:calendar",
+			"scheduledtaskadmin",
+			null,
+		];
+		const snapshot = [...stored];
+		expect(normalizePersistedToolSelections(stored)).toEqual([
+			"ScheduledTask",
+			"Browser",
+			"mcp-server:calendar",
+			"scheduledtaskadmin",
+		]);
+		expect(stored).toEqual(snapshot);
+		expect(normalizePersistedToolSelections(undefined)).toEqual([]);
+		expect(normalizePersistedToolSelections("ScheduledTaskAdmin")).toEqual([]);
+	});
+
+	test("restores the canonical selection for dormant and rebuilt sessions without an alias", async () => {
+		registerCoreTools();
+		const narrator = await createStandaloneNarrator();
+		createdNarrators.push(narrator.id);
+		await db
+			.update(narrators)
+			.set({ enabledTools: ["ScheduledTaskAdmin"] })
+			.where(eq(narrators.id, narrator.id));
+		expect(await resolveOptionalToolState(narrator.id, "ScheduledTask")).toMatchObject({
+			state: "loaded",
+			globallyEnabled: false,
+		});
+		const active = await ensureNarrator(narrator.id, "en");
+		expect(active._enabledOptionalTools.has("ScheduledTask")).toBe(true);
+		expect(active._enabledOptionalTools.has("ScheduledTaskAdmin")).toBe(false);
+		expect((await resolveOptionalToolState(narrator.id, "ScheduledTask")).state).toBe("loaded");
+		expect((await resolveOptionalToolState(narrator.id, "ScheduledTaskAdmin")).state).toBe(
+			"unknown_tool",
+		);
+		expect(await loadOptionalTool(narrator.id, "ScheduledTaskAdmin")).toBe("unknown_tool");
+		expect(await unloadOptionalTool(narrator.id, "ScheduledTaskAdmin")).toBe("unknown_tool");
+	});
+
+	test("legacy project mode still overrides the global mode and canonical trait denials win", async () => {
+		registerCoreTools();
+		setGlobalToolMode("scheduled_task", "resident");
+		const project = await createProjectWithToolMode("scheduled_task_admin", "manual");
+		const id = await createNarratorInProject(project);
+		expect(await resolveOptionalToolState(id, "ScheduledTask")).toMatchObject({
+			state: "not_loaded",
+			mode: "manual",
+		});
+		await db
+			.update(narrators)
+			.set({
+				enabledTools: ["ScheduledTaskAdmin"],
+				traits: upsertEncodedTrait([], DISABLED_TOOLS_TRAIT_PREFIX, {
+					version: 1,
+					tools: ["ScheduledTask"],
+				}),
+			})
+			.where(eq(narrators.id, id));
+		expect((await resolveOptionalToolState(id, "ScheduledTask")).state).toBe("disabled_by_trait");
+	});
+
+	test("legacy global resident preference preloads only the unified tool", async () => {
+		registerCoreTools();
+		const narrator = await createStandaloneNarrator();
+		createdNarrators.push(narrator.id);
+		// Fresh-install settings contain an explicit new auto preference; an upgraded
+		// legacy installation has only the retired key.
+		setGlobalToolMode("scheduled_task", null);
+		setGlobalToolMode("scheduled_task_admin", "resident");
+		expect(await resolveOptionalToolState(narrator.id, "ScheduledTask")).toMatchObject({
+			state: "loaded",
+			mode: "resident",
+		});
+		const active = await ensureNarrator(narrator.id, "en");
+		expect(active._enabledOptionalTools.has("ScheduledTask")).toBe(true);
+		expect(active._enabledOptionalTools.has("ScheduledTaskAdmin")).toBe(false);
 	});
 });
 

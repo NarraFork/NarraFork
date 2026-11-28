@@ -37,7 +37,7 @@ import { readTool } from "./read";
 import { recallTool } from "./recall";
 import { requestPermissionRuleTool } from "./request-permission-rule";
 import { scheduledTaskTool } from "./scheduled-task";
-import { scheduledTaskAdminTool } from "./scheduled-task-admin";
+import { scheduledTaskReportTool } from "./scheduled-task-report";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
@@ -77,6 +77,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
 	["ScheduledTask", scheduledTaskTool],
+	["ScheduledTaskReport", scheduledTaskReportTool],
 	["NarraForkAdmin", narraforkAdminTool],
 	["PackList", packListTool],
 	["PackActivate", packActivateTool],
@@ -84,7 +85,6 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["PluginInstall", pluginInstallTool],
 	["McpAdmin", mcpAdminTool],
 	["HookAdmin", hookAdminTool],
-	["ScheduledTaskAdmin", scheduledTaskAdminTool],
 	["KnowledgeCreate", knowledgeCreateTool],
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],

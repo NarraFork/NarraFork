@@ -17,6 +17,7 @@ import { storedBodyBytesSql } from "./narrator-body-reads";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning } from "./narrator-session";
 import { withIdleNarratorCleanupAdmission } from "./narrator-session-state";
+import { taskOwnerId } from "./scheduled-task-acl";
 
 export const TASK_CLEANUP_ROOT_LIMIT = 10;
 const SUBTREE_LIMIT = 100;
@@ -77,7 +78,14 @@ export async function cleanupScheduledTaskNarrators(
 	return cleanupLock.acquire(taskId, async () => {
 		const task = await db.query.scheduledTasks.findFirst({
 			where: eq(scheduledTasks.id, taskId),
-			columns: { cleanupPolicy: true, reuseNarratorId: true, createdBy: true },
+			columns: {
+				cleanupPolicy: true,
+				narratorMode: true,
+				reuseNarratorId: true,
+				ownerUserId: true,
+				createdBy: true,
+				schedule: true,
+			},
 		});
 		if (!task) throw new NotFoundError("ScheduledTask", taskId);
 		const policy = task.cleanupPolicy;
@@ -87,7 +95,7 @@ export async function cleanupScheduledTaskNarrators(
 			blockedRoots: 0,
 			limited: false,
 		};
-		if (policy.mode === "none") {
+		if (task.narratorMode === "existing" || policy.mode === "none") {
 			scanCursors.delete(taskId);
 			return result;
 		}
@@ -155,7 +163,7 @@ export async function cleanupScheduledTaskNarrators(
 			}
 			scanCursors.set(taskId, { policy: policyKey, createdAt: root.createdAt, id: root.id });
 			// A task may switch from new to reuse; never erase its remembered live session.
-			if (root.id === task.reuseNarratorId || root.ownerUserId !== task.createdBy) {
+			if (root.id === task.reuseNarratorId || root.ownerUserId !== taskOwnerId(task)) {
 				result.blockedRoots++;
 				continue;
 			}
@@ -176,10 +184,25 @@ export async function cleanupScheduledTaskNarrators(
 							.where(eq(narrators.id, root.id))
 							.limit(1)
 					)[0];
+					const currentTask = await db.query.scheduledTasks.findFirst({
+						where: eq(scheduledTasks.id, taskId),
+						columns: {
+							ownerUserId: true,
+							createdBy: true,
+							schedule: true,
+							cleanupPolicy: true,
+							narratorMode: true,
+							reuseNarratorId: true,
+						},
+					});
 					if (
 						!current ||
+						!currentTask ||
+						currentTask.narratorMode === "existing" ||
 						current.scheduledTaskId !== taskId ||
-						current.ownerUserId !== task.createdBy
+						current.ownerUserId !== taskOwnerId(currentTask) ||
+						current.id === currentTask.reuseNarratorId ||
+						JSON.stringify(currentTask.cleanupPolicy) !== policyKey
 					)
 						return null;
 					const subtree = await loadBoundedSubtree(current);
@@ -197,16 +220,19 @@ export async function cleanupScheduledTaskNarrators(
 						.select({ id: scheduledTasks.id })
 						.from(scheduledTasks)
 						.where(
-							and(
-								ne(scheduledTasks.id, taskId),
-								or(
-									inArray(scheduledTasks.reuseNarratorId, ids),
-									inArray(scheduledTasks.lastNarratorId, ids),
+							or(
+								inArray(scheduledTasks.targetNarratorId, ids),
+								and(
+									ne(scheduledTasks.id, taskId),
+									or(
+										inArray(scheduledTasks.reuseNarratorId, ids),
+										inArray(scheduledTasks.lastNarratorId, ids),
+									),
 								),
 							),
 						)
 						.limit(1);
-					if (referenced.some((t) => t.id !== taskId)) return null;
+					if (referenced.length) return null;
 					const activeTasks = await db
 						.select({ id: backgroundTasks.id })
 						.from(backgroundTasks)

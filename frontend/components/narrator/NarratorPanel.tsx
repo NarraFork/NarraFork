@@ -1,3 +1,4 @@
+import { ManagedTaskBanner } from "@frontend/components/scheduled-tasks/ManagedTaskBanner";
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { formatCompactNumber } from "@frontend/lib/compact-number";
@@ -2978,6 +2979,11 @@ function NarratorPanelBody({
 					style={{ overflow: "hidden", position: "relative" }}
 					{...dropZoneProps}
 				>
+					<ManagedTaskBanner
+						key={narratorId}
+						narratorId={narratorId}
+						model={typeof narrator.model === "string" ? narrator.model : null}
+					/>
 					{toolbarController.toolbarOverlays}
 					{!REMOTE_BUILD && (
 						<DeviceDirectoryDialog

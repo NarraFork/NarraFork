@@ -14,6 +14,7 @@ import { z } from "zod/v4";
 import { settings } from "../../settings";
 import { MAX_BYTES, MAX_LINES } from "../truncate";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { callProvenance } from "./call-provenance";
 import { looseNumber } from "./number-param";
 import {
 	OUTLINE_ASK_TOOL,
@@ -79,39 +80,6 @@ async function sessionSpaceOnlyReason(ctx: ToolContext): Promise<"readOnly" | "p
 		!resolveEffectiveRelaxedPlan(row.permissionMode, row.relaxedPlan)
 		? "plan"
 		: null;
-}
-
-/**
- * The tool call row and the message it belongs to, for the commit's provenance. The binding names
- * the row; without one (legacy callers) the provider tool-use id finds it.
- */
-async function callProvenance(
-	ctx: ToolContext,
-): Promise<{ messageId: string | null; toolCallId: string | null }> {
-	const binding = ctx.toolCallBinding;
-	if (!binding && !ctx.currentToolUseId) return { messageId: null, toolCallId: null };
-	try {
-		const [{ db }, { narratorToolCalls }, { and, eq }] = await Promise.all([
-			import("@server/db"),
-			import("@server/db/schema"),
-			import("drizzle-orm"),
-		]);
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, ctx.narratorId),
-				binding
-					? eq(narratorToolCalls.id, binding.toolCallId)
-					: eq(narratorToolCalls.toolUseId, ctx.currentToolUseId as string),
-			),
-			columns: { id: true, messageId: true },
-		});
-		return {
-			messageId: row?.messageId ?? null,
-			toolCallId: row?.id ?? binding?.toolCallId ?? null,
-		};
-	} catch {
-		return { messageId: null, toolCallId: binding?.toolCallId ?? null };
-	}
 }
 
 async function openScope(ctx: ToolContext, forWrite: boolean): Promise<Scope> {

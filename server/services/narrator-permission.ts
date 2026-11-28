@@ -202,6 +202,11 @@ import {
 	validatePermissionRuleRequestApproval,
 } from "./permission-rule-request-service";
 import { broadcastReflectionFrame } from "./reflection-broadcast";
+import {
+	getUnattendedPermissionMessage,
+	scheduledBlockReason,
+	unattendedPermissionDecision,
+} from "./scheduled-run-registry";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import {
@@ -1393,6 +1398,7 @@ function resolveBlacklistDecision(
 }
 
 const ALWAYS_ALLOW_TOOLS = [
+	"ScheduledTaskReport",
 	"EnterPlanMode",
 	"WebSearch",
 	"Watch",
@@ -1465,6 +1471,8 @@ const READ_ONLY_TOOLS = [
  * decision below already splits `Agent` by `subagent_type` and Bash by its parsed command.
  */
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
+	if (toolName === "ScheduledTaskReport") return true;
+	if (toolName === "ScheduledTask") return isScheduledTaskReadAction(input.action);
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
@@ -5610,10 +5618,24 @@ export async function recheckFinalToolExecutionPermission(
 						!!constraint,
 					)),
 				});
+	const scheduled = await (await import("./scheduled-task-run-service")).lookupScheduledRun(
+		check.narratorId,
+	);
+	if (scheduled?.reportOnly && check.toolName !== "ScheduledTaskReport")
+		finalPermissionDeny("scheduled result reminder may only report its outcome");
+	const scheduledApproval =
+		!constraint &&
+		scheduled &&
+		((scheduled.onBlocked === "auto" &&
+			check.toolName === "ExitPlanMode" &&
+			isPlanModeTrait(before.narrator.traits)) ||
+			(check.toolName === "ScheduledTask" &&
+				check.input.action === "disable" &&
+				check.input.id === scheduled.taskId));
 	if (
 		decision === "deny" ||
 		decision === "fatal" ||
-		(decision === "ask" && before.call.decidedBy === "auto")
+		(decision === "ask" && before.call.decidedBy === "auto" && !scheduledApproval)
 	) {
 		finalPermissionDeny("current policy no longer authorizes the original automatic approval");
 	}
@@ -5800,6 +5822,30 @@ export async function handlePermission(
 		? false
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
+	const scheduledRunService = await import("./scheduled-task-run-service");
+	const scheduledRun = await scheduledRunService.lookupScheduledRun(narratorId);
+	// These paths can return before ordinary permission evaluation (async Ask and
+	// rule requests included). Denial only: never elevate a capability or whitelist.
+	if (
+		scheduledRun &&
+		((scheduledRun.reportOnly && toolName !== "ScheduledTaskReport") ||
+			(scheduledRun.onBlocked === "auto" &&
+				["AskUserQuestion", OUTLINE_ASK_TOOL, "EnterPlanMode", "RequestPermissionRule"].includes(
+					toolName,
+				)))
+	) {
+		await scheduledRunService.recordScheduledAutoHandled(
+			scheduledRun.runId,
+			scheduledBlockReason(toolName) as "question" | "plan" | "permission",
+			toolName,
+		);
+		return {
+			behavior: "deny",
+			message: scheduledRun.reportOnly
+				? "This follow-up may only call ScheduledTaskReport. Do not repeat or continue business operations."
+				: getUnattendedPermissionMessage(scheduledRun.requireReport),
+		};
+	}
 
 	if (toolName === "RequestPermissionRule") {
 		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
@@ -6123,6 +6169,26 @@ export async function handlePermission(
 		}
 	}
 
+	if (toolName === "ScheduledTask") {
+		try {
+			const { resolveScheduledTaskApproval } = await import(
+				"../lib/agent/tools/scheduled-task-policy"
+			);
+			const resolved = await resolveScheduledTaskApproval(
+				{
+					narratorId,
+					userId: activeNarrators.get(narratorId)?._currentUserId ?? undefined,
+					cwd,
+					locale,
+				},
+				effectiveInput,
+			);
+			effectiveInput = resolved.input;
+		} catch (error) {
+			rethrowPermissionReadFailure(error);
+			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	// Redirects and plan canonicalization must be persisted before any approval is exposed.
 	await options?.onInputResolved?.(effectiveInput);
 
@@ -6498,6 +6564,31 @@ export async function handlePermission(
 			bashAnalysis,
 		});
 	}
+	if (scheduledRun && !runtimeConstraint) {
+		const selfDisable =
+			decision === "ask" &&
+			toolName === "ScheduledTask" &&
+			effectiveInput.action === "disable" &&
+			effectiveInput.id === scheduledRun.taskId;
+		const automated = selfDisable
+			? "allow"
+			: unattendedPermissionDecision({
+					onBlocked: scheduledRun.onBlocked,
+					toolName,
+					decision,
+					isPlanMode,
+				});
+		if (automated) {
+			await scheduledRunService.recordScheduledAutoHandled(
+				scheduledRun.runId,
+				scheduledBlockReason(toolName) as "question" | "plan" | "permission",
+				`${toolName}: ${automated}`,
+			);
+			decision = automated;
+			if (automated === "deny")
+				permMeta.blacklistReason = getUnattendedPermissionMessage(scheduledRun.requireReport);
+		}
+	}
 	if (decision === "allow") {
 		logger.debug("Permission auto-allowed", { narratorId, toolName, toolUseId, permMode });
 		await db
@@ -6645,6 +6736,24 @@ export async function handlePermission(
 		};
 	}
 
+	// A plan soft-deny may have become an ask after the ordinary decision. Never
+	// let that final escalation create a human wait in auto mode.
+	if (scheduledRun?.onBlocked === "auto") {
+		await scheduledRunService.recordScheduledAutoHandled(
+			scheduledRun.runId,
+			"permission",
+			toolName,
+		);
+		return {
+			behavior: "deny",
+			message: getUnattendedPermissionMessage(scheduledRun.requireReport),
+		};
+	}
+	if (scheduledRun)
+		await scheduledRunService.markScheduledRunBlocked(
+			scheduledRun.runId,
+			scheduledBlockReason(toolName),
+		);
 	const toolCallRecord = await readQueryFirst(
 		db.query.narratorToolCalls.findMany({
 			limit: 1,
@@ -7933,6 +8042,22 @@ export async function stopDangerReflectionLoop(
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return abortPersistedDangerReflectionWithoutRuntime(requestId, reason);
+	const scheduledService = await import("./scheduled-task-run-service");
+	const scheduled = await scheduledService.lookupScheduledRun(pause.narratorId);
+	if (scheduled?.onBlocked === "auto") {
+		await scheduledService.recordScheduledAutoHandled(
+			scheduled.runId,
+			"permission",
+			pause.toolName,
+		);
+		pause.reflectionAbortController?.abort();
+		return cancelDangerReflection(
+			requestId,
+			getUnattendedPermissionMessage(scheduled.requireReport),
+			"user",
+		);
+	}
+	if (scheduled) await scheduledService.markScheduledRunBlocked(scheduled.runId, "permission");
 
 	const message = reason?.trim() || "Danger reflection stopped by user; awaiting user decision";
 	pause.reflectionStoppedByUser = true;

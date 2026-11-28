@@ -1,5 +1,5 @@
 /**
- * `scheduledTaskService.list()` must be bounded, and must say when it truncated.
+ * `scheduledTaskService.list(principal)` must be bounded, and must say when it truncated.
  *
  * The row count here is not curated by anyone. Tasks come from the UI *and* from the
  * `ScheduledTask` agent tool, so a model in a retry loop adds rows as fast as it can
@@ -15,11 +15,11 @@
  *      bun test server/services/__tests__/scheduled-task-list-cap.test.ts
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { DEFAULT_LOCALE } from "@shared/i18n-locales";
 import { inArray } from "drizzle-orm";
 import { db } from "../../db";
-import { scheduledTasks } from "../../db/schema";
+import { scheduledTasks, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { scheduledTaskService } from "../scheduled-task-service";
 
@@ -27,6 +27,19 @@ import { scheduledTaskService } from "../scheduled-task-service";
 const LIST_MAX = 500;
 
 const createdIds: string[] = [];
+const principal = { userId: generateId(), isAdmin: true };
+beforeAll(async () => {
+	await db.insert(users).values({
+		id: principal.userId,
+		username: `list-cap-${principal.userId}`,
+		passwordHash: "test",
+		role: "admin",
+		createdAt: new Date().toISOString(),
+	});
+});
+afterAll(async () => {
+	await db.delete(users).where(inArray(users.id, [principal.userId]));
+});
 
 afterEach(async () => {
 	if (createdIds.length === 0) return;
@@ -84,7 +97,7 @@ describe("scheduledTaskService.list is bounded", () => {
 	test("returns every row and truncated:false below the cap", async () => {
 		await insertTasks(3);
 
-		const { tasks, truncated } = await scheduledTaskService.list();
+		const { tasks, truncated } = await scheduledTaskService.list(principal);
 
 		expect(tasks.length).toBe(3);
 		expect(truncated).toBe(false);
@@ -95,7 +108,7 @@ describe("scheduledTaskService.list is bounded", () => {
 		// comfortably larger number would also pass against an off-by-one cap.
 		await insertTasks(LIST_MAX + 1);
 
-		const { tasks, truncated } = await scheduledTaskService.list();
+		const { tasks, truncated } = await scheduledTaskService.list(principal);
 
 		expect(tasks.length).toBe(LIST_MAX);
 		expect(truncated).toBe(true);
@@ -107,7 +120,7 @@ describe("scheduledTaskService.list is bounded", () => {
 		// fires when nothing is missing stops being read.
 		await insertTasks(LIST_MAX);
 
-		const { tasks, truncated } = await scheduledTaskService.list();
+		const { tasks, truncated } = await scheduledTaskService.list(principal);
 
 		expect(tasks.length).toBe(LIST_MAX);
 		expect(truncated).toBe(false);
@@ -119,7 +132,7 @@ describe("scheduledTaskService.list is bounded", () => {
 		// harmless-looking until something downstream sizes a buffer by the cap.
 		await insertTasks(LIST_MAX + 5);
 
-		const { tasks } = await scheduledTaskService.list();
+		const { tasks } = await scheduledTaskService.list(principal);
 
 		expect(tasks.length).toBeLessThanOrEqual(LIST_MAX);
 		expect(new Set(tasks.map((t) => t.id)).size).toBe(tasks.length);

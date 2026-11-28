@@ -766,3 +766,65 @@ for (const change of ["device", "resident"] as const) {
 		expect((await reconcileEpoch(changed)).changed).toBe(false);
 	});
 }
+
+describe("host-required scheduled report declarations", () => {
+	test("reused epochs declare the report without ToolSearch and retain immutable older snapshots", async () => {
+		const { narratorId, input } = await fixture();
+		const report = { ...optionalTool, name: "ScheduledTaskReport" };
+		const managed = new Set([report.name]);
+		const initialInput = { ...input, managed, candidates: [baseTool, report] };
+		const initial = await reconcileEpoch(initialInput);
+		if (!initial.epoch?.prefix) throw new Error("Missing initial prefix");
+		expect(initial.epoch.baseToolNames).not.toContain(report.name);
+		const requiredInput = {
+			...initialInput,
+			current: [report.name],
+			required: new Set([report.name]),
+		};
+		const scheduled = await reconcileEpoch(requiredInput);
+		expect(scheduled.opened).toBe(true);
+		expect(scheduled.epoch?.markerId).not.toBe(initial.epoch.markerId);
+		expect(scheduled.epoch?.reason).toBe("tools");
+		expect(scheduled.epoch?.baseToolNames).toContain(report.name);
+		const oldTools = await getPrefixToolDefinitions(initial.epoch.prefix.tools);
+		expect(oldTools.map((tool) => tool.name)).not.toContain(report.name);
+		const stable = await reconcileEpoch(requiredInput);
+		expect(stable.opened).toBe(false);
+		expect(stable.epoch?.markerId).toBe(scheduled.epoch?.markerId);
+		const prepared = await buildRuntimeHistory({
+			narratorId,
+			model: input.model,
+			provider,
+			toolLoading: { ...requiredInput, epoch: stable.epoch },
+		});
+		expect(prepared.toolLoading?.baseToolNames).toContain(report.name);
+		const { selectRequestTools } = await import("../../lib/agent/tool-loading");
+		for (const strategy of [
+			"replace_tools",
+			"custom_injection",
+			"anthropic_tool_addition",
+			"anthropic_deferred_tail",
+			"openai_additional_tools",
+		] as const) {
+			const selected = selectRequestTools(
+				prepared.toolCandidates ?? [],
+				prepared.toolLoading,
+				strategy,
+			);
+			expect(selected.tools.map((tool) => tool.name)).toContain(report.name);
+		}
+	});
+
+	test("required names absent from the authorized candidates cannot reopen or widen a prefix", async () => {
+		const { input } = await fixture();
+		const initial = await reconcileEpoch(input);
+		const denied = await reconcileEpoch({
+			...input,
+			current: ["ScheduledTaskReport"],
+			required: new Set(["ScheduledTaskReport"]),
+		});
+		expect(denied.opened).toBe(false);
+		expect(denied.epoch?.markerId).toBe(initial.epoch?.markerId);
+		expect(denied.epoch?.baseToolNames).not.toContain("ScheduledTaskReport");
+	});
+});

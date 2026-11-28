@@ -732,6 +732,12 @@ export interface NarraForkSettings {
 		 */
 		extraWritableDirs: string[];
 	};
+	/** Guardrails for recurring unattended execution; bounded again at the service boundary. */
+	scheduledTasks?: {
+		maxActivePerOwner: number;
+		minIntervalMinutes: number;
+		minAgentIntervalMinutes: number;
+	};
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
 		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */

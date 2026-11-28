@@ -14,6 +14,7 @@ import {
 	isPreloadedMode,
 	normalizeToolRoutineMode,
 	normalizeToolRoutineModeOverride,
+	type RoutineModeConfig,
 	resolveEffectiveToolRoutineMode,
 	resolveProjectToolRoutineModeOverride,
 	resolveToolRoutineMode,
@@ -125,6 +126,88 @@ describe("project layer", () => {
 			mode: "auto",
 			source: "global",
 		});
+	});
+});
+
+describe("retired scheduled task loading preferences", () => {
+	const routine = { id: "scheduled_task" };
+	const legacy: RoutineModeConfig[] = [
+		{ toolModes: { scheduled_task_admin: "manual" } },
+		{ toolModes: { scheduled_task_admin: "auto" } },
+		{ toolModes: { scheduled_task_admin: "resident" } },
+		{ enabledRoutines: ["scheduled_task_admin"] },
+		{ disabledRoutines: ["scheduled_task_admin"] },
+	];
+
+	test("reads old modes and lists in global and project layers", () => {
+		const modes = ["manual", "auto", "resident", "resident", "manual"] as const;
+		for (const [index, config] of legacy.entries()) {
+			expect(resolveToolRoutineMode(routine, config)).toBe(modes[index]);
+			expect(
+				resolveEffectiveToolRoutineMode(routine, { toolModes: { scheduled_task: "auto" } }, config),
+			).toEqual({ mode: modes[index], source: "project" });
+		}
+	});
+
+	test("any explicit canonical setting wins over every retired setting in its layer", () => {
+		for (const oldConfig of legacy) {
+			for (const mode of ["manual", "auto", "resident"] as const) {
+				const config = {
+					...oldConfig,
+					toolModes: { ...oldConfig.toolModes, scheduled_task: mode },
+				};
+				expect(resolveToolRoutineMode(routine, config)).toBe(mode);
+				expect(resolveProjectToolRoutineModeOverride(routine, config)).toBe(mode);
+			}
+			for (const [field, mode] of [
+				["enabledRoutines", "resident"],
+				["disabledRoutines", "manual"],
+			] as const) {
+				const config = { ...oldConfig, [field]: ["scheduled_task"] };
+				expect(resolveToolRoutineMode(routine, config)).toBe(mode);
+				expect(resolveProjectToolRoutineModeOverride(routine, config)).toBe(mode);
+			}
+		}
+	});
+
+	test("an explicit global or invalid new mode cannot revive the old resident setting", () => {
+		for (const mode of ["global", "invalid"]) {
+			const config = {
+				toolModes: { scheduled_task: mode, scheduled_task_admin: "resident" },
+				enabledRoutines: ["scheduled_task_admin"],
+			};
+			expect(resolveToolRoutineMode(routine, config)).toBe("manual");
+			expect(
+				resolveEffectiveToolRoutineMode(routine, { toolModes: { scheduled_task: "auto" } }, config),
+			).toEqual({ mode: "auto", source: "global" });
+		}
+	});
+
+	test("writing or clearing the new preference removes old keys without mutating input", () => {
+		const original = {
+			toolModes: { scheduled_task_admin: "resident", browser: "auto" },
+			enabledRoutines: ["scheduled_task_admin", "recall"],
+			disabledRoutines: ["scheduled_task_admin", "eval"],
+			commands: ["keep"],
+		};
+		const snapshot = structuredClone(original);
+		for (const mode of ["manual", "auto", "resident"] as const) {
+			const written = applyToolRoutineMode(original, routine.id, mode);
+			expect(resolveToolRoutineMode(routine, written)).toBe(mode);
+			expect(written.toolModes).not.toHaveProperty("scheduled_task_admin");
+			expect(written.enabledRoutines).not.toContain("scheduled_task_admin");
+			expect(written.disabledRoutines).not.toContain("scheduled_task_admin");
+			expect(clearToolRoutineMode(written, routine.id)).toEqual({
+				toolModes: { browser: "auto" },
+				enabledRoutines: ["recall"],
+				disabledRoutines: ["eval"],
+				commands: ["keep"],
+			});
+		}
+		expect(
+			resolveProjectToolRoutineModeOverride(routine, clearToolRoutineMode(original, routine.id)),
+		).toBe("global");
+		expect(original).toEqual(snapshot);
 	});
 });
 

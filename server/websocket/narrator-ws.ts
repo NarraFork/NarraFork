@@ -1,7 +1,10 @@
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
-import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
+import {
+	NOTIFICATION_CENTER_CHANGED_WS_TYPE,
+	type NotificationKind,
+} from "@shared/notification-center";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
@@ -1813,6 +1816,34 @@ if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
 	});
 }
 
+// Task ids themselves can disclose private tasks. Only the invalidation crosses the wire.
+const scheduledTaskBroadcast = hotSafe("narrafork.scheduledTasksWs.pending", () => ({
+	timer: undefined as ReturnType<typeof setTimeout> | undefined,
+}));
+if (hotOnce("narrafork.scheduledTasksWs.listenersRegistered")) {
+	eventBus.on("scheduled_task:changed", () => {
+		if (scheduledTaskBroadcast.timer) return;
+		scheduledTaskBroadcast.timer = setTimeout(() => {
+			scheduledTaskBroadcast.timer = undefined;
+			const payload = JSON.stringify({ type: "scheduled_tasks_changed" });
+			for (const ws of connections) {
+				if (!ws.data.userId || ws.data.publicShare) continue;
+				try {
+					// A slow client must reconnect/refetch instead of accumulating invalidations.
+					if ((ws.getBufferedAmount?.() ?? 0) > 256 * 1024) {
+						removeConnection(ws);
+						ws.close(1013, "Scheduled task backpressure; reconnect");
+						continue;
+					}
+					ws.send(payload);
+				} catch {
+					removeConnection(ws);
+				}
+			}
+		}, 50);
+	});
+}
+
 /**
  * Per-user coalescing for notification-center frames.
  *
@@ -1828,7 +1859,7 @@ const notificationCenterPending = hotSafe(
 		new Map<
 			string,
 			{
-				kinds?: Set<"chat_message" | "permission_request">;
+				kinds?: Set<NotificationKind>;
 				timer?: ReturnType<typeof setTimeout>;
 			}
 		>(),
@@ -1851,10 +1882,7 @@ function flushNotificationCenterBroadcast(userId: string): void {
 	broadcastToUser(userId, frame);
 }
 
-function scheduleNotificationCenterBroadcast(
-	userId: string,
-	kinds?: Array<"chat_message" | "permission_request">,
-): void {
+function scheduleNotificationCenterBroadcast(userId: string, kinds?: NotificationKind[]): void {
 	if (!userId) return;
 	let pending = notificationCenterPending.get(userId);
 	if (!pending) {

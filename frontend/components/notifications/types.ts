@@ -10,11 +10,12 @@ export type {
 } from "@shared/notification-center";
 export { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 
-export type NotificationCenterFilter = "all" | "messages" | "permissions";
+export type NotificationCenterFilter = "all" | "messages" | "permissions" | "scheduled_tasks";
 export type NotificationCenterTab = "attention" | "activity";
 export type NotificationNavigateTarget =
 	| { type: "chat_room"; roomId: string }
-	| { type: "narrator"; narratorId: string };
+	| { type: "narrator"; narratorId: string }
+	| { type: "scheduled_task"; taskId: string; runId?: string };
 
 export const notificationQueryKeys = {
 	root: ["notifications"] as const,
@@ -29,6 +30,7 @@ export function listQueryParams(filter: NotificationCenterFilter): {
 } {
 	if (filter === "messages") return { kind: "chat_message", status: "all" };
 	if (filter === "permissions") return { kind: "permission_request", status: "all" };
+	if (filter === "scheduled_tasks") return { kind: "scheduled_task", status: "all" };
 	return { status: "all" };
 }
 

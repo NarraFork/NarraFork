@@ -60,7 +60,9 @@ export function NotificationListItem({ item, onActivate }: NotificationListItemP
 							t(
 								item.kind === "chat_message"
 									? "notificationKindChat"
-									: "notificationKindPermission",
+									: item.kind === "scheduled_task"
+										? "notificationKindScheduledTask"
+										: "notificationKindPermission",
 							)}
 					</Text>
 				</Group>

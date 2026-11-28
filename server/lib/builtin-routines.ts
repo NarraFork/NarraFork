@@ -163,8 +163,19 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		tool: {
 			toolName: "ScheduledTask",
 			descriptionEn:
-				"Scheduled task management — create, inspect, edit, enable/disable, delete and trigger cron tasks",
-			descriptionZh: "定时任务管理 — 创建、查看、编辑、启用/禁用、删除和立即触发 cron 任务",
+				"Scheduled task management — preview calendar schedules, create, inspect, edit, pause and trigger tasks with explicit approval",
+			descriptionZh: "计划任务管理 — 预览日历调度，经明确审批创建、查看、编辑、启停和立即运行任务",
+		},
+	},
+	{
+		id: "scheduled_task_report",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ScheduledTaskReport",
+			descriptionEn:
+				"Report the current scheduled run's outcome and evidence; bound to the active execution",
+			descriptionZh: "汇报当前计划任务执行的结果和依据；只能汇报本次运行",
 		},
 	},
 	{
@@ -221,17 +232,6 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 				"Hook management (admin only) — list, create, update, and delete narrator lifecycle hooks (command/http)",
 			descriptionZh:
 				"Hook 管理（仅管理员）— 列出、创建、更新和删除叙述者生命周期 Hook（命令/HTTP）",
-		},
-	},
-	{
-		id: "scheduled_task_admin",
-		type: "tool",
-		category: "tools",
-		tool: {
-			toolName: "ScheduledTaskAdmin",
-			descriptionEn:
-				"Scheduled task management (admin only) — create, update, toggle, run, and delete cron narrator tasks",
-			descriptionZh: "定时任务管理（仅管理员）— 创建、更新、启停、立即运行和删除 cron 叙述者任务",
 		},
 	},
 	{

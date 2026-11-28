@@ -30,6 +30,7 @@ export const DEFAULTS: NarraForkSettings = {
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
 	},
+	scheduledTasks: { maxActivePerOwner: 100, minIntervalMinutes: 1, minAgentIntervalMinutes: 5 },
 	knowledge: {
 		injectMode: "summary",
 		maxInjectedEntries: 3,
@@ -1092,6 +1093,23 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"update.autoDownload": {
 		desc: "检测到新版本时是否自动下载。下载后仍需用户确认安装。",
 		type: "boolean",
+	},
+
+	// ── scheduled tasks ─────────────────────────────────────────────────
+	"scheduledTasks.maxActivePerOwner": {
+		desc: "每个所有者最多保留的未结束计划任务数，包括已暂停任务。默认 100。",
+		type: "number",
+		valid: "1–1000 的整数",
+	},
+	"scheduledTasks.minIntervalMinutes": {
+		desc: "用户创建的循环计划最短间隔（分钟）。不限制明确列出的指定时间。默认 1。",
+		type: "number",
+		valid: "1–1440 的整数",
+	},
+	"scheduledTasks.minAgentIntervalMinutes": {
+		desc: "叙述者创建的循环计划最短间隔（分钟），不能低于用户最短间隔。默认 5。",
+		type: "number",
+		valid: "1–1440 的整数",
 	},
 
 	// ── shares ──────────────────────────────────────────────────────────

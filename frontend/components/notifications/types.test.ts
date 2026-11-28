@@ -15,6 +15,7 @@ describe("notification contracts", () => {
 		expect(listQueryParams("all")).toEqual({ status: "all" });
 		expect(listQueryParams("messages")).toEqual({ kind: "chat_message", status: "all" });
 		expect(listQueryParams("permissions")).toEqual({ kind: "permission_request", status: "all" });
+		expect(listQueryParams("scheduled_tasks")).toEqual({ kind: "scheduled_task", status: "all" });
 	});
 	test("resolved navigates, gone and unavailable do not", () => {
 		expect(
@@ -38,6 +39,11 @@ describe("notification contracts", () => {
 		expect(
 			notificationNavigateTarget({ sourceState: "active", link: { type: "unavailable" } }),
 		).toBeNull();
+	});
+	test("task links keep the run deep link and revoked task links cannot navigate", () => {
+		const link = { type: "scheduled_task" as const, taskId: "task", runId: "run" };
+		expect(notificationNavigateTarget({ sourceState: "resolved", link })).toEqual(link);
+		expect(notificationNavigateTarget({ sourceState: "gone", link })).toBeNull();
 	});
 	test("badge uses actual loaded lower bounds, including zero with more candidates", () => {
 		expect(formatUnreadBadge(0)).toBeNull();

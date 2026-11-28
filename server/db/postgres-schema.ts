@@ -4061,6 +4061,15 @@ export const scheduledTasks = pgTable(
 		name: text("name").notNull(),
 		enabled: boolean("enabled").notNull().default(true),
 		cronExpr: text("cron_expr").notNull(),
+		schedule: jsonText("schedule"),
+		scheduleKind: text("schedule_kind"),
+		firedCount: integer("fired_count").notNull().default(0),
+		scheduleRevision: integer("schedule_revision").notNull().default(0),
+		scheduleCursorAt: text("schedule_cursor_at"),
+		activeRunId: text("active_run_id"),
+		completedAt: text("completed_at"),
+		pauseReason: text("pause_reason"),
+		consecutiveFailures: integer("consecutive_failures").notNull().default(0),
 		timezone: text("timezone"),
 		prompt: text("prompt").notNull(),
 		systemPrompt: text("system_prompt"),
@@ -4071,18 +4080,43 @@ export const scheduledTasks = pgTable(
 		cwd: text("cwd"),
 		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "set null" }),
 		narratorMode: text("narrator_mode").notNull().default("new"),
+		targetNarratorId: text("target_narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		contextPolicy: text("context_policy").notNull().default("keep"),
+		onBusy: text("on_busy").notNull().default("skip"),
+		busyWaitMinutes: integer("busy_wait_minutes").notNull().default(30),
+		requireReport: boolean("require_report").notNull().default(true),
 		cleanupPolicy: jsonText("cleanup_policy")
 			.notNull()
 			.default(sql.raw('\'{"mode":"none"}\'::text')),
 		reuseNarratorId: text("reuse_narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "set null",
 		}),
+		modelPolicy: text("model_policy").notNull().default("follow"),
+		onBlocked: text("on_blocked").notNull().default("auto"),
+		blockedWaitMinutes: integer("blocked_wait_minutes").notNull().default(30),
+		maxRunMinutes: integer("max_run_minutes").notNull().default(60),
+		notifyOnSuccess: boolean("notify_on_success").notNull().default(false),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
 		createdBy: text("created_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		creatorKind: text("creator_kind").notNull().default("user"),
+		creatorNarratorId: text("creator_narrator_id"),
+		creatorMessageId: text("creator_message_id"),
+		creatorToolCallId: text("creator_tool_call_id"),
+		creatorToolUseId: text("creator_tool_use_id"),
+		creatorSnapshot: jsonText("creator_snapshot"),
+		lastModifiedBy: jsonText("last_modified_by"),
 		lastRunAt: text("last_run_at"),
 		nextRunAt: text("next_run_at"),
 		lastNarratorId: text("last_narrator_id"),
+		lastRunId: text("last_run_id"),
 		lastStatus: text("last_status"),
 		lastError: text("last_error"),
+		lastOutcome: text("last_outcome"),
+		lastSummary: text("last_summary"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -4091,7 +4125,9 @@ export const scheduledTasks = pgTable(
 		index("idx_scheduled_tasks_next_run").on(table.enabled, table.nextRunAt),
 		index("idx_scheduled_tasks_project").on(table.projectId),
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
+		index("idx_scheduled_tasks_owner").on(table.ownerUserId),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_target_narrator").on(table.targetNarratorId),
 		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 	],
 );
@@ -4106,8 +4142,27 @@ export const scheduledTaskRuns = pgTable(
 		narratorId: text("narrator_id"),
 		status: text("status").notNull(),
 		error: text("error"),
+		errorKind: text("error_kind"),
 		runContext: text("run_context").notNull(),
+		scheduledFor: text("scheduled_for"),
+		trigger: text("trigger").notNull().default("schedule"),
 		manual: boolean("manual").notNull().default(false),
+		triggerMessageId: text("trigger_message_id"),
+		logicalRunId: text("logical_run_id"),
+		model: text("model"),
+		blockReason: text("block_reason"),
+		blockedAt: text("blocked_at"),
+		outcome: text("outcome"),
+		outcomeSummary: text("outcome_summary"),
+		outcomeReportedAt: text("outcome_reported_at"),
+		autoHandled: jsonText("auto_handled"),
+		requireReport: boolean("require_report").notNull().default(true),
+		busyDeadlineAt: text("busy_deadline_at"),
+		interruptTarget: jsonText("interrupt_target"),
+		nudged: boolean("nudged").notNull().default(false),
+		missedCount: integer("missed_count"),
+		deadlineAt: text("deadline_at"),
+		stats: jsonText("stats"),
 		startedAt: text("started_at"),
 		finishedAt: text("finished_at"),
 		durationMs: integer("duration_ms"),
@@ -4115,7 +4170,22 @@ export const scheduledTaskRuns = pgTable(
 	},
 	(table) => [
 		index("idx_scheduled_task_runs_task").on(table.taskId, table.createdAt),
+		index("idx_scheduled_task_runs_task_status").on(table.taskId, table.status),
 		index("idx_scheduled_task_runs_narrator").on(table.narratorId),
+		index("idx_scheduled_task_runs_narrator_task").on(table.narratorId, table.taskId),
+		index("idx_scheduled_task_runs_wait_queue").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+		uniqueIndex("idx_scheduled_task_runs_one_waiting")
+			.on(table.taskId)
+			.where(sql.raw("\"status\" = 'waiting'")),
+		uniqueIndex("idx_scheduled_task_runs_one_interrupt")
+			.on(table.narratorId)
+			.where(sql.raw('"status" = \'waiting\' AND "interrupt_target" IS NOT NULL')),
+		index("idx_scheduled_task_runs_status").on(table.status, table.createdAt),
 	],
 );
 
@@ -4722,7 +4792,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 151,
-  "columnCount": 1985,
+  "columnCount": 2034,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -28001,6 +28071,94 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "schedule",
+          "name": "schedule",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scheduleKind",
+          "name": "schedule_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "firedCount",
+          "name": "fired_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "scheduleRevision",
+          "name": "schedule_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "scheduleCursorAt",
+          "name": "schedule_cursor_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "activeRunId",
+          "name": "active_run_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "completedAt",
+          "name": "completed_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pauseReason",
+          "name": "pause_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "consecutiveFailures",
+          "name": "consecutive_failures",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "timezone",
           "name": "timezone",
           "kind": "text",
@@ -28106,6 +28264,67 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"new\""
         },
         {
+          "property": "targetNarratorId",
+          "name": "target_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "scheduled_tasks_target_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "contextPolicy",
+          "name": "context_policy",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"keep\"",
+          "defaultExpression": "\"keep\""
+        },
+        {
+          "property": "onBusy",
+          "name": "on_busy",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"skip\"",
+          "defaultExpression": "\"skip\""
+        },
+        {
+          "property": "busyWaitMinutes",
+          "name": "busy_wait_minutes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "30",
+          "defaultExpression": "30"
+        },
+        {
+          "property": "requireReport",
+          "name": "require_report",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "true",
+          "defaultExpression": "true"
+        },
+        {
           "property": "cleanupPolicy",
           "name": "cleanup_policy",
           "kind": "text",
@@ -28134,6 +28353,78 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "modelPolicy",
+          "name": "model_policy",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"follow\"",
+          "defaultExpression": "\"follow\""
+        },
+        {
+          "property": "onBlocked",
+          "name": "on_blocked",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"auto\"",
+          "defaultExpression": "\"auto\""
+        },
+        {
+          "property": "blockedWaitMinutes",
+          "name": "blocked_wait_minutes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "30",
+          "defaultExpression": "30"
+        },
+        {
+          "property": "maxRunMinutes",
+          "name": "max_run_minutes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "60",
+          "defaultExpression": "60"
+        },
+        {
+          "property": "notifyOnSuccess",
+          "name": "notify_on_success",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "ownerUserId",
+          "name": "owner_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "scheduled_tasks_owner_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "createdBy",
           "name": "created_by",
           "kind": "text",
@@ -28148,6 +28439,73 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "scheduled_tasks_created_by_users_id_fk"
           },
           "emitAsTableConstraint": false
+        },
+        {
+          "property": "creatorKind",
+          "name": "creator_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"user\"",
+          "defaultExpression": "\"user\""
+        },
+        {
+          "property": "creatorNarratorId",
+          "name": "creator_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "creatorMessageId",
+          "name": "creator_message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "creatorToolCallId",
+          "name": "creator_tool_call_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "creatorToolUseId",
+          "name": "creator_tool_use_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "creatorSnapshot",
+          "name": "creator_snapshot",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastModifiedBy",
+          "name": "last_modified_by",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "lastRunAt",
@@ -28177,6 +28535,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "lastRunId",
+          "name": "last_run_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "lastStatus",
           "name": "last_status",
           "kind": "text",
@@ -28188,6 +28555,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "lastError",
           "name": "last_error",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastOutcome",
+          "name": "last_outcome",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastSummary",
+          "name": "last_summary",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -28244,9 +28629,23 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_scheduled_tasks_owner",
+          "columns": [
+            "ownerUserId"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_scheduled_tasks_reuse_narrator",
           "columns": [
             "reuseNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_scheduled_tasks_target_narrator",
+          "columns": [
+            "targetNarratorId"
           ],
           "unique": false
         },
@@ -28321,6 +28720,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "errorKind",
+          "name": "error_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "runContext",
           "name": "run_context",
           "kind": "text",
@@ -28328,6 +28736,26 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": true,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "scheduledFor",
+          "name": "scheduled_for",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "trigger",
+          "name": "trigger",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"schedule\"",
+          "defaultExpression": "\"schedule\""
         },
         {
           "property": "manual",
@@ -28340,6 +28768,159 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "false",
           "defaultExpression": "false"
+        },
+        {
+          "property": "triggerMessageId",
+          "name": "trigger_message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "logicalRunId",
+          "name": "logical_run_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "model",
+          "name": "model",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "blockReason",
+          "name": "block_reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "blockedAt",
+          "name": "blocked_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outcome",
+          "name": "outcome",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outcomeSummary",
+          "name": "outcome_summary",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outcomeReportedAt",
+          "name": "outcome_reported_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "autoHandled",
+          "name": "auto_handled",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requireReport",
+          "name": "require_report",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "true",
+          "defaultExpression": "true"
+        },
+        {
+          "property": "busyDeadlineAt",
+          "name": "busy_deadline_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "interruptTarget",
+          "name": "interrupt_target",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "nudged",
+          "name": "nudged",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "missedCount",
+          "name": "missed_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deadlineAt",
+          "name": "deadline_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "stats",
+          "name": "stats",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "startedAt",
@@ -28388,9 +28969,59 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_scheduled_task_runs_task_status",
+          "columns": [
+            "taskId",
+            "status"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_scheduled_task_runs_narrator",
           "columns": [
             "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_scheduled_task_runs_narrator_task",
+          "columns": [
+            "narratorId",
+            "taskId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_scheduled_task_runs_wait_queue",
+          "columns": [
+            "narratorId",
+            "status",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_scheduled_task_runs_one_waiting",
+          "columns": [
+            "taskId"
+          ],
+          "unique": true,
+          "predicate": "\"status\" = 'waiting'"
+        },
+        {
+          "name": "idx_scheduled_task_runs_one_interrupt",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": true,
+          "predicate": "\"status\" = 'waiting' AND \"interrupt_target\" IS NOT NULL"
+        },
+        {
+          "name": "idx_scheduled_task_runs_status",
+          "columns": [
+            "status",
+            "createdAt"
           ],
           "unique": false
         }

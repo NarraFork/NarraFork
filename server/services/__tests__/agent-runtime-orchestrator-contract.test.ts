@@ -14,6 +14,8 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	scheduledTaskRuns,
+	scheduledTasks,
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
@@ -63,6 +65,13 @@ const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const { acceptUserMessage } = await import("../narrator-session");
 const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
+const {
+	bindScheduledRunMember,
+	getScheduledRunMember,
+	listRegisteredScheduledRuns,
+	registerScheduledRun,
+	unregisterScheduledRun,
+} = await import("../scheduled-run-registry");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
@@ -139,6 +148,8 @@ beforeEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
 afterEach(async () => {
+	for (const registration of listRegisteredScheduledRuns())
+		unregisterScheduledRun(registration.runId);
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
@@ -251,6 +262,228 @@ function fixture(
 	};
 }
 
+async function scheduledFixture(
+	h: ReturnType<typeof fixture>,
+	reportOnly = false,
+	rootId = h.session.narratorId,
+	requireReport = true,
+) {
+	const runId = "scheduled-contract-run";
+	const taskId = "scheduled-contract-task";
+	const logicalRunId = "scheduled-contract-logical";
+	const rootLogicalRunId =
+		rootId === h.session.narratorId ? logicalRunId : "scheduled-contract-root-logical";
+	const now = new Date().toISOString();
+	h.runControl.logicalRunId = logicalRunId;
+	h.session._currentUserId = "principal-a";
+	await db.insert(scheduledTasks).values({
+		id: taskId,
+		name: "report loading",
+		requireReport,
+		prompt: "work",
+		cronExpr: "0 9 * * *",
+		ownerUserId: "principal-a",
+		lastRunId: runId,
+		activeRunId: runId,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(scheduledTaskRuns).values({
+		id: runId,
+		taskId,
+		narratorId: rootId,
+		logicalRunId: rootLogicalRunId,
+		requireReport,
+		status: "running",
+		runContext: "standalone",
+		createdAt: now,
+	});
+	registerScheduledRun({
+		runId,
+		taskId,
+		narratorId: rootId,
+		ownerUserId: "principal-a",
+		onBlocked: "auto",
+		blockedWaitMinutes: 30,
+		deadlineAt: null,
+		permissionMode: "default",
+		modelPolicy: "follow",
+		model: null,
+		reportOnly,
+		requireReport,
+	});
+	bindScheduledRunMember({
+		runId,
+		narratorId: rootId,
+		logicalRunId: rootLogicalRunId,
+		executionEpoch: rootId === h.session.narratorId ? h.owner.epoch : undefined,
+	});
+	if (rootId !== h.session.narratorId)
+		bindScheduledRunMember({
+			runId,
+			narratorId: h.session.narratorId,
+			logicalRunId,
+			executionEpoch: h.owner.epoch,
+			parentNarratorId: rootId,
+		});
+	return { runId, logicalRunId };
+}
+
+describe("scheduled report runtime tool loading", () => {
+	for (const [reportOnly, requireReport] of [
+		[false, true],
+		[true, true],
+		[false, false],
+	] as const) {
+		test(`reportOnly=${reportOnly}, requireReport=${requireReport}: real request declares and executes report without /load or ToolSearch`, async () => {
+			let reportedRunId: string | undefined;
+			const h = fixture(profiles[0], [
+				async ({ config }) => {
+					const { toolRegistry } = await import("../../lib/agent/tool-registry");
+					const report = toolRegistry.get("ScheduledTaskReport");
+					if (!report) throw new Error("Missing report tool registration");
+					expect(config.isToolLoaded?.(report.name)).toBe(true);
+					expect(config.toolFilter?.(report)).toBe(true);
+					expect(config.toolLoading?.baseToolNames).toContain(report.name);
+					const output = await report.execute(
+						{ outcome: "partial", summary: "Checked current evidence" },
+						{
+							narratorId: "contract-primary",
+							userId: "principal-a",
+							cwd: process.env.HOME as string,
+							signal: config.signal,
+							locale: "en",
+							requestPermission: async () => ({ behavior: "allow" }),
+						},
+					);
+					if (output.isError) throw new Error(output.output);
+					reportedRunId = JSON.parse(output.output).runId;
+					return { ...finished };
+				},
+			]);
+			const { runId } = await scheduledFixture(h, reportOnly, h.session.narratorId, requireReport);
+			expect((await h.run()).hasError).toBe(false);
+			expect(h.session._enabledOptionalTools.has("ScheduledTaskReport")).toBe(false);
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, h.session.narratorId),
+				columns: { enabledTools: true },
+			});
+			expect(row?.enabledTools ?? []).not.toContain("ScheduledTaskReport");
+			expect(reportedRunId).toBe(runId);
+			expect(
+				(await db.query.scheduledTaskRuns.findFirst({ where: eq(scheduledTaskRuns.id, runId) }))
+					?.outcome,
+			).toBe("partial");
+		});
+	}
+
+	test("a trusted delegated member receives the report within its existing read-only ceiling", async () => {
+		await db
+			.update(narrators)
+			.set({ traits: withRuntimePolicyTrait([], await compileDelegationCeiling("review")) })
+			.where(eq(narrators.id, "contract-child"));
+		const h = fixture(profiles[1], [
+			async ({ config }) => {
+				const { toolRegistry } = await import("../../lib/agent/tool-registry");
+				const report = toolRegistry.get("ScheduledTaskReport");
+				if (!report) throw new Error("Missing report registration");
+				expect(config.isToolLoaded?.(report.name)).toBe(true);
+				expect(config.toolFilter?.(report)).toBe(true);
+				expect(config.toolLoading?.baseToolNames).toContain(report.name);
+				const output = await report.execute(
+					{ outcome: "partial", summary: "Read-only subtask evidence" },
+					{
+						narratorId: "contract-child",
+						userId: "principal-a",
+						cwd: process.env.HOME as string,
+						signal: config.signal,
+						locale: "en",
+						requestPermission: async () => ({ behavior: "allow" }),
+					},
+				);
+				if (output.isError) throw new Error(output.output);
+				expect(JSON.parse(output.output).runId).toBe("scheduled-contract-run");
+				return { ...finished };
+			},
+		]);
+		await scheduledFixture(h, false, "contract-parent");
+		expect((await h.run()).hasError).toBe(false);
+	});
+	test("ordinary sessions cannot acquire report access from a persisted load or scheduled trait", async () => {
+		await db
+			.update(narrators)
+			.set({ traits: ["scheduled"], enabledTools: ["ScheduledTaskReport"] })
+			.where(eq(narrators.id, "contract-primary"));
+		const h = fixture(profiles[0], [finished]);
+		h.session._enabledOptionalTools.add("ScheduledTaskReport");
+		expect((await h.run()).hasError).toBe(false);
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const report = toolRegistry.get("ScheduledTaskReport");
+		if (!report) throw new Error("Missing report registration");
+		expect(h.calls[0].config.toolLoading?.baseToolNames).not.toContain(report.name);
+		expect(h.calls[0].config.isToolLoaded?.(report.name)).toBe(false);
+		expect(h.calls[0].config.toolFilter?.(report)).toBe(false);
+	});
+
+	for (const [label, traits] of [
+		["hard tool ceiling", withRuntimePolicyTrait([], { version: 1, tools: ["Read"] })],
+		[
+			"disabled-tool trait",
+			[
+				`custom-disabled-tools:${Buffer.from(JSON.stringify({ version: 1, tools: ["ScheduledTaskReport"] })).toString("base64url")}`,
+			],
+		],
+	] as const) {
+		test(`${label} still wins over automatic loading`, async () => {
+			await db
+				.update(narrators)
+				.set({ traits: [...traits] })
+				.where(eq(narrators.id, "contract-primary"));
+			const h = fixture(profiles[0], [finished]);
+			await scheduledFixture(h);
+			expect((await h.run()).hasError).toBe(false);
+			const { toolRegistry } = await import("../../lib/agent/tool-registry");
+			const report = toolRegistry.get("ScheduledTaskReport");
+			if (!report) throw new Error("Missing report registration");
+			expect(h.calls[0].config.toolLoading?.baseToolNames).not.toContain(report.name);
+			expect(h.calls[0].config.toolFilter?.(report)).toBe(false);
+		});
+	}
+
+	test("stale execution epochs do not enter the model's report declaration", async () => {
+		const h = fixture(profiles[0], [finished]);
+		await scheduledFixture(h);
+		const member = getScheduledRunMember(h.session.narratorId);
+		if (!member) throw new Error("Missing scheduled fixture member");
+		member.executionEpoch = "previous-execution-epoch";
+		expect((await h.run()).hasError).toBe(false);
+		const { config } = h.calls[0];
+		expect(config.toolLoading?.baseToolNames).not.toContain("ScheduledTaskReport");
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(false);
+	});
+
+	test("stale membership and finished registrations immediately revoke the live loaded gate", async () => {
+		const h = fixture(profiles[0], [finished]);
+		const { runId, logicalRunId } = await scheduledFixture(h);
+		expect((await h.run()).hasError).toBe(false);
+		const { config } = h.calls[0];
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(true);
+		const member = getScheduledRunMember(h.session.narratorId);
+		if (!member) throw new Error("Missing scheduled fixture member");
+		member.executionEpoch = "previous-execution-epoch";
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(false);
+		member.executionEpoch = h.owner.epoch;
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(true);
+		h.runControl.logicalRunId = "new-human-logical-run";
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(false);
+		h.runControl.logicalRunId = logicalRunId;
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(true);
+		h.owner.release();
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(false);
+		unregisterScheduledRun(runId);
+		expect(config.isToolLoaded?.("ScheduledTaskReport")).toBe(false);
+	});
+});
 describe("context overflow recovery cancellation", () => {
 	test("a stop during pre-prompt Bash runs interruption handling before history preparation", async () => {
 		const f = fixture({ kind: "primary" }, [finished]);

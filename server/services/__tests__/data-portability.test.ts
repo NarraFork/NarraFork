@@ -5,18 +5,25 @@
  * 清空按类别隔离。每个用例都在独立临时 NARRAFORK_HOME 上真实跑 SQLite。
  */
 
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-portability-"));
 process.env.NARRAFORK_HOME = testHome;
 
-const { sqlite } = await import("../../db");
+const { db, sqlite } = await import("../../db");
+const { narrators, scheduledTaskRuns, scheduledTasks, users } = await import("../../db/schema");
 const { SNAPSHOT_TABLES } = await import("../../db/snapshot-protocol");
+const { eventBus } = await import("../../lib/event-bus");
+const { invalidateScheduledTaskAssociations, listNarratorScheduledTasks } = await import(
+	"../scheduled-task-associations"
+);
 const { saveSettings, settings } = await import("../../lib/settings");
 const { getProviderKeyStore } = await import("../../lib/provider-keys");
 const { resolveNarratorFastMode } = await import("../narrator-fast-mode");
@@ -46,6 +53,9 @@ const count = (table: string) =>
 	Number((sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n);
 
 async function seed(rows = 2) {
+	invalidateScheduledTaskAssociations();
+	sqlite.run("DELETE FROM scheduled_task_runs");
+	sqlite.run("DELETE FROM scheduled_tasks");
 	sqlite.run("DELETE FROM api_requests");
 	sqlite.run("DELETE FROM usage_daily");
 	sqlite.run("DELETE FROM narrator_message_refs");
@@ -117,6 +127,68 @@ function toArrayBuffer(buffer: Buffer): ArrayBuffer {
 		buffer.byteOffset + buffer.byteLength,
 	) as ArrayBuffer;
 }
+
+const taskPrincipal = { userId: "portability-task-owner", isAdmin: true };
+const taskTimestamp = "2026-10-01T00:00:00.000Z";
+
+function seedTask(id: string, patch: Partial<typeof scheduledTasks.$inferInsert> = {}) {
+	db.insert(users)
+		.values({
+			id: taskPrincipal.userId,
+			username: taskPrincipal.userId,
+			role: "admin",
+			passwordHash: "test",
+			createdAt: taskTimestamp,
+		})
+		.onConflictDoNothing()
+		.run();
+	db.update(narrators)
+		.set({ ownerUserId: taskPrincipal.userId, traits: ["standalone"] })
+		.where(eq(narrators.id, "sess-1"))
+		.run();
+	db.insert(scheduledTasks)
+		.values({
+			id,
+			name: id,
+			cronExpr: "0 * * * *",
+			schedule: { kind: "cron", expr: "0 * * * *", end: { type: "never" } },
+			timezone: "UTC",
+			scheduleCursorAt: taskTimestamp,
+			nextRunAt: "2026-10-01T01:00:00.000Z",
+			prompt: "private scheduled prompt",
+			ownerUserId: taskPrincipal.userId,
+			narratorMode: "existing",
+			targetNarratorId: "sess-1",
+			createdAt: taskTimestamp,
+			updatedAt: taskTimestamp,
+			...patch,
+		})
+		.run();
+}
+
+function seedRun(
+	id: string,
+	taskId: string,
+	patch: Partial<typeof scheduledTaskRuns.$inferInsert> = {},
+) {
+	db.insert(scheduledTaskRuns)
+		.values({
+			id,
+			taskId,
+			narratorId: "sess-1",
+			status: "waiting",
+			runContext: "standalone",
+			busyDeadlineAt: "2099-01-01T00:00:00.000Z",
+			createdAt: taskTimestamp,
+			...patch,
+		})
+		.run();
+}
+
+const taskState = (id: string) =>
+	db.select().from(scheduledTasks).where(eq(scheduledTasks.id, id)).get();
+const runState = (id: string) =>
+	db.select().from(scheduledTaskRuns).where(eq(scheduledTaskRuns.id, id)).get();
 
 const snapshotCounts = () => ({
 	requests: count("api_requests"),
@@ -563,6 +635,344 @@ describe("data portability · 数据安全", () => {
 		// 性能护栏：5000 行全链路应远快于「逐行 JSON」方案
 		expect(elapsed).toBeLessThan(10_000);
 		expect(count("api_requests")).toBe(5000);
+	});
+});
+
+describe("data portability · scheduled task boundaries", () => {
+	test("clearing sessions cancels waiting runs once, preserves history and never retargets existing tasks", async () => {
+		seedTask("clear-waiting", {
+			lastRunId: "clear-pending",
+			lastStatus: "waiting",
+			activeRunId: "clear-active",
+			firedCount: 3,
+			consecutiveFailures: 2,
+			contextPolicy: "clear",
+			onBusy: "interrupt",
+			requireReport: false,
+			updatedAt: "2099-01-01T00:00:00.000Z",
+		});
+		seedTask("clear-newer", {
+			lastRunId: "clear-history",
+			lastStatus: "failed",
+			lastError: "Preserve the newer failure",
+			firedCount: 4,
+		});
+		seedRun("clear-pending", "clear-waiting", {
+			interruptTarget: { narratorId: "sess-1", scheduledRunId: "clear-active" },
+			requireReport: false,
+		});
+		seedRun("clear-active", "clear-waiting", {
+			status: "running",
+			logicalRunId: "active-execution",
+			startedAt: taskTimestamp,
+		});
+		seedRun("clear-old-pending", "clear-newer", { manual: true, trigger: "manual" });
+		seedRun("clear-history", "clear-newer", {
+			status: "failed",
+			errorKind: "provider",
+			finishedAt: taskTimestamp,
+		});
+		const untouched = ["clear-active", "clear-history"].map(runState);
+		const waitingBefore = runState("clear-pending");
+		const taskBefore = taskState("clear-newer");
+		if (!taskBefore) throw new Error("Expected the newer task fixture to exist");
+		const events: Array<{ sessions: number; status: string | undefined }> = [];
+		const observe = () =>
+			events.push({ sessions: count("narrators"), status: runState("clear-pending")?.status });
+		eventBus.on("scheduled_task:changed", observe);
+		try {
+			await clearData("sessions");
+			expect(events).toEqual([{ sessions: 0, status: "interrupted" }]);
+			const cancelled = runState("clear-pending");
+			expect(cancelled).toMatchObject({
+				...waitingBefore,
+				status: "interrupted",
+				errorKind: "cancelled",
+				error: "Sessions cleared before dispatch",
+				finishedAt: expect.any(String),
+				durationMs: null,
+			});
+			expect(runState("clear-old-pending")).toMatchObject({
+				status: "interrupted",
+				errorKind: "cancelled",
+			});
+			expect(taskState("clear-waiting")).toMatchObject({
+				narratorMode: "existing",
+				targetNarratorId: null,
+				lastRunId: "clear-pending",
+				lastStatus: "interrupted",
+				lastError: "Sessions cleared before dispatch",
+				activeRunId: "clear-active",
+				firedCount: 3,
+				consecutiveFailures: 2,
+				contextPolicy: "clear",
+				onBusy: "interrupt",
+				requireReport: false,
+				updatedAt: "2099-01-01T00:00:00.001Z",
+			});
+			expect(taskState("clear-newer")).toEqual({ ...taskBefore, targetNarratorId: null });
+			expect(["clear-active", "clear-history"].map(runState)).toEqual(untouched);
+			await clearData("sessions");
+			expect(runState("clear-pending")).toEqual(cancelled);
+			expect(count("scheduled_task_runs")).toBe(4);
+			expect(taskState("clear-waiting")?.firedCount).toBe(3);
+		} finally {
+			eventBus.off("scheduled_task:changed", observe);
+		}
+	});
+
+	test("cleared waits finish exhausted schedules across bounded pages without ending paused or active tasks", async () => {
+		const ids: string[] = [];
+		sqlite.transaction(() => {
+			for (let i = 0; i < 51; i++) {
+				const id = `finish-${i.toString().padStart(2, "0")}`;
+				ids.push(id);
+				seedTask(id, {
+					schedule: { kind: "cron", expr: "0 * * * *", end: { type: "count", count: 1 } },
+					firedCount: 1,
+					nextRunAt: null,
+					lastRunId: `${id}-pending`,
+					lastStatus: "waiting",
+				});
+				seedRun(`${id}-pending`, id);
+			}
+			seedTask("paused-wait", { enabled: false, nextRunAt: null });
+			seedRun("paused-pending", "paused-wait");
+			seedTask("active-wait", {
+				schedule: { kind: "cron", expr: "0 * * * *", end: { type: "count", count: 1 } },
+				firedCount: 1,
+				nextRunAt: null,
+				activeRunId: "still-active",
+			});
+			seedRun("active-pending", "active-wait");
+			seedRun("still-active", "active-wait", { status: "blocked", blockReason: "permission" });
+			// A clear only reconciles tasks it cancelled; unrelated lifecycle state is not rewritten.
+			seedTask("unrelated-finite", {
+				schedule: { kind: "cron", expr: "0 * * * *", end: { type: "count", count: 1 } },
+				firedCount: 1,
+				nextRunAt: null,
+			});
+		})();
+		await clearData("sessions");
+		for (const id of ids) {
+			expect(taskState(id)).toMatchObject({
+				completedAt: expect.any(String),
+				firedCount: 1,
+				lastStatus: "interrupted",
+				nextRunAt: null,
+			});
+		}
+		for (const id of ["paused-wait", "active-wait", "unrelated-finite"])
+			expect(taskState(id)?.completedAt).toBeNull();
+		expect(runState("still-active")?.status).toBe("blocked");
+		expect(
+			sqlite
+				.query("SELECT name FROM sqlite_temp_master WHERE name LIKE 'cleared_scheduled_waits_%'")
+				.all(),
+		).toEqual([]);
+	});
+
+	test("committed clear still reconciles waits and team caches when plugin credential cleanup fails", async () => {
+		seedTask("clear-plugin-failure", {
+			schedule: { kind: "cron", expr: "0 * * * *", end: { type: "count", count: 1 } },
+			firedCount: 1,
+			nextRunAt: null,
+			lastRunId: "clear-plugin-pending",
+			lastStatus: "waiting",
+		});
+		seedRun("clear-plugin-pending", "clear-plugin-failure");
+		sqlite.run(
+			`INSERT INTO projects (id, name, created_at, updated_at)
+			 VALUES ('clear-team-project', 'Team clear', ?, ?)`,
+			[taskTimestamp, taskTimestamp],
+		);
+		sqlite.run(
+			`INSERT INTO project_teams (narrator_id, project_id, base_branch, created_at, updated_at)
+			 VALUES ('sess-1', 'clear-team-project', 'main', ?, ?)`,
+			[taskTimestamp, taskTimestamp],
+		);
+		const { isTeamSessionCached, teamSessionMemoSize } = await import("../teams/team-session-memo");
+		expect(isTeamSessionCached("sess-1")).toBe(true);
+		const pluginCredentials = await import("../../lib/credential-transfer/plugin");
+		const cleanup = spyOn(pluginCredentials, "clearPluginCredentialSecrets").mockRejectedValue(
+			new Error("fixture credential cleanup failure"),
+		);
+		const events: number[] = [];
+		const observe = () => {
+			events.push(count("narrators"));
+		};
+		eventBus.on("scheduled_task:changed", observe);
+		try {
+			await expect(clearData("all")).rejects.toThrow("fixture credential cleanup failure");
+			expect(cleanup).toHaveBeenCalledTimes(1);
+			expect(count("narrators")).toBe(0);
+			expect(count("project_teams")).toBe(0);
+			expect(teamSessionMemoSize()).toBe(0);
+			expect(events.length).toBeGreaterThan(0);
+			expect(events.every((sessions) => sessions === 0)).toBe(true);
+			expect(taskState("clear-plugin-failure")).toMatchObject({
+				completedAt: expect.any(String),
+				firedCount: 1,
+				lastStatus: "interrupted",
+				targetNarratorId: null,
+			});
+			expect(runState("clear-plugin-pending")).toMatchObject({
+				status: "interrupted",
+				errorKind: "cancelled",
+			});
+			expect(
+				sqlite
+					.query("SELECT name FROM sqlite_temp_master WHERE name LIKE 'cleared_scheduled_waits_%'")
+					.all(),
+			).toEqual([]);
+		} finally {
+			cleanup.mockRestore();
+			eventBus.off("scheduled_task:changed", observe);
+		}
+	});
+
+	test("failed session clearing rolls back cancellation, projections and target references without invalidation", async () => {
+		seedTask("rollback-task", { lastRunId: "rollback-run", lastStatus: "waiting", firedCount: 1 });
+		seedRun("rollback-run", "rollback-task");
+		const taskBefore = taskState("rollback-task");
+		const runBefore = runState("rollback-run");
+		let events = 0;
+		const observe = () => {
+			events++;
+		};
+		eventBus.on("scheduled_task:changed", observe);
+		sqlite.run(`CREATE TEMP TRIGGER fail_clear_sessions BEFORE DELETE ON narrators
+			BEGIN SELECT RAISE(ABORT, 'clear sessions failed'); END`);
+		try {
+			await expect(clearData("sessions")).rejects.toThrow("clear sessions failed");
+		} finally {
+			sqlite.run("DROP TRIGGER fail_clear_sessions");
+			eventBus.off("scheduled_task:changed", observe);
+		}
+		expect(taskState("rollback-task")).toEqual(taskBefore);
+		expect(runState("rollback-run")).toEqual(runBefore);
+		expect(count("narrators")).toBe(1);
+		expect(count("narrator_messages")).toBe(2);
+		expect(events).toBe(0);
+	});
+
+	test("session import invalidates cached task relationships after committing", async () => {
+		seedTask("import-reference", { targetNarratorId: null });
+		const zip = await readFile(
+			(await exportData({ sessions: true, requests: false, providers: false })).zipPath,
+		);
+		expect((await listNarratorScheduledTasks("sess-1", taskPrincipal)).tasks).toEqual([]);
+		db.update(scheduledTasks)
+			.set({ targetNarratorId: "sess-1" })
+			.where(eq(scheduledTasks.id, "import-reference"))
+			.run();
+		// Deliberately seed a stale negative page; the import must publish invalidation.
+		expect((await listNarratorScheduledTasks("sess-1", taskPrincipal)).tasks).toEqual([]);
+		const preview = await previewImport(toArrayBuffer(zip), "task-relationships.zip");
+		await applyImport(preview.token, {
+			conflictDefault: "overwrite",
+			include: { sessions: true, requests: false, providers: false },
+		});
+		expect(
+			(await listNarratorScheduledTasks("sess-1", taskPrincipal)).tasks.map((t) => t.id),
+		).toEqual(["import-reference"]);
+	});
+
+	test("old narrator snapshots use defaults, ignore bundled task tables and do not restore lost targets", async () => {
+		seedTask("local-old-task", { lastRunId: "local-old-run", lastStatus: "waiting" });
+		seedRun("local-old-run", "local-old-task");
+		expect(taskState("local-old-task")).toMatchObject({
+			contextPolicy: "keep",
+			onBusy: "skip",
+			busyWaitMinutes: 30,
+			requireReport: true,
+		});
+		expect(runState("local-old-run")?.requireReport).toBe(true);
+		const zip = await readFile(
+			(await exportData({ sessions: true, requests: false, providers: false })).zipPath,
+		);
+		const preview = await previewImport(toArrayBuffer(zip), "legacy-session-columns.zip");
+		const incoming = new Database(preview.snapshotPath);
+		try {
+			incoming.run("ALTER TABLE narrators DROP COLUMN scheduled_task_id");
+			incoming.run("ALTER TABLE narrators DROP COLUMN traits");
+			incoming.run("CREATE TABLE scheduled_tasks (id TEXT PRIMARY KEY)");
+			incoming.run("INSERT INTO scheduled_tasks VALUES ('untrusted-import-task')");
+			incoming.run("CREATE TABLE scheduled_task_runs (id TEXT PRIMARY KEY)");
+			incoming.run("INSERT INTO scheduled_task_runs VALUES ('untrusted-import-run')");
+		} finally {
+			incoming.close();
+		}
+		await clearData("sessions");
+		const taskBefore = taskState("local-old-task");
+		const runBefore = runState("local-old-run");
+		const result = await applyImport(preview.token, {
+			include: { sessions: true, requests: false, providers: false },
+		});
+		expect(result.sessionsInserted).toBe(1);
+		expect(taskState("local-old-task")).toEqual(taskBefore);
+		expect(taskState("local-old-task")).toMatchObject({
+			narratorMode: "existing",
+			targetNarratorId: null,
+		});
+		expect(runState("local-old-run")).toEqual(runBefore);
+		expect(count("scheduled_tasks")).toBe(1);
+		expect(count("scheduled_task_runs")).toBe(1);
+		expect(db.select().from(narrators).where(eq(narrators.id, "sess-1")).get()).toMatchObject({
+			scheduledTaskId: null,
+			traits: [],
+		});
+		expect((await listNarratorScheduledTasks("sess-1", taskPrincipal)).tasks).toEqual([]);
+	});
+
+	test("snapshots omit tasks and runs, and restored ordinary targets have no invented task marker", async () => {
+		seedTask("export-task");
+		seedRun("export-run", "export-task");
+		db.insert(narrators)
+			.values({
+				id: "owned-export",
+				scheduledTaskId: "export-task",
+				ownerUserId: taskPrincipal.userId,
+				traits: ["standalone", "scheduled"],
+				createdAt: taskTimestamp,
+				updatedAt: taskTimestamp,
+			})
+			.run();
+		const zip = await readFile(
+			(await exportData({ sessions: true, requests: false, providers: false })).zipPath,
+		);
+		const preview = await previewImport(toArrayBuffer(zip), "task-free-snapshot.zip");
+		const incoming = new Database(preview.snapshotPath, { readonly: true });
+		try {
+			const tables = incoming
+				.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'")
+				.all();
+			for (const table of ["scheduled_tasks", "scheduled_task_runs"]) {
+				expect(Object.values(SNAPSHOT_TABLES).flat() as string[]).not.toContain(table);
+				expect(tables.map((row) => row.name)).not.toContain(table);
+			}
+		} finally {
+			incoming.close();
+		}
+		sqlite.run("DELETE FROM scheduled_tasks");
+		await clearData("sessions");
+		await applyImport(preview.token, {
+			include: { sessions: true, requests: false, providers: false },
+		});
+		expect(count("scheduled_tasks")).toBe(0);
+		expect(count("scheduled_task_runs")).toBe(0);
+		expect(db.select().from(narrators).where(eq(narrators.id, "sess-1")).get()).toMatchObject({
+			scheduledTaskId: null,
+			traits: ["standalone"],
+		});
+		expect(db.select().from(narrators).where(eq(narrators.id, "owned-export")).get()).toMatchObject(
+			{
+				scheduledTaskId: null,
+				traits: ["standalone", "scheduled"],
+			},
+		);
+		for (const id of ["sess-1", "owned-export"])
+			expect((await listNarratorScheduledTasks(id, taskPrincipal)).tasks).toEqual([]);
 	});
 });
 

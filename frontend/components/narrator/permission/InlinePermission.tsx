@@ -35,6 +35,7 @@ import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { type PermButton, PermButtonBar } from "./PermButtonBar";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
 import { usePermissionTextareaStyle } from "./permission-textarea-typography";
+import { ScheduledTaskApproval } from "./ScheduledTaskApproval";
 
 const noop = () => {};
 
@@ -383,6 +384,7 @@ export function InlinePermission({
 			{permission.toolName === "RequestPermissionRule" && (
 				<PermissionRuleRequestDetails permission={permission} />
 			)}
+			{permission.toolName === "ScheduledTask" && <ScheduledTaskApproval permission={permission} />}
 			{permissionTargetDeviceId &&
 				!isExitPlan &&
 				permission.toolName !== "RequestPermissionRule" && (

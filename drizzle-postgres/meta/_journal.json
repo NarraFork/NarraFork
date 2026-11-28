@@ -610,6 +610,13 @@
 			"when": 1795748780390,
 			"tag": "0086_team_event_kind_index",
 			"breakpoints": true
+		},
+		{
+			"idx": 87,
+			"version": "7",
+			"when": 1795861669966,
+			"tag": "0087_scheduled_tasks_redesign",
+			"breakpoints": true
 		}
   ]
 }
