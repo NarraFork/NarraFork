@@ -1,223 +1,125 @@
-import {
-	ActionIcon,
-	Badge,
-	Box,
-	Card,
-	Group,
-	Stack,
-	Switch,
-	Text,
-	Tooltip,
-	UnstyledButton,
-} from "@mantine/core";
-import { IconRefresh, IconTrash } from "@tabler/icons-react";
-import React, { useState } from "react";
+import { Badge, Box, Card, Group, Switch, Text, UnstyledButton } from "@mantine/core";
+import { IconChevronRight } from "@tabler/icons-react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
-import type { ProviderStatus } from "./ProviderStatusBadge";
+import type { ModelOption } from "../../lib/constants";
+import classes from "./ProviderCard.module.css";
 
-export interface ProviderCardProps {
+interface ProviderCardProps {
 	label: string;
-	type: "platform" | "custom";
+	prefix: string;
 	badgeLabel?: string;
-	status: ProviderStatus;
-	statusError?: string;
 	visibleCount: number;
 	hiddenCount: number;
-	previewModels: string[];
+	previewModels: ModelOption[];
 	disabled: boolean;
-	/** Left out of `auto:<model>` routing; models stay usable when named explicitly. */
 	autoExcluded?: boolean;
-	isRefreshing?: boolean;
-	controlsDisabled?: boolean;
 	onToggleDisabled: () => void;
-	onRefresh?: () => void;
-	onOpenConfig: () => void;
-	/** 删除按钮（草稿，保存后才落库）；平台/插件供应商不传。 */
-	onDelete?: () => void;
-	isSelected?: boolean;
+	onOpenConfig?: () => void;
 }
 
-export const ProviderCard = React.memo(function ProviderCard({
+export function ProviderCard({
 	label,
-	type,
+	prefix,
 	badgeLabel,
-	status,
-	statusError,
 	visibleCount,
 	hiddenCount,
 	previewModels,
 	disabled,
 	autoExcluded,
-	isRefreshing,
-	controlsDisabled,
 	onToggleDisabled,
-	onRefresh,
 	onOpenConfig,
-	onDelete,
-	isSelected,
 }: ProviderCardProps) {
 	const { t } = useTranslation("settings");
-	const [isHovered, setIsHovered] = useState(false);
+	const nameId = useId();
+	const metadataId = `${nameId}-metadata`;
+	const showPrefix = prefix && prefix !== label;
+	const showMetadata = badgeLabel || showPrefix || (autoExcluded && !disabled);
+	const moreModels = visibleCount - previewModels.length;
 
-	const isHighlighted = Boolean(isSelected || isHovered);
-	const hasMore = visibleCount > previewModels.length;
+	const content = (
+		<>
+			<Box component="span" className={classes.heading}>
+				<Text component="span" id={nameId} className={classes.name} fw={600} size="sm">
+					{label}
+				</Text>
+				{onOpenConfig && <IconChevronRight className={classes.chevron} size={16} aria-hidden />}
+			</Box>
+			{showMetadata && (
+				<Box component="span" id={metadataId} className={classes.metadata}>
+					{badgeLabel && (
+						<Text component="span" size="xs" c="dimmed">
+							{badgeLabel}
+						</Text>
+					)}
+					{showPrefix && (
+						<Text component="span" size="xs" c="dimmed">
+							{prefix}
+						</Text>
+					)}
+					{autoExcluded && !disabled && (
+						<Badge component="span" size="xs" variant="outline" color="gray">
+							{t("autoParticipation.excludedBadge")}
+						</Badge>
+					)}
+				</Box>
+			)}
+			{!disabled && (
+				<Box component="span" className={classes.preview}>
+					{previewModels.map((model) => (
+						<Text key={model.value} component="span" size="xs" c="dimmed" truncate>
+							{model.label}
+						</Text>
+					))}
+					{moreModels > 0 && (
+						<Text component="span" size="xs" c="dimmed">
+							+{moreModels} {t("overviewMoreModels")}
+						</Text>
+					)}
+					{visibleCount === 0 && (
+						<Text component="span" size="xs" c="dimmed">
+							{t("overviewNoModels")}
+						</Text>
+					)}
+				</Box>
+			)}
+		</>
+	);
 
 	return (
-		<Card
-			withBorder
-			padding="sm"
-			onClick={onOpenConfig}
-			onKeyDown={(event) => {
-				if (event.target !== event.currentTarget) return;
-				if (event.key === "Enter" || event.key === " ") {
-					event.preventDefault();
-					onOpenConfig();
-				}
-			}}
-			onMouseEnter={() => setIsHovered(true)}
-			onMouseLeave={() => setIsHovered(false)}
-			onFocus={() => setIsHovered(true)}
-			onBlur={() => setIsHovered(false)}
-			role="button"
-			tabIndex={0}
-			style={{
-				opacity: disabled ? 0.6 : 1,
-				borderColor: isHighlighted ? "var(--mantine-color-indigo-5)" : undefined,
-				borderWidth: isSelected ? 2 : 1,
-				boxShadow: isHovered && !isSelected ? "0 0 0 1px var(--mantine-color-indigo-5)" : undefined,
-				cursor: "pointer",
-				transition: "border-color 150ms ease, box-shadow 150ms ease",
-				height: "100%",
-				display: "flex",
-				flexDirection: "column",
-			}}
-		>
-			<Stack gap="xs" style={{ flex: 1, minHeight: 0 }}>
-				<Group justify="space-between" wrap="nowrap">
-					<UnstyledButton
-						onClick={(event) => {
-							event.stopPropagation();
-							onOpenConfig();
-						}}
-						style={{ flex: 1, minWidth: 0 }}
-					>
-						<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-							<Text fw={600} size="sm" truncate>
-								{label}
-							</Text>
-							<Badge
-								size="xs"
-								variant="light"
-								color={type === "platform" ? "violet" : "blue"}
-								style={{ flexShrink: 0 }}
-							>
-								{type === "platform"
-									? t("providerTypePlatform")
-									: (badgeLabel ?? t("providerTypeCustom"))}
-							</Badge>
-							{autoExcluded && !disabled && (
-								<Badge size="xs" variant="outline" color="gray" style={{ flexShrink: 0 }}>
-									{t("autoParticipation.excludedBadge")}
-								</Badge>
-							)}
-						</Group>
-					</UnstyledButton>
-					<Box
-						onClick={(event) => {
-							event.stopPropagation();
-						}}
-						style={{ flexShrink: 0 }}
-					>
-						<Group gap={4} wrap="nowrap">
-							<Switch
-								disabled={controlsDisabled}
-								size="xs"
-								checked={!disabled}
-								onChange={(event) => {
-									event.stopPropagation();
-									onToggleDisabled();
-								}}
-								aria-label={disabled ? t("overviewEnable") : t("overviewDisable")}
-							/>
-							{onDelete && (
-								<Tooltip label={t("providerDelete")}>
-									<ActionIcon
-										size="sm"
-										color="red"
-										variant="subtle"
-										disabled={controlsDisabled}
-										aria-label={t("providerDelete")}
-										onClick={(event) => {
-											event.stopPropagation();
-											onDelete();
-										}}
-									>
-										<IconTrash size={14} />
-									</ActionIcon>
-								</Tooltip>
-							)}
-						</Group>
-					</Box>
-				</Group>
-
-				{/* Model preview or status */}
-				{!disabled && previewModels.length > 0 ? (
-					<Stack gap={4}>
-						{previewModels.map((modelName) => (
-							<Text key={modelName} size="xs" c="dimmed" truncate>
-								{modelName}
-							</Text>
-						))}
-						{hasMore && (
-							<Text size="xs" c="dimmed" fs="italic">
-								+{visibleCount - previewModels.length} {t("overviewMoreModels")}
-							</Text>
-						)}
-					</Stack>
-				) : !disabled && status === "unverified" ? (
-					<Text size="xs" c="dimmed" fs="italic">
-						{t("providerStatusUnverified")}
+		<Card withBorder padding={0} className={classes.card}>
+			{onOpenConfig ? (
+				<UnstyledButton
+					type="button"
+					className={`${classes.body} ${classes.open}`}
+					aria-labelledby={nameId}
+					aria-describedby={showMetadata ? metadataId : undefined}
+					onClick={onOpenConfig}
+				>
+					{content}
+				</UnstyledButton>
+			) : (
+				<Box className={classes.body}>{content}</Box>
+			)}
+			<Group className={classes.footer} justify="space-between" wrap="nowrap">
+				<Group gap="xs">
+					<Text size="xs" fw={500}>
+						{t("overviewModelCount", { count: visibleCount })}
 					</Text>
-				) : status === "error" ? (
-					<Tooltip label={statusError} multiline maw={300}>
-						<Text size="xs" c="red" truncate>
-							{t("providerStatusError")}: {statusError}
+					{hiddenCount > 0 && (
+						<Text size="xs" c="dimmed">
+							{t("overviewHiddenCount", { count: hiddenCount })}
 						</Text>
-					</Tooltip>
-				) : null}
-
-				{/* Model count badges */}
-				<Group justify="space-between" wrap="nowrap">
-					<Group gap={4}>
-						<Badge size="xs" variant="light" color="blue">
-							{t("overviewModelCount", { count: visibleCount })}
-						</Badge>
-						{hiddenCount > 0 && (
-							<Tooltip label={t("overviewHiddenCount", { count: hiddenCount })}>
-								<Badge size="xs" variant="light" color="gray">
-									+{hiddenCount}
-								</Badge>
-							</Tooltip>
-						)}
-					</Group>
-					{onRefresh && (
-						<Tooltip label={t("providerRefreshModels")}>
-							<ActionIcon
-								variant="subtle"
-								size="sm"
-								onClick={(event) => {
-									event.stopPropagation();
-									onRefresh();
-								}}
-								loading={isRefreshing}
-								disabled={disabled}
-							>
-								<IconRefresh size={16} />
-							</ActionIcon>
-						</Tooltip>
 					)}
 				</Group>
-			</Stack>
+				<Switch
+					size="sm"
+					checked={!disabled}
+					onChange={onToggleDisabled}
+					aria-label={t("providerOverviewToggle", { name: label })}
+					style={{ flexShrink: 0 }}
+				/>
+			</Group>
 		</Card>
 	);
-});
+}

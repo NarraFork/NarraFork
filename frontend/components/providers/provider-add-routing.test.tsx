@@ -418,6 +418,28 @@ function button(key: string) {
 	if (!found) throw new Error(`Missing button: ${key}`);
 	return found;
 }
+function providerButtons() {
+	return [...container.querySelectorAll<HTMLButtonElement>("button[aria-labelledby]")];
+}
+function providerButtonLabel(node: HTMLButtonElement) {
+	return document.getElementById(node.getAttribute("aria-labelledby") ?? "")?.textContent;
+}
+function queryProviderButton(name: string) {
+	return providerButtons().find((node) => providerButtonLabel(node) === name);
+}
+function providerButton(name: string) {
+	const found = queryProviderButton(name);
+	if (!found) throw new Error(`Missing provider button: ${name}`);
+	return found;
+}
+function providerToggle(name: string) {
+	const label = i18n.t("providerOverviewToggle", { ns: "settings", name });
+	const found = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find(
+		(node) => node.getAttribute("aria-label") === label,
+	);
+	if (!found) throw new Error(`Missing provider toggle: ${name}`);
+	return found;
+}
 async function click(element: Element) {
 	await act(async () => {
 		const event = new Event("click", { bubbles: true, cancelable: true });
@@ -476,19 +498,10 @@ async function leaveDetail() {
 	await click(back);
 }
 function expectOriginalDisabled() {
-	const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-		node.textContent?.includes("Existing provider"),
-	);
-	expect(card).toBeDefined();
-	expect(card?.querySelector("input")?.getAttribute("aria-label")).toBe(text("overviewEnable"));
+	expect(providerToggle("Existing provider").checked).toBe(false);
 }
 async function dirtyOriginal() {
-	const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-		node.textContent?.includes("Existing provider"),
-	);
-	const toggle = card?.querySelector<HTMLInputElement>("input");
-	if (!toggle) throw new Error("Missing existing provider toggle");
-	await click(toggle);
+	await click(providerToggle("Existing provider"));
 	expectOriginalDisabled();
 }
 function expectNoSave() {
@@ -1094,7 +1107,7 @@ describe("provider add nested route", () => {
 			expect(router.state.location.pathname).toBe("/settings/providers");
 			expectOriginalDisabled();
 			// codex + CommandCode + existing: CommandCode 平台卡加入概览后多一张。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+			expect(providerButtons()).toHaveLength(3);
 			expect(container.textContent).not.toContain("Discard this draft");
 			expectNoSave();
 		});
@@ -1140,7 +1153,7 @@ describe("provider add nested route", () => {
 			expectOriginalDisabled();
 			expect(container.textContent).toContain(text("unsavedSave"));
 			// codex + CommandCode + existing + 新增的 draft。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
+			expect(providerButtons()).toHaveLength(4);
 		});
 	}
 
@@ -1199,16 +1212,13 @@ describe("provider add nested route", () => {
 
 	test("an existing dirty provider edit is retained locally but never sent with the new record", async () => {
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("Existing provider"),
-		);
-		if (!card) throw new Error("Missing existing provider");
-		await click(card);
+		await click(providerButton("Existing provider"));
 		await act(async () =>
 			customDetail?.onProvidersChange((providers) =>
 				providers.map((provider) => ({ ...provider, name: "Unsaved existing edit" })),
 			),
 		);
+		expect(container.querySelector("h3")?.textContent).toBe("Unsaved existing edit");
 		await leaveDetail();
 		await openAdd();
 		await fillDraft();
@@ -1218,11 +1228,8 @@ describe("provider add nested route", () => {
 		);
 		await leaveDetail();
 		expect(container.textContent).toContain(text("unsavedSave"));
-		const editedCard = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("Existing provider"),
-		);
-		if (!editedCard) throw new Error("Missing existing provider after rebase");
-		await click(editedCard);
+		expect(queryProviderButton("Existing provider")).toBeUndefined();
+		await click(providerButton("Unsaved existing edit"));
 		expect(customDetail?.provider.name).toBe("Unsaved existing edit");
 		expect(customDetail?.isProviderDirty?.("existing")).toBe(true);
 	});
@@ -1246,11 +1253,7 @@ describe("provider add nested route", () => {
 
 	test("new creation does not persist an existing local deletion", async () => {
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("Existing provider"),
-		);
-		if (!card) throw new Error("Missing existing provider");
-		await click(card);
+		await click(providerButton("Existing provider"));
 		await act(async () =>
 			customDetail?.onProvidersChange((providers) =>
 				providers.filter((provider) => provider.id !== "existing"),
@@ -1394,11 +1397,7 @@ describe("provider add nested route", () => {
 			const password = container.querySelector<HTMLInputElement>('input[type="password"]');
 			expect(password?.value).toBe("new-unsaved-key");
 			await click(button("addProviderCancel"));
-			const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-				node.textContent?.includes("Existing provider"),
-			);
-			if (!card) throw new Error("Missing recovered provider");
-			await click(card);
+			await click(providerButton("Recovered dirty edit"));
 			expect(customDetail?.provider.name).toBe("Recovered dirty edit");
 			expect(customDetail?.provider.apiKey).toBe("unsaved-other-key");
 			expect(customDetail?.hiddenModels.has("existing:hidden")).toBe(true);
@@ -1455,11 +1454,7 @@ describe("provider add nested route", () => {
 		});
 		expect(restoreSpy).toHaveBeenCalledTimes(1);
 		expect(sessionStorage.getItem(TOKENDANCE_FLOW_MARKER)).toBeNull();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("Existing provider"),
-		);
-		if (!card) throw new Error("Missing recovered existing provider");
-		await click(card);
+		await click(providerButton("Existing provider"));
 		expect(customDetail?.provider.apiKey).toBe("retry-preserved-key");
 	});
 
@@ -1498,12 +1493,7 @@ describe("provider add nested route", () => {
 		});
 		restorers.push(() => deleteSpy.mockRestore());
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
-		);
-		if (!card) throw new Error("Missing connected TokenDance");
-		expect(card.textContent).toContain(text("providerTypePlatform"));
-		await click(card);
+		await click(providerButton("TokenDance fresh"));
 		await click(button("tokendance.delete"));
 		expect(deleteSpy).not.toHaveBeenCalled();
 		confirmAnswer = true;
@@ -1613,11 +1603,7 @@ describe("provider add nested route", () => {
 			.mockResolvedValue({ models: [] });
 		restorers.push(() => refreshSpy.mockRestore());
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
-		);
-		if (!card) throw new Error("Missing TokenDance card");
-		await click(card);
+		await click(providerButton("TokenDance fresh"));
 		await click(button("tokendance.refresh"));
 		expect(container.textContent).toContain(text("tokendance.top_up_balance"));
 		await click(button("tokendance.refresh"));
@@ -1658,11 +1644,7 @@ describe("provider add nested route", () => {
 		);
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
-		);
-		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
-		if (!toggle) throw new Error("Missing platform switch");
+		const toggle = providerToggle("TokenDance fresh");
 		// 点击只写草稿：不触发任何连接接口，且底部保存条出现。
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));
@@ -1711,11 +1693,7 @@ describe("provider add nested route", () => {
 		);
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
-		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
-		);
-		if (!card) throw new Error("Missing TokenDance card");
-		await click(card);
+		await click(providerButton("TokenDance fresh"));
 		// 详情页的「启用」开关同样只写草稿，不直接改连接记录。
 		// The shared "use for auto models" switch sits above it; skip that one.
 		const toggle = container.querySelector<HTMLInputElement>(
@@ -1740,17 +1718,10 @@ describe("provider add nested route", () => {
 		serverSettings = clone(initialSettings);
 
 		await mount();
-		const cardIndex = (needle: string) =>
-			[...container.querySelectorAll('[role="button"]')].findIndex((node) =>
-				node.textContent?.includes(needle),
-			);
-		// 两者都启用：按插入序 codex 在 CommandCode 前。
+		const cardIndex = (name: string) => providerButtons().indexOf(providerButton(name));
+		// 两者都启用时按名称排列。
 		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
-		const codexCard = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("codex"),
-		);
-		const toggle = codexCard?.querySelector<HTMLInputElement>('input[type="checkbox"]');
-		if (!toggle) throw new Error("Missing codex platform switch");
+		const toggle = providerToggle("codex");
 		// 点击只写草稿：不落库、保存条出现、卡片顺序不动。
 		await act(async () => {
 			toggle.dispatchEvent(new Event("click", { bubbles: true }));
@@ -1765,6 +1736,38 @@ describe("provider add nested route", () => {
 			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
 		).toContain("codex");
 		expect(cardIndex("codex")).toBeGreaterThan(cardIndex("CommandCode"));
+	});
+
+	test("overview orders configured names naturally and exposes protocol separately from the button name", async () => {
+		const relayName = "Relay 10 East Dedicated Gateway for Gemini Research and Production";
+		const template = initialSettings.customApiProviders[0];
+		serverSettings = {
+			...clone(initialSettings),
+			customApiProviders: [
+				{ ...template, name: "AAA Disabled", id: "relay-1", prefix: "relay-1", disabled: true },
+				{
+					...template,
+					name: `  ${relayName}  `,
+					id: "relay-10",
+					prefix: "relay-10",
+					protocol: "gemini-compatible",
+					geminiTransport: "interactions",
+				},
+				{ ...template, name: "Relay 2 West", id: "relay-2", prefix: "relay-2" },
+			],
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		await mount();
+
+		const names = providerButtons().map(providerButtonLabel);
+		expect(names.slice(-3)).toEqual(["Relay 2 West", relayName, "AAA Disabled"]);
+		const geminiProvider = providerButton(relayName);
+		expect(geminiProvider.textContent).toContain(text("customApiProtocolGeminiCompatible"));
+		expect(geminiProvider.textContent).toContain(text("geminiTransportInteractionsShort"));
+		expect(geminiProvider.contains(providerToggle(relayName))).toBe(false);
+		await click(geminiProvider);
+		expect(currentCustomDetail()?.provider.id).toBe("relay-10");
+		expect(container.querySelector("h3")?.textContent).toBe(relayName);
 	});
 
 	test("slow settings keep the add-page title and back navigation visible", async () => {
@@ -1797,97 +1800,50 @@ describe("provider add nested route", () => {
 		expect(router.state.location.pathname).toBe("/settings/providers");
 		expect(container.textContent).toContain("Existing provider");
 		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
-		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+		expect(providerButtons()).toHaveLength(3);
 		expectNoSave();
 	});
 });
 
 describe("草稿删除供应商", () => {
-	const card = (name: string) =>
-		[...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes(name),
+	function removeButton() {
+		return container.querySelector<HTMLButtonElement>(
+			`button[aria-label="${text("providerDelete")}"]`,
 		);
+	}
 
-	test("卡片上删除走出草稿，保存前卡片消失，放弃更改后回来", async () => {
+	async function deleteFromDetail() {
+		useRealProviderDetails = true;
 		await mount("/settings/providers");
-		expect(card("Existing provider")).toBeDefined();
-
-		const remove = card("Existing provider")?.querySelector(
-			`[aria-label="${text("providerDelete")}"]`,
-		);
-		expect(remove).toBeDefined();
-		await click(remove as Element);
-
-		// 与详情页里的删除同一条路径：只改草稿，卡片立刻从概览消失。
-		expect(card("Existing provider")).toBeUndefined();
-		expect(container.querySelectorAll('[role="button"]')).toHaveLength(2);
+		expect(removeButton()).toBeNull();
+		await click(providerButton("Existing provider"));
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+		const remove = removeButton();
+		if (!remove) throw new Error("Missing delete button in provider settings");
+		await click(remove);
+		// Cached model groups can outlive the draft connection until the save is sent.
+		expect(queryProviderButton("Existing provider")).toBeUndefined();
+		expect(providerButtons()).toHaveLength(2);
 		expectNoSave();
+	}
 
-		const discard = [...container.querySelectorAll("button")].find(
-			(node) => node.textContent === text("unsavedDiscard"),
-		);
-		expect(discard).toBeDefined();
-		await click(discard as Element);
-		expect(card("Existing provider")).toBeDefined();
+	test("详情可删除，放弃更改后恢复供应商", async () => {
+		await deleteFromDetail();
+		await click(button("unsavedDiscard"));
+		// 恢复草稿时 URL 仍指向原来的详情页。
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+		expect(removeButton()).not.toBeNull();
+		await leaveDetail();
+		expect(queryProviderButton("Existing provider")).toBeDefined();
 	});
 
-	test("卡片删除只在保存时提交供应商列表，保存后不会复活", async () => {
-		await mount("/settings/providers");
-		const remove = card("Existing provider")?.querySelector(
-			`[aria-label="${text("providerDelete")}"]`,
-		);
-		expect(remove).toBeDefined();
-		await click(remove as Element);
-		expectNoSave();
-
+	test("详情删除只在保存时提交供应商列表", async () => {
+		await deleteFromDetail();
 		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		expect(savedPayloads[0]?.customApiProviders).toEqual([]);
 		expect(persistedProviders()).toEqual([]);
-		expect(card("Existing provider")).toBeUndefined();
+		expect(queryProviderButton("Existing provider")).toBeUndefined();
 		expect(container.textContent).not.toContain(text("unsavedSave"));
-	});
-
-	test("平台供应商的卡片没有删除按钮", async () => {
-		await mount("/settings/providers");
-		const platform = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes(text("providerTypePlatform")),
-		);
-		expect(platform).toBeDefined();
-		expect(platform?.querySelector(`[aria-label="${text("providerDelete")}"]`)).toBeNull();
-	});
-
-	test("详情删除 API key 供应商后卡片立即消失，放弃更改后回来", async () => {
-		await mount("/settings/providers");
-		expect(card("Existing provider")).toBeDefined();
-
-		await act(async () => {
-			await router.navigate({ to: "/settings/providers", search: { provider: "existing" } });
-		});
-		const detail = currentCustomDetail();
-		expect(detail?.provider.id).toBe("existing");
-
-		// 与详情页删除按钮同一条路径：把这条供应商从草稿里去掉。
-		await act(async () => {
-			detail?.onProvidersChange((prev) => prev.filter((provider) => provider.id !== "existing"));
-		});
-
-		// 卡片的数据来自服务端下发的模型分组，草稿删除后必须立刻消失。
-		expect(card("Existing provider")).toBeUndefined();
-		expect(
-			[...container.querySelectorAll('[role="button"]')].map((node) => node.textContent),
-		).toHaveLength(2);
-
-		// 放弃更改：草稿回到快照，URL 仍指向它，于是又落回这条供应商的详情页。
-		const discard = [...container.querySelectorAll("button")].find(
-			(node) => node.textContent === text("unsavedDiscard"),
-		);
-		expect(discard).toBeDefined();
-		await click(discard as Element);
-		expect(currentCustomDetail()?.provider.id).toBe("existing");
-
-		// 退回概览，卡片回来。
-		await leaveDetail();
-		expect(card("Existing provider")).toBeDefined();
 	});
 });

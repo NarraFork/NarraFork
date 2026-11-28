@@ -148,7 +148,7 @@ function prepareProviderSettingsSave(state: ProvidersState) {
 
 function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
-	const { t } = useTranslation("settings");
+	const { t, i18n } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
@@ -314,7 +314,8 @@ function SettingsProvidersPage() {
 		qc.setQueryData(["admin", "settings"], fresh);
 	}, [qc]);
 
-	const savedProviderSnapshot = savedSnapshot.current;
+	const savedProviderSnapshot =
+		state.initialized && !prevInitialized.current ? createSnapshot(state) : savedSnapshot.current;
 	const isDirty = useIsDirty(state, savedProviderSnapshot);
 	/** 平台 provider 的开关都在 state 里（见 PLATFORM_PROVIDER_PREFIXES），草稿即真值。 */
 	const tokenDanceDisabled = state.tokenDanceDisabled;
@@ -411,15 +412,6 @@ function SettingsProvidersPage() {
 	const handleDiscard = useCallback(() => {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
-
-	// 卡片上的删除与详情页里的删除按钮是同一条路径：只从草稿移除，保存条统一提交。
-	const deleteDraftProvider = useCallback(
-		(id: string) => {
-			dispatchers.setCustomApiProviders((prev) => prev.filter((provider) => provider.id !== id));
-			dispatchers.setNugProviders((prev) => prev.filter((provider) => provider.id !== id));
-		},
-		[dispatchers.setCustomApiProviders, dispatchers.setNugProviders],
-	);
 
 	const saveProvidersState = useCallback(
 		async (stateToSave: ProvidersState = state) => {
@@ -895,9 +887,9 @@ function SettingsProvidersPage() {
 	}, [settings?.geminiProviders, settings?.geminiModelsGrouped]);
 
 	// ── Build provider groups for overview ──
-	// 排序键（inactive）只由 savedProviderSnapshot 决定，且 Array.sort 是稳定排序：
-	// 草稿变化时重算但顺序不变；保存成功后快照更新，同一次渲染里顺序自然重排。
+	const providerSortLocale = i18n.resolvedLanguage;
 	const providerGroups = useMemo(() => {
+		const byName = new Intl.Collator(providerSortLocale, { numeric: true, sensitivity: "base" });
 		const byPrefix = new Map<string, ModelOption[]>();
 		const platformPrefixes = new Set(["codex", "CommandCode"]);
 		if (tokenDance?.connected) platformPrefixes.add("tokendance");
@@ -924,8 +916,8 @@ function SettingsProvidersPage() {
 				);
 				return `${protocolLabel} · ${transportLabel}`;
 			}
-			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
-			return undefined;
+			if (state.nugProviders.some((p) => p.prefix === prefix)) return "NUG";
+			return t("providerTypeCustom");
 		};
 
 		const addModel = (prefix: string, m: ModelOption) => {
@@ -978,81 +970,84 @@ function SettingsProvidersPage() {
 		const draftPrefixes = new Set(
 			[...state.customApiProviders, ...state.nugProviders].map((p) => p.prefix),
 		);
+		const savedProviders = [
+			...savedProviderSnapshot.customApiProviders,
+			...savedProviderSnapshot.nugProviders,
+		];
+		const savedById = new Map(savedProviders.map((provider) => [provider.id, provider]));
 		const draftRemoved = new Set(
-			[...savedProviderSnapshot.customApiProviders, ...savedProviderSnapshot.nugProviders]
-				.map((p) => p.prefix)
-				.filter((prefix) => prefix && !draftPrefixes.has(prefix)),
+			savedProviders.map((p) => p.prefix).filter((prefix) => prefix && !draftPrefixes.has(prefix)),
 		);
 
-		return (
-			[...byPrefix]
-				.filter(([prefix]) => !draftRemoved.has(prefix))
-				.map(([prefix, models]) => {
-					const plugin = pluginByPrefix.get(prefix);
-					// Plugin providers sit in the platform column: like the builtins they are single
-					// instance and cannot be added or removed from this page.
-					const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
+		return [...byPrefix]
+			.filter(([prefix]) => !draftRemoved.has(prefix))
+			.map(([prefix, models]) => {
+				const plugin = pluginByPrefix.get(prefix);
+				// Plugin providers sit in the platform column: like the builtins they are single
+				// instance and cannot be added or removed from this page.
+				const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
 
-					// Find provider config for multi-instance providers so local detail toggles
-					// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
-					const match = !isPlatform
-						? (state.customApiProviders.find((p) => p.prefix === prefix) ??
-							state.nugProviders.find((p) => p.prefix === prefix))
-						: undefined;
-					const providerId = match?.id;
-					// `disabledProviders` is a plain prefix set, so the overview toggle already
-					// governs plugin providers without any extra wiring. Turning one off hides its
-					// models; it deliberately does NOT stop the plugin, which may also contribute
-					// tools and views.
-					// CommandCode carries its own persisted flag (settings.commandCode.disabled,
-					// which is what stops the provider server-side), so the overview reads the
-					// draft directly and reflects a toggle before it is saved.
-					const disabled =
-						prefix === "tokendance"
-							? tokenDanceDisabled
-							: prefix === "CommandCode"
-								? state.commandCode.disabled
-								: state.disabledProviders.has(prefix) || !!match?.disabled;
+				// Find provider config for multi-instance providers so local detail toggles
+				// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
+				const match = !isPlatform
+					? (state.customApiProviders.find((p) => p.prefix === prefix) ??
+						state.nugProviders.find((p) => p.prefix === prefix))
+					: undefined;
+				const providerId = match?.id;
+				// `disabledProviders` is a plain prefix set, so the overview toggle already
+				// governs plugin providers without any extra wiring. Turning one off hides its
+				// models; it deliberately does NOT stop the plugin, which may also contribute
+				// tools and views.
+				// CommandCode carries its own persisted flag (settings.commandCode.disabled,
+				// which is what stops the provider server-side), so the overview reads the
+				// draft directly and reflects a toggle before it is saved.
+				const disabled =
+					prefix === "tokendance"
+						? tokenDanceDisabled
+						: prefix === "CommandCode"
+							? state.commandCode.disabled
+							: state.disabledProviders.has(prefix) || !!match?.disabled;
 
-					// 排序只看**已保存**的开关状态：用户开着的 provider（哪怕还没配凭据）按
-					// 意图排在前面，关掉的排到最后。未配置的引导交给卡片徽章（unverified），
-					// 不再作为排序键 —— 否则无凭据的 codex 恒垫底，开关切了卡片也不动。
-					const savedMatch = !isPlatform
-						? (savedProviderSnapshot.customApiProviders.find((p) => p.prefix === prefix) ??
-							savedProviderSnapshot.nugProviders.find((p) => p.prefix === prefix))
-						: undefined;
-					const inactive =
-						prefix === "tokendance"
-							? savedProviderSnapshot.tokenDanceDisabled
-							: prefix === "CommandCode"
-								? savedProviderSnapshot.commandCode.disabled
-								: savedProviderSnapshot.disabledProviders.includes(prefix) ||
-									!!savedMatch?.disabled;
+				// 开关在草稿中立即更新，排序等保存后再移动卡片。
+				const savedMatch = providerId ? savedById.get(providerId) : undefined;
+				const inactive =
+					prefix === "tokendance"
+						? savedProviderSnapshot.tokenDanceDisabled
+						: prefix === "CommandCode"
+							? savedProviderSnapshot.commandCode.disabled
+							: savedProviderSnapshot.disabledProviders.includes(savedMatch?.prefix ?? prefix) ||
+								!!savedMatch?.disabled;
+				const label = match
+					? match.name?.trim() || prefix || match.id
+					: providerLabels[prefix]?.trim() || prefix;
 
-					return {
-						prefix,
-						providerId,
-						label:
-							prefix === "tokendance" && tokenDance?.connected
-								? tokenDance.name || "TokenDance"
-								: (providerLabels[prefix] ?? prefix),
-						badgeLabel: plugin
-							? t("providerBadgePlugin")
-							: isPlatform
-								? undefined
-								: getBadgeLabel(prefix),
-						models,
-						disabled,
-						autoExcluded: state.autoExcludedProviders.has(prefix),
-						inactive,
-						isPlatform,
-						...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
-						...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
-					};
-				})
-				// 未启用的排到最后；同组内保持原有顺序（平台 provider 固定在前）。
-				.sort((a, b) => Number(a.inactive) - Number(b.inactive))
-		);
+				return {
+					prefix,
+					providerId,
+					label:
+						prefix === "tokendance" && tokenDance?.connected
+							? tokenDance.name?.trim() || "TokenDance"
+							: label,
+					badgeLabel: plugin
+						? t("providerBadgePlugin")
+						: isPlatform
+							? undefined
+							: getBadgeLabel(prefix),
+					models,
+					disabled,
+					autoExcluded: state.autoExcludedProviders.has(prefix),
+					inactive,
+					isPlatform,
+					...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
+					...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
+				};
+			})
+			.sort(
+				(a, b) =>
+					Number(a.inactive) - Number(b.inactive) ||
+					byName.compare(a.label, b.label) ||
+					a.prefix.localeCompare(b.prefix, providerSortLocale),
+			);
 	}, [
 		codexModels,
 		commandcodeModels,
@@ -1061,6 +1056,7 @@ function SettingsProvidersPage() {
 		geminiByProvider,
 		nugByProvider,
 		pluginProviderGroups,
+		providerSortLocale,
 		tokenDance,
 		state.customModels,
 		providerLabels,
@@ -1128,30 +1124,11 @@ function SettingsProvidersPage() {
 		return { pluginId: group.pluginId, contributionId: group.contributionId };
 	}, [selectedProvider, providerGroups]);
 
-	const selectedProviderLabel = useMemo(() => {
-		if (!selectedProvider) return "";
-		// Platform providers: selectedProvider is the prefix
-		if (["codex", "CommandCode", "tokendance"].includes(selectedProvider)) {
-			return providerLabels[selectedProvider] ?? selectedProvider;
-		}
-		// Plugin providers are also addressed by prefix; without this they would fall
-		// through to the multi-instance lookup and render with an empty title.
-		if (selectedPluginProvider) {
-			return providerLabels[selectedProvider] ?? selectedProvider;
-		}
-		// Multi-instance providers: selectedProvider is the provider ID
-		const p =
-			state.customApiProviders.find((p) => p.id === selectedProvider) ??
-			state.nugProviders.find((p) => p.id === selectedProvider);
-		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
-		return p?.name ?? "";
-	}, [
-		selectedProvider,
-		selectedPluginProvider,
-		state.customApiProviders,
-		state.nugProviders,
-		providerLabels,
-	]);
+	const selectedProviderLabel =
+		providerGroups.find((group) => (group.providerId ?? group.prefix) === selectedProvider)
+			?.label ??
+		selectedProvider ??
+		"";
 
 	/** Model prefix of the selected provider: multi-instance ones are selected by id. */
 	const selectedProviderPrefix = useMemo(() => {
@@ -1345,8 +1322,6 @@ function SettingsProvidersPage() {
 					dispatchers.toggleProviderDisabled(prefix);
 				}}
 				onOpenProviderConfig={setSelectedProvider}
-				onDeleteProvider={deleteDraftProvider}
-				selectedProvider={selectedProvider}
 			/>
 		);
 	};

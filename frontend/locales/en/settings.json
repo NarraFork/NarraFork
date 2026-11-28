@@ -2476,6 +2476,7 @@
 	"providerQuotaUnsupported": "Quota inspection is not available in this backend runtime.",
 	"providerSectionPlatform": "Platform Integrations",
 	"providerSectionCustom": "API Key Integrations",
+	"providerOverviewToggle": "{{name}} enabled",
 	"providerStatsTotal": "Total providers",
 	"providerStatsEnabled": "Enabled",
 	"providerStatsModels": "Available models",
