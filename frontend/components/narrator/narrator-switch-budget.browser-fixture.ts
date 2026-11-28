@@ -33,6 +33,7 @@ export interface RestArrival {
 	endedAt: number;
 	status: number;
 	bytes: number;
+	aborted?: boolean;
 	body?: string;
 }
 
@@ -234,6 +235,7 @@ export async function createSwitchBudgetFixture() {
 			const body = await response.clone().text();
 			record.endedAt = performance.now();
 			record.status = response.status;
+			record.aborted = request.signal.aborted;
 			record.bytes = new TextEncoder().encode(body).byteLength;
 			if (
 				/settings\/runtime|user-preferences\/ui|model-catalog\/(runtime|options)|\/ui-summary|\/api\/narrators\/[^/]+$/.test(

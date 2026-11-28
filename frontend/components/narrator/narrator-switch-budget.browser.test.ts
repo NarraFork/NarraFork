@@ -104,7 +104,61 @@ interface BrowserStart {
 	startedAt: number;
 	endedAt: number;
 	failed: boolean;
+	failureText?: string;
+	responseStatus?: number;
 }
+interface LifecycleNetworkRead {
+	startedAt: number;
+	finished: boolean;
+	responseStatus?: number;
+	canceled?: boolean;
+	failureText?: string;
+}
+const lifecycleStatusPath = "/api/system/lifecycle/status";
+
+/** Match the two ordered reads across the server, Puppeteer and native CDP evidence. */
+function reconciledLifecycleCancellation(
+	cold: boolean,
+	arrivals: RestArrival[],
+	starts: BrowserStart[],
+	network: LifecycleNetworkRead[],
+): RestArrival | undefined {
+	const server = arrivals.filter(({ path }) => path === lifecycleStatusPath);
+	const browser = starts.filter(({ path }) => path === lifecycleStatusPath);
+	if (!cold || server.length !== 2 || browser.length !== 2 || network.length !== 2) return;
+	const [canceled, replacement] = server;
+	const [failedRead, completedRead] = browser;
+	const [failedNetwork, completedNetwork] = network;
+	if (
+		server.some(({ method }) => method !== "GET") ||
+		browser.some(({ method }) => method !== "GET") ||
+		canceled.status !== 499 ||
+		canceled.aborted !== true ||
+		canceled.bytes !== 0 ||
+		replacement.status !== 200 ||
+		replacement.aborted ||
+		replacement.startedAt <= canceled.startedAt ||
+		replacement.endedAt <= replacement.startedAt ||
+		!failedRead.failed ||
+		failedRead.failureText !== "net::ERR_ABORTED" ||
+		failedRead.responseStatus !== undefined ||
+		completedRead.failed ||
+		completedRead.responseStatus !== 200 ||
+		completedRead.startedAt <= failedRead.startedAt ||
+		completedRead.endedAt <= completedRead.startedAt ||
+		failedNetwork.canceled !== true ||
+		failedNetwork.finished ||
+		failedNetwork.failureText !== "net::ERR_ABORTED" ||
+		failedNetwork.responseStatus !== undefined ||
+		completedNetwork.responseStatus !== 200 ||
+		!completedNetwork.finished ||
+		completedNetwork.canceled ||
+		completedNetwork.startedAt <= failedNetwork.startedAt
+	)
+		return;
+	return canceled;
+}
+
 function peak(rows: Array<{ startedAt: number; endedAt: number }>, from: number, until: number) {
 	const events = rows.flatMap((row) =>
 		row.startedAt < until && (row.endedAt || until) > from
@@ -157,6 +211,119 @@ async function clickSidebar(page: Page, id: string) {
 	await page.waitForFunction((expected) => location.pathname.endsWith(expected), {}, id);
 }
 
+test("only a proven cold lifecycle cancellation with a completed replacement is classified", () => {
+	const arrivals: RestArrival[] = [
+		{
+			path: lifecycleStatusPath,
+			method: "GET",
+			startedAt: 1,
+			endedAt: 2,
+			status: 499,
+			bytes: 0,
+			aborted: true,
+		},
+		{
+			path: lifecycleStatusPath,
+			method: "GET",
+			startedAt: 3,
+			endedAt: 4,
+			status: 200,
+			bytes: 100,
+			aborted: false,
+		},
+	];
+	const starts: BrowserStart[] = [
+		{
+			path: lifecycleStatusPath,
+			method: "GET",
+			startedAt: 1,
+			endedAt: 2,
+			failed: true,
+			failureText: "net::ERR_ABORTED",
+		},
+		{
+			path: lifecycleStatusPath,
+			method: "GET",
+			startedAt: 3,
+			endedAt: 4,
+			failed: false,
+			responseStatus: 200,
+		},
+	];
+	const network: LifecycleNetworkRead[] = [
+		{ startedAt: 1, finished: false, canceled: true, failureText: "net::ERR_ABORTED" },
+		{ startedAt: 3, finished: true, responseStatus: 200 },
+	];
+	expect(reconciledLifecycleCancellation(true, arrivals, starts, network)).toBe(arrivals[0]);
+	expect(reconciledLifecycleCancellation(false, arrivals, starts, network)).toBeUndefined();
+	for (const change of [
+		{ status: 400 },
+		{ status: 401 },
+		{ status: 403 },
+		{ status: 500 },
+		{ aborted: false },
+		{ bytes: 1 },
+		{ path: "/api/settings" },
+		{ method: "POST" },
+	]) {
+		expect(
+			reconciledLifecycleCancellation(
+				true,
+				[{ ...arrivals[0], ...change }, arrivals[1]],
+				starts,
+				network,
+			),
+		).toBeUndefined();
+	}
+	for (const change of [
+		{ failed: false },
+		{ failureText: "net::ERR_FAILED" },
+		{ responseStatus: 499 },
+	]) {
+		expect(
+			reconciledLifecycleCancellation(
+				true,
+				arrivals,
+				[{ ...starts[0], ...change }, starts[1]],
+				network,
+			),
+		).toBeUndefined();
+	}
+	for (const change of [
+		{ canceled: false },
+		{ failureText: "net::ERR_FAILED" },
+		{ responseStatus: 499 },
+	]) {
+		expect(
+			reconciledLifecycleCancellation(true, arrivals, starts, [
+				{ ...network[0], ...change },
+				network[1],
+			]),
+		).toBeUndefined();
+	}
+	expect(
+		reconciledLifecycleCancellation(true, arrivals.slice(0, 1), starts, network),
+	).toBeUndefined();
+	expect(
+		reconciledLifecycleCancellation(true, [...arrivals, arrivals[1]], starts, network),
+	).toBeUndefined();
+	expect(reconciledLifecycleCancellation(true, arrivals, starts, [])).toBeUndefined();
+	expect(
+		reconciledLifecycleCancellation(
+			true,
+			[arrivals[0], { ...arrivals[1], status: 503 }],
+			starts,
+			network,
+		),
+	).toBeUndefined();
+	expect(
+		reconciledLifecycleCancellation(true, arrivals, starts, [
+			network[0],
+			{ ...network[1], finished: false },
+		]),
+	).toBeUndefined();
+});
+
 test("real Chromium full SPA cold A → sidebar B → warm A has bounded requests and decoded bytes", async () => {
 	// CI must build in this worktree first. Missing prerequisites fail, never skip.
 	if (!existsSync(executablePath)) throw new Error(`Chromium required: ${executablePath}`);
@@ -180,6 +347,8 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		if (message.type() === "error") consoleErrors.push(message.text());
 	});
 	page.on("response", (response) => {
+		const record = tracked.get(response.request());
+		if (record) record.responseStatus = response.status();
 		if (response.status() >= 400)
 			resourceFailures.push(`${response.status()} ${new URL(response.url()).pathname}`);
 	});
@@ -220,10 +389,33 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		if (record) {
 			record.endedAt = performance.now();
 			record.failed = true;
+			record.failureText = request.failure()?.errorText;
 		}
 	});
 	const client = await page.createCDPSession();
 	await client.send("Network.enable");
+	const lifecycleNetworkReads = new Map<string, LifecycleNetworkRead>();
+	client.on("Network.requestWillBeSent", (event) => {
+		const url = new URL(event.request.url);
+		if (url.origin === fixture.url && url.pathname + url.search === lifecycleStatusPath) {
+			lifecycleNetworkReads.set(event.requestId, { startedAt: event.timestamp, finished: false });
+		}
+	});
+	client.on("Network.responseReceived", (event) => {
+		const read = lifecycleNetworkReads.get(event.requestId);
+		if (read) read.responseStatus = event.response.status;
+	});
+	client.on("Network.loadingFailed", (event) => {
+		const read = lifecycleNetworkReads.get(event.requestId);
+		if (read) {
+			read.canceled = event.canceled;
+			read.failureText = event.errorText;
+		}
+	});
+	client.on("Network.loadingFinished", (event) => {
+		const read = lifecycleNetworkReads.get(event.requestId);
+		if (read) read.finished = true;
+	});
 	const wsFrames: Array<{ at: number; data: string }> = [];
 	const wsConnected: number[] = [];
 	const wsSent: Array<{ type: string; narratorIds?: string[] }> = [];
@@ -363,10 +555,35 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 				})),
 			);
 			console.table(reports);
+			const lifecycleReads = [...lifecycleNetworkReads.values()];
+			const lifecycleCancellation = reconciledLifecycleCancellation(
+				index === 0,
+				arrivals,
+				browserRequests,
+				lifecycleReads,
+			);
+			if (index === 0) {
+				console.info("switch-budget lifecycle cancellation evidence", {
+					classifiedCancellation: !!lifecycleCancellation,
+					serverReads: arrivals.filter(({ path }) => path === lifecycleStatusPath),
+					browserReads: browserRequests.filter(({ path }) => path === lifecycleStatusPath),
+					cdpReads: lifecycleReads,
+					nativeWebSocketOpens: nativeTransport.wsOpens,
+				});
+			}
+			console.info("switch-budget complete phase budget", {
+				phase: label,
+				starts: browserRequests.length,
+				arrivals: arrivals.length,
+				limit: index === 0 ? 40 : 20,
+			});
 			try {
 				assertClosedPanelContract(arrivals);
 				assertPayloadBudgets(arrivals);
-				expect(arrivals.filter((row) => row.status >= 400)).toEqual([]);
+				// Classification changes error accounting only; all reads remain in every budget.
+				expect(
+					arrivals.filter((row) => row.status >= 400 && row !== lifecycleCancellation),
+				).toEqual([]);
 				if (index === 0) {
 					expect(arrivals.filter((row) => pathOf(row) === "/api/settings/runtime")).toHaveLength(1);
 					const preferences = arrivals.filter((row) => pathOf(row) === "/api/user-preferences/ui");
@@ -518,11 +735,14 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 			errors,
 			outside,
 			outbound: fixture.blockedOutbound,
-			rests: fixture.requests.map(({ method, path, status, bytes }) => ({
+			browserFailures: starts.filter((row) => row.failed),
+			lifecycleNetworkReads: [...lifecycleNetworkReads.values()],
+			rests: fixture.requests.map(({ method, path, status, bytes, aborted }) => ({
 				method,
 				path,
 				status,
 				bytes,
+				aborted,
 			})),
 			body: await page.evaluate(
 				() => document.body?.innerText.slice(0, 3500) ?? "<document body not ready>",
