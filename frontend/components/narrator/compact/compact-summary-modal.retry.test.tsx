@@ -1,14 +1,15 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { CompactMessageDetail } from "@shared/compact-message";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
 import type { RetryFailedCompactResponse } from "../../../lib/api/narrators";
+import type { CompactLiveStreamEvent } from "../../../lib/compact-live-stream";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import narratorLocale from "../../../locales/en/narrator.json";
 
@@ -177,6 +178,64 @@ function deferred<T>() {
 	return { promise, resolve, reject };
 }
 
+function runningDetail(overrides: Partial<CompactMessageDetail> = {}): CompactMessageDetail {
+	return {
+		status: "compacting",
+		summary: "",
+		attempts: [],
+		attempt: 1,
+		model: "provider:model",
+		canChangeModel: false,
+		streamVersion: 1,
+		...overrides,
+	};
+}
+
+function liveTransport() {
+	const connections: {
+		signal?: AbortSignal;
+		offsets: { output: number; thinking: number; streamVersion?: number };
+		disconnect: () => void;
+		send: (...events: CompactLiveStreamEvent[]) => void;
+	}[] = [];
+	api.streamCompactSummary = async (_narratorId, _messageId, offsets, signal) =>
+		new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					connections.push({
+						signal,
+						offsets,
+						disconnect: () => controller.close(),
+						send: (...events) =>
+							controller.enqueue(
+								new TextEncoder().encode(
+									events
+										.map((event) => `event: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`)
+										.join(""),
+								),
+							),
+					});
+				},
+			}),
+		);
+	return connections;
+}
+
+const reset = (streamVersion: number): CompactLiveStreamEvent => ({
+	kind: "reset",
+	streamVersion,
+	outputLength: 0,
+	thinkingLength: 0,
+	outputChars: 0,
+	thinkingChars: 0,
+});
+
+function modelPicker() {
+	return document.body.querySelector<HTMLButtonElement>(
+		`button[aria-label="${narratorLocale.compactRetryModel}"]`,
+	);
+}
+
 async function settle() {
 	for (let turn = 0; turn < 4; turn++) {
 		await act(async () => {
@@ -209,6 +268,7 @@ async function renderModal(opts: {
 	kind?: "context" | "segment";
 	messageId?: string;
 	onDelete?: () => void;
+	onClose?: () => void;
 	initialDetail?: CompactMessageDetail;
 }) {
 	if (!root || !queryClient) throw new Error("test harness is not initialized");
@@ -220,20 +280,34 @@ async function renderModal(opts: {
 		compactSummaryQueryKey("narrator-1", messageId, kind),
 		opts.initialDetail ?? failedDetail(),
 	);
+	function ControlledModal() {
+		const [open, setOpen] = useState(true);
+		return (
+			<CompactSummaryModal
+				target={
+					open ? { kind, narratorId: "narrator-1", messageId, onDelete: opts.onDelete } : null
+				}
+				onClose={() => {
+					setOpen(false);
+					opts.onClose?.();
+				}}
+			/>
+		);
+	}
 	await act(async () => {
 		currentRoot.render(
 			<I18nextProvider i18n={testI18n}>
-				<MantineProvider env="test">
+				<MantineProvider
+					env="test"
+					theme={{
+						components: {
+							Modal: { defaultProps: { transitionProps: { duration: 0 } } },
+							Menu: { defaultProps: { transitionProps: { duration: 0 } } },
+						},
+					}}
+				>
 					<QueryClientProvider client={currentQueryClient}>
-						<CompactSummaryModal
-							target={{
-								kind,
-								narratorId: "narrator-1",
-								messageId,
-								onDelete: opts.onDelete,
-							}}
-							onClose={() => {}}
-						/>
+						<ControlledModal />
 					</QueryClientProvider>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -277,12 +351,18 @@ beforeEach(() => {
 			mutations: { retry: false },
 		},
 	});
+	const unexpectedRequest = async () => {
+		throw new Error("Unexpected compact request in modal test");
+	};
+	api.getCompactSummary = unexpectedRequest;
+	api.getSegmentCompactSummary = unexpectedRequest;
+	api.retryFailedCompact = unexpectedRequest;
 	api.streamCompactSummary = async () => new Response(null, { status: 409 });
 });
 
 afterEach(async () => {
-	Object.assign(api, originalApi);
 	await act(async () => root?.unmount());
+	Object.assign(api, originalApi);
 	queryClient?.clear();
 	container?.remove();
 	root = undefined;
@@ -363,8 +443,11 @@ describe("CompactSummaryModal live output and retry", () => {
 			requests.push(args);
 			return { ok: true, messageId: "compact-old", queued: true, pendingModel: "other:model" };
 		};
-		api.getCompactSummary = async () => failedDetail();
-		api.getSegmentCompactSummary = async () => ({ ...failedDetail(), canRetry: false });
+		let terminal = false;
+		api.getCompactSummary = async () =>
+			terminal ? failedDetail() : { ...initial, streamVersion: 1 };
+		api.getSegmentCompactSummary = async () =>
+			terminal ? { ...failedDetail(), canRetry: false } : { ...initial, streamVersion: 1 };
 		const initial: CompactMessageDetail = {
 			status: "compacting",
 			summary: "",
@@ -434,6 +517,7 @@ describe("CompactSummaryModal live output and retry", () => {
 		});
 		await settle();
 		expect(document.body.textContent).not.toContain("first live text");
+		terminal = true;
 		await act(async () => {
 			output.enqueue(
 				encoder.encode('event: finished\ndata: {"kind":"finished","status":"failed"}\n\n'),
@@ -444,6 +528,411 @@ describe("CompactSummaryModal live output and retry", () => {
 		expect(document.body.textContent?.includes(narratorLocale.compactRetryModel)).toBe(
 			kind === "context",
 		);
+	});
+
+	test.each([
+		"context",
+		"segment",
+	] as const)("%s uses live retry metadata when WS is unavailable, without rolling back new SSE text", async (kind) => {
+		const streams = liveTransport();
+		const reads: ReturnType<typeof deferred<CompactMessageDetail>>[] = [];
+		const read = async () => {
+			const result = deferred<CompactMessageDetail>();
+			reads.push(result);
+			return result.promise;
+		};
+		if (kind === "context") api.getCompactSummary = read;
+		else api.getSegmentCompactSummary = read;
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now);
+		try {
+			await renderModal({
+				kind,
+				initialDetail: runningDetail({ output: "discarded draft", outputChars: 15 }),
+			});
+			expect(narratorWSManager.connected).toBe(false);
+			expect(modelPicker()).toBeNull();
+			await act(async () => streams[0].send(reset(2)));
+			await settle();
+			expect(reads).toHaveLength(1);
+			const waiting = runningDetail({
+				streamVersion: 2,
+				model: "other:model",
+				pendingModel: "provider:model",
+				canChangeModel: true,
+			});
+			reads[0].resolve(waiting);
+			await settle();
+			expect(modelPicker()).not.toBeNull();
+			expect(document.body.textContent).toContain(narratorLocale.compactWaitingForOutput);
+			expect(document.body.textContent).toContain("Model: other:model");
+			expect(document.body.textContent).toContain("If this request fails, retry with Provider A");
+			expect(document.body.textContent).not.toContain("discarded draft");
+
+			clock.mockReturnValue(now + 15_000);
+			await act(async () =>
+				streams[0].send({ kind: "heartbeat", outputChars: 0, thinkingChars: 0 }),
+			);
+			expect(reads).toHaveLength(2);
+			await act(async () =>
+				streams[0].send(
+					{
+						kind: "delta",
+						channel: "thinking",
+						delta: "live thought",
+						outputChars: 0,
+						thinkingChars: 12,
+					},
+					{
+						kind: "delta",
+						channel: "output",
+						delta: "live answer",
+						outputChars: 11,
+						thinkingChars: 12,
+					},
+				),
+			);
+			await settle();
+			expect(modelPicker()).toBeNull();
+			reads[1].resolve(waiting);
+			await settle();
+			expect(modelPicker()).toBeNull();
+			expect(document.body.textContent).toContain("live thought");
+			expect(document.body.textContent).toContain("live answer");
+			expect(
+				queryClient?.getQueryData<CompactMessageDetail>(
+					compactSummaryQueryKey("narrator-1", "compact-old", kind),
+				),
+			).toMatchObject({ streamVersion: 2, outputChars: 11, thinkingChars: 12 });
+			expect(streams).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("coalesces a burst of resets around a slow read and never restores retired state", async () => {
+		const streams = liveTransport();
+		const reads: ReturnType<typeof deferred<CompactMessageDetail>>[] = [];
+		api.getCompactSummary = async () => {
+			const result = deferred<CompactMessageDetail>();
+			reads.push(result);
+			return result.promise;
+		};
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now);
+		try {
+			await renderModal({ initialDetail: runningDetail() });
+			await act(async () => streams[0].send(...Array.from({ length: 20 }, (_, i) => reset(i + 2))));
+			await settle();
+			expect(reads).toHaveLength(1);
+			clock.mockReturnValue(now + 2_000);
+			reads[0].resolve(
+				runningDetail({ streamVersion: 2, model: "retired:model", canChangeModel: true }),
+			);
+			await settle();
+			expect(reads).toHaveLength(2);
+			expect(document.body.textContent).not.toContain("retired:model");
+			expect(modelPicker()).toBeNull();
+			await dispatchNarratorWs({
+				type: "compact_progress",
+				narratorId: "narrator-1",
+				messageId: "compact-old",
+				attempt: 1,
+				model: "other:model",
+				pendingModel: "provider:model",
+				canChangeModel: true,
+			});
+			reads[1].resolve(runningDetail({ streamVersion: 21 }));
+			await settle();
+			expect(document.body.textContent).toContain("Model: other:model");
+			expect(document.body.textContent).toContain("If this request fails, retry with Provider A");
+			expect(modelPicker()).not.toBeNull();
+			expect(reads).toHaveLength(2);
+			expect(streams).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("an ordinary WS deletion closes only the current target and aborts its live and detail reads", async () => {
+		const streams = liveTransport();
+		const slowRead = deferred<CompactMessageDetail>();
+		const detailReads: (AbortSignal | undefined)[] = [];
+		api.getCompactSummary = async (_narratorId, _messageId, signal) => {
+			detailReads.push(signal);
+			return slowRead.promise;
+		};
+		const onClose = mock(() => {});
+		const onDelete = mock(() => {});
+		await renderModal({ initialDetail: runningDetail(), onClose, onDelete });
+		await act(async () => streams[0].send(reset(2)));
+		await dispatchNarratorWs({
+			type: "messages_deleted",
+			narratorId: "other-narrator",
+			deletedMessageIds: ["compact-old"],
+		});
+		await dispatchNarratorWs({
+			type: "messages_deleted",
+			narratorId: "narrator-1",
+			deletedMessageIds: ["other-marker"],
+		});
+		expect(onClose).not.toHaveBeenCalled();
+		expect(detailReads).toHaveLength(1);
+		expect(detailReads[0]?.aborted).toBe(false);
+		const deletion = {
+			type: "messages_deleted",
+			narratorId: "narrator-1",
+			deletedMessageIds: ["compact-old"],
+		};
+		await dispatchNarratorWs(deletion);
+		await dispatchNarratorWs(deletion);
+		slowRead.resolve(runningDetail({ streamVersion: 2, output: "discard this late response" }));
+		await settle();
+		expect(onClose).toHaveBeenCalledTimes(1);
+		expect(onDelete).toHaveBeenCalledTimes(1);
+		expect(document.body.querySelector("[data-compact-summary-scroll]")).toBeNull();
+		expect(streams[0].signal?.aborted).toBe(true);
+		expect(detailReads[0]?.aborted).toBe(true);
+		expect(
+			queryClient?.getQueryState(compactSummaryQueryKey("narrator-1", "compact-old")),
+		).toBeUndefined();
+		expect(streams).toHaveLength(1);
+		expect(detailReads).toHaveLength(1);
+	});
+
+	test.each([
+		"finished",
+		"conflict",
+	])("a missed deletion followed by %s and an authoritative 404 never reconnects", async (ending) => {
+		const streams = liveTransport();
+		const conflict = mock(async () => new Response(null, { status: 409 }));
+		if (ending === "conflict") api.streamCompactSummary = conflict;
+		const read = mock(async () => {
+			throw new ApiError("Marker no longer exists", 404);
+		});
+		api.getCompactSummary = read;
+		const timers = spyOn(globalThis, "setTimeout");
+		const onClose = mock(() => {});
+		try {
+			await renderModal({ initialDetail: runningDetail(), onClose });
+			if (ending === "finished") {
+				await act(async () => streams[0].send({ kind: "finished", status: "failed" }));
+				await settle();
+			}
+			expect(onClose).toHaveBeenCalledTimes(1);
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(ending === "finished" ? streams.length : conflict.mock.calls.length).toBe(1);
+			expect(document.body.querySelector("[data-compact-summary-scroll]")).toBeNull();
+			expect(
+				queryClient?.getQueryState(compactSummaryQueryKey("narrator-1", "compact-old")),
+			).toBeUndefined();
+			expect(timers.mock.calls.some(([, delay]) => delay === 500)).toBe(false);
+		} finally {
+			timers.mockRestore();
+		}
+	});
+
+	test("an ordinary deletion cancels an already scheduled reconnect", async () => {
+		const initial = runningDetail();
+		const stream = mock(async () => new Response(null, { status: 409 }));
+		const read = mock(async () => initial);
+		api.streamCompactSummary = stream;
+		api.getCompactSummary = read;
+		const realSet = window.setTimeout.bind(window);
+		let reconnect: (() => void) | undefined;
+		const id = 123456;
+		const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			ms: number,
+			...args: unknown[]
+		) => {
+			if (ms !== 500) return realSet(callback, ms, ...args);
+			reconnect = callback;
+			return id;
+		}) as typeof window.setTimeout);
+		const cleared = spyOn(globalThis, "clearTimeout");
+		const onClose = mock(() => {});
+		try {
+			await renderModal({ initialDetail: initial, onClose });
+			expect(stream).toHaveBeenCalledTimes(1);
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(
+				queryClient?.getQueryState(compactSummaryQueryKey("narrator-1", "compact-old"))?.data,
+			).toEqual(initial);
+			expect(timers.mock.calls.map(([, delay]) => delay)).toContain(500);
+			expect(reconnect).toBeFunction();
+			await dispatchNarratorWs({
+				type: "messages_deleted",
+				narratorId: "narrator-1",
+				deletedMessageIds: ["compact-old"],
+			});
+			expect(cleared).toHaveBeenCalledWith(id);
+			await act(async () => reconnect?.());
+			await settle();
+			expect(onClose).toHaveBeenCalledTimes(1);
+			expect(stream).toHaveBeenCalledTimes(1);
+			expect(read).toHaveBeenCalledTimes(1);
+		} finally {
+			timers.mockRestore();
+			cleared.mockRestore();
+		}
+	});
+
+	test("reconnects from a refreshed cursor and keeps subsequent deltas exactly once", async () => {
+		const streams = liveTransport();
+		api.getCompactSummary = async () => runningDetail({ output: "prefix", outputChars: 6 });
+		const realSet = globalThis.setTimeout.bind(globalThis);
+		let reconnect: (() => void) | undefined;
+		const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			ms: number,
+			...args: unknown[]
+		) => {
+			if (ms !== 500) return realSet(callback, ms, ...args);
+			reconnect = callback;
+			return 123456;
+		}) as typeof globalThis.setTimeout);
+		try {
+			await renderModal({ initialDetail: runningDetail({ output: "pre", outputChars: 3 }) });
+			await act(async () => streams[0].disconnect());
+			await settle();
+			expect(reconnect).toBeFunction();
+			await act(async () => reconnect?.());
+			await settle();
+			expect(streams).toHaveLength(2);
+			expect(streams[1].offsets).toEqual({ output: 6, thinking: 0, streamVersion: 1 });
+			await act(async () =>
+				streams[1].send({
+					kind: "delta",
+					channel: "output",
+					delta: " appended",
+					outputChars: 15,
+					thinkingChars: 0,
+				}),
+			);
+			await settle();
+			expect(
+				queryClient?.getQueryData<CompactMessageDetail>(
+					compactSummaryQueryKey("narrator-1", "compact-old"),
+				)?.output,
+			).toBe("prefix appended");
+			expect(document.body.textContent).toContain("prefix appended");
+		} finally {
+			timers.mockRestore();
+		}
+	});
+
+	test("finished cancels a pre-terminal metadata read and resolves a retained failure", async () => {
+		const streams = liveTransport();
+		const slowRead = deferred<CompactMessageDetail>();
+		const signals: (AbortSignal | undefined)[] = [];
+		api.getCompactSummary = async (_narratorId, _messageId, signal) => {
+			signals.push(signal);
+			return signals.length === 1 ? slowRead.promise : failedDetail();
+		};
+		const onClose = mock(() => {});
+		await renderModal({ initialDetail: runningDetail(), onClose });
+		await act(async () => streams[0].send(reset(2)));
+		await settle();
+		expect(signals).toHaveLength(1);
+		await act(async () => streams[0].send({ kind: "finished", status: "failed" }));
+		await settle();
+		expect(signals).toHaveLength(2);
+		expect(signals[0]?.aborted).toBe(true);
+		slowRead.resolve(runningDetail({ streamVersion: 2, canChangeModel: true }));
+		await settle();
+		expect(onClose).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain("first compact failed");
+		expect(retryButton()).toBeDefined();
+		expect(streams).toHaveLength(1);
+	});
+
+	test("COW replacement cancels an old GET and ignores late old-ID deletion and failure", async () => {
+		const streams = liveTransport();
+		const oldRead = deferred<CompactMessageDetail>();
+		const getCalls: { messageId: string; signal?: AbortSignal }[] = [];
+		api.getCompactSummary = async (_narratorId, messageId, signal) => {
+			getCalls.push({ messageId, signal });
+			return messageId === "compact-old"
+				? oldRead.promise
+				: completedDetail("private replacement summary");
+		};
+		const onClose = mock(() => {});
+		const onDelete = mock(() => {});
+		await renderModal({ initialDetail: runningDetail(), onClose, onDelete });
+		await act(async () => streams[0].send(reset(2)));
+		await settle();
+		expect(getCalls.map((call) => call.messageId)).toEqual(["compact-old"]);
+		await act(async () => {
+			const dispatch = (event: Record<string, unknown>) =>
+				(
+					narratorWSManager as unknown as {
+						_dispatchImmediate: (event: Record<string, unknown>) => void;
+					}
+				)._dispatchImmediate(event);
+			dispatch({
+				type: "messages_deleted",
+				narratorId: "narrator-1",
+				deletedMessageIds: ["compact-old"],
+				oldMessageId: "compact-old",
+				messageId: "compact-new",
+			});
+			dispatch({
+				type: "messages_deleted",
+				narratorId: "narrator-1",
+				deletedMessageIds: ["compact-old"],
+			});
+		});
+		await settle();
+		oldRead.reject(new ApiError("old marker no longer exists", 404));
+		await settle();
+		expect(getCalls[0].signal?.aborted).toBe(true);
+		expect(streams[0].signal?.aborted).toBe(true);
+		expect(onClose).not.toHaveBeenCalled();
+		expect(onDelete).toHaveBeenCalledTimes(1);
+		expect(document.body.textContent).toContain("private replacement summary");
+		expect(
+			queryClient?.getQueryState(compactSummaryQueryKey("narrator-1", "compact-old")),
+		).toBeUndefined();
+		expect(getCalls.map((call) => call.messageId)).toEqual(["compact-old", "compact-new"]);
+	});
+
+	test("closing the modal cancels metadata reads and ignores a late queued response", async () => {
+		const streams = liveTransport();
+		const slowRead = deferred<CompactMessageDetail>();
+		const queued = deferred<RetryFailedCompactResponse>();
+		let detailSignal: AbortSignal | undefined;
+		api.getCompactSummary = async (_narratorId, _messageId, signal) => {
+			detailSignal = signal;
+			return slowRead.promise;
+		};
+		api.retryFailedCompact = async () => queued.promise;
+		const onClose = mock(() => {});
+		await renderModal({ initialDetail: runningDetail({ canChangeModel: true }), onClose });
+		await chooseSessionModel();
+		await act(async () => streams[0].send({ kind: "heartbeat", outputChars: 0, thinkingChars: 0 }));
+		await settle();
+		const closeButton = document.body.querySelector<HTMLButtonElement>(".mantine-Modal-close");
+		expect(closeButton).not.toBeNull();
+		await act(async () => closeButton?.click());
+		await settle();
+		expect(onClose).toHaveBeenCalledTimes(1);
+		expect(streams[0].signal?.aborted).toBe(true);
+		expect(detailSignal?.aborted).toBe(true);
+		slowRead.resolve(runningDetail({ output: "late text" }));
+		queued.resolve({
+			ok: true,
+			queued: true,
+			messageId: "compact-old",
+			pendingModel: "other:model",
+		});
+		await settle();
+		expect(document.body.querySelector("[data-compact-summary-scroll]")).toBeNull();
+		expect(
+			queryClient?.getQueryData<CompactMessageDetail>(
+				compactSummaryQueryKey("narrator-1", "compact-old"),
+			)?.pendingModel,
+		).toBeUndefined();
 	});
 
 	test("groups identical model names by provider and retries with the selected full model ID", async () => {
@@ -544,15 +1033,28 @@ describe("CompactSummaryModal live output and retry", () => {
 				if (messageId !== "compact-new") throw new Error(`unexpected detail ID: ${messageId}`);
 				return completedDetail("new compact detail");
 			};
+			const onClose = mock(() => {});
+			const cowFrame = {
+				type: "messages_deleted",
+				narratorId: "narrator-1",
+				deletedMessageIds: ["compact-old"],
+				oldMessageId: "compact-old",
+				messageId: "compact-new",
+				newMessageId: "compact-new",
+			};
 
 			await renderModal({
+				onClose,
 				onDelete: () => {
 					httpReconcileCalls++;
 					reconcileMessageCards();
 				},
 			});
 			await clickRetry();
-			if (wsOrder === "before") reconcileMessageCards();
+			if (wsOrder === "before") {
+				reconcileMessageCards();
+				await dispatchNarratorWs(cowFrame);
+			}
 			retry.resolve({
 				ok: true,
 				messageId: "compact-new",
@@ -560,9 +1062,19 @@ describe("CompactSummaryModal live output and retry", () => {
 				replacedMessageId: "compact-old",
 			});
 			await settle();
-			if (wsOrder === "after") reconcileMessageCards();
+			if (wsOrder === "after") {
+				reconcileMessageCards();
+				await dispatchNarratorWs(cowFrame);
+			}
+			await dispatchNarratorWs({
+				type: "messages_deleted",
+				narratorId: "narrator-1",
+				deletedMessageIds: ["compact-old"],
+			});
 			await settle();
 
+			expect(onClose).not.toHaveBeenCalled();
+			expect(document.body.querySelector("[data-compact-summary-scroll]")).not.toBeNull();
 			expect(httpReconcileCalls).toBe(1);
 			expect(currentQueryClient.getQueryData<string[]>(messageListKey)).toEqual(["compact-new"]);
 			expect(

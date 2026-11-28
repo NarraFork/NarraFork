@@ -2,7 +2,7 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
-import { DEFAULT_COMPACT_RETRY_LIMIT, MAX_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
+import { DEFAULT_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -834,9 +834,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"agent.compactMaxRetries": {
-		desc: "每次上下文压缩的自动重试次数上限。0 表示关闭自动重试，手动选定的替换模型仍可在当前请求失败后继续压缩。",
+		desc: "每次上下文压缩的自动重试次数。-1 表示不限次数，0 表示关闭；手动选定的替换模型仍可在当前请求失败后使用。",
 		type: "number",
-		valid: `0–${MAX_COMPACT_RETRY_LIMIT} 的整数，默认 ${DEFAULT_COMPACT_RETRY_LIMIT}`,
+		valid: `-1 或非负整数，默认 ${DEFAULT_COMPACT_RETRY_LIMIT}`,
 	},
 	"agent.queueDuringCompaction": {
 		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否排队等压缩完成后再执行。开启时消息进入队列（可编辑、可取消），压缩结束后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，用户都可以在发送菜单中选择插队立即执行。",

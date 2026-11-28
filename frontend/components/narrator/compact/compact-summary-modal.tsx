@@ -27,7 +27,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../../hooks/useModels";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
 import type { CompactRetryModel, RetryFailedCompactResponse } from "../../../lib/api/narrators";
 import { consumeCompactLiveStream } from "../../../lib/compact-live-stream";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
@@ -113,6 +113,74 @@ function pendingCompactDetail(previous?: CompactMessageDetail): CompactMessageDe
 		canChangeModel: false,
 	};
 }
+
+type CompactSummary = CompactMessageDetail | { summary: string };
+
+function hasNewModelState(previous: CompactMessageDetail, next: CompactMessageDetail): boolean {
+	return (
+		previous.attempt !== next.attempt ||
+		previous.model !== next.model ||
+		(previous.pendingModel ?? null) !== (next.pendingModel ?? null)
+	);
+}
+
+/** The detail endpoint owns metadata; a subscribed stream owns its replay cursor and text. */
+function reconcileCompactSnapshot(
+	snapshot: CompactSummary,
+	before: CompactMessageDetail | undefined,
+	current: CompactMessageDetail | undefined,
+	streamActive: boolean,
+	modelChanged: boolean,
+): CompactSummary {
+	if (!current?.status) return snapshot;
+	if (
+		current !== before &&
+		((before?.status !== current.status &&
+			(!("status" in snapshot) || snapshot.status !== current.status)) ||
+			(before?.streamVersion !== current.streamVersion &&
+				(!("status" in snapshot) || snapshot.streamVersion !== current.streamVersion)) ||
+			(before?.attempt !== current.attempt &&
+				(!("status" in snapshot) || snapshot.attempt !== current.attempt)))
+	) {
+		return current;
+	}
+	if (
+		!streamActive ||
+		current.status !== "compacting" ||
+		!("status" in snapshot) ||
+		snapshot.status !== "compacting"
+	) {
+		return snapshot;
+	}
+	if (
+		current.streamVersion !== undefined &&
+		snapshot.streamVersion !== undefined &&
+		current.streamVersion !== snapshot.streamVersion
+	) {
+		return current;
+	}
+	return {
+		...snapshot,
+		...(modelChanged && {
+			attempt: current.attempt,
+			model: current.model,
+			pendingModel: current.pendingModel,
+			reasoningEffort: current.reasoningEffort,
+		}),
+		// A late pre-delta snapshot must not unlock the request that just started streaming.
+		canChangeModel:
+			modelChanged || before?.output !== current.output || before?.thinking !== current.thinking
+				? current.canChangeModel
+				: snapshot.canChangeModel,
+		output: current.output,
+		thinking: current.thinking,
+		outputChars: current.outputChars,
+		thinkingChars: current.thinkingChars,
+		streamVersion: current.streamVersion ?? snapshot.streamVersion,
+	};
+}
+
+const MIN_COMPACT_META_REFRESH_MS = 1_000;
 
 export type CompactSummaryKind = "context" | "segment";
 
@@ -274,13 +342,55 @@ export function CompactSummaryModal({
 	activeTargetRef.current = activeTarget;
 	const sourceTargetKeyRef = useRef(sourceTargetKey);
 	sourceTargetKeyRef.current = sourceTargetKey;
+	const onCloseRef = useRef(onClose);
+	onCloseRef.current = onClose;
+	const liveReader = useRef<AbortController | null>(null);
+
+	const dismissDeletedTarget = useCallback(
+		(removed: CompactSummaryModalTarget) => {
+			const current = activeTargetRef.current;
+			if (
+				!current ||
+				current.narratorId !== removed.narratorId ||
+				current.kind !== removed.kind ||
+				current.messageId !== removed.messageId
+			)
+				return;
+			activeTargetRef.current = null;
+			pendingRetryMigrationRef.current = null;
+			retryRequestId.current++;
+			liveReader.current?.abort();
+			const filter = {
+				queryKey: compactSummaryQueryKey(current.narratorId, current.messageId, current.kind),
+				exact: true,
+			};
+			void queryClient.cancelQueries(filter, { revert: false });
+			onCloseRef.current();
+			queryClient.removeQueries(filter);
+			current.onDelete?.();
+		},
+		[queryClient],
+	);
 
 	const applyCompactReplacement = useCallback(
 		(event: Record<string, unknown>) => {
 			const currentTarget = activeTargetRef.current;
 			if (!currentTarget) return;
 			const migration = resolveCompactReplacementEvent(currentTarget.messageId, event);
-			if (!migration) return;
+			if (!migration) {
+				if (
+					event.type === "messages_deleted" &&
+					Array.isArray(event.deletedMessageIds) &&
+					event.deletedMessageIds.includes(currentTarget.messageId)
+				)
+					dismissDeletedTarget(currentTarget);
+				return;
+			}
+			if (migration.changed) {
+				// The next WS frame can arrive before React commits the ID override.
+				activeTargetRef.current = { ...currentTarget, messageId: migration.nextMessageId };
+				liveReader.current?.abort();
+			}
 			const currentQueryKey = compactSummaryQueryKey(
 				currentTarget.narratorId,
 				currentTarget.messageId,
@@ -355,7 +465,7 @@ export function CompactSummaryModal({
 					: { sourceTargetKey: sourceKey, messageId: migration.nextMessageId },
 			);
 		},
-		[queryClient],
+		[dismissDeletedTarget, queryClient],
 	);
 
 	useEffect(() => {
@@ -393,6 +503,8 @@ export function CompactSummaryModal({
 								if (
 									(attempt !== undefined && attempt !== previousAttempt) ||
 									(typeof event.model === "string" && event.model !== previous?.model) ||
+									(typeof event.canChangeModel === "boolean" &&
+										event.canChangeModel !== previous?.canChangeModel) ||
 									((event.pendingModel === null || typeof event.pendingModel === "string") &&
 										(event.pendingModel ?? null) !== (previous?.pendingModel ?? null))
 								) {
@@ -432,7 +544,7 @@ export function CompactSummaryModal({
 							queryKey: compactSummaryQueryKey(current.narratorId, current.messageId, current.kind),
 							exact: true,
 						},
-						{ cancelRefetch: false },
+						{ cancelRefetch: true },
 					);
 				}
 				applyCompactReplacement(event);
@@ -443,18 +555,43 @@ export function CompactSummaryModal({
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey,
-		queryFn: async () => {
+		queryFn: async ({ signal }) => {
 			if (!activeTarget) return { summary: "" };
-			return isSegment
-				? api.getSegmentCompactSummary(activeTarget.narratorId, activeTarget.messageId)
-				: api.getCompactSummary(activeTarget.narratorId, activeTarget.messageId);
+			const before = queryClient.getQueryData<CompactMessageDetail>(queryKey);
+			const revision = compactModelRevision.current;
+			const subscribed = liveReader.current !== null;
+			const read = isSegment ? api.getSegmentCompactSummary : api.getCompactSummary;
+			const snapshot = await read(activeTarget.narratorId, activeTarget.messageId, signal);
+			signal.throwIfAborted();
+			const current = queryClient.getQueryData<CompactMessageDetail>(queryKey);
+			const next = reconcileCompactSnapshot(
+				snapshot,
+				before,
+				current,
+				subscribed || liveReader.current !== null,
+				revision !== compactModelRevision.current,
+			);
+			if (current?.status && "status" in next && hasNewModelState(current, next)) {
+				compactModelRevision.current++;
+			}
+			return next;
 		},
 		enabled: !!activeTarget,
+		retry: (failures, err) =>
+			!(err instanceof ApiError && [401, 403, 404].includes(err.status)) && failures < 1,
 		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 		refetchOnWindowFocus: false,
 	});
 	const compactDetail = data && "status" in data ? data : undefined;
 	const isCompacting = compactDetail?.status === "compacting";
+
+	useEffect(() => {
+		if (activeTarget && error instanceof ApiError && error.status === 404) {
+			// A local retry of a failed, shared marker can still supply its private ID.
+			if (retrying && compactDetail?.status === "failed") return;
+			dismissDeletedTarget(activeTarget);
+		}
+	}, [activeTarget, compactDetail?.status, dismissDeletedTarget, error, retrying]);
 
 	useEffect(() => {
 		if (!isCompacting || !activeTargetNarratorId || !activeTargetMessageId) return;
@@ -464,6 +601,42 @@ export function CompactSummaryModal({
 			activeTargetMessageId,
 			activeTargetKind,
 		);
+		const filter = { queryKey: queryKeyForStream, exact: true };
+		let metaTimer: number | undefined;
+		let nextRefreshAt = 0;
+		let refreshing = false;
+		let refreshAgain = false;
+		// A burst of retry resets needs at most one in-flight read and one trailing read.
+		const refreshMetadata = () => {
+			if (controller.signal.aborted || liveReader.current !== controller) return;
+			if (refreshing) {
+				refreshAgain = true;
+				return;
+			}
+			if (metaTimer !== undefined) return;
+			const wait = nextRefreshAt - Date.now();
+			if (wait > 0) {
+				metaTimer = window.setTimeout(() => {
+					metaTimer = undefined;
+					refreshMetadata();
+				}, wait);
+				return;
+			}
+			refreshing = true;
+			// An initial/detail read already in flight may predate this reset.
+			refreshAgain = queryClient.getQueryState(queryKeyForStream)?.fetchStatus === "fetching";
+			nextRefreshAt = Date.now() + MIN_COMPACT_META_REFRESH_MS;
+			void queryClient.invalidateQueries(filter, { cancelRefetch: false }).finally(() => {
+				refreshing = false;
+				if (refreshAgain) {
+					refreshAgain = false;
+					refreshMetadata();
+				}
+			});
+		};
+		const removeConnectionListener = narratorWSManager.onConnectionChange((connected) => {
+			if (connected) refreshMetadata();
+		});
 		let reconnectTimer: number | undefined;
 		let reconnectDelayMs = 500;
 		const connect = async () => {
@@ -471,8 +644,10 @@ export function CompactSummaryModal({
 			if (controller.signal.aborted || current?.status !== "compacting") return;
 			let output = current.output;
 			let thinking = current.thinking;
-			let streamVersion = current.streamVersion;
+			const streamVersion = current.streamVersion;
 			let canReconnect = true;
+			let finished = false;
+			liveReader.current = controller;
 			try {
 				const response = await api.streamCompactSummary(
 					activeTargetNarratorId,
@@ -489,7 +664,11 @@ export function CompactSummaryModal({
 					await consumeCompactLiveStream(
 						response,
 						(event) => {
-							if (controller.signal.aborted || event.kind === "finished") return;
+							if (controller.signal.aborted) return;
+							if (event.kind === "finished") {
+								finished = true;
+								return;
+							}
 							reconnectDelayMs = 500;
 							if (event.kind === "delta") {
 								if (event.channel === "output") output = `${output ?? ""}${event.delta}`;
@@ -497,7 +676,7 @@ export function CompactSummaryModal({
 							} else if (event.kind === "reset") {
 								output = output?.slice(0, event.outputLength);
 								thinking = thinking?.slice(0, event.thinkingLength);
-								streamVersion = event.streamVersion;
+								compactModelRevision.current++;
 							}
 							queryClient.setQueryData<CompactMessageDetail>(queryKeyForStream, (previous) =>
 								previous?.status === "compacting"
@@ -505,18 +684,30 @@ export function CompactSummaryModal({
 											...previous,
 											output,
 											thinking,
-											streamVersion,
+											...(event.kind === "reset" && { streamVersion: event.streamVersion }),
+											...(event.kind === "delta" && event.delta && { canChangeModel: false }),
 											outputChars: event.outputChars,
 											thinkingChars: event.thinkingChars,
 										}
 									: previous,
 							);
+							if (
+								event.kind === "reset" ||
+								(event.kind === "heartbeat" && !narratorWSManager.connected)
+							) {
+								refreshMetadata();
+							}
 						},
 						controller.signal,
 					);
 				}
 			} catch {
 				// Refresh the status and resume from the buffered text on transient failures.
+			} finally {
+				if (liveReader.current === controller) liveReader.current = null;
+				window.clearTimeout(metaTimer);
+				metaTimer = undefined;
+				refreshAgain = false;
 			}
 			if (
 				controller.signal.aborted ||
@@ -524,11 +715,15 @@ export function CompactSummaryModal({
 			) {
 				return;
 			}
-			await queryClient.invalidateQueries(
-				{ queryKey: queryKeyForStream, exact: true },
-				{ cancelRefetch: false },
-			);
-			if (canReconnect && !controller.signal.aborted) {
+			// A GET begun before the terminal frame cannot confirm its outcome.
+			await queryClient.invalidateQueries(filter, { cancelRefetch: finished });
+			const state = queryClient.getQueryState<CompactMessageDetail>(queryKeyForStream);
+			if (
+				canReconnect &&
+				!controller.signal.aborted &&
+				state?.data?.status === "compacting" &&
+				!(state.error instanceof ApiError && [401, 403, 404].includes(state.error.status))
+			) {
 				reconnectTimer = window.setTimeout(() => void connect(), reconnectDelayMs);
 				reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000);
 			}
@@ -536,6 +731,9 @@ export function CompactSummaryModal({
 		void connect();
 		return () => {
 			controller.abort();
+			if (liveReader.current === controller) liveReader.current = null;
+			removeConnectionListener();
+			window.clearTimeout(metaTimer);
 			window.clearTimeout(reconnectTimer);
 		};
 	}, [activeTargetKind, activeTargetMessageId, activeTargetNarratorId, isCompacting, queryClient]);
@@ -623,6 +821,10 @@ export function CompactSummaryModal({
 	const elapsedLabel = `${Math.floor(elapsedMs / 60_000)}:${String(Math.floor((elapsedMs % 60_000) / 1000)).padStart(2, "0")}`;
 
 	const handleClose = () => {
+		retryRequestId.current++;
+		activeTargetRef.current = null;
+		liveReader.current?.abort();
+		void queryClient.cancelQueries({ queryKey, exact: true }, { revert: false });
 		pendingRetryMigrationRef.current = null;
 		setRetryTargetOverride(null);
 		onClose();
@@ -639,8 +841,7 @@ export function CompactSummaryModal({
 			} else {
 				await api.deleteCompactMessage(currentTarget.narratorId, currentTarget.messageId);
 			}
-			handleClose();
-			currentTarget.onDelete?.();
+			dismissDeletedTarget(currentTarget);
 		} catch {
 			notifications.show({
 				title: t("deleteMessageFailed"),
@@ -728,12 +929,14 @@ export function CompactSummaryModal({
 						) {
 							return previous;
 						}
+						compactModelRevision.current++;
 						return { ...previous, pendingModel: response.pendingModel ?? undefined };
 					},
 				);
 				return;
 			}
-			if (sourceTargetKeyRef.current !== sourceTargetKey) return;
+			if (sourceTargetKeyRef.current !== sourceTargetKey || retryRequestId.current !== requestId)
+				return;
 			const migration = resolveCompactRetryTargetMigration(currentTarget.messageId, response);
 			await Promise.all(
 				migration.retiredMessageIds.map((retiredMessageId) =>

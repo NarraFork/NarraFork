@@ -548,7 +548,9 @@ async function generateLiveCompactSummary(options: {
 			progress.setStallHandler((reason) => {
 				if (
 					requestSignal.aborted ||
-					(!progress.getPendingModel() && retryPolicy.used >= retryPolicy.limit)
+					(!progress.getPendingModel() &&
+						retryPolicy.limit !== -1 &&
+						retryPolicy.used >= retryPolicy.limit)
 				) {
 					return false;
 				}
@@ -1652,6 +1654,7 @@ async function doRunCustomCompact({
 				status: "failed",
 				error: errorMsg,
 				mode: failureMode,
+				model: selectedModel,
 				expectedAttempt,
 			})
 			.catch((e) => {

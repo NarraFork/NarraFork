@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { DEFAULTS, deepMerge } from "@server/lib/settings";
 import { normalizeLegacySettingsPatch, updateSettingsSchema } from "@server/routes/settings";
-import { MAX_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
+import { normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -222,12 +222,13 @@ describe("compaction-only context settings", () => {
 		const updated = deepMerge(deepMerge(DEFAULTS, legacy), { agent });
 		expect(updated.agent.compactMaxRetries).toBe(0);
 		expect(updated.agent.maxTransientRetries).toBe(8);
-		expect(
-			updateSettingsSchema.parse({ agent: { compactMaxRetries: MAX_COMPACT_RETRY_LIMIT } }),
-		).toEqual({
-			agent: { compactMaxRetries: MAX_COMPACT_RETRY_LIMIT },
-		});
-		for (const count of [-1, 0.5, MAX_COMPACT_RETRY_LIMIT + 1]) {
+		for (const count of [-1, 0, 11, 1_000, Number.MAX_SAFE_INTEGER]) {
+			const patch = updateSettingsSchema.parse({ agent: { compactMaxRetries: count } });
+			expect(patch).toEqual({ agent: { compactMaxRetries: count } });
+			expect(deepMerge(DEFAULTS, patch).agent.compactMaxRetries).toBe(count);
+			expect(normalizeCompactRetryLimit(count)).toBe(count);
+		}
+		for (const count of [-2, -1.5, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
 			expect(updateSettingsSchema.safeParse({ agent: { compactMaxRetries: count } }).success).toBe(
 				false,
 			);

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as agent from "../../lib/agent";
+import * as errorHandling from "../../lib/agent/error-handling";
 import { estimateTokens } from "../../lib/agent/estimate-tokens";
 import * as provider from "../../lib/agent/provider";
 import * as requestTracker from "../../lib/api-request-tracker";
@@ -454,19 +455,70 @@ describe("compact small positive budgets use actual request capacity", () => {
 			expect(generate).toHaveBeenCalledTimes(1);
 			expect(generate.mock.calls[0][11]).toEqual({ maxRetries: 0 });
 
-			settings.agent.compactMaxRetries = 2;
+			settings.agent.compactMaxRetries = 12;
 			settings.agent.maxTransientRetries = 0;
 			generate.mockClear();
 			await expect(
 				narratorContext.generateCompactSummary("n-small", "en", [message]),
 			).rejects.toThrow(error.message);
-			expect(generate).toHaveBeenCalledTimes(3);
+			expect(generate).toHaveBeenCalledTimes(13);
 		} finally {
 			settings.agent.compactMaxRetries = before;
 			settings.agent.maxTransientRetries = ordinaryBefore;
 		}
 	});
 
+	test("unlimited retries keep backing off past ten failures until the model succeeds", async () => {
+		const before = settings.agent.compactMaxRetries;
+		const delay = spyOn(errorHandling, "auxiliaryRetryDelayMs").mockReturnValue(1);
+		let calls = 0;
+		try {
+			settings.agent.compactMaxRetries = -1;
+			generate.mockImplementation(async () => {
+				if (++calls <= 12) throw new Error("Empty model response");
+				return { text: "Recovered summary" };
+			});
+			expect(
+				await narratorContext.generateCompactSummary("n-small", "en", [message]),
+			).toMatchObject({
+				summary: "Recovered summary",
+			});
+			expect(generate).toHaveBeenCalledTimes(13);
+			expect(delay).toHaveBeenCalledTimes(12);
+			expect(delay.mock.calls.at(-1)?.[0]).toBe(11);
+		} finally {
+			settings.agent.compactMaxRetries = before;
+			delay.mockRestore();
+		}
+	});
+
+	test("unlimited retries still stop immediately when cancelled during backoff", async () => {
+		const before = settings.agent.compactMaxRetries;
+		const controller = new AbortController();
+		try {
+			settings.agent.compactMaxRetries = -1;
+			generate.mockRejectedValue(new Error("Empty model response"));
+			const result = narratorContext.generateCompactSummary(
+				"n-small",
+				"en",
+				[message],
+				controller.signal,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				(info) => {
+					expect(info.maxRetries).toBe(-1);
+					expect(info.delayMs).toBeGreaterThan(0);
+					controller.abort();
+				},
+			);
+			await expect(result).rejects.toMatchObject({ name: "AbortError" });
+			expect(generate).toHaveBeenCalledTimes(1);
+		} finally {
+			settings.agent.compactMaxRetries = before;
+		}
+	});
 	test("previous summary and spec overhead are retained within the same small window", async () => {
 		previousSummary = `PREVIOUS ${"x".repeat(600)}`;
 		specContext = `LATEST SPEC ${"y".repeat(600)}`;

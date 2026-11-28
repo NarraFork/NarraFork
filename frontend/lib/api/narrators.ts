@@ -2026,8 +2026,8 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
-	getCompactSummary: (narratorId: string, messageId: string) =>
-		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`),
+	getCompactSummary: (narratorId: string, messageId: string, signal?: AbortSignal) =>
+		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`, { signal }),
 	streamCompactSummary: (
 		narratorId: string,
 		messageId: string,
@@ -2537,9 +2537,10 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify({ messageIds }),
 		}),
-	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
+	getSegmentCompactSummary: (narratorId: string, messageId: string, signal?: AbortSignal) =>
 		request<CompactMessageDetail | { summary: string }>(
 			`/narrators/${narratorId}/segment-compact/${messageId}`,
+			{ signal },
 		),
 	deleteSegmentCompact: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {

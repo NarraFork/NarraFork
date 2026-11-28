@@ -14,6 +14,7 @@ import { settings } from "../../lib/settings";
 import {
 	appendLiveCompactDelta,
 	finishLiveCompactProgress,
+	liveCompactProgress,
 	startLiveCompactProgress,
 } from "../compact-live-state";
 import { syncEnvelopeNow } from "../narrator-block-sync";
@@ -172,7 +173,7 @@ test("reads current block bodies and adds only current local live progress", asy
 			attempt: 2,
 			canChangeModel: true,
 			pendingModel: "queued-model",
-			streamVersion: 0,
+			streamVersion: liveCompactProgress.get(marker)?.streamVersion,
 			startedAt: now,
 			outputChars: 0,
 			output: "",
@@ -216,7 +217,7 @@ test("segment detail combines committed block bodies with scoped live output", a
 			attempt: 1,
 			pendingModel: "next-model",
 			canChangeModel: true,
-			streamVersion: 0,
+			streamVersion: liveCompactProgress.get(marker)?.streamVersion,
 			output: "live summary",
 		});
 		expect(await readSegment(marker, foreignId).catch((error: unknown) => error)).toBeInstanceOf(

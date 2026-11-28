@@ -248,6 +248,43 @@ describe("watchdog timeout is a compact failure", () => {
 		});
 	});
 
+	test("persists the replacement model when that model also fails", async () => {
+		seed();
+		__setCompactWatchdogTimingsForTests({ stallMs: 60_000, maxTotalMs: 60_000 });
+		const firstModel = "anthropic:claude-haiku-4-5";
+		const nextModel = "anthropic:claude-sonnet-4-5";
+		const firstRequest = Promise.withResolvers<{ summary: string }>();
+		const started = Promise.withResolvers<void>();
+		const models: Array<string | undefined> = [];
+		narratorContext.generateCompactSummary = async (_id, _locale, _messages, _signal, model) => {
+			models.push(model);
+			if (models.length === 1) {
+				started.resolve();
+				return firstRequest.promise;
+			}
+			throw new Error("Replacement model failed");
+		};
+		const compact = runCustomCompact(NARRATOR_ID, "en", "m-target", {
+			mode: "background",
+			model: firstModel,
+			contextPercentBefore: 80,
+		});
+		const settled = captureWorkerRejection(compact);
+		await Promise.race([started.promise, compact]);
+		const marker = compactLocks.get(NARRATOR_ID)?.messageId ?? "";
+		expect(queueLiveCompactModel(NARRATOR_ID, marker, nextModel, 1)).toEqual({
+			pendingModel: nextModel,
+		});
+		firstRequest.reject(new Error("Original model failed"));
+		expect(await settled).toMatchObject({ message: "Replacement model failed" });
+		expect(models).toEqual([firstModel, nextModel]);
+		expect(await narratorService.getCompactSummary(NARRATOR_ID, marker)).toMatchObject({
+			status: "failed",
+			model: nextModel,
+			attempts: [expect.objectContaining({ model: nextModel, status: "failed" })],
+		});
+		expect(compactLocks.has(NARRATOR_ID)).toBe(false);
+	});
 	test("a user cancel keeps its silent rollback", async () => {
 		seed();
 		// Ceiling and stall both far away: only the explicit cancel can end this run.

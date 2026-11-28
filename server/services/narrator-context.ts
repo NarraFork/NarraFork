@@ -704,9 +704,13 @@ export const narratorContext = {
 					});
 					throw err;
 				}
-				if (retryPolicy.used >= retryPolicy.limit) throw err;
+				if (retryPolicy.limit !== -1 && retryPolicy.used >= retryPolicy.limit) throw err;
 				const error = err instanceof Error ? err.message : String(err);
-				const delayMs = isRetryableError(err) ? auxiliaryRetryDelayMs(retryPolicy.used) : 0;
+				// Unlimited retries must yield even for immediately rejected/empty responses.
+				const delayMs =
+					retryPolicy.limit === -1 || isRetryableError(err)
+						? auxiliaryRetryDelayMs(retryPolicy.used)
+						: 0;
 				onRetryScheduled?.({
 					attempt: retryPolicy.used + 1,
 					maxRetries: retryPolicy.limit,

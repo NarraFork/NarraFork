@@ -14,7 +14,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { MAX_COMPACT_RETRY_LIMIT, normalizeCompactRetryLimit } from "@shared/compact-settings";
+import { normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
@@ -32,7 +32,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { type UseMutationResult, useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
 	AutoContinuationMode,
@@ -182,6 +182,13 @@ export function AgentSection(props: AgentSectionProps) {
 		staleTime: 30_000,
 	});
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
+	// Preserve incomplete input ("" or "-") while typing the unlimited sentinel.
+	const [compactRetryDraft, setCompactRetryDraft] = useState<number | string>(
+		props.compactMaxRetries,
+	);
+	useEffect(() => {
+		setCompactRetryDraft(props.compactMaxRetries);
+	}, [props.compactMaxRetries]);
 
 	// Pinning every request can fill the disk quickly; confirm before switching to it.
 	const handleAutoPinChange = (value: string | null) => {
@@ -475,12 +482,18 @@ export function AgentSection(props: AgentSectionProps) {
 			<NumberInput
 				label={t("compactMaxRetries")}
 				description={t("compactMaxRetriesDesc")}
-				value={props.compactMaxRetries}
-				onChange={(v) => props.setCompactMaxRetries(normalizeCompactRetryLimit(v))}
-				min={0}
-				max={MAX_COMPACT_RETRY_LIMIT}
+				value={compactRetryDraft}
+				onChange={(value) => {
+					setCompactRetryDraft(value);
+					if (value === "" || value === "-") return;
+					const parsed = typeof value === "number" ? value : Number(value);
+					if (Number.isSafeInteger(parsed) && parsed >= -1) {
+						props.setCompactMaxRetries(parsed);
+					}
+				}}
+				onBlur={() => setCompactRetryDraft(normalizeCompactRetryLimit(props.compactMaxRetries))}
+				min={-1}
 				allowDecimal={false}
-				clampBehavior="strict"
 			/>
 			<NumberInput
 				label={t("maxToolCallsPerResponse")}
