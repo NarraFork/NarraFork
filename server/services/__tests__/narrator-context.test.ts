@@ -246,7 +246,7 @@ describe("narrator compact summary", () => {
 	test("cancelling a scheduled provider replan avoids both request and charge", async () => {
 		const controller = new AbortController();
 		const policy = { limit: 2, used: 1 };
-		const retry = mock(() => controller.abort());
+		const retry = mock<CompactSummaryRetryHandler>(() => controller.abort());
 		generate.mockRejectedValue(overflow);
 		await expect(
 			cascade(entriesFor("ONE", "TWO"), policy, retry, 40_000, controller.signal),
@@ -264,7 +264,7 @@ describe("narrator compact summary", () => {
 		let queued = false;
 		const policy = { limit: 1, used: 0, shouldChangeModel: () => queued };
 		generate.mockRejectedValue(error);
-		const retry = mock(() =>
+		const retry = mock<CompactSummaryRetryHandler>(() =>
 			queueMicrotask(() => {
 				queued = true;
 			}),

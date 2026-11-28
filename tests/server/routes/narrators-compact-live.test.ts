@@ -86,7 +86,7 @@ function delta(
 	text: string,
 	outputChars: number,
 	thinkingChars: number,
-) {
+): Extract<CompactLiveStreamEvent, { kind: "delta" }> {
 	return { kind: "delta", channel, delta: text, outputChars, thinkingChars };
 }
 
@@ -120,8 +120,12 @@ test.each([
 
 	const fastEvents = await fastDone;
 	const slowEvents = await readViewer(slow);
-	const heartbeat = { kind: "heartbeat", outputChars: 4, thinkingChars: 4 };
-	const rest = [
+	const heartbeat: Extract<CompactLiveStreamEvent, { kind: "heartbeat" }> = {
+		kind: "heartbeat",
+		outputChars: 4,
+		thinkingChars: 4,
+	};
+	const rest: CompactLiveStreamEvent[] = [
 		delta("thinking", "bad?", 16, 8),
 		{
 			kind: "reset",

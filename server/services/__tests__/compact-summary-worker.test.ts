@@ -9,6 +9,7 @@ import {
 	readCompactSummary,
 } from "../../lib/db-worker/compact-summary-query";
 import * as pool from "../../lib/db-worker/pool";
+import type { DbReadTaskParams } from "../../lib/db-worker/protocol";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { settings } from "../../lib/settings";
 import {
@@ -294,7 +295,7 @@ test.each(
 		messageId: id,
 		fromBlocks: true,
 		segment: scope === "compact" ? undefined : true,
-	};
+	} satisfies DbReadTaskParams;
 	const dispatch = spyOn(pool, "runReadTask");
 	const query = spyOn(sqlite, "query");
 	const prepare = spyOn(sqlite, "prepare");
