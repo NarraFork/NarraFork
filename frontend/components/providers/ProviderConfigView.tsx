@@ -21,11 +21,19 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 
 	return (
 		<Stack gap="md" style={{ height: "100%" }}>
-			<Group gap="xs">
-				<ActionIcon variant="subtle" onClick={onClose} data-testid="provider-config-back">
+			<Group gap="xs" wrap="nowrap" align="flex-start">
+				<ActionIcon
+					variant="subtle"
+					aria-label={t("addProviderBack")}
+					onClick={onClose}
+					data-testid="provider-config-back"
+					style={{ flexShrink: 0 }}
+				>
 					<IconArrowLeft size={18} />
 				</ActionIcon>
-				<Title order={3}>{providerLabel}</Title>
+				<Title order={3} style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+					{providerLabel}
+				</Title>
 			</Group>
 
 			<Text size="sm" c="dimmed">

@@ -2476,6 +2476,7 @@
 	"providerQuotaUnsupported": "当前后端运行时不支持配额检查。",
 	"providerSectionPlatform": "平台集成",
 	"providerSectionCustom": "API key 接入",
+	"providerOverviewToggle": "启用 {{name}}",
 	"providerStatsTotal": "供应商总数",
 	"providerStatsEnabled": "已启用",
 	"providerStatsModels": "可用模型",

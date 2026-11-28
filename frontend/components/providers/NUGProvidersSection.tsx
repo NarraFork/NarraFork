@@ -1012,6 +1012,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 										color="red"
 										variant="subtle"
 										size="sm"
+										aria-label={t("providerDelete")}
 										onClick={() => handleRemoveProvider(p.id)}
 									>
 										<IconTrash size={14} />

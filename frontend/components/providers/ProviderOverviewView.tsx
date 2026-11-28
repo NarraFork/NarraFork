@@ -1,21 +1,17 @@
-import { Box, Button, Grid, Group, Paper, Stack, Text, Title } from "@mantine/core";
+import { Box, Button, Group, Paper, SimpleGrid, Stack, Text, Title } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
 import { Link } from "@tanstack/react-router";
 import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import type { ModelOption } from "../../lib/constants";
 import type { ProviderGroup } from "./ModelOverviewTab";
 import { ProviderCard } from "./ProviderCard";
-import type { ProviderStatus } from "./ProviderStatusBadge";
 
 export interface ProviderOverviewViewProps {
 	groups: ProviderGroup[];
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
-	/** 从草稿里删掉一条 API key 供应商（保存后才落库）；平台/插件供应商不传。 */
-	onDeleteProvider?: (providerId: string) => void;
-	selectedProvider: string | null;
-	pendingProvider?: string;
 }
 
 export const ProviderOverviewView = React.memo(function ProviderOverviewView({
@@ -23,9 +19,6 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	hiddenModels,
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
-	onDeleteProvider,
-	selectedProvider,
-	pendingProvider,
 }: ProviderOverviewViewProps) {
 	const { t } = useTranslation("settings");
 
@@ -43,52 +36,36 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	const platformGroups = groups.filter((g) => g.isPlatform);
 	const customGroups = groups.filter((g) => !g.isPlatform);
 
-	const getProviderStatus = (group: ProviderGroup): ProviderStatus => {
-		if (group.disabled) return "disabled";
-		if (group.prefix === "tokendance" && group.isPlatform) return "connected";
-		if (group.models.length === 0) return "unverified";
-		return "connected";
-	};
-
 	const renderProviderCard = (group: ProviderGroup) => {
 		let hiddenCount = 0;
-		const previewModels: string[] = [];
+		const previewModels: ModelOption[] = [];
 		for (const model of group.models) {
 			if (hiddenModels.has(model.value)) {
 				hiddenCount += 1;
 				continue;
 			}
 			if (previewModels.length < 3) {
-				previewModels.push(model.label);
+				previewModels.push(model);
 			}
 		}
-		const visibleCount = group.models.length - hiddenCount;
-		const status = getProviderStatus(group);
+		const canOpenConfig = group.isPlatform || !!group.providerId;
 
 		return (
-			<Grid.Col key={group.prefix} span={{ base: 12, sm: 6, md: 4, lg: 3 }}>
-				<ProviderCard
-					label={group.label}
-					type={group.isPlatform ? "platform" : "custom"}
-					badgeLabel={group.badgeLabel}
-					status={status}
-					visibleCount={visibleCount}
-					hiddenCount={hiddenCount}
-					previewModels={previewModels}
-					disabled={group.disabled}
-					autoExcluded={group.autoExcluded}
-					controlsDisabled={pendingProvider === group.prefix}
-					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
-					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
-					// 只有草稿里可增删的供应商才给删除按钮：平台与插件供应商由各自机制管理。
-					onDelete={
-						!group.isPlatform && group.providerId && onDeleteProvider
-							? () => onDeleteProvider(group.providerId as string)
-							: undefined
-					}
-					isSelected={selectedProvider === (group.providerId ?? group.prefix)}
-				/>
-			</Grid.Col>
+			<ProviderCard
+				key={group.providerId ?? group.prefix}
+				label={group.label}
+				prefix={group.prefix}
+				badgeLabel={group.badgeLabel}
+				visibleCount={group.models.length - hiddenCount}
+				hiddenCount={hiddenCount}
+				previewModels={previewModels}
+				disabled={group.disabled}
+				autoExcluded={group.autoExcluded}
+				onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
+				onOpenConfig={
+					canOpenConfig ? () => onOpenProviderConfig(group.providerId ?? group.prefix) : undefined
+				}
+			/>
 		);
 	};
 
@@ -136,21 +113,25 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 
 			{/* Platform providers */}
 			{platformGroups.length > 0 && (
-				<Box style={{ overflow: "hidden" }}>
+				<Box>
 					<Title order={4} mb="xs">
 						{t("providerSectionPlatform")}
 					</Title>
-					<Grid>{platformGroups.map(renderProviderCard)}</Grid>
+					<SimpleGrid minColWidth="min(100%, 16rem)" spacing="sm">
+						{platformGroups.map(renderProviderCard)}
+					</SimpleGrid>
 				</Box>
 			)}
 
 			{/* Custom providers */}
 			{customGroups.length > 0 && (
-				<Box style={{ overflow: "hidden" }}>
+				<Box>
 					<Title order={4} mb="xs">
 						{t("providerSectionCustom")}
 					</Title>
-					<Grid>{customGroups.map(renderProviderCard)}</Grid>
+					<SimpleGrid minColWidth="min(100%, 16rem)" spacing="sm">
+						{customGroups.map(renderProviderCard)}
+					</SimpleGrid>
 				</Box>
 			)}
 

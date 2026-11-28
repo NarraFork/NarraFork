@@ -431,7 +431,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					</Group>
 					<Group gap="xs">
 						<Switch size="xs" checked={!provider.disabled} onChange={toggleProviderDisabled} />
-						<ActionIcon color="red" variant="subtle" size="sm" onClick={handleRemoveProvider}>
+						<ActionIcon
+							color="red"
+							variant="subtle"
+							size="sm"
+							aria-label={t("providerDelete")}
+							onClick={handleRemoveProvider}
+						>
 							<IconTrash size={14} />
 						</ActionIcon>
 					</Group>

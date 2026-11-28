@@ -1,0 +1,67 @@
+.card {
+	height: 100%;
+	min-width: 0;
+}
+
+.body {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	gap: var(--mantine-spacing-xs);
+	min-width: 0;
+	padding: var(--mantine-spacing-sm);
+}
+
+.open:hover {
+	background: var(--mantine-color-default-hover);
+}
+
+.open:focus-visible {
+	outline: 2px solid var(--mantine-primary-color-filled);
+	outline-offset: -2px;
+}
+
+.heading {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: var(--mantine-spacing-xs);
+}
+
+.name,
+.metadata {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.chevron {
+	align-self: flex-start;
+	flex-shrink: 0;
+	color: var(--mantine-color-dimmed);
+}
+
+.metadata {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	column-gap: var(--mantine-spacing-xs);
+	row-gap: calc(var(--mantine-spacing-xs) / 2);
+}
+
+.metadata > * {
+	min-width: 0;
+	max-width: 100%;
+}
+
+.preview {
+	display: grid;
+	gap: 4px;
+	min-width: 0;
+	grid-template-columns: minmax(0, 1fr);
+}
+
+.footer {
+	min-height: 44px;
+	padding: calc(var(--mantine-spacing-xs) / 2) var(--mantine-spacing-sm);
+	border-top: 1px solid var(--mantine-color-default-border);
+}
