@@ -721,9 +721,7 @@ export const ExactRow = memo(
 		if (kind === "review-card" && reviewTruncatedLabel) {
 			extra.truncatedLabel = reviewTruncatedLabel;
 		}
-		// Compact / segment-compact markers: the row itself is the affordance — it
-		// opens the summary modal, or cancels a compaction still in flight. Both live
-		// outside vlist/ (modal + API), so they arrive as bound callbacks.
+		// Compact markers open details and may offer cancellation as a separate action.
 		if (compactActions) {
 			if (compactActions.onOpenCompact) extra.onOpenCompact = compactActions.onOpenCompact;
 			if (compactActions.onCancelCompact) {

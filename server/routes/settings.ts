@@ -584,6 +584,7 @@ export const updateSettingsSchema = z
 					})
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
+				compactMaxRetries: z.number().int().min(-1),
 				queueDuringCompaction: z.boolean().optional(),
 				browserProxy: proxyOverrideSchema,
 				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),

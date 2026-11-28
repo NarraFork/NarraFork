@@ -34,7 +34,8 @@ export function getNarratorWorkerTestDb() {
 			// A failed probe still needs the same acknowledged handle cleanup.
 			await ready.catch(() => {});
 			await shutdownDbWorkerPool();
-			sqlite.close();
+			// Finalize prepared statements now so Windows can unlink the fixture's WAL files.
+			sqlite.close(true);
 			rmSync(directory, { recursive: true, force: true });
 		})();
 		return closing;

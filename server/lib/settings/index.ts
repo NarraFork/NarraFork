@@ -107,6 +107,7 @@ export {
 	getAutoCompactKeepPairs,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
+	getCompactMaxRetries,
 	getContextThresholds,
 	getFirstNugProvider,
 	getGeminiProviderConfig,

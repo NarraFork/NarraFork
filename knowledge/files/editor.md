@@ -55,7 +55,7 @@ anchors:
   - shared/editor-provider-contracts.ts
   - shared/editor-stream-codec.ts
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 编辑器文档
 
@@ -71,6 +71,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 草稿锚点：本地落盘的小日志，最多 128 条/128KiB，暂存 10 分钟，发布后保留 7 天（`EDITOR_DRAFT_ANCHOR_LIMITS`）。
 - 路径拒绝符号链接（`editor-source-path.ts:rejectEditorSymlinks`）。
 - 原始读取走流：`editor-document-streams.ts` 的两个按亲和性绑定的源 Worker 做读窗口，远程设备掉线 3s 内重连会重试；窗口 256KiB、最多 8 条原始流（`EDITOR_RAW_WINDOW_BYTES`、`EDITOR_RAW_MAX_STREAMS`）；编码嗅探与 BOM 在 `shared/editor-stream-codec.ts`（只做保守嗅探，旧编码需显式提示）。`editor-document-worker.ts` 的动作是 `metadata | content | disk-state | seal | raw-seal | prepare | recovery | cleanup`。
+- `EditorStreamCodec.push` 的换行标记由新分配的 `Uint8Array<ArrayBuffer>` 返回，Worker 可直接转移其底层缓冲区；输入数组的共享与否不会改变输出缓冲区的所有权。
 - 文件变更提示：WS 消息 `editor_file_subscribe/unsubscribe` → `editor_file_subscribed/changed/error`，只是提示，不授予访问权；服务端 `EditorFileSubscriptions` 是轮询适配器（单个 15s 定时器、4 个并发鉴权、最多 128 个被授权资源、每组 16 个引用、无文件正文）；前端同名类按“每个可见资源一个订阅”（`shared/editor-file-events.ts`、`server/websocket/editor-file-ws.ts`、`frontend/lib/editor-file-subscription.ts`）。
 - 保存后通知叙述者：保存请求带 `notifyAgent` 时，`file-edit-interject.ts` 对运行中的叙述者以插话消息送达，空闲的叙述者不唤醒、只写一条 `schedule: "none"` 的注入；同一叙述者连续保存合并为一条（`/api/fs/write` 与编辑器文档提交两处都会调用）。
 - 前端文本文档视图：主线程只读/绘制有界的原始窗口，两个独立 Worker 泵做 CPU 工作（`useTextDocumentView.ts`、`text-document-view-session.ts`、`text-document.worker.ts`、`text-document-worker-client/core/protocol.ts`、`text-document-pure-core.ts`）；文档缓存 32MiB、导入 8MiB、空闲上限 128、读超时 10s（`text-document-store.ts`）；Worker 看门狗 60s、派生缓存 64MiB（`text-document-worker-protocol.ts`）。Worker 不可用时前端怎么降级：未核实。

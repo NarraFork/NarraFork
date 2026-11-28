@@ -35,7 +35,7 @@ import type { VListItem } from "./vlist-pipeline";
 
 /** Per-row compact callbacks handed to the render layer through `extra`. */
 export interface VListCompactRowActions {
-	/** Open the summary modal for a finished / failed marker. */
+	/** Open the summary modal for this marker, including while it is running. */
 	onOpenCompact?: () => void;
 	/** Ask to abort a RUNNING context compaction. */
 	onCancelCompact?: () => void;
@@ -109,11 +109,10 @@ export function useVListCompactActions({
 			);
 			if (!target) continue;
 			const actions: VListCompactRowActions = {};
-			// A running compact has no summary yet; a finished one cannot be cancelled.
-			// Exactly one of the two is ever bound (parity with the chunked marker).
 			if (target.canCancel) {
 				actions.onCancelCompact = () => setPendingCancel(target);
-			} else if (target.canOpen && summaryModal) {
+			}
+			if (target.canOpen && summaryModal) {
 				actions.onOpenCompact = () => openSummary(target);
 			}
 			if (actions.onCancelCompact || actions.onOpenCompact) map.set(item.spec.key, actions);

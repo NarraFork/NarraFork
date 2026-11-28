@@ -14,6 +14,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
+import { normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
@@ -31,7 +32,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { type UseMutationResult, useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
 	AutoContinuationMode,
@@ -105,6 +106,8 @@ export interface AgentSectionProps {
 	setAutoContinuationMode: (v: AutoContinuationMode) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	compactMaxRetries: number;
+	setCompactMaxRetries: (v: number) => void;
 	maxToolCallsPerResponse: number;
 	setMaxToolCallsPerResponse: (v: number) => void;
 	silentToolCallThreshold: number;
@@ -179,6 +182,13 @@ export function AgentSection(props: AgentSectionProps) {
 		staleTime: 30_000,
 	});
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
+	// Preserve incomplete input ("" or "-") while typing the unlimited sentinel.
+	const [compactRetryDraft, setCompactRetryDraft] = useState<number | string>(
+		props.compactMaxRetries,
+	);
+	useEffect(() => {
+		setCompactRetryDraft(props.compactMaxRetries);
+	}, [props.compactMaxRetries]);
 
 	// Pinning every request can fill the disk quickly; confirm before switching to it.
 	const handleAutoPinChange = (value: string | null) => {
@@ -468,6 +478,22 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
 				min={-1}
 				max={100}
+			/>
+			<NumberInput
+				label={t("compactMaxRetries")}
+				description={t("compactMaxRetriesDesc")}
+				value={compactRetryDraft}
+				onChange={(value) => {
+					setCompactRetryDraft(value);
+					if (value === "" || value === "-") return;
+					const parsed = typeof value === "number" ? value : Number(value);
+					if (Number.isSafeInteger(parsed) && parsed >= -1) {
+						props.setCompactMaxRetries(parsed);
+					}
+				}}
+				onBlur={() => setCompactRetryDraft(normalizeCompactRetryLimit(props.compactMaxRetries))}
+				min={-1}
+				allowDecimal={false}
 			/>
 			<NumberInput
 				label={t("maxToolCallsPerResponse")}

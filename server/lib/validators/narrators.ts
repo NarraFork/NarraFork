@@ -562,9 +562,15 @@ export const updateSegmentCompactSummarySchema = z.object({
 	summary: z.string().min(1).max(100_000),
 });
 
-export const retryFailedCompactSchema = z.object({
-	model: z.string().trim().min(1).max(200).optional(),
-});
+export const retryFailedCompactSchema = z
+	.object({
+		model: z.string().trim().min(1).max(200).optional(),
+		useSessionModel: z.boolean().optional(),
+		expectedAttempt: z.number().int().positive().optional(),
+	})
+	.refine(({ model, useSessionModel }) => !(model && useSessionModel), {
+		message: "Choose either an explicit compact model or the session model",
+	});
 
 // === Narrator title ===
 

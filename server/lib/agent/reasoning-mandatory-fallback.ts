@@ -62,12 +62,15 @@ function withoutReasoningPreference(options: GenerateOptions | undefined): Gener
  *
  * Only requests that asked for `reasoningEffort: "none"` are affected: any other
  * value is the caller's explicit choice and is never rewritten. A model already
- * known to require reasoning skips the doomed first attempt entirely.
+ * known to require reasoning skips the doomed first attempt entirely. A caller
+ * managing its own retries still learns the requirement, but receives the
+ * original rejection to decide whether and which model to call next.
  */
 export async function withReasoningMandatoryFallback<T>(
 	model: string,
 	options: GenerateOptions | undefined,
 	run: (options: GenerateOptions | undefined) => Promise<T>,
+	retryOnReasoningRejection = true,
 ): Promise<T> {
 	if (options?.reasoningEffort !== "none") return run(options);
 
@@ -80,6 +83,7 @@ export async function withReasoningMandatoryFallback<T>(
 	} catch (err) {
 		if (!isReasoningMandatoryError(err)) throw err;
 		rememberReasoningMandatory(model);
+		if (!retryOnReasoningRejection) throw err;
 		logger.warn("Endpoint requires reasoning; retrying without a reasoning preference", {
 			model,
 			error: err instanceof Error ? err.message : String(err),

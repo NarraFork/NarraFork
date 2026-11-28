@@ -209,7 +209,7 @@ test("real compact SSE survives ordinary deadline and grant cancellation drains 
 	await db
 		.insert(narratorMessageRefs)
 		.values({ id: generateId(), narratorId, messageId, seq: 0, isCompact: 0 });
-	startLiveCompactProgress(messageId, { model: "test", startedAt: now });
+	startLiveCompactProgress(messageId, { narratorId, model: "test", startedAt: now });
 	appendLiveCompactDelta(messageId, "output", "prefix:hello", {
 		outputChars: 12,
 		thinkingChars: 0,

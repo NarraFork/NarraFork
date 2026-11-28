@@ -1,13 +1,17 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { type SummaryRetryInfo, summaryGenerate } from "../lib/agent";
 import {
+	auxiliaryRetryDelayMs,
 	isContextOverflowMessage,
 	isContextWindowExceededError,
+	isRetryableError,
 } from "../lib/agent/error-handling";
 import { estimateTokens } from "../lib/agent/estimate-tokens";
 import { projectAskUserQuestionMessagesForModel } from "../lib/agent/question-model-input";
 import { projectMessageSenderText, type SenderMessage } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getCompactMaxRetries } from "../lib/settings";
 import {
 	getSummaryModelContextWindowDetail,
 	type ModelContextWindowSource,
@@ -18,7 +22,6 @@ import { taskSourceForNarrator } from "./task-source";
 export { estimateTokens };
 
 const SUMMARY_MAX_MESSAGES = 50;
-const COMPACT_MAX_RETRIES = 2;
 const COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH = 8;
 const COMPACT_OVERFLOW_RETRY_BUDGET_RATIO = 0.6;
 const COMPACT_MIN_TEXT_SPLIT_CHARS = 1_000;
@@ -104,14 +107,51 @@ export type CompactSummaryReasoningDeltaHandler = (delta: string) => void | Prom
  */
 export type CompactSummaryProgressHandler = () => void;
 
-/**
- * Fired each time a failed summary attempt is about to be retried (either the
- * per-request backoff inside `summaryGenerate`, or this module's whole-chunk
- * retry). Unlike {@link CompactSummaryProgressHandler} — a pure liveness beat —
- * this carries the failure detail so a UI can show "retrying (N)" instead of an
- * unexplained 0-char spinner.
- */
+/** Fired before waiting for a failed request to be retried. */
 export type CompactSummaryRetryHandler = (info: SummaryRetryInfo) => void;
+
+export interface CompactSummaryRetryPolicy {
+	limit: number;
+	used: number;
+	shouldChangeModel?: () => boolean;
+	onRequestStart?: () => AbortSignal;
+	onRequestFinish?: () => void;
+	onRequestSuccess?: () => void;
+	onRequestFailure?: () => void;
+}
+
+type CompactChunkResult = { summary: string; contextPercent?: number };
+type CompactOverflowFallback = (
+	failure: unknown,
+	source: "estimate" | "provider",
+) => Promise<CompactChunkResult>;
+
+function hasCompactRetry(policy: CompactSummaryRetryPolicy): boolean {
+	return policy.limit === -1 || policy.used < policy.limit;
+}
+
+function scheduleCompactRetry(
+	policy: CompactSummaryRetryPolicy,
+	failure: unknown,
+	delayMs: number,
+	onRetryScheduled?: CompactSummaryRetryHandler,
+): () => void {
+	onRetryScheduled?.({
+		attempt: policy.used + 1,
+		maxRetries: policy.limit,
+		delayMs,
+		error: failure instanceof Error ? failure.message : String(failure),
+	});
+	// A replan can produce several chunks. Charge once, at its first actual request,
+	// not during backoff or a local split that may still fail without sending anything.
+	let pending = true;
+	return () => {
+		if (!pending) return;
+		if (policy.shouldChangeModel?.() || !hasCompactRetry(policy)) throw failure;
+		pending = false;
+		policy.used += 1;
+	};
+}
 
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
@@ -310,6 +350,7 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
+		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
 	): Promise<{
 		summary: string;
 		contextPercent?: number;
@@ -433,6 +474,7 @@ export const narratorContext = {
 			onProgress,
 			onRetryScheduled,
 			userId,
+			retryPolicy,
 		);
 		return { ...result, contextWindowSource };
 	},
@@ -453,7 +495,9 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
-	): Promise<{ summary: string; contextPercent?: number }> {
+		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
+		beginRetry?: () => void,
+	): Promise<CompactChunkResult> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
 
@@ -487,6 +531,8 @@ export const narratorContext = {
 				onProgress,
 				onRetryScheduled,
 				userId,
+				retryPolicy,
+				beginRetry,
 			);
 
 			onProgress?.();
@@ -522,26 +568,16 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
-	): Promise<{ summary: string; contextPercent?: number }> {
-		try {
-			return await this._summarizeChunk(
-				narratorId,
-				entries,
-				previousSummary,
-				compactSystemPrompt,
-				compactSuffix,
-				baseFixedTokens,
-				tokenBudget,
-				signal,
-				modelOverride,
-				onTextDelta,
-				onReasoningDelta,
-				onProgress,
-				onRetryScheduled,
-				userId,
-			);
-		} catch (err) {
-			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
+		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
+		beginRetry?: () => void,
+	): Promise<CompactChunkResult> {
+		const split: CompactOverflowFallback = (err, source) => {
+			signal?.throwIfAborted();
+			if (
+				depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH ||
+				(source === "provider" &&
+					(retryPolicy.shouldChangeModel?.() || !hasCompactRetry(retryPolicy)))
+			) {
 				throw err;
 			}
 
@@ -556,6 +592,7 @@ export const narratorContext = {
 			logger.warn("Compact chunk exceeded summary model context, cascading into smaller chunks", {
 				narratorId,
 				depth,
+				source,
 				chunkEntries: entries.length,
 				fallbackChunks: fallbackChunks.length,
 				error: err instanceof Error ? err.message : String(err),
@@ -577,8 +614,31 @@ export const narratorContext = {
 				onProgress,
 				onRetryScheduled,
 				userId,
+				retryPolicy,
+				source === "provider"
+					? scheduleCompactRetry(retryPolicy, err, 0, onRetryScheduled)
+					: beginRetry,
 			);
-		}
+		};
+		return this._summarizeChunk(
+			narratorId,
+			entries,
+			previousSummary,
+			compactSystemPrompt,
+			compactSuffix,
+			baseFixedTokens,
+			tokenBudget,
+			signal,
+			modelOverride,
+			onTextDelta,
+			onReasoningDelta,
+			onProgress,
+			onRetryScheduled,
+			userId,
+			retryPolicy,
+			beginRetry,
+			split,
+		);
 	},
 
 	/**
@@ -600,7 +660,10 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
-	): Promise<{ summary: string; contextPercent?: number }> {
+		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
+		beginRetry?: () => void,
+		onOverflow?: CompactOverflowFallback,
+	): Promise<CompactChunkResult> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
 			: "";
@@ -613,7 +676,9 @@ export const narratorContext = {
 		// The caller splits oversized chunks/text recursively with a bounded depth;
 		// if even fixed overhead cannot fit, fail without committing a lossy summary.
 		if (totalTokens > contentBudget) {
-			throw new Error("Compact input exceeds maximum context length");
+			const err = new Error("Compact input exceeds maximum context length");
+			if (onOverflow) return onOverflow(err, "estimate");
+			throw err;
 		}
 
 		// ── Assemble final conversation text ──
@@ -627,16 +692,19 @@ export const narratorContext = {
 		if (!conversationText.trim()) return { summary: "No conversation history." };
 
 		const compactUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`;
-
-		let lastError: unknown;
-		for (let attempt = 1; attempt <= COMPACT_MAX_RETRIES; attempt++) {
+		let providerOverflow: unknown;
+		while (true) {
 			if (signal?.aborted) {
 				throw new DOMException("Compact summary aborted", "AbortError");
 			}
-			// Starting an attempt is progress even if the previous one produced
-			// nothing, so an inactivity watchdog must not fire mid-retry.
 			onProgress?.();
+			const requestSignal = retryPolicy.onRequestStart?.() ?? signal;
+			let requestStarted = false;
 			try {
+				signal?.throwIfAborted();
+				requestSignal?.throwIfAborted();
+				beginRetry?.();
+				requestStarted = true;
 				const result = await summaryGenerate(
 					compactUserText,
 					compactSystemPrompt,
@@ -645,38 +713,39 @@ export const narratorContext = {
 						kind: "compact",
 						userId,
 					},
-					signal,
-					onTextDelta,
+					requestSignal,
+					onTextDelta &&
+						((delta) => {
+							if (!requestSignal?.aborted) return onTextDelta(delta);
+						}),
 					modelOverride,
 					undefined,
+					false,
+					onReasoningDelta &&
+						((delta) => {
+							if (!requestSignal?.aborted) return onReasoningDelta(delta);
+						}),
 					undefined,
-					onReasoningDelta,
-					// summaryGenerate retries transient failures internally with backoff
-					// that sums to minutes. Without this, that entire chain looks like one
-					// silent gap to an inactivity watchdog, which would abort a compact
-					// that is merely being rate-limited and recovering.
-					onProgress,
-					// Surface each scheduled retry so the UI can say "retrying (N)"
-					// instead of sitting on an unexplained 0-char spinner.
-					onRetryScheduled,
+					undefined,
+					{ maxRetries: 0 },
 				);
+				requestSignal?.throwIfAborted();
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
 				}
+				retryPolicy.onRequestSuccess?.();
 				return {
 					summary: result.text,
 					contextPercent: result.contextPercent,
 				};
-			} catch (err) {
-				lastError = err;
-				// Cancelled by the user — stop retrying and propagate the abort.
-				if (
-					(err instanceof DOMException && err.name === "AbortError") ||
-					(err instanceof Error && err.name === "AbortError") ||
-					signal?.aborted
-				) {
+			} catch (failure) {
+				if (!requestStarted) throw failure;
+				const err = requestSignal?.aborted && !signal?.aborted ? requestSignal.reason : failure;
+				if ((err instanceof Error && err.name === "AbortError") || signal?.aborted) {
 					throw err;
 				}
+				retryPolicy.onRequestFailure?.();
+				if (retryPolicy.shouldChangeModel?.()) throw err;
 				if (isCompactContextOverflowError(err)) {
 					logger.warn("Compact summary request exceeded summary model context", {
 						narratorId,
@@ -685,30 +754,25 @@ export const narratorContext = {
 						activeEntries: activeTexts.length,
 						error: err instanceof Error ? err.message : String(err),
 					});
-					throw err;
+					if (!onOverflow) throw err;
+					providerOverflow = err;
+					break;
 				}
-				logger.error("Compact summary generation attempt failed", {
-					narratorId,
-					model: modelOverride,
-					attempt,
-					maxRetries: COMPACT_MAX_RETRIES,
-					error: String(err),
-				});
-				// The whole-chunk retry sits on TOP of summaryGenerate's internal
-				// backoff chain — report it too, or this layer's retry window goes
-				// back to looking like an unexplained stall.
-				if (attempt < COMPACT_MAX_RETRIES) {
-					onRetryScheduled?.({
-						attempt,
-						maxRetries: COMPACT_MAX_RETRIES,
-						delayMs: 0,
-						error: err instanceof Error ? err.message : String(err),
-					});
-				}
+				if (!hasCompactRetry(retryPolicy)) throw err;
+				// Unlimited retries must yield even for immediately rejected/empty responses.
+				const delayMs =
+					retryPolicy.limit === -1 || isRetryableError(err)
+						? auxiliaryRetryDelayMs(retryPolicy.used)
+						: 0;
+				beginRetry = scheduleCompactRetry(retryPolicy, err, delayMs, onRetryScheduled);
+				if (delayMs > 0) await sleep(delayMs, undefined, { signal });
+				if (retryPolicy.shouldChangeModel?.()) throw err;
+			} finally {
+				retryPolicy.onRequestFinish?.();
 			}
 		}
-
-		throw lastError instanceof Error ? lastError : new Error(String(lastError));
+		// Finish the rejected request before its replacement installs a new stall handler.
+		return onOverflow(providerOverflow, "provider");
 	},
 };
 

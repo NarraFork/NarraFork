@@ -1257,6 +1257,8 @@
 	"autoContinuationMode_off": "不续跑",
 	"maxTransientRetries": "可恢复错误最大重试次数",
 	"maxTransientRetriesDesc": "遇到临时性 API 错误（限流、服务器错误）时的最大重试次数。设为 -1 表示无限重试。",
+	"compactMaxRetries": "上下文压缩重试上限",
+	"compactMaxRetriesDesc": "每次上下文压缩的自动重试上限。设为 -1 时不限次数，设为 0 时关闭自动重试；正整数不设固定上限。手动选定的替换模型仍会在当前请求失败后继续压缩。",
 	"maxToolCallsPerResponse": "每条模型回复工具调用上限",
 	"maxToolCallsPerResponseDesc": "单条模型回复允许的工具调用数量上限（1–128 的整数，默认 32）。超限自动中止叙述者，不是跨整个会话累计的上限。",
 	"silentToolCallThreshold": "沉默工具调用阈值",

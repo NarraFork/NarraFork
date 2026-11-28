@@ -54,9 +54,6 @@ const LABELS = {
 	segmentCompacted: "Segment compacted ({count} messages)",
 };
 
-/** linkedom's KeyboardEvent constructor (there is no global one under Bun). */
-let makeKeyDown: (key: string) => Event;
-
 beforeAll(() => {
 	installCanvasStub();
 	const { window: win } = parseHTML("<!doctype html><html><body></body></html>");
@@ -69,15 +66,6 @@ beforeAll(() => {
 	g.Node = win.Node;
 	g.getComputedStyle = win.getComputedStyle;
 	g.IS_REACT_ACT_ENVIRONMENT = true;
-	// linkedom implements no KeyboardEvent, so synthesize one: React reads `key`
-	// straight off the native event, and a bubbling Event reaches the delegated
-	// root listener the same way.
-	const EventCtor = (win as unknown as { Event: typeof Event }).Event;
-	makeKeyDown = (key: string) => {
-		const event = new EventCtor("keydown", { bubbles: true, cancelable: true });
-		Object.defineProperty(event, "key", { value: key, configurable: true });
-		return event;
-	};
 	if (typeof g.matchMedia !== "function") {
 		g.matchMedia = () => ({
 			matches: false,
@@ -107,7 +95,10 @@ beforeAll(() => {
 function adaptCompactBlock(block: Record<string, unknown>) {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: rowWithElements({ id: "compact-msg", role: "system" }, [block as never]),
+		msg: rowWithElements(
+			{ id: "compact-msg", role: block.type === "segment_compact" ? "user" : "system" },
+			[block as never],
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: LABELS })[0];
 	if (!spec) throw new Error("no spec produced");
@@ -131,7 +122,9 @@ function renderMarker(
 	progressBinding?: { compactProgressMessageId?: string; compactProgressIsSegment?: boolean },
 ): RenderedMarker {
 	const spec = adaptCompactBlock(block);
-	expect(spec.kind).toBe("system-simple");
+	expect(spec.kind).toBe(
+		block.type === "segment_compact" && block.status === "failed" ? "system-text" : "system-simple",
+	);
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
 	const extra = resolveRenderExtra(spec);
 	if (callbacks.onOpenCompact) extra.onOpenCompact = callbacks.onOpenCompact;
@@ -180,14 +173,14 @@ describe("resolveVListCompactTarget — which rows get which affordance", () => 
 		});
 	});
 
-	it("a RUNNING context compact cancels instead of opening", () => {
+	it("a running context compact offers details and cancellation", () => {
 		expect(
 			resolveVListCompactTarget("system-simple", { kind: "compact", status: "compacting" }, ["m1"]),
 		).toEqual({
 			kind: "context",
 			messageId: "m1",
 			status: "compacting",
-			canOpen: false,
+			canOpen: true,
 			canCancel: true,
 		});
 	});
@@ -208,15 +201,14 @@ describe("resolveVListCompactTarget — which rows get which affordance", () => 
 				"m2",
 			]),
 		).toMatchObject({ kind: "segment", canOpen: true, canCancel: false });
-		// The cancel API is context-compact only (narrator-scoped), so a running
-		// segment compaction stays inert rather than firing the wrong endpoint.
+		// The cancel API is context-compact only.
 		expect(
 			resolveVListCompactTarget(
 				"system-simple",
 				{ kind: "segment_compact", status: "compacting" },
 				["m2"],
 			),
-		).toMatchObject({ canOpen: false, canCancel: false });
+		).toMatchObject({ canOpen: true, canCancel: false });
 	});
 
 	it("an unknown status is treated as compacted (adapter default parity)", () => {
@@ -245,35 +237,28 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 			{ type: "compact", status: "compacted", summary: "the summary body" },
 			{ onOpenCompact: () => opened++ },
 		);
-		expect(marker.row.getAttribute("data-compact-open")).toBe("1");
-		expect(marker.row.getAttribute("data-compact-cancel")).toBeNull();
-		act(() => (marker.row as unknown as HTMLElement).click());
+		expect(marker.row.querySelector("[data-compact-cancel]")).toBeNull();
+		act(() => marker.row.querySelector<HTMLButtonElement>("button[data-compact-open]")?.click());
 		expect(opened).toBe(1);
 		marker.unmount();
 	});
 
-	it("clicking a compacting marker cancels, and the row shows the cancel title", () => {
-		let cancelled = 0;
-		const marker = renderMarker(
-			{ type: "compact", status: "compacting", outputChars: 42 },
-			{ onCancelCompact: () => cancelled++ },
-		);
-		expect(marker.row.getAttribute("data-compact-cancel")).toBe("1");
-		expect(marker.row.getAttribute("title")).toBe(CANCEL_TITLE);
-		act(() => (marker.row as unknown as HTMLElement).click());
-		expect(cancelled).toBe(1);
-		marker.unmount();
-	});
-
-	it("a compacting marker never fires the open callback (no summary exists yet)", () => {
+	it("opens live details before the first output and confirms cancellation separately", () => {
 		let opened = 0;
 		let cancelled = 0;
 		const marker = renderMarker(
-			{ type: "compact", status: "compacting", outputChars: 7 },
+			{ type: "compact", status: "compacting", outputChars: 0 },
 			{ onOpenCompact: () => opened++, onCancelCompact: () => cancelled++ },
 		);
-		act(() => (marker.row as unknown as HTMLElement).click());
-		expect(opened).toBe(0);
+		const open = marker.row.querySelector<HTMLButtonElement>("button[data-compact-open]");
+		const cancel = marker.row.querySelector<HTMLButtonElement>("button[data-compact-cancel]");
+		expect(open?.getAttribute("aria-haspopup")).toBe("dialog");
+		expect(cancel?.getAttribute("aria-label")).toBe(CANCEL_TITLE);
+		act(() => open?.click());
+		expect(opened).toBe(1);
+		expect(cancelled).toBe(0);
+		act(() => cancel?.click());
+		expect(opened).toBe(1);
 		expect(cancelled).toBe(1);
 		marker.unmount();
 	});
@@ -331,48 +316,41 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 		clearAllCompactProgress();
 	});
 
-	it("a segment marker opens through the same slot", () => {
+	it("a running segment marker opens through the same slot", () => {
 		let opened = 0;
 		const marker = renderMarker(
-			{ type: "segment_compact", status: "compacted", messageCount: 12 },
+			{ type: "segment_compact", status: "compacting", messageCount: 12 },
 			{ onOpenCompact: () => opened++ },
 		);
-		act(() => (marker.row as unknown as HTMLElement).click());
+		act(() => marker.row.querySelector<HTMLButtonElement>("button[data-compact-open]")?.click());
+		expect(opened).toBe(1);
+		marker.unmount();
+	});
+
+	it("a failed segment marker opens the details from its error card", () => {
+		let opened = 0;
+		const block = { type: "segment_compact", status: "failed", error: "Request failed" };
+		const spec = adaptCompactBlock(block);
+		expect(resolveVListCompactTarget(spec.kind, spec.data, ["compact-msg"])).toMatchObject({
+			kind: "segment",
+			status: "failed",
+			canOpen: true,
+			canCancel: false,
+		});
+		const marker = renderMarker(block, { onOpenCompact: () => opened++ });
+		act(() => marker.row.querySelector<HTMLButtonElement>("button[data-compact-open]")?.click());
 		expect(opened).toBe(1);
 		marker.unmount();
 	});
 
 	it("without callbacks the row stays inert (harness / no provider)", () => {
 		const marker = renderMarker({ type: "compact", status: "compacted" });
-		expect(marker.row.getAttribute("data-compact-open")).toBeNull();
-		expect(marker.row.getAttribute("data-compact-cancel")).toBeNull();
+		expect(marker.row.querySelector("button")).toBeNull();
 		// An inert marker must not enter the tab order or claim a button role.
 		expect(marker.row.getAttribute("role")).toBeNull();
 		expect(marker.row.getAttribute("tabindex")).toBeNull();
 		// Clicking must not throw when nothing is bound.
 		act(() => (marker.row as unknown as HTMLElement).click());
-		marker.unmount();
-	});
-
-	it("an actionable marker is reachable as a button by keyboard", () => {
-		let opened = 0;
-		const marker = renderMarker(
-			{ type: "compact", status: "compacted" },
-			{ onOpenCompact: () => opened++ },
-		);
-		expect(marker.row.getAttribute("role")).toBe("button");
-		expect(marker.row.getAttribute("tabindex")).toBe("0");
-		for (const key of ["Enter", " "]) {
-			act(() => {
-				marker.row.dispatchEvent(makeKeyDown(key));
-			});
-		}
-		expect(opened).toBe(2);
-		// An unrelated key must not trigger the action.
-		act(() => {
-			marker.row.dispatchEvent(makeKeyDown("a"));
-		});
-		expect(opened).toBe(2);
 		marker.unmount();
 	});
 
@@ -394,7 +372,7 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 
 describe("shell wiring — the compact callbacks reach the row", () => {
 	const SHELL = Promise.resolve(shellSource());
-	const DISPATCH = Bun.file(new URL("./render-registry.tsx", import.meta.url).pathname).text();
+	const DISPATCH = Bun.file(new URL("./render-registry.tsx", import.meta.url)).text();
 
 	it("ExactRow forwards the per-row compact actions into the render extra", async () => {
 		const shell = await SHELL;
@@ -432,7 +410,7 @@ describe("shell wiring — the compact callbacks reach the row", () => {
 	});
 
 	it("ExactRow binds the compact progress identity from the owning source message", async () => {
-		const exactRow = await Bun.file(new URL("./ExactRow.tsx", import.meta.url).pathname).text();
+		const exactRow = await Bun.file(new URL("./ExactRow.tsx", import.meta.url)).text();
 		expect(exactRow).toContain("extra.compactProgressMessageId = sourceIds[0]");
 		expect(exactRow).toContain('simpleBlock?.tag === "segment_compact"');
 	});

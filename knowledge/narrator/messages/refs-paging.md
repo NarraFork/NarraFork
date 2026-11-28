@@ -48,7 +48,7 @@ keywords:
   - partitionTimeline
   - resolveLazyLineage
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 消息与引用
 
@@ -61,6 +61,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 分页以 `refs.seq` 为游标：默认取尾页，`beforeSeq` 取更旧一页，`afterSeq` 升序取更新部分；查 `limit+1` 判断是否还有更多，单页上限 100（`narrator-messages.ts:getPretextDocumentPage`）。已被分段压缩隐藏的引用（`segmentCompactId` 非空）不进入页。页组装期间文档版本变化会抛 `PRETEXT_DOCUMENT_CHANGED`（409）。
 - 压缩点：查询“最近 compact”用 `isCompact = 1` 的最大 seq（`narrator-messages.ts` 内 `lastCompactRow` 系列查询）；后续上下文只从该点之后加载，见 [上下文与压缩](../context.md)。
 - 变更类方法（删除消息/块、更新压缩摘要、dismiss 各类提示）在 `narratorMessageQueries` 中统一包了 `admittedMutation`（`narrator-messages.ts` 末尾）。
+- 编辑分段压缩摘要时，`narrator-persistence.ts:updateSegmentCompactSummary` 在同一事务内复查消息归属和已完成标记，仅修改该块的 summary，保留模型等元数据与相邻正文块，并同步字符计数。
 - 引用存储有 SQLite 与 PostgreSQL 两种实现：`narrator-refs/store.ts:getNarratorMessageRefsPort` 在绑定了 PG 端口时返回它，否则为 `undefined` 走 SQLite 路径（`assertSqliteNarratorOperation` 在 PG 下拒绝仅 SQLite 的操作）。
 - 写入层：生产者经 `narrator-store.ts:narratorStore`（`appendInput`、`appendNotice`、`openStep`、`writeStepItem`、`appendStep`、`settleTool`、`patchState` 等）写模型可见的历史，每个操作一个事务；它转调 `narrator-persistence.ts:narratorPersistence`（实现所在，体量很大）。
 - 展示页读取：`narrator-display-page-reader.ts:readNarratorDisplayMessages` 只走 worker（SQLite 路径或 PG 端口），不可用时报 `DISPLAY_PAGE_READER_UNAVAILABLE`（503，“不允许主线程原始 JSON 回退”），并发 2、排队上限 32，满则 `DISPLAY_PAGE_READER_BUSY`（503）；单次最多 10000 行、原始 16 MiB、输出 4 MiB、10 秒（`DISPLAY_PAGE_LIMITS`，`lib/db-worker/display-page-protocol.ts`）。

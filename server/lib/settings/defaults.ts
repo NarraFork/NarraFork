@@ -2,6 +2,7 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
+import { DEFAULT_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -129,6 +130,7 @@ export const DEFAULTS: NarraForkSettings = {
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
+		compactMaxRetries: DEFAULT_COMPACT_RETRY_LIMIT,
 		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
@@ -830,6 +832,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.autoCompactKeepPairs": {
 		desc: "自动压缩时在压缩摘要之后保留的最近 user/assistant 对话轮数。",
 		type: "number",
+	},
+	"agent.compactMaxRetries": {
+		desc: "每次上下文压缩的自动重试次数。-1 表示不限次数，0 表示关闭；手动选定的替换模型仍可在当前请求失败后使用。",
+		type: "number",
+		valid: `-1 或非负整数，默认 ${DEFAULT_COMPACT_RETRY_LIMIT}`,
 	},
 	"agent.queueDuringCompaction": {
 		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否排队等压缩完成后再执行。开启时消息进入队列（可编辑、可取消），压缩结束后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，用户都可以在发送菜单中选择插队立即执行。",

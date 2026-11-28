@@ -27,13 +27,10 @@ export interface VListCompactTarget {
 	/** Owning message id of the marker (the compact message itself). */
 	messageId: string;
 	status: VListCompactStatus;
-	/**
-	 * True when the row should open the summary modal. Mirrors the chunked
-	 * `canClick`: everything except a run still in flight.
-	 */
+	/** The summary modal also shows live status while a run is in flight. */
 	canOpen: boolean;
 	/**
-	 * True when the row should instead ask to CANCEL the running compaction.
+	 * True when the row also offers to cancel the running compaction.
 	 * Only the context flavour supports cancellation — the chunked
 	 * SegmentCompactIndicator has no cancel affordance, and the API is
 	 * narrator-scoped (`POST /narrators/:id/compact/cancel`).
@@ -63,21 +60,26 @@ export function resolveVListCompactTarget(
 	data: unknown,
 	sourceMessageIds: readonly string[],
 ): VListCompactTarget | null {
-	if (kind !== "system-simple") return null;
 	if (data == null || typeof data !== "object") return null;
 	const payload = data as { kind?: unknown; status?: unknown };
+	const failedSegment = kind === "system-text" && payload.kind === "segment_compact_failed";
+	if (kind !== "system-simple" && !failedSegment) return null;
 	const flavour: VListCompactKind | null =
-		payload.kind === "compact" ? "context" : payload.kind === "segment_compact" ? "segment" : null;
+		payload.kind === "compact"
+			? "context"
+			: payload.kind === "segment_compact" || failedSegment
+				? "segment"
+				: null;
 	if (!flavour) return null;
 	const messageId = sourceMessageIds[0];
 	if (!messageId) return null;
-	const status = normalizeStatus(payload.status);
+	const status = failedSegment ? "failed" : normalizeStatus(payload.status);
 	const compacting = status === "compacting";
 	return {
 		kind: flavour,
 		messageId,
 		status,
-		canOpen: !compacting,
+		canOpen: true,
 		canCancel: compacting && flavour === "context",
 	};
 }

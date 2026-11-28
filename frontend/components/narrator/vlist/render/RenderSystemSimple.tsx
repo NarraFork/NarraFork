@@ -15,7 +15,7 @@
  * row used to be.
  */
 
-import { Group, Loader, Paper, Text } from "@mantine/core";
+import { Group, Loader, Paper, Text, UnstyledButton } from "@mantine/core";
 import { IconAlertTriangle, IconArrowsMinimize, IconGitMerge, IconX } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -54,8 +54,7 @@ interface RenderSystemSimpleProps {
 	onOpenCompact?: () => void;
 	/**
 	 * Abort the compaction this marker is currently running. Present ONLY while
-	 * `status === "compacting"` and only for the context flavour, mirroring the
-	 * chunked CompactIndicator (whose cancel affordance is the marker itself).
+	 * `status === "compacting"` and only for the context flavour.
 	 */
 	onCancelCompact?: () => void;
 	/** Localized `title` for the cancel affordance (native tooltip). */
@@ -191,14 +190,8 @@ function PublicationResultRow({
 
 // ── compact / segment_compact: centered single line, py={4} ──────────────────
 /**
- * The compact marker row.
- *
- * Interaction parity with the chunked CompactIndicator / SegmentCompactIndicator:
- * the WHOLE row is the affordance. A finished (or failed) marker opens the summary
- * modal; a RUNNING context compact instead asks to cancel, and grows a trailing
- * ✕ glyph. Both live inside the row's constant height — the ✕ is 12px inside a
- * 17px line box and the underline is decoration only — so no interaction here can
- * move the measured geometry (measure-system-simple's COMPACT_CARD_HEIGHT).
+ * The label opens the same details in every state. Cancellation has its own
+ * button so both actions fit within the marker's fixed height.
  */
 function CompactRow({
 	data,
@@ -234,28 +227,29 @@ function CompactRow({
 	const isFailed = status === "failed";
 	// failed only occurs for the context compact flavour; text turns red.
 	const color = data.color ?? (isFailed ? "red" : palette);
-	// While compacting the row cancels; otherwise it opens the summary. Never both
-	// (a running compact has no summary to show yet), matching the chunked card.
 	const canCancel = isCompacting && typeof onCancel === "function";
-	const canOpen = !isCompacting && typeof onOpen === "function";
-	const onClick = canCancel ? onCancel : canOpen ? onOpen : undefined;
+	const canOpen = typeof onOpen === "function";
 	const interactive = data.interactive === true || canCancel || canOpen;
-	// An actionable marker becomes a real button for assistive tech and keyboard
-	// users (the chunked card only bound a mouse click). An INERT marker keeps its
-	// plain-div identity so it never enters the tab order. `role`/`tabIndex`/focus
-	// outline are all height-neutral, so the constant row geometry is unaffected.
-	const actionProps = onClick
-		? {
-				role: "button" as const,
-				tabIndex: 0,
-				onClick,
-				onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
-					if (event.key !== "Enter" && event.key !== " ") return;
-					event.preventDefault();
-					onClick();
-				},
-			}
-		: {};
+	const label = (
+		<>
+			{isCompacting ? (
+				<Loader size={14} color={palette} />
+			) : isFailed ? (
+				<IconAlertTriangle size={14} style={{ color: cssColor("red", 6), flexShrink: 0 }} />
+			) : (
+				<IconArrowsMinimize size={14} style={{ color: cssColor(palette, 6), flexShrink: 0 }} />
+			)}
+			<Text
+				component="span"
+				size="xs"
+				c={color}
+				td={interactive ? "underline" : undefined}
+				lineClamp={1}
+			>
+				{liveText}
+			</Text>
+		</>
+	);
 
 	return (
 		<div
@@ -268,26 +262,41 @@ function CompactRow({
 				paddingTop: CENTER_ROW_PADDING_Y,
 				paddingBottom: CENTER_ROW_PADDING_Y,
 				boxSizing: "border-box",
-				cursor: onClick ? "pointer" : undefined,
 			}}
-			{...actionProps}
-			title={canCancel ? cancelTitle : undefined}
 			data-compact-status={status}
-			{...(canCancel ? { "data-compact-cancel": "1" } : {})}
-			{...(canOpen ? { "data-compact-open": "1" } : {})}
 		>
-			{isCompacting ? (
-				<Loader size={14} color={palette} />
-			) : isFailed ? (
-				<IconAlertTriangle size={14} style={{ color: cssColor("red", 6), flexShrink: 0 }} />
+			{canOpen ? (
+				<UnstyledButton
+					type="button"
+					data-compact-open="1"
+					aria-haspopup="dialog"
+					onClick={swallowSelectionClick(onOpen)}
+					style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}
+				>
+					{label}
+				</UnstyledButton>
 			) : (
-				<IconArrowsMinimize size={14} style={{ color: cssColor(palette, 6), flexShrink: 0 }} />
+				label
 			)}
-			<Text size="xs" c={color} td={interactive ? "underline" : undefined} lineClamp={1}>
-				{liveText}
-			</Text>
 			{canCancel ? (
-				<IconX size={12} style={{ color: cssColor(palette, 6), flexShrink: 0 }} />
+				<UnstyledButton
+					type="button"
+					data-compact-cancel="1"
+					title={cancelTitle}
+					aria-label={cancelTitle}
+					aria-haspopup="dialog"
+					onClick={swallowSelectionClick(onCancel)}
+					style={{
+						display: "grid",
+						placeItems: "center",
+						width: 24,
+						height: "100%",
+						color: cssColor(palette, 6),
+						flexShrink: 0,
+					}}
+				>
+					<IconX size={12} />
+				</UnstyledButton>
 			) : null}
 		</div>
 	);

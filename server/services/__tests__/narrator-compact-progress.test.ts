@@ -272,13 +272,22 @@ describe("compact metadata lookup failure cleanup", () => {
 		expect(generate).not.toHaveBeenCalled();
 
 		broadcasts = [];
+		const oldMarkerTime = "2000-01-01T00:00:00.000Z";
+		db.update(narratorMessages)
+			.set({ createdAt: oldMarkerTime })
+			.where(eq(narratorMessages.id, markerId))
+			.run();
 		const retry = await retryFailedCompact(narratorId, "en", markerId, validModel, "compact-user");
 		expect(await retry.promise).toBe(true);
 		expect(generate.mock.calls[0]?.[4]).toBe(validModel);
 		expect(generate.mock.calls[0]?.[9]).toBe("compact-user");
-		expect(await narratorService.getCompactSummary(narratorId, retry.messageId)).toMatchObject({
-			status: "compacted",
-		});
+		const detail = await narratorService.getCompactSummary(narratorId, retry.messageId);
+		expect(detail.status).toBe("compacted");
+		const startedAt = detail.attempts.at(-1)?.startedAt;
+		expect(startedAt).toBeString();
+		expect(startedAt).not.toBe(oldMarkerTime);
+		const progress = broadcasts.find((event) => event.type === "compact_progress");
+		expect(progress).toMatchObject({ messageId: retry.messageId, startedAt });
 		expect(broadcasts.some((event) => event.type === "compact_done")).toBe(true);
 		expect(isCompactInProgress(narratorId)).toBe(false);
 	});
