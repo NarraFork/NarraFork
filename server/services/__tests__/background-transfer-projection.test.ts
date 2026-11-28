@@ -11,7 +11,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	deviceTransferTasks,
@@ -23,8 +23,11 @@ import {
 } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
 import { eventBus } from "../../lib/event-bus";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -54,10 +57,11 @@ const { TRANSFER_RESTART_PAUSE_NOTICE, DeviceTransferTaskStore } = await import(
 const transferStore = new DeviceTransferTaskStore(db);
 const { eq } = await import("drizzle-orm");
 
-afterAll(() => {
+afterAll(async () => {
 	backgroundTaskService.setBroadcastFnForTests(null);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 beforeEach(() => {
@@ -742,9 +746,11 @@ describe("transfer generation publication on resume", () => {
 			"CREATE TRIGGER reject_transfer_retry_slot BEFORE INSERT ON runtime_publication_outbox BEGIN SELECT RAISE(ABORT, 'retry slot failure'); END",
 		);
 		try {
-			await expect(
-				backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 }),
-			).rejects.toThrow("retry slot failure");
+			expect(
+				await captureWorkerRejectionThrower(
+					backgroundTaskService.createTransferTask({ ...input, runGeneration: 1 }),
+				),
+			).toThrow("retry slot failure");
 			expect(await projectionOf(transferId)).toMatchObject({
 				status: "failed",
 				logicalRunId: first.logicalRunId,
@@ -926,7 +932,9 @@ describe("silent observation completion", () => {
 		expect((await backgroundTaskService.getById(id))?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
 		expect((await backgroundTaskService.getById(id))?.output).toContain("Observation interrupted");
-		expect((await backgroundTaskService.getById(id))?.output).toContain("target was not stopped");
+		expect((await backgroundTaskService.getById(id))?.output).toContain(
+			"The watch did not stop the target, but the restart may have",
+		);
 		await runtimePublication.flushRecipient(PARENT);
 		const messages = await db.select().from(narratorBufferedMessages);
 		expect(messages).toHaveLength(1);
@@ -946,9 +954,11 @@ describe("silent observation completion", () => {
 			"CREATE TRIGGER reject_silent_slot_cleanup BEFORE DELETE ON runtime_publication_outbox BEGIN SELECT RAISE(ABORT, 'slot cleanup failure'); END",
 		);
 		try {
-			await expect(backgroundTaskService.finishObservationSilently(id, "done")).rejects.toThrow(
-				"slot cleanup failure",
-			);
+			expect(
+				await captureWorkerRejectionThrower(
+					backgroundTaskService.finishObservationSilently(id, "done"),
+				),
+			).toThrow("slot cleanup failure");
 			expect(await backgroundTaskService.getById(id)).toMatchObject({
 				status: "running",
 				notified: false,

@@ -19,9 +19,16 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../../../server/db/schema";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { captureWorkerRejectionThrower } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// Membership ownership checks read on the database Worker (file-backed WAL database).
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
@@ -186,7 +193,8 @@ beforeEach(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
@@ -314,9 +322,12 @@ describe("non-narrator panels", () => {
 		seedNarrator("n1");
 		const { panel } = await addWorkspacePanel(USER, "ws", { kind: "narrator", narratorId: "n1" });
 
-		await expect(
-			updateWorkspacePanelConfig(USER, "ws", panel.id, { any: "thing" }),
-		).rejects.toThrow(/no config/);
+		// Settle natively first: Bun's `.rejects` matcher stalls on a reused read Worker.
+		expect(
+			await captureWorkerRejectionThrower(
+				updateWorkspacePanelConfig(USER, "ws", panel.id, { any: "thing" }),
+			),
+		).toThrow(/no config/);
 	});
 
 	it("updates a webview config in place", async () => {
@@ -394,7 +405,10 @@ describe("outline pages as members", () => {
 			pageId: "page1",
 		});
 		expect(updated.config).toEqual({ spaceId: "space1", blockId: "block7" });
-		await expect(updateWorkspacePanelConfig(USER, "ws", panel.id, {})).rejects.toThrow(/spaceId/);
+		// Settle natively first: Bun's `.rejects` matcher stalls on a reused read Worker.
+		expect(
+			await captureWorkerRejectionThrower(updateWorkspacePanelConfig(USER, "ws", panel.id, {})),
+		).toThrow(/spaceId/);
 		expect(JSON.parse(panelRows("ws")[0]?.configJson ?? "null")).toEqual({
 			spaceId: "space1",
 			blockId: "block7",

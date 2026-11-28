@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { shouldDisablePlanReflectionReview } from "../lib/agent/tools/plan-mode";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import {
@@ -71,15 +72,18 @@ async function isPendingPlanFileIdUsable(narratorId: string, planFileId: string)
 		if (record?.narratorId) consumePendingPlanFileId(record.narratorId, planFileId);
 		return false;
 	}
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, record.toolCallId),
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, record.toolUseId),
-			eq(narratorToolCalls.toolName, "EnterPlanMode"),
-		),
-		columns: { status: true },
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, record.toolCallId),
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, record.toolUseId),
+				eq(narratorToolCalls.toolName, "EnterPlanMode"),
+			),
+			columns: { status: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!toolCall || !["initializing", "pending", "running"].includes(toolCall.status)) {
 		consumePendingPlanFileId(narratorId, planFileId);
 		return false;
@@ -155,10 +159,13 @@ function isSafePlanFileId(value: string | null | undefined): value is string {
 
 async function isPlanFileIdTaken(planFileId: string): Promise<boolean> {
 	if (reservedPlanFileIds.has(planFileId)) return true;
-	const existing = await db.query.narrators.findFirst({
-		where: eq(narrators.planFileId, planFileId),
-		columns: { id: true },
-	});
+	const existing = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.planFileId, planFileId),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	return !!existing;
 }
 

@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { toolCallWithExecutionTargets } from "../tool-execution-target-projection";
+import { DOMAIN_STREAM_BYTE_LIMITS } from "./domain-protocol";
 import {
 	selectVisibleToolDetail,
 	TOOL_DETAIL_CANDIDATE_LIMIT,
@@ -11,7 +12,6 @@ import {
 } from "./tool-detail-selection";
 
 export interface ToolDetailSnapshotParams {
-	kind: "toolDetailSnapshot";
 	narratorId: string;
 	toolUseId: string;
 	reference: ToolDetailReference;
@@ -30,9 +30,11 @@ export interface ToolDetailIdentity {
 	parentCopyId?: string;
 }
 
-export type ToolDetailSnapshot =
-	| { kind: "found"; json: string; identity: ToolDetailIdentity }
+export type ToolDetailMetadata =
+	| { kind: "found"; identity: ToolDetailIdentity }
 	| { kind: "ambiguous" | "notFound" | "tooLarge" };
+
+type ToolDetailSnapshot = ToolDetailMetadata & { json?: string };
 
 const candidateLimit = TOOL_DETAIL_CANDIDATE_LIMIT + 1;
 const parentColumns = `t.id, t.narrator_id AS narratorId, t.tool_use_id AS toolUseId,
@@ -177,9 +179,12 @@ function readToolDetailSnapshotTx(
 		if (typeof value === "string" && type === "json") detail[key] = JSON.parse(value);
 		if (typeof value === "number" && type === "boolean") detail[key] = value === 1;
 	}
+	const json = JSON.stringify(toolCallWithExecutionTargets(detail));
+	if (Buffer.byteLength(json) > DOMAIN_STREAM_BYTE_LIMITS.toolDetailSnapshot)
+		return { kind: "tooLarge" };
 	return {
 		kind: "found",
-		json: JSON.stringify(toolCallWithExecutionTargets(detail)),
+		json,
 		identity: {
 			id: detail.id,
 			messageId: detail.messageId,

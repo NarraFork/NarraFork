@@ -6,16 +6,13 @@ export interface GitStagingListPagesInput {
 	pages: readonly GitStagingFilesPage[];
 }
 
-import {
-	type GitStatusPage,
-	type GitStatusPageStatsResult,
-	normalizeGitStatusFilter,
-} from "../../../shared/git-status-page";
+import { type GitStatusPage, normalizeGitStatusFilter } from "../../../shared/git-status-page";
 import { GitChangesListClient } from "./git-changes-list-client";
 import {
 	GIT_CHANGES_ROW_HEIGHT,
 	type GitChangesListConfig,
 	type GitChangesListWindow,
+	type GitChangesPageStatsResult,
 	type GitChangesRow,
 	type GitChangesStatsSettlement,
 	type GitChangesStatsSource,
@@ -58,7 +55,12 @@ const sameStatsSource = (
 	left.epoch === right.epoch &&
 	left.snapshotId === right.snapshotId &&
 	left.pageGeneration === right.pageGeneration &&
-	left.filterKey === right.filterKey;
+	left.filterKey === right.filterKey &&
+	left.workspaceIdentity === right.workspaceIdentity &&
+	left.workerEpoch === right.workerEpoch &&
+	left.memberVersion === right.memberVersion &&
+	left.statsVersion === right.statsVersion &&
+	left.updating === right.updating;
 interface ConfigurationAnchor {
 	top: number;
 	index: number;
@@ -96,6 +98,7 @@ export function useGitChangesList({
 	config,
 	displayScope,
 	displayAllowed,
+	workspaceIdentity,
 	rowHeight = GIT_CHANGES_ROW_HEIGHT,
 	stagingPages = [],
 }: {
@@ -104,6 +107,7 @@ export function useGitChangesList({
 	config: GitChangesListConfig;
 	displayScope: string;
 	displayAllowed: boolean;
+	workspaceIdentity?: string;
 	rowHeight?: number;
 	stagingPages?: readonly GitStagingListPagesInput[];
 }) {
@@ -472,7 +476,7 @@ export function useGitChangesList({
 	const mergePageStats = useCallback(
 		(
 			source: GitChangesStatsSource,
-			result?: GitStatusPageStatsResult,
+			result?: GitChangesPageStatsResult,
 			options?: GitChangesStatsSettlement,
 		) => {
 			const active = lifetime.current;
@@ -484,6 +488,7 @@ export function useGitChangesList({
 				!client ||
 				client.generation !== generation ||
 				(source.pageGeneration !== undefined && source.pageGeneration !== generation) ||
+				(workspaceIdentity !== undefined && source.workspaceIdentity !== workspaceIdentity) ||
 				source.filterKey !== normalizeGitStatusFilter(configRef.current.config.filter).join(",") ||
 				!source.snapshotId ||
 				source.snapshotId !== stateRef.current.candidateWindow.snapshotId ||
@@ -500,7 +505,7 @@ export function useGitChangesList({
 			if (result || (options?.settled && options.failed))
 				client.send({ type: "page-stats", source, result, options });
 		},
-		[generation, token],
+		[generation, token, workspaceIdentity],
 	);
 	const clearDisplay = useCallback(() => {
 		const active = lifetime.current;

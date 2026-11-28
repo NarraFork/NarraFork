@@ -54,6 +54,7 @@ import {
 import { lstat, mkdtemp, open, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
@@ -128,8 +129,8 @@ const WARMUP_GIT_TIMEOUT_MS = 10 * 60_000;
  * Without a cooldown the next tool call would immediately launch another full
  * background scan, turning a hopeless tree into a permanent scan loop that keeps
  * the disk, CPU and antivirus busy forever. During the window the hot path returns
- * null instantly; the in-memory maps reset on process restart, and the settings
- * toggle (`workspace.treeSnapshotsEnabled`) is the manual escape hatch.
+ * null instantly; the in-memory maps reset on process restart. (The old
+ * `workspace.treeSnapshotsEnabled` setting is a legacy field this module never reads.)
  */
 const WARMUP_FAILURE_COOLDOWN_MS = 15 * 60_000;
 
@@ -684,8 +685,7 @@ const SHADOW_CONFIG_ENTRIES: ReadonlyArray<readonly [key: string, value: string]
 	// could be missed by one capture, so that boundary pair would not report it.
 	// git mitigates this with the same racy-clean re-validation the index stat
 	// cache uses (entries at the tick boundary are re-scanned rather than trusted),
-	// which is why this is on; the knob to disable the whole scan path on a
-	// filesystem where it misbehaves is `workspace.treeSnapshotsEnabled`.
+	// which is why this is on.
 	["core.untrackedCache", "true"],
 	// Never let `add` trigger a spontaneous `gc --auto`. Shadow repositories are
 	// repacked by gcAll() on a controlled maintenance path; an auto-gc firing in
@@ -1354,7 +1354,8 @@ async function captureUnlocked(
  * `add -A` records its removal (verified), so the force-add is only ever needed to
  * *introduce* an entry.
  */
-async function assertSnapshotStagingUntracked(worktreePath: string) {
+async function assertSnapshotStagingUntracked(worktreePath: string, signal?: AbortSignal) {
+	signal?.throwIfAborted();
 	const internal = await safeSpawn({
 		cmd: [
 			"git",
@@ -1368,7 +1369,9 @@ async function assertSnapshotStagingUntracked(worktreePath: string) {
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: 16_384,
 		env: { ...process.env, LC_ALL: "C" },
+		signal,
 	});
+	signal?.throwIfAborted();
 	if (
 		internal.exitCode !== 0 ||
 		internal.stdoutTruncated ||
@@ -1393,7 +1396,7 @@ async function addAllUnlocked(
 	if (excludeStaging) {
 		const indexKey = realIndexIdentity(worktreePath);
 		if (indexKey === null || trackedIgnoredCache.get(dir)?.indexKey !== indexKey)
-			await assertSnapshotStagingUntracked(worktreePath);
+			await assertSnapshotStagingUntracked(worktreePath, signal);
 		const removed = await runGit(
 			[
 				"rm",
@@ -1492,7 +1495,8 @@ async function trackedButIgnoredPaths(
 	const cached = trackedIgnoredCache.get(dir);
 	if (indexKey !== null && cached?.indexKey === indexKey) return [];
 
-	if (existsSync(resolve(worktreePath, ".git"))) await assertSnapshotStagingUntracked(worktreePath);
+	if (existsSync(resolve(worktreePath, ".git")))
+		await assertSnapshotStagingUntracked(worktreePath, signal);
 
 	const result = await safeSpawn({
 		cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
@@ -1724,14 +1728,18 @@ export const worktreeTreeSnapshot = {
 	 * index. Identical states yield the same hash, so repeated calls are cheap and
 	 * deduplicate naturally.
 	 *
-	 * Production goes through {@link tryCaptureHot}, which calls this with a signal;
-	 * the method stays separate because that is the seam the warm-up runs through.
+	 * Both this direct entry and {@link tryCaptureHot} enforce the file-history policy
+	 * before touching the shadow store. The retained algorithm is exercised only
+	 * under explicitly injected test policy.
 	 */
 	async capture(
 		worktreePath: string,
 		deviceId: string = LOCAL_DEVICE_ID,
 		opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 	): Promise<string> {
+		if (!isFileHistoryEnabledForDevice(deviceId)) {
+			throw new TreeSnapshotError("Local workspace tree snapshots are disabled.");
+		}
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
 		// A caller carrying a signal is the warm-up itself (the thing that can BE
@@ -1791,6 +1799,9 @@ export const worktreeTreeSnapshot = {
 			requireFresh?: boolean;
 		},
 	): Promise<string | null> {
+		// Check policy before disk probes, shared warmups, or background capture.
+		// The direct capture entry independently enforces the same policy.
+		if (!isFileHistoryEnabledForDevice(deviceId)) return null;
 		const budgetMs = opts?.budgetMs ?? HOT_PATH_CAPTURE_BUDGET_MS;
 		const warmupGitTimeoutMs = opts?.warmupGitTimeoutMs ?? WARMUP_GIT_TIMEOUT_MS;
 		const cooldownMs = opts?.cooldownMs ?? WARMUP_FAILURE_COOLDOWN_MS;

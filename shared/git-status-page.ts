@@ -6,6 +6,33 @@ export const GIT_STATUS_PAGE_DEFAULT_LIMIT = 100;
 export const GIT_STATUS_PAGE_MAX_LIMIT = 200;
 export const GIT_STATUS_PAGE_MAX_BYTES = 256 * 1024;
 
+/** Workspace-scoped cache identity; never an actor's pagination snapshot identifier. */
+export interface GitStatusPageCacheState {
+	status: "pending" | "ready" | "error";
+	workerEpoch: string;
+	memberVersion: number;
+	statsVersion: number;
+	updating: boolean;
+	/** Member/source production failure. */
+	errorCode?: string;
+	/** Statistics production failure; member observations remain independently usable. */
+	statsErrorCode?: string;
+	message?: string;
+}
+
+export interface GitStatusPageUnavailable {
+	status: "pending" | "error";
+	cache: GitStatusPageCacheState;
+}
+
+/** Ready keeps the existing page DTO at the top level. */
+export type GitStatusPageResult =
+	| (GitStatusPage & { status: "ready"; cache: GitStatusPageCacheState })
+	| GitStatusPageUnavailable;
+export type GitStatusPageStatsResponse =
+	| (GitStatusPageStatsResult & { status: "ready"; cache: GitStatusPageCacheState })
+	| GitStatusPageUnavailable;
+
 export interface GitStatusPageQuery {
 	cursor?: string;
 	limit?: number;

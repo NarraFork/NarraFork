@@ -8,7 +8,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
-import { customApiQuotaDisplayFor } from "./custom-api-usage-source";
+import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import { buildProviderQuotaView } from "./provider-quota-view";
 import { QuotaPanelIndicator, useQuotaNow } from "./QuotaPanelIndicator";
 import { formatQuotaBadgeText } from "./quota-panel-view";
@@ -214,8 +214,7 @@ test("account replacement hides an already open old panel before the new snapsho
 	const old = snapshot();
 	await render(old);
 	await openPanel();
-	const display = customApiQuotaDisplayFor({ providerId: "p", generation: "B", snapshot: old });
-	await render(display.quotaSnapshot);
+	await render(matchesProviderQuotaIdentity(old, "p", "B") ? old : null);
 	expect(host.querySelector("button")).toBeNull();
 	expect(document.body.textContent).not.toContain("Third-party plan");
 });

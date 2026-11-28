@@ -17,6 +17,7 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { db } from "../../../server/db";
@@ -88,7 +89,15 @@ function api() {
 			? Response.json({ error: error.message, code: error.code }, { status: error.statusCode })
 			: Response.json({ error: String(error) }, { status: 500 }),
 	);
-	app.get("/api/settings", (c) => c.json({ outline: { enabled: true } }));
+	app.get("/api/settings/runtime", (c) =>
+		c.json({
+			revision: 1,
+			agent: { defaultModel: "", summaryModel: "" },
+			outline: { enabled: true },
+			requestEvidence: { autoPin: "off" },
+			summaryModelAvailable: null,
+		} satisfies RuntimeSettings),
+	);
 	app.use("/api/outline/view-state/*", async (c, next) => {
 		if (c.req.method === "PUT") {
 			viewState.puts++;
@@ -728,12 +737,12 @@ test("the same while the stored folding is slow to arrive", async () => {
 			decisions.a,
 		);
 		// A round trip later (anything sent before it has reached the server), still nothing.
-		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		await page.evaluate(() => fetch("/api/settings/runtime").then((r) => r.json()));
 		expect(viewState.puts).toBe(0);
 		release();
 		viewState.hold = null;
 		await until(page, "the stored folding applied", closedRow, decisions.pageId, decisions.a);
-		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		await page.evaluate(() => fetch("/api/settings/runtime").then((r) => r.json()));
 		expect(viewState.puts).toBe(0);
 		expect(await storedFolding(decisions.pageId)).toEqual({
 			collapsed: [decisions.a],
@@ -786,7 +795,7 @@ test("folding before the stored state arrives lays it under what the reader did,
 				.querySelector<HTMLButtonElement>(`[data-block-id="${id}"] [data-fold-toggle]`)
 				?.click();
 		}, big.firstDone);
-		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		await page.evaluate(() => fetch("/api/settings/runtime").then((r) => r.json()));
 		expect(viewState.puts).toBe(0);
 		release();
 		viewState.hold = null;
@@ -838,7 +847,7 @@ test("when the stored folding cannot be read, nothing is written over it", async
 			personalSpace,
 		);
 		await until(page, "away", (f) => f.count("[data-testid=outline-space-home]") === 1);
-		await page.evaluate(() => fetch("/api/settings").then((r) => r.json()));
+		await page.evaluate(() => fetch("/api/settings/runtime").then((r) => r.json()));
 		expect(viewState.puts).toBe(0);
 		expect(await storedFolding(decisions.pageId)).toEqual({
 			collapsed: [decisions.a],

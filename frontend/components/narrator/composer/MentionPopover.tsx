@@ -7,61 +7,53 @@ import {
 	UnstyledButton,
 	useComputedColorScheme,
 } from "@mantine/core";
-import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	foldHandle,
+	HANDLE_CHAR_RE,
+	HANDLE_START_RE,
+	MAX_HANDLE_LENGTH,
+} from "@shared/narrator-handle";
+import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { CandidateVerificationStatus } from "../../../hooks/useNarratorMentionCandidates";
 import { Z } from "../../../lib/z-index";
 import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 export interface MentionCandidate {
 	id: string;
-	handle: string;
+	handle?: string | null;
 	title?: string | null;
 	status?: string;
+	isRecent?: boolean;
+	canConnect?: boolean;
+	parentTitle?: string | null;
 }
-
 interface MentionPopoverProps {
-	/** Named-narrator candidates to choose from. */
 	candidates: MentionCandidate[];
-	/** The active @token query (text after @, without the @). null = not mentioning. */
 	query: string | null;
 	visible: boolean;
+	loading?: boolean;
+	error?: boolean;
+	verification?: CandidateVerificationStatus;
 	anchorRef?: RefObject<HTMLElement | null>;
-	/** Called with the chosen handle when the user selects/confirms. */
 	onSelect: (candidate: MentionCandidate) => void;
 	onClose: () => void;
 }
-
-const MAX_MENTION_ITEMS = 50;
-
-/** Boundary chars allowed immediately before `@` (mirrors the backend rules,
- * incl. common CJK punctuation so `你好，@小明` works). */
 const MENTION_BOUNDARY_RE = /[\s(,:;!?，。！？、（【「《]/u;
-
-/**
- * Given a textarea value and caret position, detect whether the caret is inside
- * an `@handle` token being typed, and return the partial handle (case-folded) or
- * null. Mirrors the mention rules: token starts at `@` that is at string start
- * or preceded by a boundary char, then Unicode letters/digits/_/- (incl. CJK).
- * The returned value is folded (NFC + lowercase) so callers compare against
- * folded handles.
- */
+/** Detect only the contiguous typed token; ordinary text never acquires reference identity. */
 export function getMentionQuery(value: string, caret: number): string | null {
 	const upto = value.slice(0, caret);
-	// Find the last @ before the caret.
 	const at = upto.lastIndexOf("@");
-	if (at === -1) return null;
-	// Char before @ must be a boundary (start, whitespace, or punctuation).
-	if (at > 0 && !MENTION_BOUNDARY_RE.test(upto[at - 1])) return null;
+	if (at === -1 || (at > 0 && !MENTION_BOUNDARY_RE.test(upto[at - 1]))) return null;
 	const partial = upto.slice(at + 1);
-	// Empty right after @ is allowed (popover shows all candidates).
 	if (partial === "") return "";
-	// Token must start with a letter/digit, then allow letters/digits/_/- .
-	const chars = [...partial];
-	if (!HANDLE_START_RE.test(chars[0])) return null;
-	for (const ch of chars) {
-		if (!HANDLE_CHAR_RE.test(ch)) return null;
-	}
+	const chars = [...partial.normalize("NFC")];
+	if (
+		chars.length > MAX_HANDLE_LENGTH ||
+		!HANDLE_START_RE.test(chars[0]) ||
+		chars.some((ch) => !HANDLE_CHAR_RE.test(ch))
+	)
+		return null;
 	return foldHandle(partial);
 }
 
@@ -69,153 +61,190 @@ export function MentionPopover({
 	candidates,
 	query,
 	visible,
+	loading = false,
+	error = false,
+	verification,
 	anchorRef,
 	onSelect,
 	onClose,
 }: MentionPopoverProps) {
 	const { t } = useTranslation("narrator");
-	const computedScheme = useComputedColorScheme("dark");
-	const isDark = computedScheme === "dark";
-	const [selectedIndex, setSelectedIndex] = useState(0);
+	const isDark = useComputedColorScheme("dark") === "dark";
+	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const listRef = useRef<HTMLDivElement>(null);
-
-	const filtered = useMemo(() => {
-		const q = query ?? "";
-		const matches = candidates.filter(
-			(c) => foldHandle(c.handle).startsWith(q) || foldHandle(c.title ?? "").includes(q),
-		);
-		return matches.slice(0, MAX_MENTION_ITEMS);
-	}, [candidates, query]);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset on query change
+	const listId = useId();
+	const checking = verification === "checking";
+	// The unified reader already filters local rows and bounds the merged page.
+	const selected = candidates.find((c) => c.id === selectedId) ?? candidates[0];
+	const optionId = useCallback((id: string) => `${listId}-${encodeURIComponent(id)}`, [listId]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: A new typed token resets selection; result enrichment must not.
 	useEffect(() => {
-		setSelectedIndex(0);
+		setSelectedId(null);
 	}, [query]);
-
 	useEffect(() => {
-		if (selectedIndex >= filtered.length) {
-			setSelectedIndex(Math.max(0, filtered.length - 1));
-		}
-	}, [selectedIndex, filtered.length]);
-
+		if (selected && selectedId !== selected.id) setSelectedId(selected.id);
+	}, [selected, selectedId]);
 	useEffect(() => {
-		if (!listRef.current) return;
-		const items = listRef.current.querySelectorAll("[data-mention-item]");
-		items[selectedIndex]?.scrollIntoView({ block: "nearest" });
-	}, [selectedIndex]);
-
+		const item = listRef.current?.ownerDocument.getElementById(
+			selected ? optionId(selected.id) : "",
+		);
+		item?.scrollIntoView?.({ block: "nearest" });
+	}, [selected, optionId]);
+	useEffect(() => {
+		const anchor = anchorRef?.current;
+		if (!anchor || !visible) return;
+		anchor.setAttribute("aria-controls", listId);
+		anchor.setAttribute("aria-expanded", "true");
+		if (selected) anchor.setAttribute("aria-activedescendant", optionId(selected.id));
+		else anchor.removeAttribute("aria-activedescendant");
+		return () => {
+			anchor.removeAttribute("aria-controls");
+			anchor.removeAttribute("aria-expanded");
+			anchor.removeAttribute("aria-activedescendant");
+		};
+	}, [visible, anchorRef, listId, selected, optionId]);
 	const handleKeyDown = useCallback(
-		(e: KeyboardEvent) => {
-			if (!visible || filtered.length === 0) return;
+		(event: KeyboardEvent) => {
+			if (!visible) return;
 			const anchor = anchorRef?.current;
 			if (
 				anchorRef &&
-				(!anchor || !e.target || !(e.target as Node).nodeType || !anchor.contains(e.target as Node))
+				(!anchor ||
+					!event.target ||
+					!(event.target as Node).nodeType ||
+					!anchor.contains(event.target as Node))
 			)
 				return;
-			// The listener is capture-phase, so it sees the keystroke before the IME
-			// candidate list does. While a CJK query is being composed, Enter/Tab pick
-			// a candidate and the arrows move through them — stealing those left the
-			// user unable to finish the word they were typing into the query.
-			if (e.isComposing) return;
-			if (e.key === "ArrowDown") {
-				e.preventDefault();
-				setSelectedIndex((i) => (i + 1) % filtered.length);
-			} else if (e.key === "ArrowUp") {
-				e.preventDefault();
-				setSelectedIndex((i) => (i - 1 + filtered.length) % filtered.length);
-			} else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
-				e.preventDefault();
-				e.stopPropagation();
-				onSelect(filtered[selectedIndex]);
-			} else if (e.key === "Escape") {
-				e.preventDefault();
+			if (event.isComposing || event.keyCode === 229) return;
+			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+				event.preventDefault();
+				event.stopPropagation();
+				if (checking || !candidates.length) return;
+				const index = candidates.findIndex((c) => c.id === selected?.id);
+				setSelectedId(
+					candidates[
+						(index + (event.key === "ArrowDown" ? 1 : -1) + candidates.length) % candidates.length
+					].id,
+				);
+			} else if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
+				// Empty/loading/error states still own confirmation; never leak Enter into send.
+				event.preventDefault();
+				event.stopPropagation();
+				if (!checking && selected && selected.canConnect !== false) onSelect(selected);
+			} else if (event.key === "Escape") {
+				event.preventDefault();
+				event.stopPropagation();
 				onClose();
 			}
 		},
-		[visible, filtered, selectedIndex, onSelect, onClose, anchorRef],
+		[visible, anchorRef, candidates, selected, checking, onSelect, onClose],
 	);
-
 	useEffect(() => {
-		if (visible) {
-			const doc = anchorRef?.current?.ownerDocument ?? document;
-			doc.addEventListener("keydown", handleKeyDown, true);
-			return () => doc.removeEventListener("keydown", handleKeyDown, true);
-		}
+		if (!visible) return;
+		const doc = anchorRef?.current?.ownerDocument ?? document;
+		doc.addEventListener("keydown", handleKeyDown, true);
+		return () => doc.removeEventListener("keydown", handleKeyDown, true);
 	}, [visible, handleKeyDown, anchorRef]);
-
-	// List cap (240) plus the gap to the composer.
-	const popoverSide = useComposerPopoverSide(anchorRef, visible, 248);
-
-	if (!visible || filtered.length === 0) return null;
-
+	const side = useComposerPopoverSide(anchorRef, visible, 248);
+	if (!visible) return null;
 	return (
 		<Paper
+			ref={listRef}
 			shadow="md"
 			radius="sm"
 			withBorder
 			style={{
 				position: "absolute",
-				...composerPopoverOffset(popoverSide),
+				...composerPopoverOffset(side),
 				left: 0,
 				right: 0,
 				maxHeight: 240,
 				overflow: "auto",
 				zIndex: Z.dropdown,
 			}}
-			ref={listRef}
 		>
-			<Text size="xs" c="dimmed" px={10} py={4}>
-				{t("mentionPopoverTitle")}
-			</Text>
-			{filtered.map((c, i) => (
-				<UnstyledButton
-					key={c.id}
-					data-mention-item
-					// Prevent the textarea from losing focus before the click lands —
-					// otherwise onBlur tears down this popover and the click never fires.
-					onPointerDown={(e) => e.preventDefault()}
-					onMouseDown={(e) => e.preventDefault()}
-					onClick={() => onSelect(c)}
-					onMouseEnter={() => setSelectedIndex(i)}
-					style={{
-						display: "flex",
-						width: "100%",
-						padding: 0,
-						backgroundColor:
-							i === selectedIndex
-								? isDark
-									? "var(--mantine-color-dark-5)"
-									: "var(--mantine-color-gray-1)"
-								: undefined,
-						borderRadius: 0,
-					}}
-				>
-					<Box
-						style={{
-							width: 3,
-							flexShrink: 0,
-							backgroundColor: "var(--mantine-color-grape-6)",
-							borderRadius: "2px 0 0 2px",
-						}}
-					/>
-					<Group gap="xs" wrap="nowrap" style={{ flex: 1, padding: "6px 10px" }}>
-						<Text size="sm" fw={600} c="grape.4">
-							@{c.handle}
-						</Text>
-						{c.title && (
-							<Text size="xs" c="dimmed" truncate="end" style={{ flex: 1 }}>
-								{c.title}
+			<Box
+				id={listId}
+				role="listbox"
+				aria-label={t("mentionPopoverTitle")}
+				aria-busy={loading || checking}
+			>
+				{candidates.map((candidate, index) => (
+					<Box key={candidate.id}>
+						{(index === 0 || candidates[index - 1].isRecent !== candidate.isRecent) && (
+							<Text size="xs" c="dimmed" px={10} py={4}>
+								{t(candidate.isRecent ? "mentionRecentSessions" : "mentionMoreSessions")}
 							</Text>
 						)}
-						{c.status && c.status !== "idle" && (
-							<Badge size="xs" variant="light" color="blue">
-								{t(`status_${c.status}`, c.status)}
-							</Badge>
-						)}
-					</Group>
-				</UnstyledButton>
-			))}
+						<UnstyledButton
+							id={optionId(candidate.id)}
+							role="option"
+							aria-selected={selected?.id === candidate.id}
+							aria-disabled={checking || candidate.canConnect === false}
+							data-mention-item
+							onPointerDown={(event) => event.preventDefault()}
+							onMouseDown={(event) => event.preventDefault()}
+							onClick={() => {
+								if (!checking && candidate.canConnect !== false) onSelect(candidate);
+							}}
+							onMouseEnter={() => {
+								if (!checking) setSelectedId(candidate.id);
+							}}
+							style={{
+								display: "flex",
+								width: "100%",
+								padding: 0,
+								backgroundColor:
+									selected?.id === candidate.id
+										? isDark
+											? "var(--mantine-color-dark-5)"
+											: "var(--mantine-color-gray-1)"
+										: undefined,
+								opacity: candidate.canConnect === false ? 0.5 : 1,
+							}}
+						>
+							<Group gap="xs" wrap="nowrap" style={{ flex: 1, padding: "8px 10px", minWidth: 0 }}>
+								<Box style={{ minWidth: 0, flex: 1 }}>
+									<Text size="sm" fw={600} truncate="end">
+										{candidate.title || candidate.handle || candidate.id}
+									</Text>
+									{(candidate.handle || candidate.parentTitle) && (
+										<Text size="xs" c="dimmed" truncate="end">
+											{candidate.handle ? `@${candidate.handle}` : candidate.parentTitle}
+										</Text>
+									)}
+								</Box>
+								{candidate.canConnect === undefined && (
+									<Text size="xs" c="dimmed">
+										{t("mentionVerifyRequired")}
+									</Text>
+								)}
+								{candidate.status && candidate.status !== "idle" && (
+									<Badge size="xs" variant="light" color="blue">
+										{t(`status_${candidate.status}`, candidate.status)}
+									</Badge>
+								)}
+							</Group>
+						</UnstyledButton>
+					</Box>
+				))}
+			</Box>
+			{verification && (
+				<Text role={checking ? "status" : "alert"} size="xs" px={10} py={6}>
+					{t(
+						checking
+							? "mentionVerifyChecking"
+							: verification === "denied"
+								? "mentionVerifyDenied"
+								: "mentionVerifyError",
+					)}
+				</Text>
+			)}
+			{!verification && (loading || error || !candidates.length) && (
+				<Text role="status" size="xs" c="dimmed" px={10} py={6}>
+					{t(loading ? "mentionSearching" : error ? "mentionSearchError" : "mentionNoResults")}
+				</Text>
+			)}
 		</Paper>
 	);
 }

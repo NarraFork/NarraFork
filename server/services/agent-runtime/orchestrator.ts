@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { readQueryFirst } from "@server/db/worker-read";
 import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
@@ -59,7 +60,6 @@ import {
 	isBotNarrator,
 	isPlanModeTrait,
 	isTeamNarrator,
-	parseSubstatus,
 	redactDraftTraits,
 } from "../../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
@@ -120,7 +120,6 @@ import {
 import { type ExecutionOwner, getRunHold, type RunControl } from "../agent-runtime/ownership";
 import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
-import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { getStatusSummaryCached, markStatusDirty, peekStatusSummary } from "../git-status-cache";
 import { classifyGitToolRefresh, GitToolRefreshQueue } from "../git-tool-refresh-policy";
@@ -172,6 +171,7 @@ import {
 } from "../narrator-recovery";
 import { handleBashCommand, narratorService } from "../narrator-service";
 import {
+	abortPendingBufferedGuidance,
 	accountRequestTokenUsage,
 	accountTokenUsageForTurn,
 	applySessionDefaultDevice,
@@ -179,19 +179,18 @@ import {
 	buildSystemPrompt,
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
+	consumeBufferedSoftStopRequest,
 	consumeQuestionAnswerModelReceipts,
 	decideOutlineTurnEndNote,
 	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
-	evaluateSoftStopRequest,
 	executeQueuedGoalCommand,
 	executeQueuedNewCommand,
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
-	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -264,9 +263,11 @@ import { trackCommunicationWork } from "./async-work";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { type CheckpointStop, isCheckpointStop } from "./checkpoint-stop";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
+import { createRuntimeFinalizationReads } from "./finalization-reads";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { hasPendingSessionWake } from "./pending-wake";
 import {
 	applyPlanApproval,
 	dropDeferredPlanApproval,
@@ -443,11 +444,7 @@ export async function runAgentLoopUnlocked(
 	active._runPersonActed = false;
 	const personRun = () => personSpoke || active._runPersonActed === true;
 	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
-	const workPendingAtEnd = async (): Promise<boolean> =>
-		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
-		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
-		// A question a person has yet to answer: their answer wakes the session.
-		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
+	const workPendingAtEnd = (): Promise<boolean> => hasPendingSessionWake(narratorId);
 	let checkpointPause: CheckpointStop | undefined;
 	const checkpointIdentity = run?.logicalRunId
 		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }
@@ -1027,9 +1024,7 @@ export async function runAgentLoopUnlocked(
 			active._guidanceAbortController = new AbortController();
 			const passUrgentGuidance = new AbortController();
 			active._urgentGuidanceAbortController = passUrgentGuidance;
-			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
-				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
-			}
+			await abortPendingBufferedGuidance(active);
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -1198,11 +1193,18 @@ export async function runAgentLoopUnlocked(
 					)
 						managedOptionalTools.add(tool.name);
 				}
-				const [latestNarrator] = await db
-					.select({ enabledTools: narrators.enabledTools })
-					.from(narrators)
-					.where(eq(narrators.id, narratorId))
-					.limit(1);
+				const latestNarrator = await readQueryFirst(
+					db
+						.select({ enabledTools: narrators.enabledTools })
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal: active.abortController.signal,
+					},
+				);
 				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
@@ -1338,6 +1340,8 @@ export async function runAgentLoopUnlocked(
 				active._modelSelectionRef ?? active._modelRef ?? FOLLOW_DEFAULT_MODEL,
 				resolved.provider,
 				resolved.model,
+				turnEffectiveModel,
+				getSettingsRevision(),
 			);
 
 			// Resolve behavior-fence injection settings for this turn (narrator override → global default).
@@ -1444,6 +1448,8 @@ export async function runAgentLoopUnlocked(
 					// Legacy resumed plan paths cannot be reconstructed from the identity.
 					active._planFilePath,
 					{
+						communicationSourceNarratorId: narratorId,
+						communicationSignal: active.abortController.signal,
 						taskSection: taskSectionFor(taskBackend, current.type),
 						...(contextParts ? { contextParts } : {}),
 						...(outlinePlan ? { outlinePlan } : {}),
@@ -1753,10 +1759,14 @@ export async function runAgentLoopUnlocked(
 						});
 						return { titleUpdate: false };
 					}
-					const n = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { title: true },
-					});
+					const n = await readQueryFirst(
+						db.query.narrators.findMany({
+							limit: 1,
+							where: eq(narrators.id, narratorId),
+							columns: { title: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					// `messageCount` is the real message count, not a turn count, so it is
 					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
@@ -2235,13 +2245,7 @@ export async function runAgentLoopUnlocked(
 				historyEndsWithToolResults: preparedHistory.endsWithToolResults,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
-				shouldIdleOnReasoningOnly: async () => {
-					// Waiting on a mailbox reply or on its own background work, for any session.
-					if (lastModelInputWasMailbox) return true;
-					const { activeWorkCount } =
-						await backgroundTaskService.countActiveKindsByParent(narratorId);
-					return activeWorkCount > 0;
-				},
+				hasPendingWake: async () => lastModelInputWasMailbox || (await workPendingAtEnd()),
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
@@ -2252,26 +2256,29 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
 							? afterToolsInput.mailbox
 							: isLastModelInputMailbox(history, content);
-					consumeAgentMessageHistory(history);
+					void trackCommunicationWork(consumeAgentMessageHistory(history));
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, placement);
 					return {
 						...input,
-						onConsumed: () => {
-							input.onConsumed();
+						onConsumed: async () => {
+							await input.onConsumed();
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can
@@ -2399,7 +2406,7 @@ export async function runAgentLoopUnlocked(
 					return !!active._planApprovedContinue;
 				},
 				// Queued user input never skips a call: the step's tools all run first.
-				shouldYieldToInput: () => {
+				shouldYieldToInput: async () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -2407,15 +2414,7 @@ export async function runAgentLoopUnlocked(
 					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
 						active._bufferSoftStopTaken = true;
 					}
-					const decision = evaluateSoftStopRequest({
-						feedbackSoftStop: active._feedbackSoftStop,
-						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
-					});
-					active._feedbackSoftStop = decision.feedbackSoftStop;
-					active._bufferSoftStop = decision.bufferSoftStop;
-					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
-					return decision.stop;
+					return consumeBufferedSoftStopRequest(active);
 				},
 				// Both primary and child loops can outlive the abort drain. Never reuse
 				// eventContext/hooks here: a new turn may already own their mutable state.
@@ -2714,6 +2713,31 @@ export async function runAgentLoopUnlocked(
 					eventContext,
 					hooks,
 				);
+			// Only an already-admitted continuation can reach another model pass. Its
+			// outcome supersedes the failed pass, including cleanup's eager error latch
+			// and diagnostics. Otherwise a later success would still stop inbox wakes
+			// at finalization. Keep genuine terminal failures latched when no pass follows.
+			if (
+				(runState.hadError || terminalStatus) &&
+				active.alive &&
+				owner.isCurrent() &&
+				!config.signal.aborted
+			) {
+				const resumed = await narratorService.updateStatus(narratorId, "working", {
+					unlessArchived: true,
+				});
+				if (resumed === false) {
+					runState.wasInterrupted = true;
+					break;
+				}
+				// Cancellation may have landed while the status write was pending. Leave
+				// its abort handling (including a held turn) to the executor as before.
+				if (active.alive && owner.isCurrent() && !config.signal.aborted) {
+					runState.hadError = false;
+					terminalStatus = undefined;
+					runState.finalText = "";
+				}
+			}
 			let result: ExecuteLoopResult;
 			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
@@ -2929,6 +2953,7 @@ export async function runAgentLoopUnlocked(
 							providerPrefix: payment.providerPrefix,
 							balance: payment.balance,
 							required: payment.required,
+							...(payment.paymentContext ? { paymentContext: payment.paymentContext } : {}),
 							resumeAction: payment.resumeAction,
 							...(isParentCopy && { isSubagent: true }),
 						});
@@ -3476,7 +3501,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3537,20 +3562,23 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
-			// Anything queued during this turn (completions AND inbound messages) keeps the
-			// loop running instead of going idle. Previously only completions were checked
-			// here, so a message that arrived at this exact moment waited for the next wake.
+			// Queued completions and inbound messages keep a successful turn running.
+			// They are not recovery authorization: preserve them if this pass failed,
+			// just as the buffered-input path below does, rather than retrying a terminal
+			// error merely to acknowledge a notice that arrived before the failure.
 			// [continuation-source: injection-drain]
-			const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
-			if (bgCompletionPrompt) {
-				await narratorService.updateStatus(narratorId, "working");
-				runState.input.media = undefined;
-				runState.input.text = "";
-				runState.input.images = undefined;
-				// This drain starts a fresh pass before the buffer consumer below is
-				// reached, which would strand a cut-in message for the rest of the loop.
-				rearmCutInSoftStopBeforeContinuing(active);
-				continue;
+			if (!runState.hadError) {
+				const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
+				if (bgCompletionPrompt) {
+					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
+					runState.input.text = "";
+					runState.input.images = undefined;
+					// This drain starts a fresh pass before the buffer consumer below is
+					// reached, which would strand a cut-in message for the rest of the loop.
+					await rearmCutInSoftStopBeforeContinuing(active);
+					continue;
+				}
 			}
 
 			// Queued input BEFORE transitioning to idle/unread — this prevents spurious
@@ -3844,20 +3872,8 @@ export async function runAgentLoopUnlocked(
 				});
 			} else {
 				try {
-					const fresh = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { pendingModelRestore: true },
-					});
-					if (fresh?.pendingModelRestore) {
-						const restoreModel = fresh.pendingModelRestore;
-						await db
-							.update(narrators)
-							.set({
-								model: restoreModel,
-								pendingModelRestore: null,
-								updatedAt: new Date().toISOString(),
-							})
-							.where(eq(narrators.id, narratorId));
+					const restoreModel = await createRuntimeFinalizationReads(db).restoreModel(narratorId);
+					if (restoreModel) {
 						updateNarratorModel(narratorId, restoreModel);
 						// The primary active is already marked dead above, so the live
 						// updater only propagates to followers; still publish this DB restore.
@@ -3971,16 +3987,17 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const leftover = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { substatus: true },
-					});
-					const tags = parseSubstatus(leftover?.substatus);
-					if (tags.includes("reflecting") || tags.includes("reasoning")) {
-						await narratorService.updateSubstatus(
+					const statusPatch =
+						await createRuntimeFinalizationReads(db).clearTransientStatusPatch(narratorId);
+					if (statusPatch) {
+						(
+							await import("../background-occupancy-store")
+						).backgroundOccupancyStore.refreshNarrator(narratorId);
+						broadcastToNarrator(narratorId, {
+							type: "substatus_change",
 							narratorId,
-							tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
-						);
+							...statusPatch,
+						});
 					}
 				} catch (err) {
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {

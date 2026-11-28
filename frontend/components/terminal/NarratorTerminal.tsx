@@ -1,6 +1,7 @@
 import { ActionIcon, Box, Group, Text, Tooltip } from "@mantine/core";
+import { useDocumentVisibility } from "@mantine/hooks";
 import { IconPlus } from "@tabler/icons-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
@@ -11,15 +12,15 @@ import {
 	useRenameTerminal,
 } from "../../hooks/useTerminals";
 import { useTerminalViewState } from "../../hooks/useTerminalViewState";
-import { getTerminalWSManager } from "../../hooks/useTerminalWS";
 import { LayoutSelector, type TerminalLayout } from "./LayoutSelector";
 import { TerminalGrid } from "./TerminalGrid";
 import { TerminalTabBar } from "./TerminalTabBar";
 
 interface NarratorTerminalProps {
 	narratorId: string;
+	/** Dock visibility, not keyboard focus. Hidden terminals must not read or connect. */
+	visible?: boolean;
 	onSendToChat?: (text: string) => void;
-	onWriteRef?: (write: ((text: string) => void) | null) => void;
 	onExit?: (code: number) => void;
 }
 
@@ -58,12 +59,20 @@ const LAYOUT_PANEL_COUNT: Record<TerminalLayout, number> = {
 	quad: 4,
 };
 
-export function NarratorTerminal({
-	narratorId,
-	onSendToChat,
-	onWriteRef,
-	onExit,
-}: NarratorTerminalProps) {
+export function NarratorTerminal({ visible = true, ...props }: NarratorTerminalProps) {
+	const documentVisibility = useDocumentVisibility();
+	const canOpen = useCanOpenTerminals(props.narratorId);
+	// PTY state remains on the server; unmounting releases xterm/WS and in-flight list reads.
+	return visible &&
+		documentVisibility === "visible" &&
+		typeof document !== "undefined" &&
+		document.visibilityState === "visible" &&
+		canOpen === true ? (
+		<NarratorTerminalContent {...props} />
+	) : null;
+}
+
+function NarratorTerminalContent({ narratorId, onSendToChat, onExit }: NarratorTerminalProps) {
 	const ctx = useMemo(() => ({ narratorId }), [narratorId]);
 	const { data: terminals } = useNarratorTerminals(narratorId);
 	const createTerminal = useCreateNarratorTerminal(narratorId);
@@ -94,22 +103,6 @@ export function NarratorTerminal({
 			),
 		[runningTerminals, savedOrder],
 	);
-
-	// Expose write function to parent — writes to the first running terminal
-	const writeRef = useRef(onWriteRef);
-	writeRef.current = onWriteRef;
-	useEffect(() => {
-		if (runningTerminals.length > 0) {
-			const termId = runningTerminals[0].id;
-			writeRef.current?.((text: string) => getTerminalWSManager().sendInput(termId, text));
-		} else {
-			writeRef.current?.(null);
-		}
-	}, [runningTerminals]);
-
-	useEffect(() => {
-		return () => writeRef.current?.(null);
-	}, []);
 
 	// Sync active tab from view state on load
 	// biome-ignore lint/correctness/useExhaustiveDependencies: only sync once when view state loads

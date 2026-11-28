@@ -292,14 +292,18 @@ describe("request recording HTTP contracts and ACL", () => {
 		const firstDispatch = Promise.withResolvers<void>();
 		const dispatchGate = Promise.withResolvers<void>();
 		const sendOrder: string[] = [];
+		const aclReads: string[] = [];
 		const create = WorkerHandle.thread;
 		const spawn = spyOn(WorkerHandle, "thread").mockImplementation((entry, options) => {
 			const handle = create(entry, options);
 			const send = handle.resource.postMessage.bind(handle.resource);
 			spyOn(handle.resource, "postMessage").mockImplementation((message) => {
 				if (message.type === "task") {
-					sendOrder.push(message.params.sql.includes('"api_requests"') ? "recording" : "auth");
-					if (sendOrder.length === 1) {
+					const sql = message.params.sql;
+					if (sql.includes('"api_requests"')) sendOrder.push("recording");
+					else if (sql.includes('"users"')) sendOrder.push("auth");
+					else aclReads.push(sql);
+					if (sendOrder.length === 1 && aclReads.length === 0) {
 						firstDispatch.resolve();
 						void dispatchGate.promise.then(() => send(message));
 						return;
@@ -337,6 +341,8 @@ describe("request recording HTTP contracts and ACL", () => {
 			dispatchGate.resolve();
 			expect(await auth).toMatchObject([{ id: OWNER }, { id: VIEWER }]);
 			await Promise.all([first, ...queued]);
+			expect(aclReads).toHaveLength(1);
+			expect(aclReads[0]).toContain('"narrators"');
 			expect(sendOrder).toEqual([
 				"recording",
 				"auth",

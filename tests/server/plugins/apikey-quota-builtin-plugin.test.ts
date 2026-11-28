@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import quotaManifest from "../../../plugins/provider-quota/manifest.json";
 import {
 	archivedQuotaFixture,
 	closeQuotaTestPackage,
@@ -22,6 +23,7 @@ const PLUGIN_ID = "io.narrafork.provider-quota";
 let fixture: Awaited<ReturnType<typeof archivedQuotaFixture>>;
 beforeAll(async () => {
 	fixture = await archivedQuotaFixture({
+		approveSettings: false,
 		fetch: async () =>
 			Response.json({ isValid: true, mode: "unrestricted", unit: "USD", balance: 7 }),
 	});
@@ -41,7 +43,7 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 		expect(plugin).toBeDefined();
 		expect(plugin?.status).toBe("compatible");
 		expect(plugin?.diagnostics).toEqual([]);
-		expect(plugin?.current?.version).toBe("1.0.3");
+		expect(plugin?.current?.version).toBe(quotaManifest.version);
 		expect(plugin?.current?.hash).toMatch(/^[a-f0-9]{64}$/);
 		expect(plugin?.contributions.filter(({ kind }) => kind === "quotaSource")).toHaveLength(4);
 		expect(
@@ -66,7 +68,7 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 			"server/builtin-plugins/apikey-quota",
 		);
 	});
-	test("initial authority contains precisely the two declared quota capabilities", async () => {
+	test("initial authority keeps the two quota capabilities without approving provider settings", async () => {
 		expect(
 			(await fixture.manager.getPermissions(PLUGIN_ID)).grants
 				.map(({ capability }) => capability)
@@ -88,6 +90,7 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 		expect(fixture.supervisor.get(PLUGIN_ID)?.pid).toBeGreaterThan(0);
 	});
 	test("disable and re-enable persist through the normal manager state record", async () => {
+		await fixture.approveSettings();
 		expect((await fixture.manager.disable(PLUGIN_ID)).desiredState).toBe("disabled");
 		expect((await fixture.manager.getStatus(PLUGIN_ID))?.desiredState).toBe("disabled");
 		expect(fixture.platform.quotaRegistry.listSources()).toEqual([]);
@@ -103,7 +106,7 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 		});
 		expect(runtime.getDiagnostics()).toMatchObject({
 			pluginId: PLUGIN_ID,
-			pluginVersion: "1.0.3",
+			pluginVersion: quotaManifest.version,
 			inFlight: 0,
 		});
 	});
@@ -155,6 +158,7 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 			runtimeSupervisor: supervisor,
 			hostServices: platform.hostServices,
 			quotaRegistry: platform.quotaRegistry,
+			contributionRegistry: platform.contributionRegistry,
 			contributionCoordinator: platform.contributionCoordinator,
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,

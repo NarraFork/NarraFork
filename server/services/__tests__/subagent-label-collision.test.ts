@@ -13,11 +13,14 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -25,9 +28,10 @@ const { resolveSubagentTargets } = await import("../agent-communication");
 const { agentLabelFromNarrator, clearAgentLabelMemo } = await import("../subagent-label");
 const { clearAliasRegistry, registerTaskAlias } = await import("../subagent-alias");
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 const PARENT = "collision-parent";

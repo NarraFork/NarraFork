@@ -5,6 +5,7 @@ import {
 	beforeEach,
 	describe,
 	expect,
+	mock,
 	spyOn,
 	test,
 } from "bun:test";
@@ -23,6 +24,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
+import * as fileHistoryPolicy from "../../shared/file-change-protocol";
 import { db } from "../db";
 import {
 	fileAttributions,
@@ -43,9 +45,10 @@ import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { narratorGitRoutes } from "../routes/git";
+import { makeRetainedHistoryRuntimeForTests } from "./__tests__/retained-file-history";
 import { recordAttribution } from "./file-attribution-service";
 import { fileChangeLocalIo } from "./file-change-local-io";
-import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
+import { type LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import { gitCurrentBaselineReader } from "./git-current-baseline";
 import { getGitCurrentDiffView } from "./git-current-diff-view";
 import { getWorkspaceModificationView } from "./workspace-modification-view";
@@ -60,7 +63,7 @@ const originalSnapshot = gitCurrentBaselineReader.snapshot;
 
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
-	runtime = new LocalFileChangeRuntime({
+	runtime = makeRetainedHistoryRuntimeForTests({
 		db,
 		privateRoot: getNarraforkHome(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
@@ -212,7 +215,69 @@ async function view() {
 	return getGitCurrentDiffView(workspace, { filePaths: ["a.txt"] });
 }
 
+describe("local current Git targets with disabled history", () => {
+	test("clean targets retain a complete live baseline", async () => {
+		const current = await view();
+		expect(current).toMatchObject({ baselineStatus: "stable", clean: true, complete: true });
+		for (const target of [current.byFile[0]?.index, current.byFile[0]?.worktree])
+			expect(target).toMatchObject({ status: "clean", reason: null, actor: null });
+	});
+
+	test("local AI and editor writes keep live fingerprints while actor proof stays unknown", async () => {
+		await aiWrite(initial.replace("first: initial", "first: AI"));
+		const ai = await view();
+		expect(ai).toMatchObject({ baselineStatus: "stable", clean: false, complete: false });
+		expect(ai.byFile[0]?.worktree).toMatchObject({ reason: "history_incomplete", actor: null });
+		expect(ai.byFile[0]?.index.status).toBe("clean");
+		await human(
+			initial.replace("first: initial", "first: AI").replace("last: initial", "last: human"),
+		);
+		const person = await view();
+		expect(person.byFile[0]?.worktree).toMatchObject({
+			reason: "history_incomplete",
+			actor: null,
+		});
+		expect(person.version).not.toBe(ai.version);
+	});
+
+	test("live CRLF bytes and executable mode still change the baseline version", async () => {
+		const { chmod } = await import("node:fs/promises");
+		const path = join(workspace, "a.txt");
+		await writeFile(path, "first: human\r\nlast: human\r\n");
+		const crlf = await view();
+		await writeFile(path, "first: human\nlast: human\n");
+		const lf = await view();
+		expect(lf.version).not.toBe(crlf.version);
+		await chmod(path, 0o755);
+		const executable = await view();
+		expect(executable.version).not.toBe(lf.version);
+		expect(executable.byFile[0]?.worktree).toMatchObject({ reason: "history_incomplete" });
+	}, 20_000);
+
+	test("remote devices stay unsupported without a fingerprint read", async () => {
+		const snapshot = spyOn(gitCurrentBaselineReader, "snapshot");
+		try {
+			const remote = await getGitCurrentDiffView(workspace, {
+				deviceId: "not-local",
+				filePaths: ["a.txt"],
+			});
+			expect(remote.baselineStatus).toBe("unsupported");
+			expect(snapshot).not.toHaveBeenCalled();
+		} finally {
+			snapshot.mockRestore();
+		}
+	});
+});
+
+/**
+ * The matching engine is kept for devices whose history is retained. Local history is
+ * disabled by policy, so these cases opt the local device back in explicitly.
+ */
 describe("current Git targets matched against recorded writes", () => {
+	beforeEach(() => {
+		spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	});
+	afterEach(() => mock.restore());
 	test("real AI Write and editor another hunk name only the latest matching after, not all contributors", async () => {
 		await aiWrite(initial.replace("first: initial", "first: AI"));
 		const ai = await view();
@@ -533,7 +598,7 @@ describe("current Git targets matched against recorded writes", () => {
 		const entered = new Promise<void>((resolve) => {
 			applying = resolve;
 		});
-		const pendingRuntime = new LocalFileChangeRuntime({
+		const pendingRuntime = makeRetainedHistoryRuntimeForTests({
 			db,
 			privateRoot: getNarraforkHome(),
 			blobStoreOptions: { minimumFreeBytes: 0 },

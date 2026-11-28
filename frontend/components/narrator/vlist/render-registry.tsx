@@ -17,6 +17,8 @@ import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { SubagentDelegation } from "@shared/outline-report-note";
+import type { ReasoningTranslationEvidence } from "@shared/pretext-layout/reasoning-translation-sources";
+import type { ReasoningTranslationVisibilityTarget } from "@shared/reasoning-translation";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
@@ -41,6 +43,7 @@ import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
 import { RenderSystemText } from "./render/RenderSystemText";
+import { RenderTeamChip, RenderTeamEvent } from "./render/RenderTeamRow";
 import {
 	type ContentTargetResolver,
 	RenderToolCall,
@@ -359,6 +362,12 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					translationEvidence={
+						extra.reasoningTranslationEvidence as ReasoningTranslationEvidence[] | undefined
+					}
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
 						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
@@ -433,7 +442,12 @@ export function renderElement(
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
 		case "modeltrace-result":
-			return <RenderModelTraceResult measured={m} />;
+			return (
+				<RenderModelTraceResult
+					measured={m}
+					calibrationNarratorId={extra.modelTraceCalibrationNarratorId as string | undefined}
+				/>
+			);
 		case "plan-card":
 			return (
 				<RenderPlanCard
@@ -519,6 +533,12 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					translationEvidence={
+						extra.reasoningTranslationEvidence as ReasoningTranslationEvidence[] | undefined
+					}
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
@@ -609,5 +629,11 @@ export function renderElement(
 			// paint (composed by the adapter from the shared usage formatter), so this
 			// kind needs no `extra` at all.
 			return <RenderTurnUsage measured={m} />;
+		case "team-chip":
+			// Team page only. The open state lives on the measured element; the toggle is the
+			// shell's ordinary per-key fold (`TOGGLEABLE_CARD_KINDS`).
+			return <RenderTeamChip measured={m} onToggle={extra.onToggle as (() => void) | undefined} />;
+		case "team-event":
+			return <RenderTeamEvent measured={m} />;
 	}
 }

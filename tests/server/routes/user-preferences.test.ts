@@ -1,13 +1,36 @@
-import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
-import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import type {
+	PersistedRecentTab,
+	RecentTabsMutationResult,
+	RecentTabsPageResult,
+} from "@shared/recent-tabs";
+import { eq, ne } from "drizzle-orm";
 import { Hono } from "hono";
-import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
+import {
+	aclGrants,
+	narrators,
+	projects,
+	projectTeams,
+	userPreferences,
+	userRecentTabs,
+	users,
+} from "../../../server/db/schema";
 import type { SessionPayload } from "../../../server/lib/auth";
+import * as pool from "../../../server/lib/db-worker/pool";
 import { eventBus } from "../../../server/lib/event-bus";
-import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	specTabLayoutPatchSchema,
+	updateUserPreferencesSchema,
+} from "../../../server/lib/validators/settings";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 const realSettingsModule = { ...(await import("../../../server/lib/settings")) };
 const testSettings = {
@@ -24,12 +47,14 @@ mock.module("../../../server/lib/settings", () => ({
 }));
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
+const userBroadcasts: Array<{ userId: string; event: unknown }> = [];
 mock.module("../../../server/websocket/narrator-ws", () => ({
-	broadcastToUser: () => {},
+	broadcastToUser: (userId: string, event: unknown) => userBroadcasts.push({ userId, event }),
 	getNarratorPresenceBatch: () => new Map(),
 }));
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
+const { buildAppErrorResponse } = await import("../../../server/lib/app-error-response");
 
 const authUser: SessionPayload = {
 	sub: "user-1",
@@ -44,6 +69,7 @@ app.use("*", async (c, next) => {
 	await next();
 });
 app.route("/", userPreferencesRoutes);
+app.onError((err, c) => buildAppErrorResponse(err, c) ?? c.json({ error: String(err) }, 500));
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -57,11 +83,11 @@ function tab(id: string, overrides: Partial<PersistedRecentTab> = {}): Persisted
 	};
 }
 
-function seedUser(): void {
+function seedUser(userId = "user-1"): void {
 	db.insert(users)
 		.values({
-			id: "user-1",
-			username: "user-1",
+			id: userId,
+			username: userId,
 			passwordHash: "test-password-hash",
 			role: "user",
 			createdAt: NOW,
@@ -86,6 +112,26 @@ function seedPreferences(
 		.run();
 }
 
+function seedRecentResources(tabs: PersistedRecentTab[]): void {
+	for (const tab of tabs) {
+		if (tab.type === "narrator") {
+			db.insert(narrators)
+				.values({ id: tab.id, ownerUserId: "user-1", createdAt: NOW, updatedAt: NOW })
+				.run();
+		} else if (tab.type === "project") {
+			db.insert(projects)
+				.values({
+					id: tab.id,
+					name: tab.title,
+					ownerUserId: "user-1",
+					createdAt: NOW,
+					updatedAt: NOW,
+				})
+				.run();
+		}
+	}
+}
+
 async function requestJson(
 	path: string,
 	init?: RequestInit,
@@ -96,17 +142,361 @@ async function requestJson(
 
 afterEach(() => {
 	cleanDb(sqlite);
+	userBroadcasts.length = 0;
 	authUser.sub = "user-1";
 	authUser.role = "user";
 	testSettings.setupWizardCompleted = undefined;
 	saveTestSettings.mockClear();
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+describe("bounded UI preferences projection", () => {
+	function budgetCheckedApp() {
+		const checked = new Hono();
+		checked.use("*", async (c, next) => {
+			c.set("user", authUser);
+			await next();
+		});
+		checked.onError(
+			(error) =>
+				new Response(error.message, {
+					status: (error as { statusCode?: number }).statusCode ?? 500,
+				}),
+		);
+		checked.route("/", userPreferencesRoutes);
+		return checked;
+	}
+	const BODY_BUDGET = 64 * 1024;
+	const bodyPaths = ["/ui", "/?view=ui", "/spec-tab-layout"];
+
+	it("bounds raw whitespace before parsing UI/alias/Spec JSON and leaves the row unchanged", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const readStored = () =>
+			sqlite.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences").get();
+		const before = readStored();
+		for (const path of bodyPaths) {
+			const input =
+				path === "/spec-tab-layout"
+					? { narratorId: "retained", order: ["new.md"], pinned: [] }
+					: { language: "zh-CN" };
+			const smallJson = JSON.stringify(input);
+			const oversized = " ".repeat(BODY_BUDGET) + smallJson;
+			for (const length of [undefined, "1"]) {
+				const headers = new Headers({ "content-type": "application/json" });
+				if (length) headers.set("content-length", length);
+				const response = await checked.request(path, { method: "PATCH", headers, body: oversized });
+				expect(response.status).toBe(413);
+				expect(readStored()).toEqual(before);
+			}
+		}
+		// The compatibility full-detail PATCH retains its original, larger body allowance.
+		const legacy = await checked.request("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: " ".repeat(BODY_BUDGET) + JSON.stringify({ language: "zh-CN" }),
+		});
+		expect(legacy.status).toBe(200);
+		expect(
+			sqlite.query<{ language: string }, []>("SELECT language FROM user_preferences").get()
+				?.language,
+		).toBe("zh-CN");
+	});
+
+	it("checks declared bytes before pulling and stops chunked streams at the raw cap", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const before = sqlite
+			.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences")
+			.get();
+		for (const path of bodyPaths) {
+			let pulls = 0;
+			let cancelled = false;
+			const stream = new ReadableStream<Uint8Array>(
+				{
+					pull(controller) {
+						pulls++;
+						controller.enqueue(new TextEncoder().encode(" ".repeat(16 * 1024)));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+			const response = await checked.request(
+				new Request(`http://localhost${path}`, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: stream,
+				}),
+			);
+			expect(response.status).toBe(413);
+			expect(pulls).toBe(5);
+			expect(cancelled).toBe(true);
+			let headerPulls = 0;
+			let headerCancelled = false;
+			const declaredStream = new ReadableStream<Uint8Array>(
+				{
+					pull(controller) {
+						headerPulls++;
+						controller.enqueue(new Uint8Array([123, 125]));
+						controller.close();
+					},
+					cancel() {
+						headerCancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+			const declared = await checked.request(
+				new Request(`http://localhost${path}`, {
+					method: "PATCH",
+					headers: {
+						"content-type": "application/json",
+						"content-length": String(BODY_BUDGET + 1),
+					},
+					body: declaredStream,
+				}),
+			);
+			expect(declared.status).toBe(413);
+			expect(headerPulls).toBe(0);
+			expect(headerCancelled).toBe(true);
+			expect(
+				sqlite.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences").get(),
+			).toEqual(before);
+		}
+	});
+
+	it("accepts exact raw-byte boundaries and rejects CJK layout overflow before SQL writes", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const layout = { order: Array.from({ length: 84 }, () => "文".repeat(256)), pinned: [] };
+		const json = JSON.stringify({ narratorId: "retained", ...layout });
+		const rawBytes = Buffer.byteLength(json);
+		expect(rawBytes).toBeLessThan(BODY_BUDGET);
+		const exact = json + " ".repeat(BODY_BUDGET - rawBytes);
+		expect(Buffer.byteLength(exact)).toBe(BODY_BUDGET);
+		expect(
+			(await checked.request("/spec-tab-layout", { method: "PATCH", body: exact })).status,
+		).toBe(200);
+		const get = await checked.request("/spec-tab-layout?narratorId=retained");
+		expect(get.status).toBe(200);
+		expect(await get.json()).toEqual(layout);
+		const before = sqlite.query("SELECT spec_tab_layout, updated_at FROM user_preferences").get();
+		const overflow = {
+			narratorId: "retained",
+			order: Array.from({ length: 100 }, () => "文".repeat(256)),
+			pinned: Array.from({ length: 100 }, () => "文".repeat(256)),
+		};
+		expect(specTabLayoutPatchSchema.safeParse(overflow).success).toBe(true);
+		for (const body of [`${exact} `, JSON.stringify(overflow)]) {
+			expect((await checked.request("/spec-tab-layout", { method: "PATCH", body })).status).toBe(
+				413,
+			);
+			expect(
+				sqlite.query("SELECT spec_tab_layout, updated_at FROM user_preferences").get(),
+			).toEqual(before);
+		}
+		for (const path of ["/ui", "/?view=ui"]) {
+			const small = JSON.stringify({ language: "zh-CN" });
+			const exactUI = small + " ".repeat(BODY_BUDGET - Buffer.byteLength(small));
+			expect((await checked.request(path, { method: "PATCH", body: exactUI })).status).toBe(200);
+		}
+	});
+	it("reads and patches UI without full-row reads, legacy tabs or enrichment", async () => {
+		seedPreferences(
+			Array.from({ length: 1000 }, (_, i) => tab(`legacy-${i}`)),
+			{
+				gatewayConfig: JSON.stringify({ huge: "g".repeat(500_000) }),
+				commands: JSON.stringify([{ name: "huge", prompt: "p".repeat(500_000) }]),
+				specTabLayout: JSON.stringify(
+					Object.fromEntries(
+						Array.from({ length: 1000 }, (_, i) => [`n-${i}`, { order: ["a.md"], pinned: [] }]),
+					),
+				),
+				notifyDingtalkWebhook: "https://secret.invalid/hidden",
+			},
+		);
+		const tabsModule = await import("../../../server/services/recent-tabs-service");
+		const prefsModule = await import("../../../server/services/user-preferences-service");
+		const forbidden = () => {
+			throw new Error("UI projection touched full preferences/tabs");
+		};
+		const fullRead = spyOn(db.query.userPreferences, "findFirst").mockImplementation(forbidden);
+		const legacy = spyOn(tabsModule, "listLegacyTabs").mockImplementation(forbidden);
+		const enrichment = spyOn(prefsModule, "enrichTabs").mockImplementation(forbidden);
+		try {
+			for (const path of ["/ui", "/?view=ui"]) {
+				const result = await requestJson(path);
+				expect(result.status).toBe(200);
+				expect(result.body).toMatchObject({
+					language: "en",
+					appearancePreferences: {},
+					hiddenPluginOverlays: [],
+				});
+				for (const key of [
+					"recentTabs",
+					"commands",
+					"gatewayConfig",
+					"specTabLayout",
+					"graphViewports",
+					"notifyDingtalkWebhook",
+					"outlineDigestTime",
+				]) {
+					expect(result.body).not.toHaveProperty(key);
+				}
+				expect(Buffer.byteLength(JSON.stringify(result.body))).toBeLessThan(8 * 1024);
+			}
+			for (const path of ["/ui", "/?view=ui"]) {
+				const saved = await requestJson(path, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						language: "zh-CN",
+						fastModeDefault: true,
+						narratorLineHeightV2Percent: 112,
+					}),
+				});
+				expect(saved.status).toBe(200);
+				expect(saved.body).toMatchObject({
+					language: "zh-CN",
+					fastModeDefault: true,
+					narratorLineHeightV2Percent: 112,
+				});
+				expect(saved.body).not.toHaveProperty("commands");
+			}
+			expect(fullRead).not.toHaveBeenCalled();
+			expect(legacy).not.toHaveBeenCalled();
+			expect(enrichment).not.toHaveBeenCalled();
+		} finally {
+			fullRead.mockRestore();
+			legacy.mockRestore();
+			enrichment.mockRestore();
+		}
+		const row = sqlite
+			.query<{ commands: string; gateway_config: string }, []>(
+				"SELECT commands, gateway_config FROM user_preferences",
+			)
+			.get();
+		expect(row?.commands.length).toBeGreaterThan(500_000);
+		expect(row?.gateway_config.length).toBeGreaterThan(500_000);
+	});
+
+	it("rejects heavy fields and over-budget persisted UI data without partial success", async () => {
+		seedPreferences([], { navLayout: JSON.stringify({ items: [{ id: "x".repeat(70_000) }] }) });
+		const checked = new Hono();
+		checked.use("*", async (c, next) => {
+			c.set("user", authUser);
+			await next();
+		});
+		checked.onError(
+			(error) =>
+				new Response(error.message, {
+					status: (error as { statusCode?: number }).statusCode ?? 500,
+				}),
+		);
+		checked.route("/", userPreferencesRoutes);
+		expect((await checked.request("/ui")).status).toBe(413);
+		const rejected = await checked.request("/ui", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ language: "zh-CN" }),
+		});
+		expect(rejected.status).toBe(413);
+		expect(
+			sqlite.query<{ language: string }, []>("SELECT language FROM user_preferences").get()
+				?.language,
+		).toBe("en");
+		for (const field of [
+			"commands",
+			"gatewayConfig",
+			"recentTabs",
+			"specTabLayout",
+			"notifyDingtalkSecret",
+			"outlineDigestTime",
+		]) {
+			const response = await checked.request("/ui", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ [field]: [] }),
+			});
+			expect(response.status).toBe(400);
+		}
+	});
+
+	it("uses UI defaults on first write and preserves partial appearance merges", async () => {
+		seedUser();
+		expect((await requestJson("/ui")).body).toMatchObject({
+			notifySoundMaxConcurrent: 2,
+			enterQueueMode: "turn",
+			narratorLineHeightV2Percent: 100,
+		});
+		for (const patch of [
+			{ appearancePreferences: { narrafork_oled: true } },
+			{ appearancePreferences: { narrafork_blur_in_ms: 0 } },
+		]) {
+			expect(
+				(
+					await requestJson("/ui", {
+						method: "PATCH",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(patch),
+					})
+				).status,
+			).toBe(200);
+		}
+		expect((await requestJson("/ui")).body).toMatchObject({
+			appearancePreferences: { narrafork_oled: true, narrafork_blur_in_ms: 0 },
+		});
+	});
+
+	it("extracts only the current narrator layout and atomically retains historical entries", async () => {
+		const layouts = Object.fromEntries(
+			Array.from({ length: 1000 }, (_, i) => [`n-${i}`, { order: [`${i}.md`], pinned: [] }]),
+		);
+		seedPreferences([], { specTabLayout: JSON.stringify(layouts) });
+		const fullRead = spyOn(db.query.userPreferences, "findFirst").mockImplementation(() => {
+			throw new Error("No layout map reads");
+		});
+		try {
+			const result = await requestJson("/spec-tab-layout?narratorId=n-517");
+			expect(result).toEqual({ status: 200, body: { order: ["517.md"], pinned: [] } });
+			expect(Buffer.byteLength(JSON.stringify(result.body))).toBeLessThan(100);
+			const saved = await requestJson("/spec-tab-layout", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ narratorId: "n-517", order: ["new.md"], pinned: ["pin.md"] }),
+			});
+			expect(saved.status).toBe(200);
+			expect((await requestJson("/spec-tab-layout?narratorId=n-517")).body).toEqual({
+				order: ["new.md"],
+				pinned: ["pin.md"],
+			});
+			expect((await requestJson("/spec-tab-layout?narratorId=n-518")).body).toEqual(
+				layouts["n-518"],
+			);
+			expect((await requestJson("/spec-tab-layout?narratorId=absent")).body).toEqual({
+				order: [],
+				pinned: [],
+			});
+		} finally {
+			fullRead.mockRestore();
+		}
+	});
 });
 
 describe("account appearance preferences", () => {
@@ -695,8 +1085,6 @@ describe("user preferences secret serialization", () => {
 		});
 		const getResult = await requestJson("/");
 		const masked = getResult.body as Record<string, unknown>;
-		const preferenceQuery = db.query.userPreferences;
-		const originalFindFirst = preferenceQuery.findFirst.bind(preferenceQuery);
 		let releaseStaleRead!: () => void;
 		const staleReadReleased = new Promise<void>((resolve) => {
 			releaseStaleRead = resolve;
@@ -705,15 +1093,19 @@ describe("user preferences secret serialization", () => {
 		const staleReadStarted = new Promise<void>((resolve) => {
 			markStaleReadStarted = resolve;
 		});
+		// Hold the masked PATCH's preferences read (taken on the Worker) after it returned,
+		// so the rotation PATCH is queued behind it on the preferences lock.
 		let interceptNextRead = true;
-		preferenceQuery.findFirst = (async (...args: Parameters<typeof originalFindFirst>) => {
-			if (!interceptNextRead) return originalFindFirst(...args);
-			interceptNextRead = false;
-			const staleRow = await originalFindFirst(...args);
-			markStaleReadStarted();
-			await staleReadReleased;
-			return staleRow;
-		}) as typeof preferenceQuery.findFirst;
+		const runReadTask = pool.runReadTask;
+		const hold = spyOn(pool, "runReadTask").mockImplementation((async (path, params, options) => {
+			const result = await runReadTask(path, params, options);
+			if (interceptNextRead && "sql" in params && params.sql.includes('"user_preferences"')) {
+				interceptNextRead = false;
+				markStaleReadStarted();
+				await staleReadReleased;
+			}
+			return result;
+		}) as typeof pool.runReadTask);
 
 		try {
 			const maskedPatch = requestJson("/", {
@@ -744,7 +1136,7 @@ describe("user preferences secret serialization", () => {
 			expect(gatewayConfig.platforms[0].stt.apiKey).toBe("rotated-stt-api-key-9999");
 		} finally {
 			releaseStaleRead();
-			preferenceQuery.findFirst = originalFindFirst as typeof preferenceQuery.findFirst;
+			hold.mockRestore();
 		}
 	});
 
@@ -1151,9 +1543,311 @@ describe("narrator line height across the rescale", () => {
 	});
 });
 
+describe("recent-tabs current read authorization", () => {
+	function page(body: unknown) {
+		return body as RecentTabsPageResult;
+	}
+
+	it("checks the account, read grants and delegated ACL root for each page and intact folder", async () => {
+		seedPreferences([]);
+		seedUser("owner");
+		seedUser("other");
+		const tabs = [
+			tab("empty", { type: "folder", pinned: true }),
+			tab("only-denied", { folderId: "empty" }),
+			tab("folder", { type: "folder" }),
+			tab("root", { folderId: "folder", pinned: true, title: "Revoked root title" }),
+			tab("child", { type: "subagent", folderId: "folder", title: "Revoked child title" }),
+			tab("own", { folderId: "folder" }),
+			tab("role-read"),
+			tab("outside", { title: "Never authorized title" }),
+			tab("shared-project", { type: "project", title: "Revoked project title" }),
+			tab("my-project", { type: "project" }),
+		];
+		seedRecentResources(tabs);
+		db.update(narrators).set({ ownerUserId: "owner" }).where(ne(narrators.id, "own")).run();
+		db.update(projects)
+			.set({ ownerUserId: "owner" })
+			.where(eq(projects.id, "shared-project"))
+			.run();
+		db.insert(narrators)
+			.values({
+				id: "child",
+				type: "subagent",
+				ownerUserId: "user-1",
+				visibility: "public",
+				aclRootNarratorId: "root",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(aclGrants)
+			.values([
+				{
+					id: "root-grant",
+					scopeType: "narrator",
+					scopeId: "root",
+					principalType: "user",
+					principalId: "user-1",
+					capability: "read",
+					createdAt: NOW,
+				},
+				{
+					id: "role-grant",
+					scopeType: "narrator",
+					scopeId: "role-read",
+					principalType: "role",
+					principalId: "user",
+					capability: "read",
+					createdAt: NOW,
+				},
+				{
+					id: "project-grant",
+					scopeType: "project",
+					scopeId: "shared-project",
+					principalType: "user",
+					principalId: "user-1",
+					capability: "read",
+					createdAt: NOW,
+				},
+			])
+			.run();
+		const { restoreRecentTabs } = await import("../../../server/services/recent-tabs-service");
+		await restoreRecentTabs("user-1", { tabs });
+		await restoreRecentTabs("other", {
+			tabs: [tab("root", { title: "Other account's bookmark" }), tab("role-read")],
+		});
+		const first = page((await requestJson("/recent-tabs?section=work&limit=1")).body);
+		expect(first.items).toEqual([]);
+		expect(first.hasMore).toBe(true);
+		expect(first.nextCursor).toBeString();
+		const folderPath = `/recent-tabs?section=work&limit=1&cursor=${encodeURIComponent(first.nextCursor ?? "")}`;
+		expect(page((await requestJson(folderPath)).body).items.map((item) => item.id)).toEqual([
+			"folder",
+			"root",
+			"child",
+			"own",
+		]);
+		expect(
+			page((await requestJson("/recent-tabs?section=work")).body).items.map((item) => item.id),
+		).toEqual(["folder", "root", "child", "own", "role-read", "shared-project", "my-project"]);
+		expect(page((await requestJson("/recent-tabs?section=projects")).body).items).toEqual([]);
+
+		authUser.sub = "other";
+		expect(
+			page((await requestJson("/recent-tabs?section=work")).body).items.map((item) => item.id),
+		).toEqual(["role-read"]);
+		authUser.sub = "user-1";
+		db.delete(aclGrants).where(ne(aclGrants.id, "role-grant")).run();
+		const filtered = page((await requestJson("/recent-tabs?section=work")).body);
+		expect(filtered.items.map((item) => item.id)).toEqual([
+			"folder",
+			"own",
+			"role-read",
+			"my-project",
+		]);
+		expect(page((await requestJson(folderPath)).body).items.map((item) => item.id)).toEqual([
+			"folder",
+			"own",
+		]);
+		expect(page((await requestJson("/recent-tabs?section=projects")).body).items).toEqual([]);
+		expect(JSON.stringify(filtered.items)).not.toContain("Revoked");
+		expect(filtered.revision).toBe(first.revision);
+		expect(
+			db.select().from(userRecentTabs).where(eq(userRecentTabs.userId, "user-1")).all(),
+		).toHaveLength(tabs.length);
+	});
+
+	it("does not return revoked metadata through legacy preferences, runtime patches, or HTTP and WS upserts", async () => {
+		const revoked = tab("revoked", { title: "Old secret", status: "waiting" });
+		const visible = tab("visible");
+		seedPreferences([revoked, visible]);
+		seedRecentResources([revoked, visible]);
+		seedUser("owner");
+		const runtime = () =>
+			requestJson("/recent-tabs/runtime", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ keys: ["narrator:revoked", "narrator:visible"] }),
+			});
+		const keys = (body: unknown) =>
+			(body as { patches: { key: string }[] }).patches.map((item) => item.key);
+		expect(keys((await runtime()).body)).toEqual(["narrator:revoked", "narrator:visible"]);
+		db.update(narrators).set({ ownerUserId: "owner" }).where(eq(narrators.id, "revoked")).run();
+		const preferences = await requestJson("/");
+		expect(
+			(preferences.body as { recentTabs: PersistedRecentTab[] }).recentTabs.map((item) => item.id),
+		).toEqual(["visible"]);
+		expect(JSON.stringify(preferences.body)).not.toContain("Old secret");
+		expect(keys((await runtime()).body)).toEqual(["narrator:visible"]);
+		const update = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ ...revoked, title: "Late secret update" }),
+		});
+		expect(update.status).toBe(200);
+		const delta = { baseRevision: 0, revision: 1, operations: [] };
+		expect(update.body).toMatchObject({ changed: true, ...delta });
+		expect(userBroadcasts).toEqual([
+			{
+				userId: "user-1",
+				event: {
+					type: "user:recent_tabs_delta",
+					...delta,
+					batchIndex: 0,
+					batchCount: 1,
+				},
+			},
+		]);
+		expect(
+			db
+				.select({ title: userRecentTabs.title })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.entityId, "revoked"))
+				.get(),
+		).toEqual({ title: "Late secret update" });
+		const updatedVisible = { ...visible, title: "Still readable" };
+		const mixed = await requestJson("/recent-tabs/batch", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ tabs: [revoked, updatedVisible] }),
+		});
+		const operations = [
+			{
+				type: "upsert",
+				key: "narrator:visible",
+				tab: updatedVisible,
+				beforeKey: null,
+				afterKey: null,
+			},
+		];
+		expect(mixed.body).toMatchObject({ baseRevision: 1, revision: 2, operations });
+		expect(userBroadcasts.at(-1)?.event).toMatchObject({
+			baseRevision: 1,
+			revision: 2,
+			operations,
+		});
+		const removal = await requestJson("/recent-tabs/narrator/revoked?cascade=1", {
+			method: "DELETE",
+		});
+		expect(removal.body).toMatchObject({
+			baseRevision: 2,
+			revision: 3,
+			operations: [{ type: "remove", key: "narrator:revoked" }],
+		});
+	});
+
+	it("keeps a readable team's canonical link but hides it everywhere after revocation", async () => {
+		const team = tab("private-team", { type: "team", title: "Client title" });
+		const session = tab("visible");
+		seedPreferences([session]);
+		seedRecentResources([session, tab("own-project", { type: "project" })]);
+		seedUser("owner");
+		db.insert(narrators)
+			.values({
+				id: team.id,
+				title: "Actual team title",
+				ownerUserId: "owner",
+				contextProjectId: "own-project",
+				traits: ["team"],
+				status: "waiting",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(projectTeams)
+			.values({
+				narratorId: team.id,
+				projectId: "own-project",
+				baseBranch: "main",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(aclGrants)
+			.values({
+				id: "team-grant",
+				scopeType: "narrator",
+				scopeId: team.id,
+				principalType: "user",
+				principalId: "user-1",
+				capability: "read",
+				createdAt: NOW,
+			})
+			.run();
+		const key = `team:${team.id}`;
+		const state = () => requestJson(`/recent-tabs/state?type=team&id=${team.id}`);
+		const runtime = () =>
+			requestJson("/recent-tabs/runtime", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ keys: [key] }),
+			});
+		const pinned = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ ...team, projectId: "forged", pin: true }),
+		});
+		const authorizedTab = {
+			...team,
+			title: "Actual team title",
+			projectId: "own-project",
+			pinned: true,
+		};
+		const pinnedDelta = {
+			baseRevision: 0,
+			revision: 1,
+			operations: [{ type: "upsert", key, tab: authorizedTab }],
+		};
+		expect(pinned.body).toMatchObject(pinnedDelta);
+		expect(userBroadcasts.at(-1)?.event).toMatchObject(pinnedDelta);
+		expect((await state()).body).toEqual({ present: true, pinned: true });
+		expect(page((await requestJson("/recent-tabs?section=work&limit=1")).body).items).toEqual([
+			authorizedTab,
+		]);
+		expect((await runtime()).body).toMatchObject({
+			patches: [
+				{ key, patch: { status: "waiting", teamOnlooker: true, pendingApprovalCount: null } },
+			],
+		});
+		expect((await requestJson("/")).body).toMatchObject({ recentTabs: [authorizedTab, session] });
+
+		db.delete(aclGrants).where(eq(aclGrants.id, "team-grant")).run();
+		const first = page((await requestJson("/recent-tabs?section=work&limit=1")).body);
+		expect(first).toMatchObject({ items: [], hasMore: true, revision: 1 });
+		expect(first.nextCursor).toBeString();
+		expect(Buffer.from(first.nextCursor ?? "", "base64url").toString()).not.toContain(team.id);
+		const next = await requestJson(`/recent-tabs?section=work&limit=1&cursor=${first.nextCursor}`);
+		expect(page(next.body)).toMatchObject({ items: [session], hasMore: false });
+		expect((await state()).body).toEqual({ present: false, pinned: false });
+		expect((await runtime()).body).toEqual({ patches: [], revision: 1 });
+		expect((await requestJson("/")).body).toMatchObject({ recentTabs: [session] });
+		const patch = await requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ language: "zh-CN" }),
+		});
+		expect(patch.status).toBe(200);
+		expect(patch.body).not.toHaveProperty("recentTabs");
+
+		const { syncNarratorTitleToRecentTabs } = await import(
+			"../../../server/services/recent-tabs-service"
+		);
+		await syncNarratorTitleToRecentTabs(team.id, "New private title");
+		expect(userBroadcasts.at(-1)?.event).toMatchObject({ revision: 2, operations: [] });
+		const removed = await requestJson(`/recent-tabs/team/${team.id}?cascade=1`, {
+			method: "DELETE",
+		});
+		const removal = { revision: 3, operations: [{ type: "remove", key }] };
+		expect(removed.body).toMatchObject(removal);
+		expect(userBroadcasts.at(-1)?.event).toMatchObject(removal);
+	});
+});
+
 describe("recent-tabs route contracts", () => {
 	it("returns a mutation delta instead of the full tab collection", async () => {
 		seedPreferences([]);
+		seedRecentResources([tab("n-1")]);
 		const { status, body } = await requestJson("/recent-tabs", {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
@@ -1244,8 +1938,14 @@ describe("recent-tabs route contracts", () => {
 		).toEqual(["narrator:a", "narrator:c", "narrator:b"]);
 	});
 
-	it("supports section pagination and key-relative moves", async () => {
-		seedPreferences([tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })]);
+	it("supports work-list pagination and key-relative moves", async () => {
+		// An unpinned legacy project tab was an automatic visit, dropped even if readable.
+		const tabs = [tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })];
+		seedPreferences(tabs);
+		seedRecentResources(tabs);
+		const projects = await requestJson("/recent-tabs?section=projects");
+		expect(projects.status).toBe(200);
+		expect(projects.body).toMatchObject({ items: [], hasMore: false, revision: 0 });
 
 		const first = await requestJson("/recent-tabs?section=work&limit=1");
 		expect(first.status).toBe(200);
@@ -1275,11 +1975,63 @@ describe("recent-tabs route contracts", () => {
 			.from(userRecentTabs)
 			.orderBy(userRecentTabs.sortOrder)
 			.all();
-		expect(stored.map((row) => row.key)).toEqual(["narrator:n-2", "narrator:n-1", "project:p-1"]);
+		expect(stored.map((row) => row.key)).toEqual(["narrator:n-2", "narrator:n-1"]);
+	});
+
+	it("reads one tab's pin state wherever it sits in the list", async () => {
+		// The pinned project sits after more pinned sessions than a page holds.
+		const tabs = [
+			...Array.from({ length: 55 }, (_, index) => tab(`n-${index}`, { pinned: true })),
+			tab("p-pinned", { type: "project", pinned: true }),
+			tab("n-loose"),
+		];
+		seedPreferences(tabs);
+		seedRecentResources(tabs);
+		const firstPage = await requestJson("/recent-tabs?section=work");
+		expect(firstPage.body).toMatchObject({ hasMore: true });
+		expect(
+			(firstPage.body as { items: PersistedRecentTab[] }).items.some(
+				(item) => item.id === "p-pinned",
+			),
+		).toBe(false);
+
+		expect(await requestJson("/recent-tabs/state?type=project&id=p-pinned")).toEqual({
+			status: 200,
+			body: { present: true, pinned: true },
+		});
+		expect(await requestJson("/recent-tabs/state?type=narrator&id=n-loose")).toEqual({
+			status: 200,
+			body: { present: true, pinned: false },
+		});
+		expect(await requestJson("/recent-tabs/state?type=team&id=nowhere")).toEqual({
+			status: 200,
+			body: { present: false, pinned: false },
+		});
+		for (const query of [
+			"type=workspace&id=x",
+			"type=project",
+			`type=project&id=${"x".repeat(51)}`,
+		]) {
+			expect((await requestJson(`/recent-tabs/state?${query}`)).status).toBe(400);
+		}
+	});
+
+	it("answers 409 to a pin the server refuses instead of a silent no-op", async () => {
+		seedPreferences([]);
+		const refused = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...tab("no-such-team", { type: "team" }), pin: true }),
+		});
+		expect(refused.status).toBe(409);
+		expect(refused.body).toMatchObject({ code: "RECENT_TAB_REFUSED" });
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(0);
 	});
 
 	it("keeps GET /user-preferences compatible with at most 20 enriched legacy tabs", async () => {
-		seedPreferences(Array.from({ length: 30 }, (_, index) => tab(`n-${index}`)));
+		const tabs = Array.from({ length: 30 }, (_, index) => tab(`n-${index}`));
+		seedPreferences(tabs);
+		seedRecentResources(tabs);
 
 		const { status, body } = await requestJson("/");
 		expect(status).toBe(200);

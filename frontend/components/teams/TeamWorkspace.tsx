@@ -1,79 +1,114 @@
 /**
- * The team page's frame (docs/PROJECT_TEAMS-PLAN.md §二.11; P4): the project's teams on the
- * left, the coordinator's conversation in the middle, the board and the activity on the right,
- * the top bar above.
+ * The team page's frame (the redesign R): the header, 「等你处理」 when anything waits, then two
+ * columns: the coordinator's conversation on the left (about 60%) and the right column (about
+ * 40%) with its 「工作 | 动态」 switch. Narrow frames (a phone, or a desktop window whose sidebar
+ * leaves little room) show 「对话 | 工作 (N)」 tabs instead; the work tab keeps the same switch.
  *
- * The layout follows the frame's own width, not the viewport's (the app's sidebar takes up to
- * 480 px of it), and the conversation keeps at least `TEAM_CONVERSATION_MIN_WIDTH`:
- *   - room for all three → three columns;
- *   - room for the conversation and the side panel → two (the teams list leaves; the top bar's
- *     back link leads to the project, which lists them);
- *   - less → tabs (conversation / board / activity).
+ * The layout follows the frame's own width, not the viewport's (the app sidebar takes some). The
+ * conversation sits at ONE place in the React tree in every layout; only CSS and the tab bar
+ * change around it, so a resize never remounts the session view (which would reload it and lose
+ * its scroll position). A compact header (`conversationHeader`, the coordinator's line) sits above
+ * the conversation, whose own toolbar the page leaves out; an overlay (the starting state's prompt)
+ * can sit over the conversation's empty message area without covering that header or the
+ * composer.
  *
- * The conversation sits at ONE place in the React tree in every layout; only CSS (display,
- * widths) and the tab bar change around it. So a tablet rotation or a sidebar resize never
- * remounts the session view (which would reload it and lose its scroll position).
- *
- * Layout only: the route fills the slots, so the browser fixture can render the frame without a
+ * Layout only: the page fills the slots, so the browser fixture can render the frame without a
  * live session.
  */
 import { NarratorPanelVisibilityProvider } from "@frontend/components/narrator/narrator-panel-visibility";
-import { Box, ScrollArea, SegmentedControl, Stack, Tabs } from "@mantine/core";
+import { Box, Group, ScrollArea, SegmentedControl, Stack, Text } from "@mantine/core";
 import { useElementSize } from "@mantine/hooks";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	TEAM_PAGE_TABS,
-	TEAM_SIDE_WIDTH,
-	TEAM_TEAMS_WIDTH,
-	type TeamPageTab,
-	teamWorkspaceLayout,
-} from "./team-page-model";
+import { type TeamPhoneTab, teamWorkspaceLayout } from "./team-page-model";
+import { TABULAR } from "./team-page-ui";
 
-type SideTab = Exclude<TeamPageTab, "conversation">;
+export type SideTab = "work" | "activity";
 
 export function TeamWorkspace({
-	topBar,
-	teams,
+	header,
+	attention,
 	conversation,
-	board,
+	conversationHeader,
+	conversationOverlay,
+	work,
 	activity,
-	initialTab = "conversation",
+	openCount,
 	focusConversation = 0,
+	initialTab = "conversation",
+	onLayout,
 }: {
-	topBar: ReactNode;
-	teams: ReactNode;
+	header: (layout: "split" | "tabs") => ReactNode;
+	attention: (layout: "split" | "tabs") => ReactNode;
 	conversation: ReactNode;
-	board: ReactNode;
+	/** Above the conversation: the coordinator's compact header. */
+	conversationHeader?: ReactNode;
+	/** Drawn over the conversation's message area (the starting state). */
+	conversationOverlay?: ReactNode;
+	work: ReactNode;
 	activity: ReactNode;
-	initialTab?: TeamPageTab;
+	/** Unfinished work items, for 「工作 (N)」 and 「N 项未完成」. */
+	openCount: number;
 	/** Bumped to bring the conversation into view (and focus its composer). */
 	focusConversation?: number;
+	initialTab?: TeamPhoneTab;
+	onLayout?: (layout: "split" | "tabs") => void;
 }) {
 	const { t } = useTranslation("projects");
 	const { ref, width } = useElementSize();
 	const measured = width > 0;
-	const layout = measured ? teamWorkspaceLayout(width) : null;
-	const tabs = layout === "tabs";
-	const [tab, setTab] = useState<TeamPageTab>(initialTab);
-	const [side, setSide] = useState<SideTab>(initialTab === "activity" ? "activity" : "board");
+	const layout = measured ? teamWorkspaceLayout(width) : "split";
+	const tabs = measured && layout === "tabs";
+	const [tab, setTab] = useState<TeamPhoneTab>(initialTab);
+	const [side, setSide] = useState<SideTab>("work");
 	const conversationRef = useRef<HTMLDivElement | null>(null);
 
 	useEffect(() => {
+		if (measured) onLayout?.(layout);
+	}, [measured, layout, onLayout]);
+
+	// Bring the conversation forward, then focus its composer once it is shown (after the tab
+	// switch has rendered, not in the same frame).
+	const [focusWanted, setFocusWanted] = useState(0);
+	useEffect(() => {
 		if (!focusConversation) return;
 		setTab("conversation");
-		// After the tab switch has shown it.
-		requestAnimationFrame(() => {
+		setFocusWanted(focusConversation);
+	}, [focusConversation]);
+	useEffect(() => {
+		if (!focusWanted || (tabs && tab !== "conversation")) return;
+		const frame = requestAnimationFrame(() => {
 			const element = conversationRef.current;
 			if (!element) return;
 			element.scrollIntoView({ block: "nearest" });
 			element.querySelector<HTMLElement>("textarea, [contenteditable=true]")?.focus();
+			setFocusWanted(0);
 		});
-	}, [focusConversation]);
+		return () => cancelAnimationFrame(frame);
+	}, [focusWanted, tabs, tab]);
 
 	const conversationShown = !tabs || tab === "conversation";
-	const sideShown = !tabs || tab !== "conversation";
-	const sideContent: SideTab = tabs ? (tab === "activity" ? "activity" : "board") : side;
+	const sideShown = !tabs || tab === "work";
+
+	const sideSwitch = (
+		<Group justify="space-between" wrap="nowrap" px="sm" py={8}>
+			<SegmentedControl
+				size="xs"
+				value={side}
+				onChange={(value) => setSide(value as SideTab)}
+				data={[
+					{ value: "work", label: t("teams.page.work.work") },
+					{ value: "activity", label: t("teams.page.work.activity") },
+				]}
+				data-testid="team-side-switch"
+			/>
+			{openCount > 0 && (
+				<Text size="xs" c="dimmed" style={TABULAR} data-testid="team-open-count">
+					{t("teams.page.work.openCount", { count: openCount })}
+				</Text>
+			)}
+		</Group>
+	);
 
 	return (
 		<Stack
@@ -82,78 +117,72 @@ export function TeamWorkspace({
 			h="100%"
 			style={{ minWidth: 0, visibility: measured ? undefined : "hidden" }}
 			data-testid="team-workspace"
-			data-layout={layout ?? "measuring"}
+			data-layout={measured ? layout : "measuring"}
 		>
-			{topBar}
+			{header(layout)}
+			{attention(layout)}
 			{tabs && (
-				<Tabs value={tab} onChange={(value) => value && setTab(value as TeamPageTab)}>
-					<Tabs.List grow>
-						{TEAM_PAGE_TABS.map((value) => (
-							<Tabs.Tab key={value} value={value} data-testid={`team-tab-${value}`}>
-								{t(`teams.tabs.${value}`)}
-							</Tabs.Tab>
-						))}
-					</Tabs.List>
-				</Tabs>
+				<Box px="sm" pt="sm">
+					<SegmentedControl
+						fullWidth
+						value={tab}
+						onChange={(value) => setTab(value as TeamPhoneTab)}
+						data={[
+							{ value: "conversation", label: t("teams.tabs.conversation") },
+							{
+								value: "work",
+								label: t("teams.page.work.phoneWork", { count: openCount }),
+							},
+						]}
+						data-testid="team-phone-tabs"
+					/>
+				</Box>
 			)}
-			<Box style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "stretch" }}>
-				<ScrollArea
-					w={TEAM_TEAMS_WIDTH}
-					type="auto"
-					style={{
-						display: layout === "columns" ? undefined : "none",
-						flexShrink: 0,
-						borderRight: "1px solid var(--mantine-color-default-border)",
-					}}
-				>
-					<Box p="sm">{layout === "columns" && teams}</Box>
-				</ScrollArea>
+			<Box
+				style={{
+					flex: 1,
+					minHeight: 0,
+					display: "flex",
+					alignItems: "stretch",
+					paddingTop: tabs ? undefined : "var(--mantine-spacing-xs)",
+				}}
+			>
 				<Box
 					ref={conversationRef}
 					style={{
-						display: conversationShown ? undefined : "none",
-						flex: 1,
+						display: conversationShown ? "flex" : "none",
+						flexDirection: "column",
+						flex: tabs ? 1 : "3 1 0",
 						minWidth: 0,
 						minHeight: 0,
 					}}
 					data-testid="team-conversation"
 				>
-					{/* Hidden but mounted: the session stops what only a visible panel needs. */}
-					<NarratorPanelVisibilityProvider value={conversationShown}>
-						{conversation}
-					</NarratorPanelVisibilityProvider>
+					{conversationHeader}
+					<Box style={{ flex: 1, minHeight: 0, position: "relative" }}>
+						{/* Hidden but mounted: the session stops what only a visible panel needs. */}
+						<NarratorPanelVisibilityProvider value={conversationShown}>
+							{conversation}
+						</NarratorPanelVisibilityProvider>
+						{conversationOverlay}
+					</Box>
 				</Box>
 				<Stack
 					gap={0}
 					style={{
 						display: sideShown ? undefined : "none",
-						flex: tabs ? 1 : undefined,
-						width: tabs ? undefined : TEAM_SIDE_WIDTH,
-						flexShrink: 0,
-						minWidth: 0,
+						flex: tabs ? 1 : "2 1 0",
+						minWidth: tabs ? 0 : 320,
+						maxWidth: tabs ? undefined : 560,
 						minHeight: 0,
 						borderLeft: tabs ? undefined : "1px solid var(--mantine-color-default-border)",
 					}}
 					data-testid="team-side"
 				>
-					{!tabs && (
-						<Box p="xs">
-							<SegmentedControl
-								fullWidth
-								size="xs"
-								value={side}
-								onChange={(value) => setSide(value as SideTab)}
-								data={[
-									{ value: "board", label: t("teams.tabs.board") },
-									{ value: "activity", label: t("teams.tabs.activity") },
-								]}
-								data-testid="team-side-switch"
-							/>
-						</Box>
-					)}
+					{sideSwitch}
 					<ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto">
-						<Box p="sm" pt={tabs ? "sm" : 4}>
-							{sideContent === "board" ? board : activity}
+						<Box px={6} pb="md">
+							{side === "work" ? work : activity}
 						</Box>
 					</ScrollArea>
 				</Stack>

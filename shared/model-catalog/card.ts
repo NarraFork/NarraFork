@@ -150,6 +150,10 @@ export interface PriceGroup {
 	tier: string;
 	rows: PriceRow[];
 }
+const timeOfUseTiers = ["peak", "off_peak"] as const;
+type TimeOfUseTier = (typeof timeOfUseTiers)[number];
+export type TimeOfUsePriceGroup = PriceGroup & { tier: TimeOfUseTier };
+
 export interface ModelCardView {
 	mode: string | null;
 	category: string;
@@ -234,6 +238,50 @@ function priceIdentity(
 	if (definition.component === "cacheWrite" && cacheDuration === null) cacheDuration = "default";
 	return { key, ...definition, tier, thresholdTokens, cacheDuration };
 }
+/** Project catalog time-of-use references without validating or changing ordinary card rates. */
+export function timeOfUsePriceGroups(metadata: RawMetadata): TimeOfUsePriceGroup[] {
+	const currency = typeof metadata.currency === "string" ? metadata.currency : "USD";
+	const groups: Record<TimeOfUseTier, PriceRow[]> = { peak: [], off_peak: [] };
+	for (const [key, value] of Object.entries(metadata)) {
+		const tier = key.endsWith("_off_peak") ? "off_peak" : key.endsWith("_peak") ? "peak" : null;
+		if (!tier) continue;
+		const identity = priceIdentity(key.slice(0, -tier.length - 1));
+		if (
+			identity?.tier !== "standard" ||
+			typeof identity.unit !== "string" ||
+			(identity.thresholdTokens !== null && !Number.isSafeInteger(identity.thresholdTokens))
+		)
+			continue;
+		try {
+			const rate = value === null ? null : decimalValue(value);
+			const token = identity.unit === "token";
+			groups[tier].push({
+				...identity,
+				key,
+				tier,
+				currency,
+				rate,
+				displayRate: value === null ? null : decimalValue(value, token ? 6 : 0),
+				displayQuantity: token ? 1_000_000 : 1,
+				derived: false,
+			});
+		} catch {
+			// Ignore an invalid price without hiding its valid siblings or failing a model request.
+		}
+	}
+	return timeOfUseTiers.flatMap((tier) => {
+		const rows = groups[tier];
+		return rows.length ? [{ tier, rows: rows.sort(comparePriceRows) }] : [];
+	});
+}
+
+function comparePriceRows(a: PriceRow, b: PriceRow): number {
+	return (
+		(a.thresholdTokens ?? -1) - (b.thresholdTokens ?? -1) ||
+		(a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+	);
+}
+
 export function isRawPriceField(key: string): boolean {
 	return (
 		priceIdentity(key) !== undefined ||
@@ -428,13 +476,7 @@ export function modelCardView(metadata: RawMetadata): ModelCardView {
 		.sort((a, b) => tiers.indexOf(a) - tiers.indexOf(b))
 		.map((tier) => ({
 			tier,
-			rows: rows
-				.filter((row) => row.tier === tier)
-				.sort(
-					(a, b) =>
-						(a.thresholdTokens ?? -1) - (b.thresholdTokens ?? -1) ||
-						(a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
-				),
+			rows: rows.filter((row) => row.tier === tier).sort(comparePriceRows),
 		}));
 	const fields = cardFields
 		.filter((field) => Object.hasOwn(raw, field.key))

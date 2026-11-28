@@ -3,11 +3,14 @@ import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 import {
 	BackgroundOccupancyIndex,
+	changedOccupancyListParents,
 	isOccupancyNarratorSeed,
 	isOccupancyTaskActive,
 	type OccupancyActiveTaskOptions,
+	type OccupancyListSnapshot,
 	type OccupancyNarrator,
 	type OccupancySnapshot,
 	type OccupancyTask,
@@ -39,6 +42,13 @@ const narratorColumns = {
 		Boolean,
 	),
 	takenOver: sql<boolean>`instr(${narrators.substatus}, '"taken_over"') > 0`.mapWith(Boolean),
+	timeout: sql<boolean>`instr(${narrators.substatus}, '"timeout"') > 0`.mapWith(Boolean),
+	unread: sql<boolean>`instr(${narrators.substatus}, '"unread"') > 0`.mapWith(Boolean),
+	interrupted: sql<boolean>`instr(${narrators.substatus}, '"interrupted"') > 0`.mapWith(Boolean),
+	error: sql<boolean>`instr(${narrators.substatus}, '"error"') > 0`.mapWith(Boolean),
+	hasError: sql<boolean>`coalesce(length(${narrators.errorMessage}), 0) > 0`.mapWith(Boolean),
+	errorTimeout: sql<boolean>`coalesce(instr(lower(${narrators.errorMessage}), 'timed out') > 0 or
+		instr(lower(${narrators.errorMessage}), 'execution timeout') > 0, 0)`.mapWith(Boolean),
 	// Keep both scopes explicitly qualified. Drizzle's single-table SELECT mode
 	// strips interpolated column qualifiers, turning this into an id=id probe.
 	hasProjection: sql<boolean>`exists(select 1 from background_tasks as occupancy_projection where
@@ -57,69 +67,80 @@ const taskColumns = {
 	subagentNarratorId: backgroundTasks.subagentNarratorId,
 };
 
-/** Injectable DB handle also exercises the real SQL against an isolated in-memory DB. */
+/** Injectable DB handle exercises real SQL against a committed file/WAL database. */
 export function createDatabaseBackgroundOccupancySource(
 	readDatabase: () => Promise<Pick<BunSQLiteDatabase, "select">>,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): BackgroundOccupancySource {
 	return {
 		async scanNarrators(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(after === null ? undefined : gt(narrators.id, after))
-				.orderBy(asc(narrators.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(after === null ? undefined : gt(narrators.id, after))
+					.orderBy(asc(narrators.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async scanTasks(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(after === null ? undefined : gt(backgroundTasks.id, after))
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(after === null ? undefined : gt(backgroundTasks.id, after))
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async getNarrators(ids) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(inArray(narrators.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getTasks(ids) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(inArray(backgroundTasks.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(inArray(backgroundTasks.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getProjections(childId, after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(
-					and(
-						or(
-							eq(backgroundTasks.id, childId),
-							and(
-								eq(backgroundTasks.type, "agent"),
-								eq(backgroundTasks.subagentNarratorId, childId),
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(
+						and(
+							or(
+								eq(backgroundTasks.id, childId),
+								and(
+									eq(backgroundTasks.type, "agent"),
+									eq(backgroundTasks.subagentNarratorId, childId),
+								),
 							),
+							after === null ? undefined : gt(backgroundTasks.id, after),
 						),
-						after === null ? undefined : gt(backgroundTasks.id, after),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 	};
 }
@@ -128,6 +149,15 @@ export function createDatabaseBackgroundOccupancySource(
 export const databaseBackgroundOccupancySource = createDatabaseBackgroundOccupancySource(
 	async () => (await import("@server/db")).db,
 );
+
+export interface OccupancyNotification {
+	/** Wide graph impact remains available to non-list occupancy consumers. */
+	affectedParentIds: readonly string[];
+	/** Only list projection changes (or conservatively unknown cold values). */
+	listChangedParentIds: readonly string[];
+}
+
+type OccupancyListener = (parentIds: readonly string[], metadata: OccupancyNotification) => void;
 
 class OccupancyGenerationCancelled extends Error {}
 
@@ -149,14 +179,18 @@ export class BackgroundOccupancyStore {
 	private runtimeLive = new Set<string>();
 	/** Old owners must survive failed reads even after source rows were replaced. */
 	private pendingAffected = new Set<string>();
-	private subscribers = new Map<string, (parentIds: readonly string[]) => void>();
+	/** Batch baseline survives partial failed mutations until successful replay. */
+	private pendingListSnapshot: OccupancyListSnapshot | null = null;
+	/** Cold rows may be read and removed again within the same maintenance batch. */
+	private pendingUnknownListParents = new Set<string>();
+	private subscribers = new Map<string, OccupancyListener>();
 
 	constructor(
 		private readonly source: BackgroundOccupancySource = databaseBackgroundOccupancySource,
 	) {}
 
 	/** Keyed replacement survives hot-reload without accumulating callbacks. */
-	subscribe(key: string, listener: (parentIds: readonly string[]) => void): void {
+	subscribe(key: string, listener: OccupancyListener): void {
 		this.subscribers.set(key, listener);
 	}
 
@@ -179,6 +213,10 @@ export class BackgroundOccupancyStore {
 			await (this.worker ?? this.launch(false));
 		}
 		if (this.failure) throw this.failure;
+	}
+
+	async drain(): Promise<void> {
+		while (this.worker) await this.worker;
 	}
 
 	refreshTask(id: string): void {
@@ -236,6 +274,8 @@ export class BackgroundOccupancyStore {
 		this.removedNarrators.clear();
 		this.runtimeLive.clear();
 		this.pendingAffected = new Set();
+		this.pendingListSnapshot = null;
+		this.pendingUnknownListParents.clear();
 	}
 
 	snapshot(ids: readonly string[]): OccupancySnapshot {
@@ -245,6 +285,11 @@ export class BackgroundOccupancyStore {
 
 	get isReady(): boolean {
 		return this.ready && !this.failure;
+	}
+
+	/** Stopped for shutdown: its counts are no longer read, not zero. */
+	get isStopped(): boolean {
+		return this.stopped;
 	}
 
 	getActiveTaskIds(parentId: string, opts?: OccupancyActiveTaskOptions): string[] {
@@ -294,7 +339,8 @@ export class BackgroundOccupancyStore {
 
 	private launch(initial: boolean): Promise<void> {
 		const generation = this.generation;
-		const work = this.maintain(initial, generation).then((parentIds) => {
+		const work = this.maintain(initial, generation).then((metadata) => {
+			const parentIds = metadata.affectedParentIds;
 			if (parentIds.length === 0) return;
 			// Run after publication AND worker settlement. A listener may call
 			// flush(), so neither invoke it inline nor await its returned promise.
@@ -304,7 +350,7 @@ export class BackgroundOccupancyStore {
 					const failed = (error: unknown) =>
 						logger.error("Background occupancy subscriber failed", { key, error: String(error) });
 					try {
-						void Promise.resolve(listener(parentIds)).catch(failed);
+						void Promise.resolve(listener(parentIds, metadata)).catch(failed);
 					} catch (error) {
 						failed(error);
 					}
@@ -378,8 +424,12 @@ export class BackgroundOccupancyStore {
 		}
 	}
 
-	private async maintain(initial: boolean, generation: number): Promise<readonly string[]> {
+	private async maintain(initial: boolean, generation: number): Promise<OccupancyNotification> {
 		const target = initial ? new BackgroundOccupancyIndex() : this.index;
+		// Capture source/display inputs BEFORE the first mutation, not just rebuild.
+		// On read failure the same baseline must survive partially replaced rows.
+		this.pendingListSnapshot ??= target.listSnapshot();
+		const before = this.pendingListSnapshot;
 		const affected = this.pendingAffected;
 		const changed = new Set<string>();
 		const remember = (id: string) => {
@@ -393,7 +443,7 @@ export class BackgroundOccupancyStore {
 				(after, limit) => this.source.scanNarrators(after, limit),
 				(row) => {
 					if (isOccupancyNarratorSeed(row) || this.runtimeLive.has(row.id))
-						target.upsertNarrator(row);
+						this.upsertListNarrator(target, row);
 				},
 			);
 			await this.scan(
@@ -401,7 +451,7 @@ export class BackgroundOccupancyStore {
 				generation,
 				(after, limit) => this.source.scanTasks(after, limit),
 				(row) => {
-					if (isOccupancyTaskActive(row)) target.upsertTask(row);
+					if (isOccupancyTaskActive(row)) this.upsertListTask(target, row);
 				},
 			);
 			const roots = new Set([...target.getNarratorIds(), ...this.runtimeLive]);
@@ -455,12 +505,38 @@ export class BackgroundOccupancyStore {
 			logger.warn("Slow background occupancy graph rebuild", { rebuildMs });
 		for (const id of changed) this.collectAffected(target, id, affected);
 		for (const id of target.getAncestorIdsForBatch(affected)) affected.add(id);
+		const listChanged = new Set(
+			initial ? affected : changedOccupancyListParents(before, target.listSnapshot()),
+		);
+		for (const id of this.pendingUnknownListParents) listChanged.add(id);
+		for (const id of listChanged) affected.add(id);
 		target.prune();
 		this.index = target;
 		this.ready = true;
 		this.failure = null;
 		this.pendingAffected = new Set();
-		return Object.freeze([...affected]);
+		this.pendingListSnapshot = null;
+		this.pendingUnknownListParents = new Set();
+		return Object.freeze({
+			affectedParentIds: Object.freeze([...affected]),
+			listChangedParentIds: Object.freeze([...listChanged]),
+		});
+	}
+
+	private rememberUnknownListRow(parentId: string, key: string): void {
+		if (!this.pendingListSnapshot?.get(parentId)?.rows.has(key))
+			this.pendingUnknownListParents.add(parentId);
+	}
+
+	private upsertListTask(target: BackgroundOccupancyIndex, row: OccupancyTask): void {
+		this.rememberUnknownListRow(row.parentNarratorId, `task:${row.id}`);
+		target.upsertTask(row);
+	}
+
+	private upsertListNarrator(target: BackgroundOccupancyIndex, row: OccupancyNarrator): void {
+		if (row.parentNarratorId && !row.hasProjection && (row.isBackground || row.legacySubagent))
+			this.rememberUnknownListRow(row.parentNarratorId, `legacy:${row.id}`);
+		target.upsertNarrator(row);
 	}
 
 	private collectAffected(
@@ -512,7 +588,7 @@ export class BackgroundOccupancyStore {
 			const rows = await this.page("dirty tasks", generation, () => this.source.getTasks(batch));
 			for (const row of rows) {
 				remember(row.parentNarratorId);
-				target.upsertTask(row);
+				this.upsertListTask(target, row);
 				if (row.type === "agent") nodes.add(row.subagentNarratorId ?? row.id);
 				if (!(row.type === "bash" && row.backgroundKind === "service"))
 					nodes.add(row.parentNarratorId);
@@ -535,6 +611,7 @@ export class BackgroundOccupancyStore {
 			const next = new Set<string>();
 			const checked: string[] = [];
 			const missing = new Set<string>();
+			const withoutProjection = new Set<string>();
 			for (let offset = 0; offset < frontier.length; offset += PAGE_SIZE) {
 				const batch = frontier.slice(offset, offset + PAGE_SIZE).filter((id) => !visited.has(id));
 				if (batch.length === 0) continue;
@@ -549,8 +626,9 @@ export class BackgroundOccupancyStore {
 				const found = new Set(rows.map((row) => row.id));
 				for (const id of batch) if (!found.has(id) && !removed.has(id)) missing.add(id);
 				for (const row of rows) {
+					if (!row.hasProjection) withoutProjection.add(row.id);
 					remember(row.id);
-					target.upsertNarrator(row);
+					this.upsertListNarrator(target, row);
 					if (row.type === "subagent" && row.parentNarratorId && !visited.has(row.parentNarratorId))
 						next.add(row.parentNarratorId);
 				}
@@ -580,6 +658,7 @@ export class BackgroundOccupancyStore {
 					if (old) remember(old.parentNarratorId);
 					target.deleteTask(taskId);
 				}
+				if (withoutProjection.has(id)) continue;
 				await this.scan(
 					`projections:${id}`,
 					generation,
@@ -587,7 +666,7 @@ export class BackgroundOccupancyStore {
 					(task) => {
 						if (task.type === "agent" || isOccupancyTaskActive(task)) {
 							remember(task.parentNarratorId);
-							target.upsertTask(task);
+							this.upsertListTask(target, task);
 						}
 						if (task.type !== "agent") return;
 						if (!visited.has(task.parentNarratorId)) next.add(task.parentNarratorId);

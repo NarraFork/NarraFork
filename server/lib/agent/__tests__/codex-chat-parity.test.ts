@@ -108,19 +108,16 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
-	/**
-	 * Parity here means matching a real non-lite Codex request: top-level
-	 * instructions + tools. The lite header is the opt-in for the *other* contract
-	 * (instructions/tools removed, additional_tools spliced into input,
-	 * parallel_tool_calls off), so sending it alongside this body matches no real
-	 * client and upstream rejects the pairing outright.
-	 */
 	test("does not claim the responses-lite contract while sending a non-lite body", async () => {
 		const req = await captureChat();
 
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 		expect(req.body.tools).toBeDefined();
-		expect(req.body.instructions).toBeTruthy();
+		expect(req.body).not.toHaveProperty("instructions");
+		expect((req.body.input as unknown[])[0]).toMatchObject({
+			role: "developer",
+			content: [{ type: "input_text", text: expect.stringContaining("NarraFork Narrator") }],
+		});
 	});
 
 	test("correlates the conversation identity across headers and body", async () => {

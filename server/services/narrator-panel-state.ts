@@ -22,12 +22,20 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { projectMailboxUserMessage, toBufferSummary } from "./narrator-buffer";
 import { getNarratorDraftMetadata } from "./narrator-draft-service";
-import { getQuestionReflectionDeadline } from "./narrator-permission";
+import {
+	getQuestionReflectionDeadline,
+	isPendingPlanReflectionAvailable,
+} from "./narrator-permission";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 
 const PANEL_BYTE_LIMIT = 4 * 1024 * 1024;
 type Cursor = {
@@ -168,7 +176,11 @@ function permissionScope(narratorId: string): SQL {
 		ORDER BY CAST(reflection.key AS INTEGER) LIMIT 1), 'awaiting_user') = 'awaiting_user'`,
 	) as SQL;
 }
-async function permissionPage(narratorId: string, rawCursor?: string) {
+async function permissionPage(
+	narratorId: string,
+	rawCursor: string | undefined,
+	readBudget: NarratorSurfaceReadBudget,
+) {
 	if (rawCursor === "end") return { items: [], hasMore: false, cursor: undefined };
 	const cursor = decodeCursor(rawCursor, narratorId, "permissions");
 	const scope = permissionScope(narratorId);
@@ -181,37 +193,43 @@ async function permissionPage(narratorId: string, rawCursor?: string) {
 				),
 			)
 		: undefined;
-	const metadata = await db
-		.select({
-			id: narratorToolCalls.id,
-			createdAt: narratorToolCalls.createdAt,
-			bytes: permissionBytes,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
-		.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-		.where(and(scope, after))
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-		.limit(NARRATOR_PANEL_PAGE_SIZE + 1);
+	const metadata = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				createdAt: narratorToolCalls.createdAt,
+				bytes: permissionBytes,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+			.where(and(scope, after))
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+			.limit(NARRATOR_PANEL_PAGE_SIZE + 1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: NARRATOR_PANEL_PAGE_SIZE + 1 },
+	);
 	const selected = boundedPrefix(metadata);
 	const rows = selected.length
-		? await db
-				.select(permissionColumns)
-				.from(narratorToolCalls)
-				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
-				.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-				.where(
-					and(
-						scope,
-						or(
-							...selected.map((row) =>
-								and(eq(narratorToolCalls.id, row.id), lte(permissionBytes, row.bytes)),
+		? await readQuery(
+				db
+					.select(permissionColumns)
+					.from(narratorToolCalls)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+					.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+					.where(
+						and(
+							scope,
+							or(
+								...selected.map((row) =>
+									and(eq(narratorToolCalls.id, row.id), lte(permissionBytes, row.bytes)),
+								),
 							),
 						),
-					),
-				)
-				.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-				.limit(selected.length)
+					)
+					.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+					.limit(selected.length),
+				{ ...narratorSurfaceReadOptions(readBudget), maxRows: selected.length },
+			)
 		: [];
 	assertPageRows(selected, rows);
 	const items = rows.map((row) => {
@@ -221,6 +239,10 @@ async function permissionPage(narratorId: string, rawCursor?: string) {
 			parentToolUseId: row.ownerNarratorId === narratorId ? null : row.parentToolUseId,
 			subagentNarratorId: row.ownerNarratorId === narratorId ? null : row.ownerNarratorId,
 			...(reflectionDeadline !== null ? { reflectionDeadline } : {}),
+			// The card renders 计划反思 only where the raising loop still holds a runner.
+			...(row.toolName === "ExitPlanMode"
+				? { planReflectionAvailable: isPendingPlanReflectionAvailable(row.id) }
+				: {}),
 		});
 	});
 	const hasMore = metadata.length > selected.length;
@@ -234,7 +256,11 @@ async function permissionPage(narratorId: string, rawCursor?: string) {
 				: undefined,
 	};
 }
-async function bufferPage(narratorId: string, rawCursor?: string) {
+async function bufferPage(
+	narratorId: string,
+	rawCursor: string | undefined,
+	readBudget: NarratorSurfaceReadBudget,
+) {
 	if (rawCursor === "end") return { items: [], hasMore: false, cursor: undefined };
 	const cursor = decodeCursor(rawCursor, narratorId, "buffer");
 	const arrival = sql<number>`coalesce(${mailbox.arrivalSeq}, -1)`;
@@ -263,20 +289,23 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 	);
 	// Normal queues hold at most 50 rows. A bounded metadata fingerprint rejects
 	// reordered/edited queues between pages rather than silently skipping items.
-	const identities = await db
-		.select({
-			id: mailbox.id,
-			seq: mailbox.seq,
-			arrivalSeq: mailbox.arrivalSeq,
-			priority: mailbox.priority,
-			state: mailbox.state,
-			revision: mailbox.currentRevision,
-			updatedAt: mailbox.updatedAt,
-		})
-		.from(mailbox)
-		.where(scope)
-		.orderBy(asc(mailbox.id))
-		.limit(1025);
+	const identities = await readQuery(
+		db
+			.select({
+				id: mailbox.id,
+				seq: mailbox.seq,
+				arrivalSeq: mailbox.arrivalSeq,
+				priority: mailbox.priority,
+				state: mailbox.state,
+				revision: mailbox.currentRevision,
+				updatedAt: mailbox.updatedAt,
+			})
+			.from(mailbox)
+			.where(scope)
+			.orderBy(asc(mailbox.id))
+			.limit(1025),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1025 },
+	);
 	if (identities.length > 1024)
 		throw new AppError(
 			"Panel buffer metadata exceeds its budget.",
@@ -286,35 +315,43 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 	const fingerprint = createHash("sha256").update(JSON.stringify(identities)).digest("hex");
 	if (cursor && cursor.fingerprint !== fingerprint)
 		throw new AppError("Buffer queue changed; restart pagination.", 409, "PANEL_STATE_CHANGED");
-	const metadata = await db
-		.select({
-			id: mailbox.id,
-			priority: mailbox.priority,
-			seq: mailbox.seq,
-			arrivalSeq: mailbox.arrivalSeq,
-			bytes: bufferBytes,
-		})
-		.from(mailbox)
-		.where(and(scope, after))
-		.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
-		.limit(NARRATOR_PANEL_PAGE_SIZE + 1);
+	const metadata = await readQuery(
+		db
+			.select({
+				id: mailbox.id,
+				priority: mailbox.priority,
+				seq: mailbox.seq,
+				arrivalSeq: mailbox.arrivalSeq,
+				bytes: bufferBytes,
+			})
+			.from(mailbox)
+			.where(and(scope, after))
+			.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
+			.limit(NARRATOR_PANEL_PAGE_SIZE + 1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: NARRATOR_PANEL_PAGE_SIZE + 1 },
+	);
 	const selected = boundedPrefix(metadata);
 	const rows = selected.length
-		? await db
-				.select({
-					...getTableColumns(mailbox),
-					commandText: sql<null>`NULL`,
-					bashCommand: sql<null>`NULL`,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						scope,
-						or(...selected.map((row) => and(eq(mailbox.id, row.id), lte(bufferBytes, row.bytes)))),
-					),
-				)
-				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
-				.limit(selected.length)
+		? await readQuery(
+				db
+					.select({
+						...getTableColumns(mailbox),
+						commandText: sql<null>`NULL`,
+						bashCommand: sql<null>`NULL`,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							scope,
+							or(
+								...selected.map((row) => and(eq(mailbox.id, row.id), lte(bufferBytes, row.bytes))),
+							),
+						),
+					)
+					.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
+					.limit(selected.length),
+				{ ...narratorSurfaceReadOptions(readBudget), maxRows: selected.length },
+			)
 		: [];
 	assertPageRows(selected, rows);
 	const messages = rows.map(projectMailboxUserMessage);
@@ -326,16 +363,19 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 		),
 	];
 	const authors = authorIds.length
-		? await db
-				.select({
-					id: users.id,
-					username: users.username,
-					avatarColor: users.avatarColor,
-					avatarImageId: users.avatarImageId,
-				})
-				.from(users)
-				.where(inArray(users.id, authorIds))
-				.limit(authorIds.length)
+		? await readQuery(
+				db
+					.select({
+						id: users.id,
+						username: users.username,
+						avatarColor: users.avatarColor,
+						avatarImageId: users.avatarImageId,
+					})
+					.from(users)
+					.where(inArray(users.id, authorIds))
+					.limit(authorIds.length),
+				{ ...narratorSurfaceReadOptions(readBudget), maxRows: authorIds.length },
+			)
 		: [];
 	const byId = new Map(authors.map((author) => [author.id, author]));
 	for (const message of messages)
@@ -366,7 +406,9 @@ export async function getNarratorPanelState(
 	narratorId: string,
 	userId: string,
 	cursors: { permissionsCursor?: string; bufferCursor?: string } = {},
+	options: NarratorSurfaceReadBudget = {},
 ) {
+	const readBudget = narratorSurfaceReadOptions(options);
 	const started = performance.now();
 	const phases: Record<string, number> = {};
 	const timed = async <T>(name: string, read: Promise<T>) => {
@@ -377,9 +419,9 @@ export async function getNarratorPanelState(
 		}
 	};
 	const [permissions, buffer, draft] = await Promise.all([
-		timed("permissionsMs", permissionPage(narratorId, cursors.permissionsCursor)),
-		timed("bufferMs", bufferPage(narratorId, cursors.bufferCursor)),
-		timed("draftMs", getNarratorDraftMetadata(userId, narratorId)),
+		timed("permissionsMs", permissionPage(narratorId, cursors.permissionsCursor, readBudget)),
+		timed("bufferMs", bufferPage(narratorId, cursors.bufferCursor, readBudget)),
+		timed("draftMs", getNarratorDraftMetadata(userId, narratorId, readBudget)),
 	]);
 	const elapsedMs = Math.round(performance.now() - started);
 	if (elapsedMs >= 250)

@@ -18,6 +18,9 @@ beforeEach(() => {
 		["provider-quotas", "provider", "p", "A"],
 		["provider-quotas", "provider", "q", "B"],
 		["provider-quotas", "list", [["p", "A"]]],
+		["quota-snapshots", null, 1],
+		["quota-snapshots", { groupId: "nug", cachedOnly: true, expectedGeneration: 1 }, 1],
+		["provider-settings", "custom-api", "p"],
 		["settings"],
 		["admin", "settings"],
 		["nug", "quotas"],
@@ -34,8 +37,17 @@ afterEach(() => {
 	else Reflect.deleteProperty(globalThis, "window");
 });
 
-test("quota changes invalidate just relevant Custom API identities and lists", () => {
+test("quota changes invalidate Custom API identities and unified reads without cached-only platform reads", async () => {
 	invalidateProviderQuotaQueries(client, ["p"]);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(client.getQueryState(["quota-snapshots", null, 1])?.isInvalidated).toBe(true);
+	expect(
+		client.getQueryState([
+			"quota-snapshots",
+			{ groupId: "nug", cachedOnly: true, expectedGeneration: 1 },
+			1,
+		])?.isInvalidated,
+	).toBe(false);
 	expect(client.getQueryState(["provider-quotas", "provider", "p", "A"])?.isInvalidated).toBe(true);
 	expect(client.getQueryState(["provider-quotas", "list", [["p", "A"]]])?.isInvalidated).toBe(true);
 	expect(client.getQueryState(["provider-quotas", "provider", "q", "B"])?.isInvalidated).toBe(
@@ -157,6 +169,8 @@ test("quotaSources lifecycle mutations invalidate data-only contributions withou
 	expect(client.getQueryState(["settings"])?.isInvalidated).toBe(true);
 	expect(client.getQueryState(["admin", "settings"])?.isInvalidated).toBe(true);
 	expect(client.getQueryState(["provider-quotas", "provider", "p", "A"])?.isInvalidated).toBe(true);
+	expect(client.getQueryState(["quota-snapshots", null, 1])?.isInvalidated).toBe(true);
+	expect(client.getQueryState(["provider-settings", "custom-api", "p"])?.isInvalidated).toBe(true);
 	for (const key of [
 		["nug", "quotas"],
 		["codex", "quota"],

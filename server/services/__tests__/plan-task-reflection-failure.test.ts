@@ -7,10 +7,13 @@ import {
 } from "@shared/pretext-layout/reflection";
 import { eq } from "drizzle-orm";
 import { reflectionResolvedStatus } from "../../../frontend/components/narrator/vlist/vlist-live-events";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Tool-call id lookups read on the database Worker (file-backed WAL database).
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 const realWsModule = { ...(await import("../../websocket/narrator-ws")) };
 const realServiceModule = { ...(await import("../narrator-service")) };
@@ -56,12 +59,12 @@ afterEach(() => {
 	broadcasts.length = 0;
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realWsModule);
 	mock.module("../narrator-service", () => realServiceModule);
 	mock.restore();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 
 async function seed() {

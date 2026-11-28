@@ -113,20 +113,20 @@ function languageUpdates(request: CapturedRequest) {
 		.map(([text]) => text)
 		.filter((text) => text.includes("[language]\n"));
 }
-async function waitUntil(check: () => boolean, label: string) {
+async function waitUntil(check: () => boolean | Promise<boolean>, label: string) {
 	const deadline = Date.now() + 8_000;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() >= deadline) throw new Error(`Timed out: ${label}; requests=${requests.length}`);
 		await Bun.sleep(10);
 	}
 }
 async function idle(count: number) {
 	await waitUntil(
-		() =>
+		async () =>
 			requests.length === count &&
 			recipientRow().status === "idle" &&
 			!getExecutionOwner(recipient) &&
-			!hasPendingBufferedWork(recipient),
+			!(await hasPendingBufferedWork(recipient)),
 		"recipient idle",
 	);
 }
@@ -292,6 +292,14 @@ test("adopts queued human pairs only on consumption; Send, answers, completion a
 	await idle(2);
 
 	// The real Send agent lane has sender provenance, not a human language adoption.
+	const { ensureCommunicationNodeTx, seedFixtureCommunicationPeer } = await import(
+		"./runtime-communication-fixtures"
+	);
+	db.transaction((tx) => {
+		ensureCommunicationNodeTx(tx, sender, null);
+		ensureCommunicationNodeTx(tx, recipient, null);
+		seedFixtureCommunicationPeer(tx, sender, recipient, "user-a");
+	});
 	seedTool(sender, "send-source", "Send");
 	const text = "中文发送者的消息，不应替换收件会话语言";
 	const delivery = createAgentMessageDelivery(

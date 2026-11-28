@@ -88,6 +88,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useTeamConversationMode } from "../team-conversation-mode";
 import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
@@ -108,6 +109,10 @@ import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
+import {
+	ReasoningTranslationVisibilityContext,
+	useReasoningTranslationVisibility,
+} from "./reasoning-translation-visibility";
 import { resolveRenderExtra } from "./render-registry";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
@@ -292,6 +297,7 @@ import {
 	useTracePermissionSlots,
 } from "./vlist-permission-bridge";
 import { predictInlinePermission } from "./vlist-permission-prediction";
+import { usePersistedToolLive } from "./vlist-persisted-tool-live";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
 import { buildReflectionSourceIndex } from "./vlist-reflection-index";
@@ -401,6 +407,10 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Pause transport/subscriptions without unmounting the loaded document or anchor. */
+	suspended?: boolean;
+	/** Chat rooms have no narrator identity for error diagnostics or model actions. */
+	enableNarratorErrorActions?: boolean;
 	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
 	deferInteractions?: boolean;
 	isSubagent?: boolean;
@@ -532,6 +542,8 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				suspended = false,
+				enableNarratorErrorActions = true,
 				deferInteractions = true,
 				isSubagent,
 				isActive = false,
@@ -614,6 +626,8 @@ export const PretextExactMessageList = memo(
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const panelVisible = useNarratorPanelVisible();
+			const suspendedRef = useRef(suspended);
+			suspendedRef.current = suspended;
 			const interactionOwner = useMemo(
 				() => ({
 					narratorId,
@@ -1660,7 +1674,7 @@ export const PretextExactMessageList = memo(
 			// close button deletes the notice. The dialog is one shell-level instance
 			// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
 			// callbacks.
-			const errorNotice = useVListErrorNoticeActions(narratorId);
+			const errorNotice = useVListErrorNoticeActions(narratorId, enableNarratorErrorActions);
 
 			// Interrupt task-guard reminder cards: the heading-row close button deletes
 			// the notice. No dialog, so the resolver alone is all the shell needs.
@@ -2002,7 +2016,11 @@ export const PretextExactMessageList = memo(
 				[narratorId, truncatedToolCalls, ensureWriteSource, writeSources.isWrite],
 			);
 			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
-				useVListToolDetails(narratorId, fullDetailRequests, dataSource?.fetchToolDetail);
+				useVListToolDetails(
+					narratorId,
+					suspended ? [] : fullDetailRequests,
+					dataSource?.fetchToolDetail,
+				);
 			const resolveDocumentToolInput = useCallback(
 				(
 					toolUseId: string | undefined,
@@ -2162,10 +2180,41 @@ export const PretextExactMessageList = memo(
 				() => ({
 					...(dataSource?.fetchPage ? { fetchPage: dataSource.fetchPage } : {}),
 					...(dataSource?.locateMessage ? { locateMessage: dataSource.locateMessage } : {}),
+					refreshWindow: dataSource?.refreshWindow,
+					finalizeRefreshWindow: dataSource?.finalizeRefreshWindow,
+					refreshFailurePolicy: dataSource?.refreshFailurePolicy,
+					onRefreshError: dataSource?.onRefreshError,
 				}),
-				[dataSource?.fetchPage, dataSource?.locateMessage],
+				[
+					dataSource?.fetchPage,
+					dataSource?.locateMessage,
+					dataSource?.refreshWindow,
+					dataSource?.finalizeRefreshWindow,
+					dataSource?.refreshFailurePolicy,
+					dataSource?.onRefreshError,
+				],
+			);
+			// Team mode (the team page's coordinator column only; null on every other host).
+			// Only the coordinator's own top-level list: a subagent or nested list under the same
+			// provider builds exactly as on the session page.
+			const providedTeamMode = useTeamConversationMode();
+			const teamMode =
+				providedTeamMode && !isSubagent && providedTeamMode.narratorId === narratorId
+					? providedTeamMode
+					: null;
+			const teamConversation = useMemo(
+				() =>
+					teamMode
+						? {
+								events: teamMode.events,
+								chipLabels: teamMode.chipLabels,
+								revision: teamMode.revision,
+							}
+						: undefined,
+				[teamMode],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				suspended,
 				compactAuxiliaryContent,
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
@@ -2226,7 +2275,30 @@ export const PretextExactMessageList = memo(
 				formatUsageNumber: formatLocaleNumber,
 				onScrollTopCorrection,
 				isSubagent,
+				...(teamConversation ? { teamConversation } : {}),
 			});
+			// Team mode: report the loaded window so its events page together with the messages.
+			const teamWindowReport = teamMode?.onWindowChange;
+			const teamWindowOldestAt = pretextDocument.document?.messages[0]?.createdAt ?? null;
+			const teamWindowHasPrev = pretextDocument.document?.hasPrev ?? false;
+			useEffect(() => {
+				teamWindowReport?.({ oldestAt: teamWindowOldestAt, hasPrev: teamWindowHasPrev });
+			}, [teamWindowReport, teamWindowOldestAt, teamWindowHasPrev]);
+			useEffect(() => {
+				if (!dataSource?.onWindowChange) return;
+				if (pretextDocument.document) {
+					dataSource.onWindowChange(pretextDocument.document);
+				} else {
+					const status = (pretextDocument.error as { status?: number })?.status;
+					if (status === 401 || status === 403)
+						dataSource.onWindowChange({
+							messages: [],
+							messageVersion: 0,
+							oldestLoadedSeq: null,
+							hasPrev: false,
+						});
+				}
+			}, [dataSource?.onWindowChange, pretextDocument.document, pretextDocument.error]);
 			upsertMessageRef.current = pretextDocument.upsertMessage;
 			insertMessageRef.current = pretextDocument.insertMessage;
 			removeMessagesRef.current = pretextDocument.removeMessages;
@@ -2311,7 +2383,9 @@ export const PretextExactMessageList = memo(
 			}, [narratorId]);
 
 			const revisionSubscriptionId =
-				pretextDocument.index && pretextDocument.status !== "loading" ? narratorId : undefined;
+				!suspended && pretextDocument.index && pretextDocument.status !== "loading"
+					? narratorId
+					: undefined;
 			// Cursor AND version travel together: the server needs both to decide whether this
 			// subscriber is behind. Passing a bare cursor made `useNarratorWS` read `.cursor`
 			// off a `CatchUpCursor` and get `undefined`, silently disabling catch-up for this
@@ -2459,7 +2533,12 @@ export const PretextExactMessageList = memo(
 			// control stream once a complete document exists. Realtime mutations reload
 			// the full exact input; reconnect catch-up reloads only when it reports data.
 			const externalSubscribeMessages = dataSource?.subscribeMessages;
+			const translationVisibility = useReasoningTranslationVisibility(
+				dataSource ? undefined : revisionSubscriptionId,
+			);
 			const messageWsCallbacks: NarratorWSCallbacks = {
+				onStreamingSnapshot: translationVisibility?.resume,
+				onReasoningTranslationStatus: translationVisibility?.receive,
 				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 					upsertOrReload(wsData.message),
 				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
@@ -2515,9 +2594,11 @@ export const PretextExactMessageList = memo(
 					if (messageId) compactProgressKeysRef.current.delete(messageId);
 				},
 				onFullReload: () => {
+					translationVisibility?.resume();
 					clearAllCompactProgress();
 					compactProgressKeysRef.current.clear();
-					bumpMessageRevision();
+					if (dataSource?.refreshWindow) pretextDocumentRef.current.reload();
+					else bumpMessageRevision();
 				},
 				// Live compact-progress ticks repaint only the mounted fixed-height marker.
 				// They never enter the pretext document or its measurement cache.
@@ -2542,6 +2623,7 @@ export const PretextExactMessageList = memo(
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
 				onCatchUp: (orphanChildren, topLevel, subagentActivities): undefined => {
+					translationVisibility?.resume();
 					const initialSync = initialRevisionSyncRef.current;
 					initialRevisionSyncRef.current = false;
 					let applied = false;
@@ -2559,6 +2641,7 @@ export const PretextExactMessageList = memo(
 					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
 				},
 				onSyncOk: () => {
+					translationVisibility?.resume();
 					initialRevisionSyncRef.current = false;
 				},
 				// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
@@ -2566,6 +2649,7 @@ export const PretextExactMessageList = memo(
 				// receive, and refetch — the REST call now answers 404 and the surrounding
 				// route renders its "not found" state instead of an endless spinner.
 				onSubscribeDenied: () => {
+					translationVisibility?.pause();
 					initialRevisionSyncRef.current = false;
 					bumpMessageRevision();
 				},
@@ -2583,6 +2667,7 @@ export const PretextExactMessageList = memo(
 			const stableExternalHandlers = useMemo<NarratorWSCallbacks>(() => {
 				const forward = <K extends keyof NarratorWSCallbacks>(key: K) =>
 					((...args: unknown[]) => {
+						if (suspendedRef.current) return;
 						const handler = messageWsCallbacksRef.current[key];
 						if (typeof handler === "function") (handler as (...a: unknown[]) => void)(...args);
 					}) as never;
@@ -2602,9 +2687,9 @@ export const PretextExactMessageList = memo(
 				};
 			}, []);
 			useEffect(() => {
-				if (!externalSubscribeMessages) return;
+				if (suspended || !externalSubscribeMessages) return;
 				return externalSubscribeMessages(stableExternalHandlers);
-			}, [externalSubscribeMessages, stableExternalHandlers]);
+			}, [suspended, externalSubscribeMessages, stableExternalHandlers]);
 			// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
 			// decisions, background terminals, subagent activity). These mutate an
 			// already-loaded message in place, so they are applied as anchor-preserving
@@ -3177,7 +3262,7 @@ export const PretextExactMessageList = memo(
 			onVisibleMessagesChangeRef.current = onVisibleMessagesChange;
 			useEffect(() => {
 				const callback = onVisibleMessagesChangeRef.current;
-				if (!callback) return;
+				if (suspended || !callback) return;
 				const manifestItems = pretextDocument.manifest?.items ?? [];
 				const lastItem = manifestItems[seenWindow.end - 1];
 				const lastId = lastItem?.sourceMessageIds.at(-1) ?? null;
@@ -3189,7 +3274,7 @@ export const PretextExactMessageList = memo(
 							}
 						: null,
 				);
-			}, [seenWindow.end, pretextDocument.manifest]);
+			}, [suspended, seenWindow.end, pretextDocument.manifest]);
 
 			/**
 			 * Identity of the currently committed DOCUMENT (not its geometry).
@@ -3931,11 +4016,19 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				setStreamAnimMountEpoch(nextStreamAnimEpoch());
 			}, [narratorId]);
+			// A tool still executing after its message persisted has no synthetic card
+			// left; its live output reaches the committed card through a coalesced patch.
+			const onPersistedToolLive = usePersistedToolLive(
+				narratorId,
+				pretextDocument.applyLivePatch,
+				pretextDocument.messages,
+			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,
 				committedMessages: pretextDocument.messages,
 				fetchTextDocumentRange: textDocumentRangeReader,
+				onPersistedToolLive,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {
@@ -4235,7 +4328,7 @@ export const PretextExactMessageList = memo(
 			// exhausted). Each load grows totalHeight or clears hasPrev, so this settles.
 			// Gated on !loadingOlder so one page is in flight at a time (no request storm).
 			useEffect(() => {
-				if (pretextDocument.status !== "ready") return;
+				if (suspended || pretextDocument.status !== "ready") return;
 				if (!hasPrev || loadingOlder) return;
 				if (!pinnedToBottom || !pinnedToBottomRef.current) return;
 				if (viewportHeight <= 0) return;
@@ -4262,6 +4355,7 @@ export const PretextExactMessageList = memo(
 				loadingOlder,
 				pinnedToBottom,
 				pretextDocument.status,
+				suspended,
 				viewportHeight,
 			]);
 
@@ -4270,6 +4364,7 @@ export const PretextExactMessageList = memo(
 			// uses the header button instead. The exact rebuild anchors on the viewport
 			// top, so the prepended page grows the canvas upward with zero visible shift.
 			const maybeAutoLoadOlder = useCallback((scrollTopNow: number, atBottom: boolean) => {
+				if (suspendedRef.current) return;
 				const decision = resolveOlderHistoryAutoLoad({
 					intentAt: olderHistoryIntentAtRef.current,
 					now: Date.now(),
@@ -4290,6 +4385,7 @@ export const PretextExactMessageList = memo(
 			// do at most one window computation.
 			const processScrollFrame = useCallback(() => {
 				scrollRafRef.current = 0;
+				if (suspendedRef.current) return;
 				const node = viewportRef.current;
 				// A queued scroll rAF can run after the host parks in display:none.
 				// Zero geometry must not change pin, unread count, intent or window.
@@ -5442,6 +5538,7 @@ export const PretextExactMessageList = memo(
 						rowInteraction: traceBinding?.rowInteraction,
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
+						canCalibrateModelTrace: item.spec.kind === "modeltrace-result" && !dataSource,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
 						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,
@@ -5623,9 +5720,11 @@ export const PretextExactMessageList = memo(
 										/>
 									);
 								})}
-								<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
-									{windowRowElements}
-								</VListInteractionAdmissionContext.Provider>
+								<ReasoningTranslationVisibilityContext.Provider value={translationVisibility}>
+									<VListInteractionAdmissionContext.Provider value={interactionAdmission}>
+										{windowRowElements}
+									</VListInteractionAdmissionContext.Provider>
+								</ReasoningTranslationVisibilityContext.Provider>
 							</div>
 						) : (
 							// Loading / error placeholder. While the document is being fetched and

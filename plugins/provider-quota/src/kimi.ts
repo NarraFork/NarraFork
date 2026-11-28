@@ -187,5 +187,7 @@ export function kimiQuotaData(payload: KimiUsagePayload): QuotaData | null {
 	add("monthly", payload.monthly);
 	for (const [index, window] of payload.extraWindows.entries())
 		add(`extra:${index}`, window, window.label);
-	return windows.length && windows.length <= 32 ? { amounts: [], windows } : null;
+	return windows.length && windows.length <= 32
+		? { scope: "subscription", amounts: [], windows }
+		: null;
 }

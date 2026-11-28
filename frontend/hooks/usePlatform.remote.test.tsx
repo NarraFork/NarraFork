@@ -38,10 +38,7 @@ const {
 	useOutlineQuestionGroups,
 	useOutlineQuestionsLive,
 } = await import("./useOutline");
-const { useDeepSeekBalance } = await import("./useDeepSeekBalance");
-const { useOpencodeUsage } = await import("./useOpencodeUsage");
-const { useProviderBalance } = await import("./useProviderBalance");
-const { useTokenDanceBalance } = await import("./useTokenDanceBalance");
+const { useQuotaSnapshots, useQuotaSnapshot } = await import("./useQuotaSnapshots");
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root;
 let client: QueryClient;
@@ -130,10 +127,8 @@ function Probe() {
 		],
 		true,
 	);
-	useDeepSeekBalance("provider", "generation", true);
-	useOpencodeUsage("provider", "generation", true);
-	useProviderBalance("provider", "generation", true);
-	useTokenDanceBalance(1, true);
+	useQuotaSnapshots(true);
+	useQuotaSnapshot("provider", "credential", true);
 	const outline = useOutlineEnabled();
 	const cachedOutline = useOutlineEnabledInCache();
 	return (

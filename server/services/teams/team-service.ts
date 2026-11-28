@@ -23,6 +23,7 @@ import {
 	type TeamDetail,
 	type TeamEventKind,
 	type TeamSettings,
+	type TeamSettingsPatch,
 	type TeamStatus,
 	type TeamSummary,
 } from "@shared/project-teams";
@@ -44,12 +45,14 @@ import {
 	narratorReadableWhere,
 } from "../narrator-acl";
 import { type NarratorCreationTransaction, narratorService } from "../narrator-service";
+import { isGitWorkTree, teamGit } from "./team-git";
 import {
 	currentTeamStatusActor,
 	personActor,
 	runAsTeamStatusActor,
 	type TeamStatusActor,
 } from "./team-records";
+import { peekWorkStartDefault } from "./team-work-start";
 
 type TeamRow = typeof projectTeams.$inferSelect;
 type CoordinatorRow = {
@@ -109,13 +112,15 @@ function toDetail(team: TeamRow, coordinator: CoordinatorRow, access: TeamAccess
 		...toSummary(team, coordinator, utf8Bytes(team.brief), access),
 		brief: team.brief,
 		settings: team.settingsJson ?? {},
+		// W: what applies when the team sets no work start (cached hosting; null while checking).
+		workStartDefault: peekWorkStartDefault(team.projectId),
 	};
 }
 
 type EventExecutor = Pick<typeof db, "insert">;
 
 /** Append one team-level event. Synchronous so it can share a caller's transaction. */
-function recordTeamEvent(
+export function recordTeamEvent(
 	executor: EventExecutor,
 	teamId: string,
 	kind: TeamEventKind,
@@ -193,6 +198,41 @@ export async function getTeam(
 	return toDetail(team, coordinator, access);
 }
 
+/**
+ * The git checks every new team makes before anything is written, on every path that makes one
+ * (`createTeam`, and the upgrade of a session in `team-conversion.ts`):
+ * - the project directory is a local git work tree (`TEAM_PROJECT_NOT_GIT`): a project may be
+ *   associated with any existing folder, but a team's work items branch from a work tree;
+ * - the base branch resolves to a commit there (`TEAM_BASE_BRANCH_UNRESOLVED`): a base that names
+ *   no commit (a repository with only `master` and the schema default `main`, a typo) would leave
+ *   every work item unable to create its worktree. A project default git could not read as one
+ *   revision is answered the same way.
+ * Async git I/O: callers run it outside any synchronous transaction.
+ */
+export async function assertTeamProjectUsable(
+	project: { gitPath: string },
+	baseBranch: string,
+): Promise<void> {
+	if (!(await isGitWorkTree(project.gitPath)))
+		throw new AppError(
+			"A team needs a project whose directory is a local git work tree",
+			409,
+			"TEAM_PROJECT_NOT_GIT",
+		);
+	const baseCommit = await teamGit(project.gitPath)
+		.resolveCommit(baseBranch)
+		.catch((error: unknown) => {
+			if (error instanceof ValidationError) return null;
+			throw error;
+		});
+	if (!baseCommit)
+		throw new AppError(
+			`The base branch "${baseBranch}" does not resolve to a commit in the project's repository`,
+			409,
+			"TEAM_BASE_BRANCH_UNRESOLVED",
+		);
+}
+
 export interface CreateTeamInput {
 	projectId: string;
 	name: string;
@@ -226,6 +266,8 @@ export async function createTeam(
 		throw new AppError("An archived project cannot get a new team", 409, "PROJECT_ARCHIVED");
 	if (!project.gitPath)
 		throw new ValidationError("A team needs a project with a git repository directory");
+	const baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
+	await assertTeamProjectUsable({ gitPath: project.gitPath }, baseBranch);
 
 	const audiences = resolveNarratorAudiences(
 		input.visibility,
@@ -234,7 +276,6 @@ export async function createTeam(
 		settings.agent.defaultNarratorVisibility,
 		settings.agent.defaultNarratorWriteAudience,
 	);
-	const baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
 	const brief = input.brief ?? "";
 	const teamSettings = input.settings ?? {};
 
@@ -273,6 +314,7 @@ export async function createTeam(
 			},
 		},
 	);
+	eventBus.emit({ type: "team:communication_changed", teamId: narrator.id });
 	logger.info("Team created", { teamId: narrator.id, projectId: project.id });
 	return getTeam(narrator.id, principal);
 }
@@ -280,7 +322,22 @@ export async function createTeam(
 export interface UpdateTeamInput {
 	baseBranch?: string;
 	brief?: string;
-	settings?: TeamSettings;
+	/** Only these keys change, merged into the stored settings; `null` removes a key. */
+	settings?: TeamSettingsPatch;
+}
+
+/** Stored settings with a patch applied (`null` removes a key). */
+export function applySettingsPatch(
+	current: TeamSettings | null | undefined,
+	patch: TeamSettingsPatch,
+): TeamSettings {
+	const next: Record<string, unknown> = { ...(current ?? {}) };
+	for (const [key, value] of Object.entries(patch)) {
+		if (value === undefined) continue;
+		if (value === null) delete next[key];
+		else next[key] = value;
+	}
+	return next as TeamSettings;
 }
 
 export async function updateTeam(
@@ -296,25 +353,57 @@ export async function updateTeam(
 			409,
 			"TEAM_ARCHIVED",
 		);
+	// A new base must name a commit in the project's repository, as at creation: otherwise every
+	// later work item's worktree fails. Async git (bounded by team-git's timeout), outside the
+	// transaction; the transaction refuses if the project's directory changed meanwhile.
+	const changingBase = patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch;
+	const checkedGitPath = changingBase ? projectGitPath(team.projectId) : null;
+	if (changingBase && patch.baseBranch !== undefined) {
+		if (!checkedGitPath)
+			throw new AppError(
+				"The team's project has no repository directory",
+				409,
+				"TEAM_PROJECT_NOT_GIT",
+			);
+		await assertTeamProjectUsable({ gitPath: checkedGitPath }, patch.baseBranch);
+	}
 	const now = new Date().toISOString();
 	const actor = { kind: "person" as const, id: principal.userId || null };
+	let settingsChanged = false;
 	db.transaction((tx) => {
+		if (changingBase && projectGitPath(team.projectId, tx) !== checkedGitPath)
+			throw new AppError(
+				"The project's repository changed while the base branch was checked; try again",
+				409,
+				"TEAM_PROJECT_CHANGED",
+			);
+		// Merged with what is stored now, inside the transaction: a concurrent change of another
+		// setting is kept.
+		const stored =
+			patch.settings !== undefined
+				? (tx
+						.select({ settings: projectTeams.settingsJson })
+						.from(projectTeams)
+						.where(eq(projectTeams.narratorId, teamId))
+						.limit(1)
+						.get()?.settings ?? {})
+				: null;
+		const settingsJson =
+			patch.settings !== undefined ? applySettingsPatch(stored, patch.settings) : undefined;
+		settingsChanged =
+			settingsJson !== undefined && JSON.stringify(settingsJson) !== JSON.stringify(stored ?? {});
 		tx.update(projectTeams)
 			.set({
 				...(patch.baseBranch !== undefined ? { baseBranch: patch.baseBranch } : {}),
 				...(patch.brief !== undefined ? { brief: patch.brief } : {}),
-				...(patch.settings !== undefined ? { settingsJson: patch.settings } : {}),
+				...(settingsJson !== undefined ? { settingsJson } : {}),
 				updatedAt: now,
 			})
 			.where(eq(projectTeams.narratorId, teamId))
 			.run();
 		if (patch.brief !== undefined && patch.brief !== team.brief)
 			recordTeamEvent(tx, teamId, "team.brief", actor, { bytes: utf8Bytes(patch.brief) }, now);
-		if (
-			(patch.settings !== undefined &&
-				JSON.stringify(patch.settings) !== JSON.stringify(team.settingsJson ?? {})) ||
-			(patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch)
-		)
+		if (settingsChanged || (patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch))
 			recordTeamEvent(
 				tx,
 				teamId,
@@ -327,7 +416,23 @@ export async function updateTeam(
 				now,
 			);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return getTeam(teamId, principal, projectId);
+}
+
+/** A project's repository directory (primary key), or null. */
+function projectGitPath(
+	projectId: string,
+	executor: Pick<typeof db, "select"> = db,
+): string | null {
+	return (
+		executor
+			.select({ gitPath: projects.gitPath })
+			.from(projects)
+			.where(eq(projects.id, projectId))
+			.limit(1)
+			.get()?.gitPath ?? null
+	);
 }
 
 /**
@@ -368,6 +473,7 @@ function syncTeamStatus(teamId: string, archived: boolean, actor: TeamStatusActo
 			now,
 		);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return true;
 }
 
@@ -500,7 +606,20 @@ export async function listProjectTeams(
 export function startTeamStatusSync(): () => void {
 	const onStatus = (event: { narratorId: string; status: string }) => {
 		try {
-			syncTeamStatus(event.narratorId, event.status === "archived", currentTeamStatusActor());
+			const archived = event.status === "archived";
+			const changed = syncTeamStatus(event.narratorId, archived, currentTeamStatusActor());
+			// An archived team leaves every sidebar it was pinned to (unarchiving does not bring the
+			// tab back: pinning it again is one click on the team page).
+			if (changed && archived) {
+				void import("../recent-tabs-service")
+					.then(({ pruneTeamTabs }) => pruneTeamTabs(event.narratorId))
+					.catch((error) =>
+						logger.warn("Failed to remove an archived team's tabs", {
+							teamId: event.narratorId,
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					);
+			}
 		} catch (error) {
 			logger.warn("Team status sync failed", {
 				teamId: event.narratorId,

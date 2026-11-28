@@ -4,7 +4,7 @@ import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
-import { getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { readTestMessageContent } from "../../../tests/setup";
 import {
 	apiRequests,
 	narratorMessageRefs,
@@ -19,17 +19,21 @@ import {
 	tryClaimExecution,
 } from "../agent-runtime/ownership";
 import type { TokenUsageSnapshot } from "../narrator-event-handler";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // Functional in-memory test db (not empty stubs): Bun's mock.module is global
 // and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
 // Do NOT import the real `../../db` first: that opens the runtime database and runs
 // drizzle migrations (journal may reference SQL files that are gitignored / absent).
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const dbStub = {
 	db,
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
 	releaseDatabaseInstanceLockOnly: () => {},
@@ -62,6 +66,7 @@ const {
 	retireSubagentOutputCharCount,
 } = await import("../narrator-event-handler");
 
+const { streamQuotaIdentityForRequest } = await import("../../lib/provider-key-subjects");
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 
 const PARENT_NARRATOR_ID = "parent-narrator";
@@ -557,8 +562,42 @@ test("sealing a streamed assistant retains final duration, TTFT and metering wit
 });
 
 const outputOwners = new Map<string, ExecutionOwner>();
+function quotaIdentityForTarget(
+	prefix: string,
+	target: import("../provider-quota-push").CustomApiQuotaPushTarget,
+) {
+	const identity = streamQuotaIdentityForRequest(prefix, {
+		credentialId: target.keyId ?? target.providerId,
+	});
+	if (!identity) throw new Error("Missing captured quota credential identity");
+	return identity;
+}
+
+let streamQuotaFixture:
+	| ReturnType<
+			typeof import("../../lib/__tests__/provider-quota-legacy-fixture").legacyQuotaFixture
+	  >
+	| undefined;
+
+async function useStreamQuotaFixture(
+	providers: import("../../lib/settings").CustomApiProviderConfig[],
+) {
+	const { legacyQuotaFixture } = await import("../../lib/__tests__/provider-quota-legacy-fixture");
+	const { customApiQuotaTargets } = await import("../provider-quota-targets");
+	const quota = legacyQuotaFixture(providers);
+	streamQuotaFixture = quota;
+	spyOn(customApiQuotaTargets, "list").mockImplementation(() => quota.directory.list());
+	spyOn(customApiQuotaTargets, "get").mockImplementation((id) => quota.directory.get(id));
+	spyOn(customApiQuotaTargets, "getKey").mockImplementation((id) => quota.directory.getKey(id));
+	return quota;
+}
 
 afterEach(() => {
+	if (streamQuotaFixture) {
+		streamQuotaFixture.dispose();
+		streamQuotaFixture = undefined;
+		mock.restore();
+	}
 	for (const [id, owner] of outputOwners) {
 		const runId = getRunControl(id)?.logicalRunId;
 		if (runId) retireSubagentOutputCharCount(id, runId);
@@ -573,12 +612,13 @@ afterEach(() => {
 	broadcastTargets.length = 0;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	// Leave the in-memory stub in place. Bun's mock.module is process-global and
 	// mock.restore() does not undo module mocks; re-pointing at a lazily imported
 	// real `../../db` would open the runtime database mid-suite.
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+	await fixture.close();
 });
 
 async function cleanupFileContextNarrator(id: string) {
@@ -3259,10 +3299,12 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 	const first = make("switch-quota-a");
 	const second = make("switch-quota-b");
 	try {
-		settings.customApiProviders = [first, second];
+		await useStreamQuotaFixture([first, second]);
 		const a = captureCustomApiQuotaPushTarget(first.prefix);
 		const b = captureCustomApiQuotaPushTarget(second.prefix);
 		if (!a || !b) throw new Error("Missing quota fixture identity");
+		const aIdentity = quotaIdentityForTarget(first.prefix, a);
+		const bIdentity = quotaIdentityForTarget(second.prefix, b);
 		const ctx = {
 			...makeMainContext(),
 			provider: first.prefix,
@@ -3271,11 +3313,24 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 		};
 		await processEvent({ type: "model_switched", provider: second.prefix, model: "model-b" }, ctx);
 		expect(ctx.customApiQuotaTarget).toEqual(b);
-		await processEvent({ type: "quota_balance", quotaBalance: "0", customApiQuotaTarget: b }, ctx);
+		await processEvent(
+			{
+				type: "quota_balance",
+				quotaBalance: "0",
+				customApiQuotaTarget: b,
+				providerIdentity: bIdentity,
+			},
+			ctx,
+		);
 		expect(getCustomApiCachedQuota(second.id)).toMatchObject({ quotaBalance: "0" });
 		const sent = broadcastMessages.length;
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "999", customApiQuotaTarget: a },
+			{
+				type: "quota_balance",
+				quotaBalance: "999",
+				customApiQuotaTarget: a,
+				providerIdentity: aIdentity,
+			},
 			ctx,
 		);
 		expect(broadcastMessages).toHaveLength(sent);
@@ -3289,7 +3344,12 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 		expect(ctx.customApiQuotaTarget).toEqual(b);
 		const beforeRotationFrame = broadcastMessages.length;
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "888", customApiQuotaTarget: b },
+			{
+				type: "quota_balance",
+				quotaBalance: "888",
+				customApiQuotaTarget: b,
+				providerIdentity: bIdentity,
+			},
 			ctx,
 		);
 		expect(broadcastMessages).toHaveLength(beforeRotationFrame);
@@ -3300,7 +3360,12 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 		expect(ctx.customApiQuotaTarget).toBeNull();
 		const afterSwitch = broadcastMessages.length;
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "777", customApiQuotaTarget: b },
+			{
+				type: "quota_balance",
+				quotaBalance: "777",
+				customApiQuotaTarget: b,
+				providerIdentity: bIdentity,
+			},
 			ctx,
 		);
 		expect(broadcastMessages).toHaveLength(afterSwitch);
@@ -3312,7 +3377,6 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 
 describe("Custom API stream quota generation", () => {
 	test("a captured old-account balance is neither broadcast nor persisted after rotation", async () => {
-		const { settings } = await import("../../lib/settings");
 		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
 		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
 			"../../lib/custom-api-quota-cache"
@@ -3326,10 +3390,11 @@ describe("Custom API stream quota generation", () => {
 			protocol: "completions-compatible" as const,
 			defaultModel: "model",
 		};
-		settings.customApiProviders = [provider];
+		await useStreamQuotaFixture([provider]);
 		purgeCustomApiQuotaCache([provider.id]);
 		const target = captureCustomApiQuotaPushTarget(provider.prefix);
 		if (!target) throw new Error("expected captured Custom API target");
+		const providerIdentity = quotaIdentityForTarget(provider.prefix, target);
 		const ctx = {
 			...makeMainContext(),
 			providerPrefix: provider.prefix,
@@ -3338,7 +3403,12 @@ describe("Custom API stream quota generation", () => {
 		provider.apiKey = "new-key";
 		const before = broadcastMessages.length;
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "999", detailedQuotaBalance: "old account" },
+			{
+				type: "quota_balance",
+				quotaBalance: "999",
+				detailedQuotaBalance: "old account",
+				providerIdentity,
+			},
 			ctx,
 		);
 		expect(broadcastMessages.length).toBe(before);
@@ -3346,7 +3416,6 @@ describe("Custom API stream quota generation", () => {
 	});
 
 	test("current stream quota keeps zero, target identity and the existing push cache", async () => {
-		const { settings } = await import("../../lib/settings");
 		const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
 		const { getCustomApiCachedQuota, purgeCustomApiQuotaCache } = await import(
 			"../../lib/custom-api-quota-cache"
@@ -3360,11 +3429,17 @@ describe("Custom API stream quota generation", () => {
 			protocol: "completions-compatible" as const,
 			defaultModel: "model",
 		};
-		settings.customApiProviders = [provider];
+		await useStreamQuotaFixture([provider]);
 		const target = captureCustomApiQuotaPushTarget(provider.prefix);
 		if (!target) throw new Error("expected captured Custom API target");
+		const providerIdentity = quotaIdentityForTarget(provider.prefix, target);
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "0", detailedQuotaBalance: "live detail" },
+			{
+				type: "quota_balance",
+				quotaBalance: "0",
+				detailedQuotaBalance: "live detail",
+				providerIdentity,
+			},
 			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
 		);
 		expect(broadcastMessages.at(-1)).toMatchObject({
@@ -3373,6 +3448,7 @@ describe("Custom API stream quota generation", () => {
 			quotaBalance: "0",
 		});
 		expect(getCustomApiCachedQuota(provider.id)).toMatchObject({
+			generation: target.generation,
 			quotaBalance: "0",
 			detailedQuotaBalance: "live detail",
 		});
@@ -3381,7 +3457,6 @@ describe("Custom API stream quota generation", () => {
 });
 
 test("a captured Custom API quota pass never feeds the independent NUG cache", async () => {
-	const { settings } = await import("../../lib/settings");
 	const { captureCustomApiQuotaPushTarget } = await import("../provider-quota-push");
 	const { purgeCustomApiQuotaCache } = await import("../../lib/custom-api-quota-cache");
 	const nug = await import("../../routes/nug");
@@ -3395,12 +3470,13 @@ test("a captured Custom API quota pass never feeds the independent NUG cache", a
 		protocol: "completions-compatible" as const,
 		defaultModel: "model",
 	};
-	settings.customApiProviders = [provider];
+	await useStreamQuotaFixture([provider]);
 	const target = captureCustomApiQuotaPushTarget(provider.prefix);
 	if (!target) throw new Error("expected captured Custom API target");
+	const providerIdentity = quotaIdentityForTarget(provider.prefix, target);
 	try {
 		await processEvent(
-			{ type: "quota_balance", quotaBalance: "999" },
+			{ type: "quota_balance", quotaBalance: "999", providerIdentity },
 			{ ...makeMainContext(), providerPrefix: provider.prefix, customApiQuotaTarget: target },
 		);
 		expect(update).not.toHaveBeenCalled();
@@ -3448,6 +3524,54 @@ describe("quota and payment frames stay with their own session", () => {
 		expect(self).not.toHaveProperty("isSubagent");
 	});
 
+	test("private attempt identity reaches both cache updaters but never public frames", async () => {
+		const { streamQuotaIdentity } = await import("../../lib/provider-key-subjects");
+		const privateIdentity = streamQuotaIdentity(
+			{ id: "quota-test", baseUrl: "https://quota.test", apiKey: "private-api-key" },
+			"actual-B",
+		);
+		const customQuota = await import("../../lib/custom-api-quota-cache");
+		const nugQuota = await import("../../routes/nug");
+		const customUpdate = spyOn(customQuota, "updateCustomApiQuotaByPrefix").mockImplementation(
+			() => {},
+		);
+		const nugUpdate = spyOn(nugQuota, "updateNugQuotaByPrefix").mockImplementation(() => {});
+		try {
+			await processEvent(
+				{
+					type: "quota_balance",
+					quotaBalance: "0",
+					detailedQuotaBalance: "actual account",
+					providerIdentity: privateIdentity,
+				},
+				{ ...makeMainContext(), providerPrefix: "quota-test" },
+			);
+			expect(customUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				"0",
+				"actual account",
+				privateIdentity,
+				undefined,
+			);
+			expect(nugUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				0,
+				"actual account",
+				undefined,
+				privateIdentity,
+			);
+			for (const frame of framesOf("quota_balance")) {
+				expect(frame).not.toHaveProperty("providerIdentity");
+				expect(frame).not.toHaveProperty("credentialId");
+				expect(JSON.stringify(frame)).not.toContain("private-api-key");
+				expect(JSON.stringify(frame)).not.toContain("actual-B");
+			}
+		} finally {
+			customUpdate.mockRestore();
+			nugUpdate.mockRestore();
+		}
+	});
+
 	test("a primary narrator quota frame carries no subagent marker", async () => {
 		await processEvent({ type: "quota_balance", quotaBalance: "12.5" }, makeMainContext());
 		const [frame] = framesOf("quota_balance");
@@ -3465,6 +3589,42 @@ describe("quota and payment frames stay with their own session", () => {
 			narratorId: PARENT_NARRATOR_ID,
 			isSubagent: true,
 		});
+	});
+
+	test("公开付款帧只携带专用opaque context，不泄露CID或私有STREAM identity", async () => {
+		const paymentContext = `npc1.${(Date.now() + 900000).toString(36)}.${"n".repeat(22)}.${"m".repeat(43)}`;
+		const event = {
+			type: "payment_required" as const,
+			message: "private-secret",
+			providerId: "nug-1",
+			providerPrefix: "nug",
+			paymentContext,
+			credentialId: "private-cid-B",
+			providerIdentity: '["private-secret","private-cid-B"]',
+			resumeAction: "retry" as const,
+		};
+		await processEvent(event, makeMainContext());
+		const [frame] = framesOf("payment_required");
+		expect(frame).toMatchObject({ narratorId: PARENT_NARRATOR_ID, paymentContext });
+		expect(frame).not.toHaveProperty("credentialId");
+		expect(frame).not.toHaveProperty("providerIdentity");
+		expect(JSON.stringify(frame)).not.toContain("private-cid-B");
+		expect(JSON.stringify(frame)).not.toContain("private-secret");
+	});
+
+	test("错误地填入私有identity的付款context在公开边界被丢弃", async () => {
+		await processEvent(
+			{
+				type: "payment_required",
+				message: "private-secret",
+				paymentContext: '["private-cid","private-secret"]',
+				resumeAction: "retry",
+			},
+			makeMainContext(),
+		);
+		const [frame] = framesOf("payment_required");
+		expect(frame).not.toHaveProperty("paymentContext");
+		expect(JSON.stringify(frame)).not.toContain("private-secret");
 	});
 
 	test("a subagent payment_required is tagged for the parent and stripped for its own page", async () => {

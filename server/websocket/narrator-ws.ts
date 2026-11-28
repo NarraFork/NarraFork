@@ -6,6 +6,7 @@ import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
 } from "@shared/pretext-layout/text-document";
+import type { ReasoningTranslationVisibilityReport } from "@shared/reasoning-translation";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
@@ -24,17 +25,19 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION;
 
 import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
-import { and, count as countFn, eq, inArray } from "drizzle-orm";
+import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, narratorToolCalls, terminals } from "../db/schema";
+import { narrators, narratorToolCalls, terminals, users } from "../db/schema";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
+import { AppError, ForbiddenError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getUserLanguage } from "../lib/prompt-i18n";
+import { getSettingsRevision, subscribeSettingsChanges } from "../lib/settings";
 import { narratorWsMessageSchema } from "../lib/validators";
 import type {
 	BlockAllSkillsResult,
@@ -71,6 +74,12 @@ import {
 	toBufferSummary,
 	updateBufferedMessage,
 } from "../services/narrator-session";
+import {
+	committedNarratorStatusPatch,
+	type NarratorStatusVersion,
+	narratorStatusPatchColumns,
+	nextNarratorStatusVersion,
+} from "../services/narrator-status-version";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { permissionPolicyChanges } from "../services/permission-rule-service";
 import { broadcastProviderQuotaInvalidation } from "../services/provider-quota-events";
@@ -78,7 +87,7 @@ import { customApiQuotaTargets } from "../services/provider-quota-targets";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
 	isPublicToolSourceAllowed,
-	projectPublicNarratorEvent,
+	projectPublicNarratorEvent as projectPublicNarratorPayloadEvent,
 	rememberPublicToolIdentity,
 } from "../services/public-narrator-share-gen-ui";
 import {
@@ -86,6 +95,7 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { reasoningTranslationScheduler } from "../services/reasoning-translation-runtime";
 import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
@@ -95,6 +105,7 @@ import {
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
 import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./editor-file-ws";
+import { registerExecutionDeviceChangeBroadcast } from "./execution-device-events";
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import { projectNarratorActivityEvent } from "./narrator-activity-projection";
 import {
@@ -103,6 +114,10 @@ import {
 	toBlockSnapshot,
 	toolOpened,
 } from "./narrator-block-protocol";
+import {
+	handleCommunicationMessage,
+	releaseCommunicationSubscriptions,
+} from "./narrator-communication-ws";
 import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
@@ -169,8 +184,10 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 // Client → Server messages
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
+	| ReasoningTranslationVisibilityReport
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
+	| import("@shared/narrator-communication").CommunicationClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -199,7 +216,7 @@ export type NarratorClientMessage =
 	| { type: "remove_buffer"; narratorId: string; messageId: string }
 	| { type: "presence_join"; narratorId: string }
 	| { type: "presence_leave"; narratorId: string }
-	| { type: "chat_subscribe"; roomIds: string[] }
+	| { type: "chat_subscribe"; roomIds: string[]; requestId?: string }
 	| { type: "chat_unsubscribe"; roomIds: string[] }
 	| { type: "subscribe_stats" }
 	| { type: "unsubscribe_stats" }
@@ -216,6 +233,88 @@ export type NarratorClientMessage =
 // === Connection registry ===
 
 type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
+
+const translationHolders = new WeakMap<NarratorWS, Map<string, { narratorId: string }>>();
+
+function releaseTranslationDemand(ws: NarratorWS, narratorId?: string): void {
+	const holders = translationHolders.get(ws);
+	for (const [id, holder] of holders ?? []) {
+		if (narratorId && holder.narratorId !== narratorId) continue;
+		reasoningTranslationScheduler.replace(holder, []);
+		holders?.delete(id);
+	}
+}
+
+function setTranslationDemand(ws: NarratorWS, report: ReasoningTranslationVisibilityReport): void {
+	const { narratorId, visibilityId, targets } = report;
+	const userId = ws.data.userId;
+	if (
+		!userId ||
+		!connections.has(ws) ||
+		!ws.data.subscribedNarrators.has(narratorId) ||
+		ws.data.activityOnlyNarrators?.has(narratorId)
+	)
+		return;
+	const holders = translationHolders.get(ws) ?? new Map<string, { narratorId: string }>();
+	const previous = holders.get(visibilityId);
+	if (previous && previous.narratorId !== narratorId) return;
+	if (!targets.length) {
+		if (previous) reasoningTranslationScheduler.replace(previous, []);
+		holders.delete(visibilityId);
+		return;
+	}
+	if (!previous && holders.size >= 8) return;
+	const holder = previous ?? { narratorId };
+	holders.set(visibilityId, holder);
+	translationHolders.set(ws, holders);
+	const viewer = {
+		narratorId,
+		userId,
+		authorize: async (owner: string) => {
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { role: true },
+			});
+			if (!user) return false;
+			const principal = { userId, isAdmin: user.role === "admin" };
+			return (
+				(await authorizeNarratorId(narratorId, principal, "write")) &&
+				(owner === narratorId || (await authorizeNarratorId(owner, principal, "write")))
+			);
+		},
+	};
+	reasoningTranslationScheduler.replace(
+		holder,
+		targets.map((target) => ({
+			viewer,
+			target,
+			publish: (patch) => {
+				broadcastToNarrator(narratorId, patch);
+				if (patch.ownerNarratorId !== narratorId)
+					broadcastToNarrator(patch.ownerNarratorId, {
+						...patch,
+						narratorId: patch.ownerNarratorId,
+					});
+			},
+		})),
+		({ target }, status) =>
+			queueMicrotask(() => {
+				if (
+					!connections.has(ws) ||
+					!ws.data.subscribedNarrators.has(narratorId) ||
+					ws.data.activityOnlyNarrators?.has(narratorId)
+				)
+					return;
+				safeSend(ws, {
+					type: "reasoning_translation_status",
+					narratorId,
+					visibilityId,
+					target,
+					status,
+				});
+			}),
+	);
+}
 
 type ViewerInfo = {
 	userId: string;
@@ -258,12 +357,14 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	releaseTranslationDemand(ws);
 	toolInputLaneSender.close(ws);
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
 	releaseEditorFileSubscriptions(ws);
 	releaseOutlinePageSubscriptions(ws);
+	releaseCommunicationSubscriptions(ws);
 	releaseOutlineLive(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
@@ -300,6 +401,11 @@ const chatRoomSubscribers = hotSafe(
 /** Per-connection ceiling, mirroring the narrator subscription cap's intent. */
 export const MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION = 50;
 
+// Each owner needs its own ACK. Unsubscribe cancels every pending join for a room,
+// but another simultaneous subscribe must not invalidate an earlier owner's ACK.
+type PendingChatJoin = { requestId?: string };
+const pendingChatJoins = new WeakMap<NarratorWS, Map<string, Set<PendingChatJoin>>>();
+
 function addChatSubscription(ws: NarratorWS, roomId: string): void {
 	ws.data.subscribedChatRooms.add(roomId);
 	let subscribers = chatRoomSubscribers.get(roomId);
@@ -311,6 +417,7 @@ function addChatSubscription(ws: NarratorWS, roomId: string): void {
 }
 
 function removeChatSubscription(ws: NarratorWS, roomId: string): void {
+	pendingChatJoins.get(ws)?.delete(roomId);
 	ws.data.subscribedChatRooms.delete(roomId);
 	const subscribers = chatRoomSubscribers.get(roomId);
 	if (!subscribers) return;
@@ -805,6 +912,32 @@ permissionPolicyBridge.dispose = permissionPolicyChanges.on((event) => {
 	broadcastToNarrator(event.narratorId, event);
 });
 
+/** Status details are account-only; keep public broadcasts and snapshots on one whitelist. */
+function projectPublicNarratorEvent<T extends { type: string }>(
+	narratorId: string,
+	message: T,
+): T | null {
+	if (message.type !== "status_change" && message.type !== "substatus_change")
+		return projectPublicNarratorPayloadEvent(narratorId, message);
+	const source = message as Record<string, unknown>;
+	const projected: Record<string, unknown> = {};
+	for (const key of [
+		"type",
+		"narratorId",
+		"status",
+		"substatus",
+		"turnStartedAt",
+		"updatedAt",
+		"messageCount",
+		"statusEpoch",
+		"statusRevision",
+		"backgroundWorkActive",
+	]) {
+		if (Object.hasOwn(source, key)) projected[key] = source[key];
+	}
+	return projected as T;
+}
+
 function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	message: T,
 	subscriptionRequestId?: string,
@@ -1061,10 +1194,11 @@ type NarratorStatusRow = {
 	status: string;
 	substatus: string | null;
 	turnStartedAt: string | null;
-};
+} & NarratorStatusVersion;
 
-async function loadStatusRows(narratorIds: string[]): Promise<NarratorStatusRow[]> {
+function loadStatusRows(narratorIds: string[]): NarratorStatusRow[] {
 	if (narratorIds.length === 0) return [];
+	const version = nextNarratorStatusVersion();
 	return db
 		.select({
 			id: narrators.id,
@@ -1073,7 +1207,9 @@ async function loadStatusRows(narratorIds: string[]): Promise<NarratorStatusRow[
 			turnStartedAt: narrators.turnStartedAt,
 		})
 		.from(narrators)
-		.where(inArray(narrators.id, narratorIds));
+		.where(inArray(narrators.id, narratorIds))
+		.all()
+		.map((row) => ({ ...row, ...version }));
 }
 
 function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnapshotItem {
@@ -1082,12 +1218,26 @@ function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnaps
 		status: row.status,
 		substatus: parseSubstatus(row.substatus),
 		turnStartedAt: row.turnStartedAt ?? undefined,
+		statusEpoch: row.statusEpoch,
+		statusRevision: row.statusRevision,
 	};
 }
 
 // Panel snapshots retain the existing per-narrator status_change behavior.
 async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
-	const rows = await loadStatusRows(narratorIds);
+	if (narratorIds.length === 0) return;
+	// Allocate before the synchronous read, never after the occupancy await below.
+	const version = nextNarratorStatusVersion();
+	// Panel-only detail columns: high-cardinality list snapshots must stay lightweight.
+	const rows = db
+		.select({
+			id: narrators.id,
+			...narratorStatusPatchColumns,
+		})
+		.from(narrators)
+		.where(inArray(narrators.id, narratorIds))
+		.all()
+		.map((row) => ({ ...row, ...version }));
 	// Replay the done-transition suppression flag: an idle+unread narrator whose
 	// background work is still running must not re-trigger the client's sound/PWA
 	// on (re)subscribe. Consumed by RecentTabs' shared-connection listener, which
@@ -1117,6 +1267,7 @@ async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promis
 			!safeSend(ws, {
 				type: "status_change",
 				...item,
+				...(await committedNarratorStatusPatch(row.id, row)),
 				...(backgroundWorkActive ? { backgroundWorkActive } : {}),
 			})
 		)
@@ -1579,6 +1730,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 			verdicts.set(cacheKey, allowed);
 		}
 		if (allowed) continue;
+		releaseTranslationDemand(ws, narratorId);
 		ws.data.subscribedNarrators.delete(narratorId);
 		toolInputLaneSender.clearNarrator(ws, narratorId);
 		safeSend(ws, { type: "subscribe_denied", narratorId });
@@ -1740,6 +1892,13 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 	}
 }
 
+// A revision-only hint: clients re-read their own bounded projections after authorization.
+if (hotOnce("narrafork.settingsRuntimeWs.listenersRegistered")) {
+	subscribeSettingsChanges(() => {
+		broadcastToAll({ type: "settings_runtime_changed", revision: getSettingsRevision() });
+	});
+}
+
 // A separate hot-reload key activates this bridge in already-running development modules.
 if (hotOnce("narrafork.fastModeWs.listenersRegistered")) {
 	eventBus.on("narrator:imported", () => {
@@ -1786,7 +1945,13 @@ async function broadcastTerminalCount(narratorId: string | null) {
 	const row = await db
 		.select({ count: countFn() })
 		.from(terminals)
-		.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running")))
+		.where(
+			and(
+				eq(terminals.narratorId, narratorId),
+				eq(terminals.status, "running"),
+				isNull(terminals.worktreeResourceId),
+			),
+		)
 		.get();
 	broadcastToNarrator(narratorId, {
 		type: "terminal_count_changed",
@@ -1873,6 +2038,8 @@ if (hotOnce("narrafork.providerQuotaWs.listenersRegistered")) {
 // duplicate handlers — causing N× DB queries and WS broadcasts.
 
 if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
+	registerExecutionDeviceChangeBroadcast(broadcastToAll);
+
 	eventBus.on("terminal:created", (event) => {
 		debouncedTerminalCount(event.narratorId);
 	});
@@ -1983,6 +2150,15 @@ export const handleNarratorWS = {
 		}
 		ws.data.lastPongAt = Date.now();
 		addConnection(ws);
+		if (ws.data.userId && !ws.data.publicShare) {
+			// Close the initial HTTP -> WS gap without forcing a second GET when the
+			// already-returned bounded projection is at this revision.
+			safeSend(ws, {
+				type: "settings_runtime_changed",
+				revision: getSettingsRevision(),
+				initial: true,
+			});
+		}
 	},
 
 	async message(ws: NarratorWS, parsed: NarratorClientMessage) {
@@ -2026,6 +2202,13 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "communication_subscribe":
+			case "communication_unsubscribe":
+				handleCommunicationMessage(ws, msg);
+				break;
+			case "reasoning_translation_visibility":
+				setTranslationDemand(ws, msg);
+				break;
 			case "editor_file_subscribe":
 			case "editor_file_unsubscribe":
 				await handleEditorFileMessage(ws, msg);
@@ -2076,7 +2259,10 @@ export const handleNarratorWS = {
 				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
 				if (kind === "activity") {
 					ws.data.activityOnlyNarrators ??= new Set();
-					for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
+					for (const id of activityLevelIds) {
+						releaseTranslationDemand(ws, id);
+						ws.data.activityOnlyNarrators.add(id);
+					}
 				} else {
 					for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
 				}
@@ -2136,6 +2322,7 @@ export const handleNarratorWS = {
 			}
 			case "unsubscribe": {
 				for (const id of msg.narratorIds) {
+					releaseTranslationDemand(ws, id);
 					ws.data.subscribedNarrators.delete(id);
 					ws.data.activityOnlyNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);
@@ -2343,7 +2530,7 @@ export const handleNarratorWS = {
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
 				// to resume.
-				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+				await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2363,7 +2550,7 @@ export const handleNarratorWS = {
 			case "remove_buffer": {
 				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
-					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+					await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);
 				}
 				break;
@@ -2377,44 +2564,91 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "chat_subscribe": {
-				const userId = ws.data.userId;
-				if (!userId) {
-					// Public-share reader: exactly the share's own discussion room, nothing
-					// else. Revalidated so a revoked link cannot keep the room feed.
-					const share = ws.data.publicShare;
-					if (!share) break;
-					let liveShare: VerifiedPublicShare;
-					try {
-						liveShare = revalidatePublicShare(share);
-					} catch {
-						break;
-					}
-					for (const roomId of msg.roomIds) {
-						if (roomId !== liveShare.roomId) continue;
-						if (ws.data.subscribedChatRooms.has(roomId)) continue;
-						addChatSubscription(ws, roomId);
-					}
-					break;
+				let pending = pendingChatJoins.get(ws);
+				if (!pending) {
+					pending = new Map();
+					pendingChatJoins.set(ws, pending);
 				}
-				const { assertCanRead } = await import("../services/chat-service");
-				for (const roomId of msg.roomIds) {
-					if (ws.data.subscribedChatRooms.has(roomId)) continue;
-					if (ws.data.subscribedChatRooms.size >= MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION) {
-						safeSend(ws, {
-							type: "error",
-							message: "Too many chat room subscriptions on one connection",
-						});
-						break;
+				const intents = [...new Set(msg.roomIds)].map((roomId) => {
+					const token: PendingChatJoin = { requestId: msg.requestId };
+					let tokens = pending.get(roomId);
+					if (!tokens) {
+						tokens = new Set();
+						pending.set(roomId, tokens);
 					}
-					// The single delivery-side authorization point. A room the caller
-					// cannot read never enters the index, so it can never be delivered.
+					tokens.add(token);
+					return { roomId, token };
+				});
+				const { assertCanRead, readChatTailSeq } = await import("../services/chat-service");
+				for (const { roomId, token } of intents) {
+					const current = () => connections.has(ws) && pending.get(roomId)?.has(token);
+					if (!current()) continue;
 					try {
-						await assertCanRead(roomId, userId);
-					} catch {
-						logger.debug("Chat subscribe denied", { roomId, userId });
-						continue;
+						// Reauthorize even an existing join: a resumed window needs a fresh
+						// verdict, not the authority of its previous subscription.
+						try {
+							if (ws.data.userId) {
+								await assertCanRead(roomId, ws.data.userId);
+							} else {
+								const share = ws.data.publicShare;
+								if (!share || revalidatePublicShare(share).roomId !== roomId)
+									throw new ForbiddenError("Discussion unavailable");
+							}
+						} catch (error) {
+							// Operational failures must retain the window, not masquerade as
+							// permission loss (which tells the client to clear its old content).
+							if (!(error instanceof AppError) || ![403, 404].includes(error.statusCode))
+								throw error;
+							if (!current()) continue;
+							const denied = pending.get(roomId);
+							removeChatSubscription(ws, roomId);
+							// Evict every waiting owner with an explicit verdict, not a timeout
+							// that would leave one panel retaining content it can no longer read.
+							for (const attempt of denied ?? []) {
+								if (!attempt.requestId) continue;
+								safeSend(ws, {
+									type: "chat:subscription_denied",
+									roomId,
+									requestId: attempt.requestId,
+									status: 403,
+								});
+							}
+							continue;
+						}
+						if (!current()) continue;
+						if (
+							!ws.data.subscribedChatRooms.has(roomId) &&
+							ws.data.subscribedChatRooms.size >= MAX_CHAT_ROOM_SUBSCRIPTIONS_PER_CONNECTION
+						) {
+							safeSend(ws, {
+								type: "error",
+								message: "Too many chat room subscriptions on one connection",
+							});
+							continue;
+						}
+						addChatSubscription(ws, roomId);
+						if (msg.requestId) {
+							// Join first, THEN read the ceiling. Messages committed in between
+							// are covered by live delivery and/or this fixed recovery interval.
+							const tailSeq = await readChatTailSeq(roomId);
+							if (!current()) continue;
+							safeSend(ws, {
+								type: "chat:subscribed",
+								roomId,
+								requestId: msg.requestId,
+								tailSeq,
+							});
+						}
+					} catch (error) {
+						logger.warn("Chat subscribe failed", { roomId, error: String(error) });
+						if (current()) {
+							safeSend(ws, { type: "error", message: "Chat subscription temporarily unavailable" });
+						}
+					} finally {
+						const tokens = pending.get(roomId);
+						tokens?.delete(token);
+						if (tokens?.size === 0) pending.delete(roomId);
 					}
-					addChatSubscription(ws, roomId);
 				}
 				break;
 			}

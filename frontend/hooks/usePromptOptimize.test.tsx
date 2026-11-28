@@ -23,8 +23,8 @@ import {
 	startPromptOptimizeTask,
 } from "../lib/prompt-optimize-tasks";
 
-mock.module("./useInstanceSettings", () => ({
-	useInstanceSettings: () => ({ promptOptimizeContextMaxMessages: 10 }),
+mock.module("./useRuntimeSettings", () => ({
+	useRuntimeSettings: () => ({ data: { agent: { promptOptimizeContextMaxMessages: 10 } } }),
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const { usePromptOptimize } = await import("./usePromptOptimize");

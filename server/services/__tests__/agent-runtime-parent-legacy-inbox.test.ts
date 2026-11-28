@@ -1,6 +1,5 @@
 import { afterAll, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { getTestDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -9,9 +8,12 @@ import {
 } from "../../db/schema";
 import { hotSafe } from "../../lib/hot-safe";
 import type { PendingInjection } from "../parent-injection-queue";
+import { closeRuntimeTestDb, getRuntimeTestDb as getTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const { db, sqlite, ready } = getTestDb();
+await ready;
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const before = new Date(Date.now() - 60_000).toISOString();
 db.insert(narrators).values({ id: "recipient", createdAt: before, updatedAt: before }).run();
 for (const id of ["legacy-terminal", "wrong-run"])
@@ -73,9 +75,9 @@ const { migrateLegacyParentInjections, drainPendingInjections } = await import(
 );
 const { runtimePublication } = await import("../agent-runtime/publication");
 runtimePublication.setWake(undefined);
-afterAll(() => {
+afterAll(async () => {
 	runtimePublication.stop();
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite, { sessionTails: true });
 });
 
 test("unbound legacy terminal diagnostic is durable before removal and valid next entry migrates once", async () => {
@@ -94,7 +96,7 @@ test("unbound legacy terminal diagnostic is durable before removal and valid nex
 	expect(
 		diagnostics.some((row) => row.contentText?.includes("old progress retained for human review")),
 	).toBe(true);
-	runtimePublication.flushRecipient("recipient");
+	await runtimePublication.flushRecipient("recipient");
 	const rows = db
 		.select()
 		.from(narratorBufferedMessages)

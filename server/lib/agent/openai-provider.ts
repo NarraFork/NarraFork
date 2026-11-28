@@ -12,6 +12,7 @@ import {
 } from "@shared/tool-result-images";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
+import { getEffectiveModelProfile } from "../model-catalog";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -42,7 +43,7 @@ import {
 	type ImageGenerationResponse,
 } from "./image-generation-api";
 import {
-	markRuntimeInstructions,
+	isRuntimeSystemMessage,
 	markRuntimeSystemMessage,
 	reportInputCharacters,
 } from "./input-characters";
@@ -340,27 +341,36 @@ export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	return resolveMetadataReasoning(effectiveModelProfile(model), reasoningEffort, model);
+	return resolveMetadataReasoning(
+		getEffectiveModelProfile(model, { codex: true }),
+		reasoningEffort,
+		model,
+	);
 }
 
 /**
  * Resolve the effort value sent on a Codex Responses request, falling back to
- * the configured default. Shared with CodexProvider so both entry points send
- * the same value for the same settings.
+ * the configured default. Do not substitute `none` for a missing effort on
+ * known GPT-6.2 Codex routes, where it is not supported by default.
  */
 export function resolveCodexRequestReasoningEffort(
 	model: string,
 	reasoningEffort?: string,
-): string {
-	return (
-		normalizeCodexReasoningEffort(
-			model,
-			reasoningEffort ??
-				effectiveModelProfile(model).reasoning?.defaultLevel ??
-				settings.agent.defaultReasoningEffort ??
-				"max",
-		) ?? "none"
+): string | undefined {
+	const profile = getEffectiveModelProfile(model, { codex: true });
+	const effort = resolveMetadataReasoning(
+		profile,
+		reasoningEffort ??
+			profile.reasoning.defaultLevel ??
+			settings.agent.defaultReasoningEffort ??
+			"max",
+		model,
 	);
+	// Fixed intensity intentionally resolves an enabled request to no effort.
+	// Do not reinterpret that omission as an explicit off switch.
+	if (profile.reasoning.mode === "fixed") return effort;
+	// Preserve the legacy Codex default only when there is no tier declaration.
+	return Array.isArray(profile.reasoning.levels) ? effort : (effort ?? "none");
 }
 
 /**
@@ -528,7 +538,7 @@ interface ResponsesFunctionCallOutputMessage {
 }
 
 export interface OAIMessage {
-	role: "system" | "user" | "assistant" | "tool";
+	role: "system" | "developer" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
 	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
 	tools?: OAITool[];
@@ -854,7 +864,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const identity = identityMap[locale] ?? identityMap.en;
 		const content = `${identity}\n\n${systemPrompt}`;
 		const role = this.responsesFormat ? "developer" : "system";
-		h.unshift(markRuntimeSystemMessage({ role, content }) as unknown as OAIMessage);
+		h.unshift(markRuntimeSystemMessage({ role, content }));
 	}
 
 	private assertResponsesMediaInput(model: string, values: unknown): void {
@@ -1039,36 +1049,14 @@ export class OpenAIProvider implements ProviderAdapter {
 			// Responses API & Codex: POST /responses
 			endpoint = `${baseUrl}/responses`;
 
-			// Extract instructions from developer/system messages
-			let instructions = "";
-			const inputMessages: OAIMessage[] = [];
-
-			for (const msg of messages) {
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				const m = msg as any;
-				if (!isResponsesInputItem(m) && (m.role === "developer" || m.role === "system")) {
-					// Accumulate instructions from developer/system messages
-					if (typeof m.content === "string") {
-						instructions += (instructions ? "\n\n" : "") + m.content;
-					}
-				} else {
-					inputMessages.push(msg);
-				}
-			}
-
-			const sanitizedInputMessages = inputMessages.filter((msg) => {
-				if (msg.role !== "assistant") return true;
-				// Responses API rejects assistant role messages with null/empty content and no tool calls.
-				const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-				if (hasToolCalls) return true;
-				if (typeof msg.content === "string") return msg.content.length > 0;
-				if (Array.isArray(msg.content)) return msg.content.length > 0;
-				return false;
-			});
-			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages, {
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: this.getActiveReasoningSource(),
-			});
+			const responsesInput = buildResponsesInput(
+				messages,
+				{
+					strict: hasCredentialBoundReasoning(model),
+					currentSource: this.getActiveReasoningSource(),
+				},
+				this.apiMode,
+			);
 
 			// Codex CLI sets store based on endpoint: false for standard OpenAI/ChatGPT
 			// endpoints, true only for Azure OpenAI. Since we use the ChatGPT backend
@@ -1077,13 +1065,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			// previous_response_id is unsupported — always send full history.
 			body = { model, input: responsesInput, stream: true, store: false };
 
-			if (instructions) {
-				body.instructions = instructions;
-			} else if (this.apiMode === "codex") {
-				// Codex gateway requires non-empty instructions even for pure tool/result turns.
-				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
-				markRuntimeInstructions(body);
-			}
 			if (tools.length > 0) body.tools = tools;
 
 			// Codex: inject native server-side tools only when the selected model supports them.
@@ -1109,7 +1090,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						diagnosticTransportIdentity(params),
 						this.codexInstallationId(),
 					),
-					reasoningEffort: normalizedCodexReasoningEffort as string,
+					reasoningEffort: normalizedCodexReasoningEffort,
 				});
 			} else {
 				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):
@@ -1125,8 +1106,6 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			logger.debug("Responses API request body", {
 				model,
-				hasInstructions: !!instructions,
-				instructionsLength: instructions.length,
 				inputMessageCount: responsesInput.length,
 				toolCount: tools.length,
 				reasoningEffort: normalizedCodexReasoningEffort,
@@ -1387,7 +1366,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						delete textOptions.format;
 						if (Object.keys(textOptions).length === 0) delete body.text;
 					}
-					body.instructions = fallbackInstruction;
+					body.input = responsesTextInput(text, fallbackInstruction, this.apiMode);
 				} else {
 					delete body.response_format;
 					body.messages = [
@@ -1437,19 +1416,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
-				input: [{ role: "user", content: text }],
+				input: responsesTextInput(text, instruction, this.apiMode),
 				store: false,
 			};
 			const codexIdentity =
 				this.apiMode === "codex"
 					? createCodexRequestIdentity(undefined, this.codexInstallationId())
 					: undefined;
-			if (instruction) {
-				body.instructions = instruction;
-			} else if (this.apiMode === "codex") {
-				// Codex gateway requires non-empty instructions on /responses.
-				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
-			}
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1551,8 +1524,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
-				instructions: systemInstruction,
-				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
+				input: responsesTextInput(`${reminder}\n\n${content}`, systemInstruction, this.apiMode),
 				store: false,
 			};
 			const codexIdentity =
@@ -1954,40 +1926,19 @@ export class OpenAIProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
-		let instructions = "";
-		const inputMessages: OAIMessage[] = [];
-		for (const msg of messages) {
-			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
-			const role = (msg as any).role;
-			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
-				if (typeof msg.content === "string") {
-					instructions += (instructions ? "\n\n" : "") + msg.content;
-				}
-				continue;
-			}
-			inputMessages.push(msg);
-		}
-
-		const sanitizedInputMessages = inputMessages.filter((msg) => {
-			if (msg.role !== "assistant") return true;
-			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-			if (hasToolCalls) return true;
-			if (typeof msg.content === "string") return msg.content.length > 0;
-			if (Array.isArray(msg.content)) return msg.content.length > 0;
-			return false;
-		});
-
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: this.getActiveReasoningSource(),
-			}),
+			input: buildResponsesInput(
+				messages,
+				{
+					strict: hasCredentialBoundReasoning(model),
+					currentSource: this.getActiveReasoningSource(),
+				},
+				"codex",
+			),
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
 		const tools =
 			params.diagnostic && !params.diagnosticFork
 				? []
@@ -2521,6 +2472,7 @@ export interface ResponsesReasoningAccum {
 	nativeParts?: Map<number, string>;
 	/** Summary bytes are separate from the rendered text and its inserted boundaries. */
 	summaryParts?: Map<number, string>;
+	sealedSummaryParts?: Set<number>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	/** Last terminal snapshot, so completed.output may enrich it without duplicating text. */
 	replayMetadata?: ReasoningProviderMetadata["openai"];
@@ -2598,6 +2550,7 @@ function pushReasoningTextEvent(
 		acc.summaryParts ??= new Map();
 		const index = chunk.summary_index ?? 0;
 		const previous = acc.summaryParts.get(index) ?? "";
+		if (!options.emitOnlyIfAccumulatorEmpty) acc.sealedSummaryParts?.delete(index);
 		if (options.emitOnlyIfAccumulatorEmpty) rememberReasoningPart(acc.summaryParts, index, text);
 		else acc.summaryParts.set(index, previous + text);
 		if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
@@ -3224,10 +3177,29 @@ export function parseResponsesAPIEvent(
 		type === "response.reasoning_summary_part.done"
 	) {
 		const text = chunk.text ?? chunk.part?.text;
+		const initial = resolveReasoningAccum(chunk, reasoningAccum);
+		const index = chunk.summary_index;
+		const seen = index === undefined ? undefined : initial?.summaryParts?.get(index);
 		if (typeof text === "string") {
 			pushReasoningTextEvent(results, chunk, reasoningAccum, text, {
 				emitOnlyIfAccumulatorEmpty: true,
 			});
+		}
+		const acc = resolveReasoningAccum(chunk, reasoningAccum);
+		let reasoningSummaryEnd: number | undefined;
+		if (
+			type !== "response.reasoning_text.done" &&
+			typeof index === "number" &&
+			Number.isSafeInteger(index) &&
+			index >= 0 &&
+			acc?.textFormat === "summary_text" &&
+			acc.summaryParts?.get(index) &&
+			(typeof text !== "string" || !seen || text === seen)
+		) {
+			acc.sealedSummaryParts ??= new Set();
+			acc.sealedSummaryParts.add(index);
+			if (acc.summaryParts.size === acc.sealedSummaryParts.size)
+				reasoningSummaryEnd = acc.emittedText?.length;
 		}
 		// A summary is not an independently replayable reasoning item. Final
 		// encrypted_content arrives only on output_item.done.
@@ -3237,6 +3209,7 @@ export function parseResponsesAPIEvent(
 				phase: "checkpoint",
 				blockId: responsesBlockId(chunk, "reasoning"),
 				outputIndex: chunk.output_index,
+				...(reasoningSummaryEnd ? { reasoningSummaryEnd } : {}),
 			},
 		});
 		return results;
@@ -4237,8 +4210,48 @@ function additionalToolsItem(change: ToolLoadingChange): OAIMessage {
 }
 
 /** Input items that carry a `role` but are not messages and must stay in `input`. */
-export function isResponsesInputItem(message: unknown): boolean {
+function isResponsesInputItem(message: unknown): boolean {
 	return (message as { type?: unknown }).type === "additional_tools";
+}
+
+function responsesDeveloperMessage(text: string): OAIMessage {
+	return { role: "developer", content: [{ type: "input_text", text }] };
+}
+
+function responsesTextInput(
+	text: string,
+	instruction: string | undefined,
+	mode: OpenAIApiMode,
+): OAIMessage[] {
+	const prefix = instruction || (mode === "codex" ? CODEX_DEFAULT_INSTRUCTIONS : "");
+	const user: OAIMessage = { role: "user", content: text };
+	return prefix ? [responsesDeveloperMessage(prefix), user] : [user];
+}
+
+export function buildResponsesInput(
+	messages: OAIMessage[],
+	options: ReasoningReplayOptions,
+	mode: OpenAIApiMode,
+): OAIMessage[] {
+	// Reusable instructions must be in the input prefix to be eligible for caching.
+	const prefix: OAIMessage[] = [];
+	const history: OAIMessage[] = [];
+	for (const msg of messages) {
+		if (!isResponsesInputItem(msg) && (msg.role === "system" || msg.role === "developer")) {
+			if (typeof msg.content === "string" && msg.content) {
+				const item = responsesDeveloperMessage(msg.content);
+				prefix.push(isRuntimeSystemMessage(msg) ? markRuntimeSystemMessage(item) : item);
+			}
+			continue;
+		}
+		// Responses rejects assistant messages without content or tool calls.
+		if (msg.role === "assistant" && !msg.tool_calls?.length && !msg.content?.length) continue;
+		history.push(msg);
+	}
+	if (prefix.length === 0 && mode === "codex") {
+		prefix.push(markRuntimeSystemMessage(responsesDeveloperMessage(CODEX_DEFAULT_INSTRUCTIONS)));
+	}
+	return prefix.concat(convertHistoryToResponsesApi(history, options));
 }
 
 /**
@@ -4259,8 +4272,7 @@ function responsesWireHistory(
 			for (const item of turn.items) {
 				if (item.toolChange)
 					history.push(additionalToolsItem(item.toolChange as ToolLoadingChange));
-				// Runtime context stays a user item: developer items would be hoisted into
-				// `instructions`, which can leave the input empty and changes the prefix.
+				// Runtime context stays at its original position to preserve the cached prefix.
 				const content: OAIContentPart[] = orderUserContent(item.text, item.images, "before").map(
 					(part) =>
 						part.type === "text"

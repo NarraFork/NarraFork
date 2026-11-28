@@ -11,11 +11,12 @@
  *    bounded preview of the input, and an approval goes through the ordinary permission route.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { initTeamRepo } from "../../services/teams/__tests__/team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-board-"));
@@ -152,7 +153,7 @@ async function pendingCall(narratorId: string, input: Record<string, unknown>, t
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	for (const id of [OWNER, MEMBER, READER, OUTSIDER])
 		await db
@@ -275,6 +276,10 @@ describe("board", () => {
 			exclusiveKey: "migrations",
 			createdAt: expect.any(String),
 			updatedAt: expect.any(String),
+			// The worker runs but has made no tool call yet.
+			activity: null,
+			// D: the card's dependencies (none here).
+			dependsOn: [],
 		});
 		expect(JSON.stringify(progress)).not.toContain("src/file-");
 		expect((await column("review")).items.map((card: { id: string }) => card.id).sort()).toEqual(
@@ -294,7 +299,8 @@ describe("board", () => {
 			cancelled: 1,
 		});
 		expect(summary.runningAgents).toEqual([
-			{ id: workerId, title: "worker one", status: "working" },
+			// What the worker did last (none yet): the rows' "doing now" stays live from here.
+			{ id: workerId, title: "worker one", status: "working", activity: null },
 		]);
 		expect(summary.runningCount).toBe(1);
 		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, workerId));

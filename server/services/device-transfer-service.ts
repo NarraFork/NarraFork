@@ -1589,7 +1589,10 @@ export function createDeviceTransferTaskManager(
 ) {
 	const { activeRuns } = runtime;
 	const ensureRecovery = () => {
-		runtime.recoveryPromise ??= store.recoverInterrupted();
+		runtime.recoveryPromise ??= store.recoverInterrupted().catch((error) => {
+			runtime.recoveryPromise = null;
+			throw error;
+		});
 		return runtime.recoveryPromise;
 	};
 

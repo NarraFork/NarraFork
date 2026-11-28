@@ -40,9 +40,9 @@ import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
-import {
-	composeReasoningTranslation,
-	type ReasoningTranslationFields,
+import type {
+	ReasoningTranslationFields,
+	ReasoningTranslationVisibilityTarget,
 } from "../reasoning-translation";
 import {
 	escapeMarkdown,
@@ -76,11 +76,13 @@ type ToolTimingRecord = Partial<
 
 import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
+import { watchNoticeFromTask } from "../watch-command";
 import {
 	type AuxiliaryContentProjection,
 	auxiliaryContentKey,
 	auxiliaryContentViews,
 	buildAuxiliaryContentData,
+	watchNoticeOutcomeLabel,
 } from "./auxiliary-content";
 import {
 	type CommunicationState,
@@ -106,6 +108,13 @@ import {
 	parseStreamingReasoningSegments,
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
+import {
+	appendReasoningTranslationParagraph,
+	mergedReasoningTranslationEvidence,
+	type ReasoningTranslationEvidence,
+	reasoningBlockDisplayText,
+	reasoningTranslationSources,
+} from "./reasoning-translation-sources";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -240,6 +249,9 @@ export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	id?: string;
 	role: string;
 	createdAt?: string;
+	/** Bounded composer detail is fetched only for mounted, explicitly flagged user rows. */
+	hasComposerDocument?: boolean;
+	stateRevision?: number;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
@@ -868,7 +880,12 @@ export type AdapterRenderUnit =
 			key: string;
 			items: AdapterActivityInput[];
 			sourceMessages: AdapterMessage[];
-	  };
+	  }
+	/**
+	 * A ready-made element supplied by an opt-in host transform (the team page's chips and
+	 * dividers). Passed through as its own top-level unit; the default build never emits one.
+	 */
+	| { kind: "element"; spec: ElementSpec };
 
 /** One element to measure/render: which registry kind + its measure input. */
 export interface ElementSpec {
@@ -877,6 +894,9 @@ export interface ElementSpec {
 	key: string;
 	/** Measure input `data` for `measureElement(kind, data, …)`. */
 	data: unknown;
+	/** Persisted source coordinates for the transcript's visibility observer. */
+	reasoningTranslationSources?: ReasoningTranslationVisibilityTarget[];
+	reasoningTranslationEvidence?: ReasoningTranslationEvidence[];
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
 	/**
@@ -1398,10 +1418,7 @@ function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]
 	const parts = blocks.map((block) => {
 		const source = block.thinking ?? block.text ?? "";
 		if (!source.length) return source;
-		const replacement =
-			block.translationGeneration !== undefined || block.translationParts !== undefined
-				? composeReasoningTranslation(source, block.translationGeneration, block.translationParts)
-				: block.translatedText;
+		const replacement = reasoningBlockDisplayText(block);
 		if (!replacement) return source;
 		translated = true;
 		return replacement;
@@ -1485,6 +1502,7 @@ function reasoningStepsData(
 	isStreaming: boolean,
 	ctx: AdapterContext,
 	unitSource?: ReasoningStepUnitSource,
+	translationSteps?: ReadonlySet<number>,
 ) {
 	return {
 		steps: segments.map((segment, index) => ({
@@ -1492,6 +1510,7 @@ function reasoningStepsData(
 			body: segment.isEmpty ? null : segment.body,
 			shimmer: isStreaming && index === segments.length - 1,
 			key: `seg${index}`,
+			...(translationSteps?.has(index) ? { sourceRanges: true } : {}),
 			// Same string the folded row of this step carries at L1/L2, so the two
 			// renderings pair across the level switch. Height-neutral passthrough.
 			...(unitSource
@@ -2120,6 +2139,9 @@ function adaptMessage(
 				data: {
 					role: "user",
 					text,
+					...(msg.hasComposerDocument && msg.id
+						? { composerDocumentSource: { messageId: msg.id, revision: msg.stateRevision ?? 0 } }
+						: {}),
 					// Chat-style surfaces fold a follow-up's header (grouping) and may
 					// carry a reply quote strip or a tombstone; the narrator defaults
 					// remain byte-identical when none of these are set.
@@ -2313,6 +2335,16 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
+			const entries = runIndices.map((index, position) => ({
+				block: reasoningBlocks[position],
+				index,
+			}));
+			const translationSources =
+				!streamingMessage && entries.length === 1 ? reasoningTranslationSources(msg, entries) : [];
+			const translationEvidence =
+				!streamingMessage && entries.length > 1
+					? mergedReasoningTranslationEvidence(msg, entries)
+					: undefined;
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -2326,20 +2358,53 @@ function adaptMessage(
 			const displayText = data.translatedText ?? data.text;
 			const lifecycleId = contentBlockLifecycleId(block);
 			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
+			const stepEvidence: ReasoningTranslationEvidence[] = [];
+			const parseStepsWithProvenance = (text: string, evidence: ReasoningTranslationEvidence[]) => {
+				const single = longSingleReasoningStep(key, text);
+				if (single) {
+					const body = single[0].body;
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						0,
+						0,
+						text.trimEnd().length - body.length,
+						body.length,
+					);
+					return single;
+				}
+				return parseReasoningSegments(text, (step, bodyStart, runStart, length) => {
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						step,
+						bodyStart,
+						runStart,
+						length,
+					);
+				});
+			};
 			const parsed =
 				!usesStructuredReasoning(msg.model) ||
 				(!textExpanded && isLongPlainReasoning(key, displayText))
 					? []
-					: (longSingleReasoningStep(key, displayText) ??
-						(streaming && !ctx.resolveReasoningSegments
-							? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
-							: parseReasoning(displayText)));
+					: translationEvidence && !ctx.resolveReasoningSegments
+						? parseStepsWithProvenance(displayText, translationEvidence)
+						: (longSingleReasoningStep(key, displayText) ??
+							(streaming && !ctx.resolveReasoningSegments
+								? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
+								: parseReasoning(displayText)));
+			const directTranslation = translationSources.length
+				? { reasoningTranslationSources: translationSources }
+				: {};
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
 					key,
+					...directTranslation,
+					...(stepEvidence.length ? { reasoningTranslationEvidence: stepEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2357,6 +2422,9 @@ function adaptMessage(
 						msg.id && msg.id !== STREAMING_MESSAGE_ID
 							? { messageId: msg.id, runStartBlockIndex: bi }
 							: undefined,
+						stepEvidence.length
+							? new Set(stepEvidence.map(({ step }) => step as number))
+							: undefined,
 					),
 					// No LOD input: a step trace has ONE shape at every level — titles
 					// visible, each step's body openable. A level that showed titles whose
@@ -2370,15 +2438,22 @@ function adaptMessage(
 					},
 				});
 			} else {
+				const bodyEvidence =
+					showOriginal && translationEvidence
+						? mergedReasoningTranslationEvidence(msg, entries, true)
+						: translationEvidence;
 				specs.push({
 					kind,
 					key,
+					...directTranslation,
+					...(bodyEvidence ? { reasoningTranslationEvidence: bodyEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
 						textExpanded,
 						showOriginal,
+						...(bodyEvidence ? { sourceRanges: true } : {}),
 						// A live reasoning body (synthetic streaming row or checkpoint
 						// projection) must go through the incremental prepared-block path
 						// in the measure registry — the same flag markdown already carries.
@@ -2476,6 +2551,7 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	status_fail: "Failed",
+	watchNoticeLabel: "Watch",
 	// Body of a background-task bubble whose task produced no output. Needs a fallback
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
@@ -2654,6 +2730,11 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSpecImport: "Dynamic Spec moved to the outline",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
 	sidecarSourceTeamStatus: "Team status",
+	sidecarSourceTeamUpgrade: "Became a team coordinator",
+	sidecarSourceTeamDisband: "Team disbanded",
+	sidecarSourceTeamReturn: "Work item returned",
+	sidecarSourceTeamUnblocked: "Work item can start",
+	sidecarSourceTeamMerge: "Work item merge",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2786,6 +2867,15 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_answer: "sidecarSourceOutlineAnswer",
 	// A team coordinator's team status (Project Teams P2).
 	team_status: "sidecarSourceTeamStatus",
+	// A session turned into a team coordinator, or its team disbanded and the session kept.
+	team_upgrade: "sidecarSourceTeamUpgrade",
+	team_disband: "sidecarSourceTeamDisband",
+	// A person returned a work item from the team page, with the reason to relay (R).
+	team_return: "sidecarSourceTeamReturn",
+	// The last dependency of a queued work item merged: it can start now (D).
+	team_unblocked: "sidecarSourceTeamUnblocked",
+	// A member's merge of a work item landed, or conflicted with the base (M).
+	team_merge: "sidecarSourceTeamMerge",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3281,7 +3371,10 @@ function adaptSpokenInjection(
 		// the task id alone — no positional suffix.
 		const task = Array.isArray(body.items) ? body.items[0] : undefined;
 		if (!task) return null;
-		const preview = (task.preview ?? "").trim();
+		// A Watch observation's result arrives as a bash completion; it is labelled as the
+		// watch it is, addressed by its target, with the result header moved to the badge.
+		const watch = body.flavor === "bash" ? watchNoticeFromTask(task) : null;
+		const preview = (watch?.body ?? task.preview ?? "").trim();
 		// A bash task's preview is VERBATIM stdout/stderr, so it is fenced unconditionally
 		// (`verbatimOutputToMarkdown`) rather than handed to the Markdown parser. Linter
 		// and compiler output is preformatted text whose indentation and column rules ARE
@@ -3315,10 +3408,13 @@ function adaptSpokenInjection(
 					speaker:
 						body.flavor === "agent"
 							? task.title?.trim() || task.alias?.trim() || task.id
-							: task.alias?.trim() || task.title?.trim() || task.id,
+							: watch?.targetName || task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
-					speakerKind: task.status ?? null,
+					speakerKind: watch
+						? `${sysLabel(ctx, "watchNoticeLabel")} · ${watchNoticeOutcomeLabel(watch.outcome, ctx.labels)}`
+						: (task.status ?? null),
+					...(watch ? { watch: true } : {}),
 					// Only the AGENT flavour has a session: a background agent's task id IS
 					// its narrator id, whereas a bash task id addresses a shell invocation
 					// with no session to open. Gating on `flavor` rather than on the presence
@@ -6179,6 +6275,9 @@ export function adaptRenderUnits(
 		const unitFirstIndex = out.length;
 		if (unit.kind === "activity") {
 			out.push(adaptActivityUnit(unit.items, unit.key, ctx));
+			previousCard = undefined;
+		} else if (unit.kind === "element") {
+			out.push(unit.spec);
 			previousCard = undefined;
 		} else if (isAssistantCardSegment(unit.seg)) {
 			previousCard = appendCardSpecs(out, adaptSegment(unit.seg, ctx), previousCard);

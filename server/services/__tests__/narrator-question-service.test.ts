@@ -1,3 +1,4 @@
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 /**
  * Contract for asynchronous AskUserQuestion records.
  *
@@ -15,7 +16,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -23,6 +24,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 // The shared migrated test database, not a hand-rolled subset.
 //
@@ -30,7 +32,9 @@ import {
 // mock is process-wide, so those four tables became `db` for all 190 sibling files and
 // broke 139 unrelated assertions. `getTestDb()` runs the real migrations, so a leak
 // costs nothing structural — and the `afterAll` below re-points the module anyway.
-const { db: testDb, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db: testDb, sqlite } = fixture;
+await fixture.ready;
 
 // Snapshot the real module first so `afterAll` can restore it: `mock.restore()` does
 // NOT undo `mock.module`, and an FTS-less test db leaking into later real-db suites is
@@ -220,16 +224,20 @@ describe("question lifecycle closure", () => {
 	test("new async requires context, user-deferred remains compatible, and UTF-8 budgets apply", async () => {
 		const call = await seedToolCall();
 		await expect(
-			createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
-		).rejects.toThrow("context");
+			await captureWorkerRejectionThrower(
+				createQuestionRecord({ narratorId: NARRATOR_ID, ...call, questions: QUESTIONS }),
+			),
+		).toThrow("context");
 		await expect(
-			createQuestionRecord({
-				narratorId: NARRATOR_ID,
-				...call,
-				questions: QUESTIONS,
-				context: "中".repeat(700),
-			}),
-		).rejects.toThrow("2048");
+			await captureWorkerRejectionThrower(
+				createQuestionRecord({
+					narratorId: NARRATOR_ID,
+					...call,
+					questions: QUESTIONS,
+					context: "中".repeat(700),
+				}),
+			),
+		).toThrow("2048");
 		const result = await createQuestionRecord({
 			narratorId: NARRATOR_ID,
 			...call,
@@ -422,26 +430,30 @@ describe("question lifecycle closure", () => {
 	test("oversized snapshots and answers reject before changing state; legacy detail stays bounded", async () => {
 		const call = await seedToolCall();
 		await expect(
-			createAsyncQuestion({
-				narratorId: NARRATOR_ID,
-				...call,
-				questions: [
-					{
-						id: "q",
-						header: "Question",
-						options: [{ header: "Artifact", preview: "x".repeat(64 * 1024) }],
-					},
-				],
-			}),
-		).rejects.toThrow("snapshot");
+			await captureWorkerRejectionThrower(
+				createAsyncQuestion({
+					narratorId: NARRATOR_ID,
+					...call,
+					questions: [
+						{
+							id: "q",
+							header: "Question",
+							options: [{ header: "Artifact", preview: "x".repeat(64 * 1024) }],
+						},
+					],
+				}),
+			),
+		).toThrow("snapshot");
 		const { record } = await createAsyncQuestion({
 			narratorId: NARRATOR_ID,
 			...call,
 			questions: QUESTIONS,
 		});
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
-		).rejects.toThrow("answers");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { "cache-layer": "x".repeat(16 * 1024) } }),
+			),
+		).toThrow("answers");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		sqlite
 			.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?")
@@ -460,8 +472,10 @@ describe("question lifecycle closure", () => {
 			record.id,
 		);
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
-		).rejects.toThrow("ambiguous");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { Same: "ambiguous" } }),
+			),
+		).toThrow("ambiguous");
 		sqlite.query("UPDATE narrator_questions SET questions_json = ? WHERE id = ?").run(
 			JSON.stringify([
 				{
@@ -575,7 +589,7 @@ beforeEach(async () => {
 	await seedParents();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	setQuestionServiceSeam(null);
 	setInjectionScheduler(previousScheduler);
 	// Re-point the module at the real database. `mock.restore()` does not undo
@@ -584,6 +598,7 @@ afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 describe("own question query capability", () => {
@@ -839,8 +854,10 @@ describe("answerAsyncQuestion", () => {
 		broadcasts = [];
 		deliveryError = new Error("injected persistence failure");
 		await expect(
-			answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-		).rejects.toThrow("injected persistence failure");
+			await captureWorkerRejectionThrower(
+				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+			),
+		).toThrow("injected persistence failure");
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		expect((await getAsyncQuestion(record.id))?.answers).toBeNull();
 		expect(broadcasts).toEqual([]);
@@ -872,8 +889,10 @@ describe("answerAsyncQuestion", () => {
 			WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'injected message insert failure'); END`);
 		try {
 			await expect(
-				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected message insert failure");
+				await captureWorkerRejectionThrower(
+					answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+				),
+			).toThrow("injected message insert failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect((await getAsyncQuestion(record.id))?.answerMessageId).toBeNull();
 		} finally {
@@ -896,8 +915,10 @@ describe("answerAsyncQuestion", () => {
 			BEGIN SELECT RAISE(ABORT, 'injected question update failure'); END`);
 		try {
 			await expect(
-				answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
-			).rejects.toThrow("injected question update failure");
+				await captureWorkerRejectionThrower(
+					answerAsyncQuestion(record.id, { answers: { "cache-layer": "Redis" } }),
+				),
+			).toThrow("injected question update failure");
 			expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 			expect(
 				sqlite.query("SELECT count(*) AS n FROM narrator_messages WHERE role = 'user'").get(),
@@ -974,7 +995,9 @@ describe("dismissAsyncQuestion", () => {
 			questions: QUESTIONS,
 		});
 		deliveryError = new Error("injected dismissal failure");
-		await expect(dismissAsyncQuestion(record.id)).rejects.toThrow("injected dismissal failure");
+		await expect(await captureWorkerRejectionThrower(dismissAsyncQuestion(record.id))).toThrow(
+			"injected dismissal failure",
+		);
 		expect((await getAsyncQuestion(record.id))?.status).toBe("open");
 		deliveryError = null;
 		const result = await dismissAsyncQuestion(record.id);

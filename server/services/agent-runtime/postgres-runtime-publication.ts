@@ -91,6 +91,7 @@ import {
 	type PgPersistedMessageRef,
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
+import { assertRecoveryFields, assertRecoveryRunAdmission } from "../recovery-observation";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 import { MAILBOX_LIMITS as L } from "./limits";
 import {
@@ -125,6 +126,7 @@ import {
 	decodeRunAssistantProjection,
 	parseRunSourceBoundary,
 } from "./publication-result";
+import { assertRuntimeSourceUnchanged } from "./read-conflict";
 import type { PgRuntimeTx, RuntimeQueuePort } from "./runtime-queue-port";
 import { translateWriteError } from "./runtime-write";
 
@@ -422,6 +424,7 @@ export interface PgTakeoverInput {
 export interface PgCancelAgentNarratorInput {
 	readonly narratorId: string;
 	readonly now: string;
+	readonly expectedLogicalRunId?: string | null;
 }
 
 /**
@@ -453,6 +456,34 @@ export interface PgRecoverStaleTaskInput {
 	readonly text: string;
 	readonly eventKind: "failed" | "cancelled";
 	readonly now: string;
+	/**
+	 * The row as the restart scan saw it. When present, the terminal CAS also
+	 * requires every identity column to be unchanged, so a row that was re-run,
+	 * re-owned or re-bound after the scan is left alone instead of receiving a
+	 * synthetic restart terminal (the SQLite path's `assertRestartTask`).
+	 */
+	readonly expected?: PgStaleTaskRow;
+}
+
+/** Identity columns the restart CAS compares against the scanned row. */
+function staleTaskIdentityMatches(expected: PgStaleTaskRow) {
+	const same = <T>(column: Parameters<typeof eq>[0], value: T | null | undefined) =>
+		value === null || value === undefined ? isNull(column) : eq(column, value);
+	return and(
+		eq(backgroundTasks.type, expected.type as BackgroundTaskRecord["type"]),
+		eq(backgroundTasks.parentNarratorId, expected.parentNarratorId),
+		same(backgroundTasks.subagentNarratorId, expected.subagentNarratorId),
+		same(backgroundTasks.logicalRunId, expected.logicalRunId),
+		same(backgroundTasks.toolCallId, expected.toolCallId),
+		same(backgroundTasks.executionAttempt, expected.executionAttempt),
+		expected.backgroundKind === undefined
+			? undefined
+			: eq(
+					backgroundTasks.backgroundKind,
+					expected.backgroundKind as BackgroundTaskRecord["backgroundKind"],
+				),
+		expected.command === undefined ? undefined : same(backgroundTasks.command, expected.command),
+	);
 }
 
 export interface PgPauseStaleTransferInput {
@@ -589,9 +620,12 @@ export function createPostgresRuntimePublication(
 		// remains in its existing source; later semantic edits must not change this receipt.
 		const originalBytes = Buffer.byteLength(text);
 		const preview = text.slice(0, 12_001);
-		const storedText = new TextDecoder().decode(Buffer.from(preview).subarray(0, snapshotBytes), {
-			stream: true,
-		});
+		const storedText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+			Buffer.from(preview).subarray(0, snapshotBytes),
+			{
+				stream: true,
+			},
+		);
 		const truncated = originalBytes > Buffer.byteLength(storedText);
 		const message: RefMessageInput = {
 			id: messageId,
@@ -854,6 +888,84 @@ export function createPostgresRuntimePublication(
 			if (input.taskRow && !input.binding.deliverTo)
 				throw new ValidationError("Background task registration requires a delivery destination");
 			return runComposite("publication.startRun", async (tx) => {
+				if (input.expectedTask || input.subagentRecovery || input.parentRecoveryTurn) {
+					await tx
+						.select({ id: narrators.id })
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+				}
+				if (input.expectedTask) {
+					const [current] = await tx
+						.select({
+							id: backgroundTasks.id,
+							type: backgroundTasks.type,
+							status: backgroundTasks.status,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							logicalRunId: backgroundTasks.logicalRunId,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.expectedTask.id))
+						.for("update");
+					assertRecoveryFields(input.expectedTask.row, current);
+				}
+				if (input.subagentRecovery) {
+					const [current] = await tx
+						.select({
+							id: narrators.id,
+							status: narrators.status,
+							substatus: narrators.substatus,
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							policySourceNarratorId: narrators.policySourceNarratorId,
+							createdAt: narrators.createdAt,
+							backgroundStatus: narrators.backgroundStatus,
+							backgroundCompletedAt: narrators.backgroundCompletedAt,
+							isBackground: narrators.isBackground,
+							title: narrators.title,
+							subagentType: narrators.subagentType,
+							traits: narrators.traits,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryFields(input.subagentRecovery, current);
+				}
+				if (input.parentRecoveryTurn) {
+					const [current] = await tx
+						.select({ id: narrators.id, turnStartedAt: narrators.turnStartedAt })
+						.from(narrators)
+						.where(eq(narrators.id, input.parentRecoveryTurn.id))
+						.for("update");
+					assertRecoveryFields(input.parentRecoveryTurn, current);
+				}
+				if (input.recoveryObservation) {
+					const [current] = await tx
+						.select({
+							id: narrators.id,
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							status: narrators.status,
+							substatus: narrators.substatus,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryRunAdmission(input.recoveryObservation, current);
+				}
+				if (input.expectedSource) {
+					const [source] = await tx
+						.select({
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							ownerUserId: narrators.ownerUserId,
+							policySourceNarratorId: narrators.policySourceNarratorId,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRuntimeSourceUnchanged(input.expectedSource, source);
+				}
 				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
 				if ((input.taskRow || input.adoptRegisteredRun) && recipientId) {
@@ -1019,17 +1131,24 @@ export function createPostgresRuntimePublication(
 						);
 				}
 				if (publication && input.taskRow) {
-					const inserted = await tx
-						.insert(backgroundTasks)
-						.values({ ...input.taskRow, logicalRunId })
-						.onConflictDoNothing({
-							target: [backgroundTasks.toolCallId, backgroundTasks.executionAttempt],
-						})
-						.returning({ id: backgroundTasks.id });
-					if (!inserted[0])
-						throw new ValidationError(
-							"Background agent task already exists for this execution attempt",
-						);
+					if (input.expectedTask?.row) {
+						await tx
+							.update(backgroundTasks)
+							.set({ ...input.taskRow, logicalRunId })
+							.where(eq(backgroundTasks.id, input.taskRow.id));
+					} else {
+						const inserted = await tx
+							.insert(backgroundTasks)
+							.values({ ...input.taskRow, logicalRunId })
+							.onConflictDoNothing({
+								target: [backgroundTasks.toolCallId, backgroundTasks.executionAttempt],
+							})
+							.returning({ id: backgroundTasks.id });
+						if (!inserted[0])
+							throw new ValidationError(
+								"Background agent task already exists for this execution attempt",
+							);
+					}
 				}
 				// Same rule as SQLite: only a live projection follows the run here.
 				await tx
@@ -1038,7 +1157,21 @@ export function createPostgresRuntimePublication(
 					.where(
 						and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
 					);
-				return { binding: registration.run, ...(publication ? { publication } : {}) };
+				return {
+					binding: registration.run,
+					...(publication ? { publication } : {}),
+					...(input.subagentRecovery
+						? {
+								recoveryObservation: {
+									id: input.narratorId,
+									logicalRunId,
+									runtimeRegistrationJson: registration,
+									status: input.subagentRecovery.status,
+									substatus: input.subagentRecovery.substatus,
+								},
+							}
+						: {}),
+				};
 			});
 		},
 
@@ -1827,7 +1960,13 @@ export function createPostgresRuntimePublication(
 						completedAt: input.now,
 						updatedAt: input.now,
 					})
-					.where(and(eq(backgroundTasks.id, input.taskId), eq(backgroundTasks.status, "running")))
+					.where(
+						and(
+							eq(backgroundTasks.id, input.taskId),
+							eq(backgroundTasks.status, "running"),
+							input.expected ? staleTaskIdentityMatches(input.expected) : undefined,
+						),
+					)
 					.returning({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
@@ -1902,6 +2041,13 @@ export function createPostgresRuntimePublication(
 					resultRef: section.resultRef,
 					summary: summarize(input.text),
 				});
+				if (
+					task.type === "bash" &&
+					!run.logicalRunId.startsWith("legacy:unknown:") &&
+					!task.command?.startsWith(WATCH_COMMAND_PREFIX) &&
+					!task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
+				)
+					await primitives.consumeAwaitedTerminal(tx, run);
 				return task;
 			});
 			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
@@ -2303,6 +2449,14 @@ export function createPostgresRuntimePublication(
 		 */
 		async cancelAgentNarrator(input: PgCancelAgentNarratorInput): Promise<void> {
 			await runComposite("publication.cancelAgentNarrator", async (tx) => {
+				if (input.expectedLogicalRunId !== undefined) {
+					const [current] = await tx
+						.select({ logicalRunId: narrators.logicalRunId })
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryFields({ logicalRunId: input.expectedLogicalRunId }, current);
+				}
 				await tx
 					.update(narrators)
 					.set({

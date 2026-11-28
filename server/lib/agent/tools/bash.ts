@@ -1,5 +1,4 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
-import { beginBashCaptureWindow } from "@server/services/narrator-tree-snapshot-hooks";
 import { z } from "zod/v4";
 import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
@@ -100,6 +99,18 @@ export async function detachBashProcess(
 	return entry.detach();
 }
 
+/**
+ * How long a foreground Bash waits for its process to exit after killing it. A
+ * process that survives the kill (uninterruptible I/O, a lost exit event, a remote
+ * device that stopped answering) must not hold the turn forever.
+ */
+let killSettleGraceMs = 15_000;
+
+/** Test hook: shorten the post-kill grace period. */
+export function setBashKillSettleGraceMsForTests(ms: number | undefined): void {
+	killSettleGraceMs = ms ?? 15_000;
+}
+
 const runningBashProcesses = hotSafe(
 	"narrafork:runningBashProcesses",
 	() => new Map<string, RunningBashEntry>(),
@@ -174,7 +185,10 @@ export const REVIEW_READ_ONLY_BASH_DESCRIPTION =
 	"commands.";
 
 interface BashExecution {
-	start(signal: AbortSignal, options?: Pick<ExecParams, "durableService">): Promise<ExecHandle>;
+	start(
+		signal: AbortSignal,
+		options?: Pick<ExecParams, "durableService" | "backgroundSession">,
+	): Promise<ExecHandle>;
 	cancelUndispatched(): void;
 }
 
@@ -196,7 +210,6 @@ async function prepareBashExecution(
 	cwd: string,
 	ctx: BashStartContext,
 	env?: Record<string, string> | null,
-	captureId?: string,
 ): Promise<BashExecution> {
 	const target = ctx.executionTarget;
 	if (
@@ -210,56 +223,24 @@ async function prepareBashExecution(
 		throw new Error("Bash execution target does not match its frozen backend/cwd");
 	ctx.signal.throwIfAborted();
 	let started = false;
-	let ended = false;
-	let bashWindow: { end(): void } | undefined;
-	const end = () => {
-		if (ended) return;
-		ended = true;
-		try {
-			bashWindow?.end();
-		} catch (error) {
-			logger.warn("Bash snapshot observation failed", { error: String(error) });
-		}
-		bashWindow = undefined;
-	};
 	return {
 		async start(signal, options) {
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
-			let handle: ExecHandle;
-			try {
-				signal.throwIfAborted();
-				if (backend.kind === "local") {
-					try {
-						bashWindow = beginBashCaptureWindow(
-							cwd,
-							ctx.currentToolUseId ?? captureId ?? "__anonymous__",
-						);
-					} catch (error) {
-						logger.warn("Bash snapshot observation unavailable", { error: String(error) });
-					}
-				}
-				handle = await backend.execCommand({
-					command,
-					cwd,
-					signal,
-					env: env ?? undefined,
-					...(options?.durableService ? { durableService: options.durableService } : {}),
-				});
-			} catch (error) {
-				// LocalBackend rejects dispatch only before spawning. Asynchronous
-				// spawn/process errors always come with a handle and its real barrier.
-				end();
-				throw error;
-			}
-			void (handle.whenSettled ?? handle.exited).then(
-				() => end(),
-				() => end(),
-			);
-			return handle;
+			signal.throwIfAborted();
+			// Execution admission remains independent of file history. Local Bash,
+			// including background commands, does not open tree-capture windows.
+			return backend.execCommand({
+				command,
+				cwd,
+				signal,
+				env: env ?? undefined,
+				...(options?.durableService ? { durableService: options.durableService } : {}),
+				...(options?.backgroundSession ? { backgroundSession: options.backgroundSession } : {}),
+			});
 		},
 		cancelUndispatched() {
-			if (!started) end();
+			// No observation resources are allocated before dispatch.
 		},
 	};
 }
@@ -557,8 +538,23 @@ export const bashTool: ToolDefinition = {
 				let timedOut = false;
 				let aborted = false;
 				let exited = false;
+				let abandoned = false;
+				let abandonTimer: ReturnType<typeof setTimeout> | undefined;
+				const abandonWait = Promise.withResolvers<null>();
 
 				const kill = () => handle.kill();
+				// A kill that ends the foreground wait is bounded: stop waiting for an exit
+				// that never comes, so the turn ends with a result instead of hanging.
+				const stopAndBound = () => {
+					if (!abandonTimer && !detached) {
+						abandonTimer = setTimeout(() => {
+							if (exited || detached) return;
+							abandoned = true;
+							abandonWait.resolve(null);
+						}, killSettleGraceMs);
+					}
+					return kill();
+				};
 
 				// Collect stdout + stderr into a single buffer with size limit.
 				// Use StringDecoder to handle multi-byte UTF-8 characters split across chunks.
@@ -630,19 +626,19 @@ export const bashTool: ToolDefinition = {
 				// Abort: if already aborted, kill immediately
 				if (ctx.signal.aborted) {
 					aborted = true;
-					await kill();
+					await stopAndBound();
 				}
 
 				const abortHandler = () => {
 					aborted = true;
-					void kill();
+					void stopAndBound();
 				};
 				ctx.signal.addEventListener("abort", abortHandler, { once: true });
 
 				// Timeout
 				const timer = setTimeout(() => {
 					timedOut = true;
-					void kill();
+					void stopAndBound();
 				}, timeoutMs);
 
 				// Serialize concurrent detach requests. Output stays in this collector
@@ -738,7 +734,7 @@ export const bashTool: ToolDefinition = {
 						timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
 						narratorId: ctx.narratorId,
 						detach,
-						kill: () => void kill(),
+						kill: () => void stopAndBound(),
 						setTimedOut: () => {
 							timedOut = true;
 						},
@@ -777,7 +773,7 @@ export const bashTool: ToolDefinition = {
 					// Kill if process is dead and no recent output (zombie/leaked)
 					if (!pidAlive && !hadOutput && !exited) {
 						watchdogKilled = true;
-						void kill();
+						void stopAndBound();
 						return;
 					}
 
@@ -796,7 +792,7 @@ export const bashTool: ToolDefinition = {
 				// Wait for process to finish
 				let exitCodeValue: number | null = null;
 				try {
-					exitCodeValue = await handle.exited;
+					exitCodeValue = await Promise.race([handle.exited, abandonWait.promise]);
 					await detachPending?.catch(() => undefined);
 				} catch (error) {
 					await detachPending?.catch(() => undefined);
@@ -816,6 +812,7 @@ export const bashTool: ToolDefinition = {
 					throw error;
 				} finally {
 					clearTimeout(timer);
+					clearTimeout(abandonTimer);
 					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
@@ -854,6 +851,13 @@ export const bashTool: ToolDefinition = {
 				if (watchdogKilled)
 					meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 				if (aborted) meta.push("Command was aborted by user");
+				if (abandoned) {
+					meta.push(
+						`Process did not exit within ${killSettleGraceMs}ms after being killed` +
+							(handle.pid ? ` (pid ${handle.pid})` : "") +
+							"; stopped waiting for it, it may still be running",
+					);
+				}
 				if (!timedOut && !aborted && handle.outputIncomplete?.()) {
 					meta.push(
 						"Output is incomplete: the device reached its output limit or a background " +
@@ -864,7 +868,8 @@ export const bashTool: ToolDefinition = {
 					output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 				}
 
-				const exitCode = exitCodeValue ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
+				const exitCode =
+					exitCodeValue ?? (timedOut || aborted || watchdogKilled || abandoned ? 1 : 0);
 				if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 				if (detached) {
@@ -967,17 +972,10 @@ export async function startManualBackgroundBash(input: {
 	const env = await resolveNarratorGitIdentityEnv({ turnUserId: input.userId, narratorId });
 	const context = { narratorId, signal, executionTarget: target, updateExecutionLease };
 	const taskId = `bash_${generateShortId()}`;
-	const execution = await prepareBashExecution(
-		backend,
-		command,
-		target.cwd,
-		context,
-		{
-			...env,
-			...input.proxyEnv,
-		},
-		taskId,
-	);
+	const execution = await prepareBashExecution(backend, command, target.cwd, context, {
+		...env,
+		...input.proxyEnv,
+	});
 	try {
 		const task = await launchBackgroundBash(
 			command,
@@ -1113,10 +1111,16 @@ async function startBackgroundBash(
 			// supports it, it writes to a log file and leaves a manifest so a restarted server
 			// can re-attach instead of reporting it failed.
 			const handle = await backgroundTaskService.runBashStartup(() =>
-				execution.start(
-					bgAbort.signal,
-					backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
-				),
+				execution.start(bgAbort.signal, {
+					...(backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : {}),
+					// On a remote device with durable exec sessions, the command outlives a lost
+					// connection or a restart of this server either way.
+					backgroundSession: {
+						taskId,
+						...(timeoutMs !== undefined ? { timeoutMs } : {}),
+						bind: (binding) => backgroundTaskService.bindExecutorSession(taskId, binding),
+					},
+				}),
 			);
 			monitoringStarted = true;
 			// Settled beside monitoring, not before it: output must not wait for the check.
@@ -1180,7 +1184,13 @@ export interface MonitorBackgroundBashOptions {
  * Shared by fresh launches and by services a restarted server re-attached to.
  */
 export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
-	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
+	const { taskId, handle, bgAbort, backgroundKind } = opts;
+	// A process that enforces the deadline itself (an executor session) reports whether it
+	// hit it; this side only steps in after a grace period, e.g. when the device is away.
+	const timeoutMs =
+		opts.timeoutMs !== undefined && handle.timedOut
+			? Math.max(opts.timeoutMs, 0) + EXECUTOR_DEADLINE_GRACE_MS
+			: opts.timeoutMs;
 	let timedOut = false;
 	let terminalStarted = false;
 	try {
@@ -1188,6 +1198,10 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		let outputTruncated = false;
 		const killFn = () => handle.kill();
 		backgroundTaskService.registerKillHandler(taskId, () => void killFn());
+		if (handle.detachForShutdown) {
+			const detach = handle.detachForShutdown.bind(handle);
+			backgroundTaskService.registerShutdownDetach(taskId, detach);
+		}
 
 		const bgDecoder = createStreamDecoder();
 		const appendOutput = (raw: Uint8Array) => {
@@ -1277,6 +1291,13 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		}
 
 		const exitCode = resolvedExitCode ?? 1;
+		if (!timedOut && (handle as ExecHandle).timedOut?.()) {
+			timedOut = true;
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
+			);
+		}
 		if (watchdogKilled) {
 			backgroundTaskService.appendOutput(
 				taskId,
@@ -1328,6 +1349,7 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		// Preserved collectors leave their task and manifest for the next server to recover.
 		if (terminalCommitted && handle instanceof DurableServiceHandle)
 			await removeServiceArtifacts(taskId);
+		if (terminalCommitted) await releaseAfterTerminal(taskId, handle);
 	} catch (err) {
 		// Persistence failure is a lifecycle failure, not a second terminal outcome to retry.
 		if (terminalStarted) throw err;
@@ -1352,5 +1374,18 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		}
 		if (terminalCommitted && handle instanceof DurableServiceHandle)
 			await removeServiceArtifacts(taskId);
+		if (terminalCommitted) await releaseAfterTerminal(taskId, handle);
+	}
+}
+
+/** How long past the deadline this server waits for an executor's own timeout verdict. */
+export const EXECUTOR_DEADLINE_GRACE_MS = 30_000;
+
+/** Let a handle that keeps output outside this process release it; never fails the task. */
+async function releaseAfterTerminal(taskId: string, handle: ExecHandle): Promise<void> {
+	try {
+		await handle.afterTerminalCommitted?.();
+	} catch (error) {
+		logger.warn("Background command release failed", { taskId, error: String(error) });
 	}
 }

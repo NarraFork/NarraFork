@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import quotaManifest from "../plugins/provider-quota/manifest.json";
 import {
 	bundledPluginArchiveIdentity,
 	renderBundledPluginModule,
@@ -212,7 +213,7 @@ test("frozen builds embed independent bundled plugin archives across A/B/A launc
 		const home = join(temp, "home");
 		await Promise.all([mkdir(source), mkdir(cwd), mkdir(home)]);
 		const pluginId = "io.narrafork.provider-quota";
-		const version = "1.0.3";
+		const version = quotaManifest.version;
 		const fixture = join(root, "tests/fixtures/plugins/packages/valid-package");
 		const manifest = parseManifest({
 			...JSON.parse(await readFile(join(fixture, "manifest.json"), "utf8")),

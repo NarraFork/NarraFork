@@ -9,6 +9,8 @@ export interface ReasoningTranslationPart {
 }
 
 export interface ReasoningTranslationFields {
+	/** Display hint for an open checkpoint; server activity authorizes its source. */
+	sealedReasoningLength?: number;
 	/** Appending source preserves the generation; replacing source does not. */
 	translationGeneration?: string;
 	translationParts?: ReasoningTranslationPart[];
@@ -25,6 +27,71 @@ export interface ReasoningTranslationPatch {
 	stateRevision: number;
 	translationGeneration: string;
 	part: ReasoningTranslationPart;
+}
+
+export interface ReasoningTranslationVisibilityTarget {
+	ownerNarratorId: string;
+	messageId: string;
+	blockId: string;
+	blockRevision: number;
+	elementId: string;
+}
+
+export const MAX_REASONING_TRANSLATION_VISIBLE_TARGETS = 16;
+
+export interface ReasoningTranslationVisibilityReport {
+	type: "reasoning_translation_visibility";
+	narratorId: string;
+	visibilityId: string;
+	targets: ReasoningTranslationVisibilityTarget[];
+}
+
+export type ReasoningTranslationStatus = "queued" | "running" | "idle" | "deferred";
+
+export interface ReasoningTranslationStatusFrame {
+	type: "reasoning_translation_status";
+	narratorId: string;
+	visibilityId: string;
+	target: ReasoningTranslationVisibilityTarget;
+	status: ReasoningTranslationStatus;
+}
+
+export function reasoningTranslationTargetKey(
+	target: ReasoningTranslationVisibilityTarget,
+): string {
+	return JSON.stringify([
+		target.ownerNarratorId,
+		target.messageId,
+		target.blockId,
+		target.blockRevision,
+		target.elementId,
+	]);
+}
+
+export function readReasoningTranslationStatus(
+	value: unknown,
+): ReasoningTranslationStatusFrame | null {
+	if (!value || typeof value !== "object") return null;
+	const frame = value as ReasoningTranslationStatusFrame;
+	const target = frame.target;
+	if (
+		frame.type !== "reasoning_translation_status" ||
+		!isReasoningTranslationId(frame.narratorId) ||
+		!isReasoningTranslationId(frame.visibilityId) ||
+		(frame.status !== "queued" &&
+			frame.status !== "running" &&
+			frame.status !== "idle" &&
+			frame.status !== "deferred") ||
+		!target ||
+		typeof target !== "object" ||
+		![target.ownerNarratorId, target.messageId, target.blockId, target.elementId].every(
+			isReasoningTranslationId,
+		) ||
+		!Number.isSafeInteger(target.blockRevision) ||
+		target.blockRevision < 0
+	)
+		return null;
+	return frame;
 }
 
 export const MAX_REASONING_TRANSLATION_ID_LENGTH = 256;

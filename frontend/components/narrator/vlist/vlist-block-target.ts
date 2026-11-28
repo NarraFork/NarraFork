@@ -37,7 +37,13 @@ export interface VListBlockTarget {
 /** Kinds that are folded aggregates spanning multiple blocks/messages. These
  *  intentionally get no single-block menu (parity with the chunked path, whose
  *  ActivityTrace/ToolRunCount are not wrapped in a block menu). */
-const AGGREGATE_KINDS = new Set<VListElementKind>(["tool-run-count", "activity-trace"]);
+const AGGREGATE_KINDS = new Set<VListElementKind>([
+	"tool-run-count",
+	"activity-trace",
+	// Team page: a chip folds several calls; a divider is a team event, not a message block.
+	"team-chip",
+	"team-event",
+]);
 
 /** Kinds that never participate in the single-block interaction menu. */
 const NON_INTERACTIVE_KINDS = new Set<VListElementKind>([

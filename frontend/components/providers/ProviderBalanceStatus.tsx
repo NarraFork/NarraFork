@@ -7,15 +7,12 @@ import {
 	useProviderQuota,
 	useRefreshProviderQuota,
 } from "../../hooks/useProviderQuota";
-import { useQuotaNow } from "../../hooks/useQuotaNow";
+import { selectQuotaEntries, useQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
-import {
-	buildProviderQuotaView,
-	isProviderQuotaUnavailable,
-} from "../narrator/model/provider-quota-view";
-import { QuotaPanelIndicator } from "../narrator/model/QuotaPanelIndicator";
+import { isProviderQuotaUnavailable } from "../narrator/model/provider-quota-view";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 
-/** Saved Custom API account quota. The historical component name stays compatible. */
+/** Saved Custom API diagnostics and operations share the unified quota presentation. */
 export function ProviderBalanceStatus({
 	providerId,
 	dirty,
@@ -34,9 +31,15 @@ export function ProviderBalanceStatus({
 	const generation = typeof rawGeneration === "string" ? rawGeneration : undefined;
 	const capabilityEnabled = isProviderQuotaCapabilityEnabled(settings);
 	const query = useProviderQuota(providerId, generation, true, capabilityEnabled);
-	const snapshot = query.data;
-	const unavailable = isProviderQuotaUnavailable(snapshot);
-	const probing = snapshot?.status === "pending" || snapshot?.status === "probing";
+	const diagnostic = query.data;
+	const unavailable = isProviderQuotaUnavailable(diagnostic);
+	const snapshots = useQuotaSnapshots(capabilityEnabled && !!generation && !unavailable);
+	const entries = selectQuotaEntries(snapshots.data?.entries ?? []).filter(
+		(item) => item.groupId === providerId && item.generation === generation,
+	);
+	const entry = entries.find((item) => item.primary) ?? entries[0];
+	const probing =
+		diagnostic?.status === "pending" || diagnostic?.status === "probing" || entry?.refreshing;
 	const canRefresh =
 		capabilityEnabled &&
 		user?.role === "admin" &&
@@ -44,18 +47,22 @@ export function ProviderBalanceStatus({
 		Boolean(generation) &&
 		!query.isPending &&
 		!query.isError &&
+		!snapshots.isPending &&
+		!snapshots.isError &&
 		!probing &&
 		!unavailable;
 	const refresh = useRefreshProviderQuota(providerId, generation, canRefresh);
-	const now = useQuotaNow(capabilityEnabled && !unavailable && Boolean(snapshot?.data?.expiresAt));
 	if (!capabilityEnabled || !generation || unavailable) return null;
-	const view = buildProviderQuotaView(snapshot, t, user?.role === "admin", query.isError, now);
-	const mode = snapshot?.status === "supported" ? "refresh" : "probe";
+	const mode = diagnostic?.status === "supported" ? "refresh" : "probe";
+	const snapshot =
+		entry?.snapshot && (query.isError || snapshots.isError)
+			? { ...entry.snapshot, hasError: true }
+			: entry?.snapshot;
 	return (
 		<Stack gap={4}>
 			<Group justify="space-between">
 				<Text size="xs" c="dimmed">
-					{t(`providerQuota.${snapshot?.status ?? "pending"}`)}
+					{t(`providerQuota.${diagnostic?.status ?? "pending"}`)}
 				</Text>
 				{user?.role === "admin" && (
 					<Button
@@ -69,8 +76,13 @@ export function ProviderBalanceStatus({
 					</Button>
 				)}
 			</Group>
-			<QuotaPanelIndicator view={view} now={snapshot?.data?.expiresAt ? now : undefined} />
-			{(query.isError || refresh.isError) && (
+			<QuotaSnapshotIndicator snapshot={snapshot} title={t("providerQuota.supported")} />
+			{user?.role === "admin" && diagnostic?.error && diagnostic.error !== "unavailable" && (
+				<Text size="xs" c="yellow">
+					{t(`providerQuota.errors.${diagnostic.error}`)}
+				</Text>
+			)}
+			{(query.isError || snapshots.isError || refresh.isError) && (
 				<Text size="xs" c="red">
 					{t("providerQuota.error")}
 				</Text>

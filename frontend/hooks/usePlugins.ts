@@ -46,9 +46,10 @@ export function invalidatePluginQueries(qc: {
 	void qc.invalidateQueries({ queryKey: pluginKeys.all });
 	void qc.invalidateQueries({ queryKey: pluginKeys.uiContributions });
 	void qc.invalidateQueries({ queryKey: pluginKeys.uiHealth });
-	// Data-only quotaSources have no iframe contribution, but their lifecycle
-	// still invalidates Custom API snapshots (never platform or NUG caches).
+	// Data-only contributions also invalidate their settings and unified quota projection.
+	void qc.invalidateQueries({ queryKey: ["provider-settings"] });
 	void qc.invalidateQueries({ queryKey: ["provider-quotas"] });
+	void qc.invalidateQueries({ queryKey: ["quota-snapshots"] });
 	// Quota-source enablement also controls the saved balance row and site-account form.
 	void qc.invalidateQueries({ queryKey: ["settings"] });
 	void qc.invalidateQueries({ queryKey: ["admin", "settings"] });

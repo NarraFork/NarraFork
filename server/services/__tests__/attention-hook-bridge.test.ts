@@ -7,11 +7,15 @@
  */
 
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { HookInput, HookResult } from "../hook-service";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -56,7 +60,8 @@ function seedNarrator(): void {
 
 /** The bridge handler is async (narrator lookup + runHooks). */
 async function settleBridge(): Promise<void> {
-	for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+	const deadline = Date.now() + 5_000;
+	while (runHookCalls.length === 0 && Date.now() < deadline) await Bun.sleep(5);
 }
 
 afterEach(() => {

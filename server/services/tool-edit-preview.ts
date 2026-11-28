@@ -3,19 +3,20 @@ import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
 	type FileChangeState,
+	isFileHistoryEnabledForDevice,
 } from "@shared/file-change-protocol";
 import type {
 	ToolEditPreview,
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
 } from "@shared/tool-edit-preview";
-import { type AnyColumn, and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { activeDatabaseBackend, db, sqlite } from "../db";
 import { narratorToolCalls, worktreeTreeSnapshots } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import {
 	sameToolEditBinding,
-	type ToolEditBinding,
 	type ToolEditEffect,
 	type ToolEditOperation,
 	type ToolEditPreviewSnapshot,
@@ -29,87 +30,58 @@ import {
 	type FileChangeScopeIdentity,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
+import { type ToolPreviewReadSnapshot, toolEditPreviewColumns } from "./tool-edit-preview-reader";
 import { snapshotPathIdentity } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 const PREVIEW_TIMEOUT_MS = 5_000;
 
-function boundedText(column: AnyColumn) {
-	return sql<
-		string | null
-	>`CASE WHEN octet_length(${column}) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN ${column} ELSE NULL END`;
-}
-
-// Never load inputJson/outputJson: the model's edit strings are not historical evidence.
-// Location extraction is separately capped before SQLite attempts to parse JSON.
-export const toolEditPreviewColumns = {
-	id: narratorToolCalls.id,
-	narratorId: narratorToolCalls.narratorId,
-	messageId: narratorToolCalls.messageId,
-	toolUseId: narratorToolCalls.toolUseId,
-	toolName: narratorToolCalls.toolName,
-	executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
-	executionOriginToolCallId: narratorToolCalls.executionOriginToolCallId,
-	executionAttempt: narratorToolCalls.executionAttempt,
-	fileChangeOperationId: narratorToolCalls.fileChangeOperationId,
-	executionDeviceId: boundedText(narratorToolCalls.executionDeviceId),
-	executionCwd: boundedText(narratorToolCalls.executionCwd),
-	executionPathFlavor: narratorToolCalls.executionPathFlavor,
-	resolvedFilePath: boundedText(narratorToolCalls.resolvedFilePath),
-	canonicalFilePath: boundedText(narratorToolCalls.canonicalFilePath),
-	runtimeGeneration: narratorToolCalls.runtimeGeneration,
-	treeHashBefore: boundedText(narratorToolCalls.treeHashBefore),
-	treeHashAfter: boundedText(narratorToolCalls.treeHashAfter),
-	locationJson: sql<string | null>`CASE
-		WHEN octet_length(${narratorToolCalls.outputJson}) <= ${64 * 1024}
-		THEN CASE WHEN json_valid(${narratorToolCalls.outputJson})
-			THEN json_extract(${narratorToolCalls.outputJson}, '$._metadata') END
-		END`,
-};
-
-export type ToolEditPreviewMetadata = ReturnType<typeof readOrigin>;
-function readOrigin(id: string) {
-	return db
-		.select(toolEditPreviewColumns)
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.id, id))
-		.get();
-}
+export { toolEditPreviewColumns } from "./tool-edit-preview-reader";
+export type ToolEditPreviewMetadata = ToolPreviewReadSnapshot["row"];
 type ToolRow = NonNullable<ToolEditPreviewMetadata>;
 
-async function readEvidence(row: ToolRow, signal: AbortSignal): Promise<ToolEditPreviewSnapshot> {
-	const operationId = row.fileChangeOperationId;
-	if (!operationId) return { status: "missing" };
+type PreviewEvidence =
+	| { status: "missing" }
+	| { status: "too_large" }
+	| {
+			status: "ambiguous";
+			row: ToolRow;
+			original: ToolRow | null;
+			operation: ToolEditOperation;
+	  }
+	| {
+			status: "ok";
+			row: ToolRow;
+			original: ToolRow | null;
+			operation: ToolEditOperation;
+			effect?: ToolEditEffect;
+			scope: FileChangeScopeIdentity | null;
+	  };
+
+async function readEvidence(row: ToolRow, signal: AbortSignal): Promise<PreviewEvidence> {
 	if (activeDatabaseBackend === "sqlite") {
-		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction)
 			throw new WorkersUnavailableError("requires_committed_file");
-		}
-		return runReadTask<ToolEditPreviewSnapshot>(
+		const snapshot = await runReadTask<ToolEditPreviewSnapshot>(
 			sqlite.filename,
 			{ kind: "toolEditPreview", toolCallId: row.id },
 			{ signal, timeoutMs: PREVIEW_TIMEOUT_MS },
 		);
+		if (snapshot.status === "missing" || snapshot.status === "too_large") return snapshot;
+		const common = {
+			row: snapshot.row as ToolRow,
+			original: (snapshot.original as ToolRow | undefined) ?? null,
+			operation: snapshot.operation,
+		};
+		if (snapshot.status === "ambiguous") return { status: "ambiguous", ...common };
+		return {
+			status: "ok",
+			...common,
+			effect: snapshot.effect,
+			scope: snapshot.scope,
+		};
 	}
-	const evidence = new FileChangeEvidenceService(db);
-	const operation = evidence.getOperation(operationId);
-	if (!operation) return { status: "missing" };
-	const original = row.executionOriginToolCallId
-		? readOrigin(row.executionOriginToolCallId)
-		: undefined;
-	if (!operationMatches(row, operation, original))
-		return { status: "ok", row, original, operation, effect: undefined, scope: null };
-	const page = evidence.listEffects(operation.id, { limit: 2 });
-	if (page.hasMore || page.items.length > 1)
-		return { status: "ambiguous", row, original, operation };
-	const effect = page.items[0];
-	return {
-		status: "ok",
-		row,
-		original,
-		operation,
-		effect,
-		scope: effect ? evidence.getScope(effect.scopeId) : null,
-	};
+	return readPostgresPreviewSnapshot(row.id, signal);
 }
 
 function unavailable(reason: ToolEditPreviewUnavailableReason): ToolEditPreviewSide {
@@ -135,9 +107,9 @@ function locationOf(value: string | null): ToolEditPreview["location"] {
 }
 
 function operationMatches(
-	row: ToolEditBinding,
+	row: ToolRow,
 	operation: ToolEditOperation,
-	original?: ToolEditBinding,
+	original: ToolRow | null = null,
 ): boolean {
 	const originId = row.executionOriginToolCallId ?? row.id;
 	if (
@@ -289,19 +261,21 @@ async function treePreview(
 	if (hashes.length === 0) return missing;
 	// The exact tool row already freezes these hashes and cwd. A v1 path alias is
 	// evidence only for those explicit hashes, never proof of the current directory.
-	const recorded = db
-		.select({ treeHash: worktreeTreeSnapshots.treeHash })
-		.from(worktreeTreeSnapshots)
-		.where(
-			and(
-				eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
-				inArray(worktreeTreeSnapshots.worktreePath, paths),
-				inArray(worktreeTreeSnapshots.treeHash, hashes),
-			),
-		)
-		// The unique (device, path, hash) index bounds two paths × two hashes to four rows.
-		.limit(4)
-		.all();
+	const recorded = await readQuery(
+		db
+			.select({ treeHash: worktreeTreeSnapshots.treeHash })
+			.from(worktreeTreeSnapshots)
+			.where(
+				and(
+					eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
+					inArray(worktreeTreeSnapshots.worktreePath, paths),
+					inArray(worktreeTreeSnapshots.treeHash, hashes),
+				),
+			)
+			// The unique (device, path, hash) index bounds two paths × two hashes to four rows.
+			.limit(4),
+		{ executionPolicy: "worker-required", maxRows: 4, signal, timeoutMs: PREVIEW_TIMEOUT_MS },
+	);
 	const recordedHashes = new Set(recorded.map(({ treeHash }) => treeHash));
 	const side = async (hash: string | null): Promise<ToolEditPreviewSide> => {
 		if (!hash || !recordedHashes.has(hash)) return unavailable("missing_evidence");
@@ -320,6 +294,63 @@ async function treePreview(
 			before.status === "unavailable" && after.status === "unavailable" ? "unavailable" : "tree",
 		before,
 		after,
+	};
+}
+
+async function readPostgresPreviewSnapshot(
+	toolCallId: string,
+	signal: AbortSignal,
+): Promise<PreviewEvidence> {
+	const origin = (id: string) =>
+		readQueryFirst(
+			db
+				.select(toolEditPreviewColumns)
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, id))
+				.limit(1),
+			{ executionPolicy: "worker-required", signal, maxRows: 1, timeoutMs: PREVIEW_TIMEOUT_MS },
+		);
+	const row = (await origin(toolCallId)) ?? null;
+	if (!row) return { status: "missing" };
+	const original = row.executionOriginToolCallId
+		? ((await origin(row.executionOriginToolCallId)) ?? null)
+		: null;
+	const evidence = new FileChangeEvidenceService(db);
+	const operation = row.fileChangeOperationId
+		? await evidence.getOperation(row.fileChangeOperationId, {
+				signal,
+				timeoutMs: PREVIEW_TIMEOUT_MS,
+			})
+		: null;
+	if (!operation) return { status: "missing" };
+	const effects = (
+		await evidence.listEffects(operation.id, {
+			limit: 2,
+			signal,
+			timeoutMs: PREVIEW_TIMEOUT_MS,
+		})
+	).items;
+	if (effects.length > 1)
+		return {
+			status: "ambiguous",
+			row,
+			original,
+			operation: operation as ToolEditOperation,
+		};
+	const effect = effects[0] as ToolEditEffect | undefined;
+	const scope = effect
+		? ((await evidence.getScope(effect.scopeId, {
+				signal,
+				timeoutMs: PREVIEW_TIMEOUT_MS,
+			})) as FileChangeScopeIdentity | null)
+		: null;
+	return {
+		status: "ok",
+		row,
+		original,
+		operation: operation as ToolEditOperation,
+		effect,
+		scope,
 	};
 }
 
@@ -351,16 +382,20 @@ export async function getToolEditPreview(
 		if (row.executionPathFlavor === "spec" || row.resolvedFilePath?.startsWith("spec://"))
 			return reject("unsupported");
 		signal.throwIfAborted();
+		// The message-ref selector supplies the frozen execution target, not request input.
+		if (!isFileHistoryEnabledForDevice(row.executionDeviceId)) return result;
 		if (!row.fileChangeOperationId) return { ...result, ...(await treePreview(row, signal)) };
 		const snapshot = await readEvidence(row, signal);
 		signal.throwIfAborted();
 		if (snapshot.status === "missing") return reject("missing_evidence");
 		if (snapshot.status === "too_large") return reject("too_large");
-		const { operation, original } = snapshot;
-		if (!sameToolEditBinding(row, snapshot.row) || !operationMatches(row, operation, original))
-			return reject("identity_unverified");
 		if (snapshot.status === "ambiguous") return reject("ambiguous");
-		const { effect, scope } = snapshot;
+		if (
+			!sameToolEditBinding(row, snapshot.row) ||
+			!operationMatches(row, snapshot.operation, snapshot.original)
+		)
+			return reject("identity_unverified");
+		const { operation, effect, scope } = snapshot;
 		if (!effect) return reject("missing_evidence");
 		if (!effectMatches(row, operation, effect, scope)) {
 			return reject("identity_unverified");

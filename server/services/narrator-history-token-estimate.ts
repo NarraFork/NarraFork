@@ -62,7 +62,12 @@ export async function estimateNarratorBuildHistoryTokens(
 
 	const effectiveModel =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? (await resolveSubagentModelForRun(narrator, narrator.ownerUserId)).model
+			? (
+					await resolveSubagentModelForRun(narrator, narrator.ownerUserId, undefined, {
+						signal: options.signal,
+						deadlineAt: deadline,
+					})
+				).model
 			: resolveEffectiveModel(narrator.model, resolveProvider(narrator.model ?? undefined));
 	const resolved = resolveProviderAndModel(effectiveModel, resolveProvider(effectiveModel));
 	const { history } = await buildHistory(dbMessages, resolved.model, resolved.provider, narratorId);

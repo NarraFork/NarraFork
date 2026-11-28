@@ -6,7 +6,6 @@
 	"processExited": "[Process exited with code {{code}}]",
 	"error": "[Error: {{message}}]",
 	"sendToChat": "Send to chat",
-	"sendToTerminal": "Send to terminal",
 	"openTerminal": "Open terminal",
 	"closeTerminal": "Close terminal",
 	"restartTerminal": "Restart terminal",

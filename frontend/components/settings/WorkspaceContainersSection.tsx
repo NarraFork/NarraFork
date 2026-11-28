@@ -1,4 +1,4 @@
-import { Alert, Button, Group, Stack, Switch, Text, Title } from "@mantine/core";
+import { Alert, Button, Group, Stack, Text, Title } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -6,12 +6,7 @@ import { useContainersCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { PodmanInstallModal } from "../container/PodmanInstallModal";
 
-export interface WorkspaceContainersSectionProps {
-	treeSnapshots: boolean;
-	setTreeSnapshots: (v: boolean) => void;
-}
-
-export function WorkspaceContainersSection(props: WorkspaceContainersSectionProps) {
+export function WorkspaceContainersSection() {
 	const { t } = useTranslation("settings");
 	const containersCapability = useContainersCapability();
 	const [podmanOpen, setPodmanOpen] = useState(false);
@@ -23,17 +18,7 @@ export function WorkspaceContainersSection(props: WorkspaceContainersSectionProp
 
 	return (
 		<Stack>
-			<Title order={5}>{t("workspaceSubSection")}</Title>
-			<Switch
-				label={t("treeSnapshotsEnabled")}
-				description={t("treeSnapshotsEnabledDesc")}
-				checked={props.treeSnapshots}
-				onChange={(e) => props.setTreeSnapshots(e.currentTarget.checked)}
-			/>
-
-			<Title order={5} mt="sm">
-				{t("containersSubSection")}
-			</Title>
+			<Title order={5}>{t("containersSubSection")}</Title>
 			<Text size="sm" c="dimmed">
 				{t("containersDesc")}
 			</Text>

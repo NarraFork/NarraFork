@@ -107,13 +107,30 @@ function bashLabel(title: string | null, command: string | null): string {
  * same selector grammar Send/Watch honour). Returns the input unchanged when
  * nothing matches, so the caller's own validation produces the error.
  */
-async function resolveTeamMemberId(callerNarratorId: string, selector: string): Promise<string> {
+async function resolveTeamMemberId(
+	callerNarratorId: string,
+	selector: string,
+	options?: { historical?: boolean; teamId?: string },
+): Promise<string> {
 	const { resolveSubagentTargets } = await import("@server/services/agent-communication");
-	const targets = await resolveSubagentTargets({
-		callerNarratorId,
-		id: selector,
-	}).catch(() => []);
-	return targets.length === 1 ? targets[0].id : selector;
+	try {
+		const targets = await resolveSubagentTargets({
+			callerNarratorId,
+			id: selector,
+			historical: options?.historical,
+			teamId: options?.teamId,
+		});
+		return targets.length === 1 ? targets[0].id : selector;
+	} catch (err) {
+		if (
+			options?.historical &&
+			err instanceof Error &&
+			err.message.startsWith("Ambiguous subagent target")
+		) {
+			throw err;
+		}
+		return selector;
+	}
 }
 
 export const teamStatusTool: ToolDefinition = {
@@ -349,14 +366,19 @@ export const teamStatusTool: ToolDefinition = {
 				// Resolve a target BEFORE querying; it must not be constrained by the
 				// whole-team page budget or an empty first-page aggregate.
 				const resolvedId = target_id
-					? await resolveTeamMemberId(ctx.narratorId, target_id)
+					? await resolveTeamMemberId(ctx.narratorId, target_id, {
+							historical: true,
+							teamId: parentNarratorId,
+						})
 					: undefined;
-				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId);
+				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId, {
+					signal: ctx.signal,
+				});
 				// Only ids are tracked here, so labels need the async resolver.
 				const { resolveAgentLabel } = await import("@server/services/subagent-label");
 				if (resolvedId) {
 					const files = changes.get(resolvedId);
-					const label = await resolveAgentLabel(scopeId, resolvedId);
+					const label = await resolveAgentLabel(scopeId, resolvedId, { signal: ctx.signal });
 					if (!files?.size) {
 						return { output: `No file changes recorded for ${label}.` };
 					}
@@ -370,7 +392,7 @@ export const teamStatusTool: ToolDefinition = {
 				const sections: string[] = [];
 				for (const [subId, files] of changes) {
 					const isSelf = subId === ctx.narratorId ? " (you)" : "";
-					const label = await resolveAgentLabel(scopeId, subId);
+					const label = await resolveAgentLabel(scopeId, subId, { signal: ctx.signal });
 					sections.push(
 						`${label}${isSelf} (${files.size} files):\n${[...files].map((f) => `  ${f}`).join("\n")}`,
 					);

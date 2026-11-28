@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,8 @@ import {
 	getCredentialUsageTotals,
 	recordCredentialUsage,
 } from "@server/services/credential-usage-totals";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "../../services/__tests__/narrator-worker-fixture";
 import { CodexManager, isArchivedCodexCredential } from "../codex-manager";
 import { readSecretJSON } from "../secret-store";
 
@@ -69,7 +70,10 @@ function readCredentialsFile(tmpHome: string): Array<Record<string, unknown>> {
 }
 
 const tempHomes: string[] = [];
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+beforeAll(() => workerFixture.ready);
+afterAll(() => workerFixture.close());
 
 afterEach(() => {
 	for (const p of tempHomes.splice(0)) {
@@ -410,7 +414,7 @@ describe("归档与删除对累计用量的影响", () => {
 		);
 	}
 
-	test("归档保留累计用量（归档不是删除）", () => {
+	test("归档保留累计用量（归档不是删除）", async () => {
 		const { manager, tmpHome } = createManager([{ id: "retired" }]);
 		tempHomes.push(tmpHome);
 		seedUsage("retired");
@@ -418,35 +422,35 @@ describe("归档与删除对累计用量的影响", () => {
 		manager.archiveCredential("retired");
 
 		// No usage-totals call belongs on the archive path at all.
-		const summary = getCredentialUsageTotals("codex", "retired", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "retired", 50, db);
 		expect(summary.requestCount).toBe(1);
 		expect(summary.inputTokens).toBe(1000);
 
 		manager.dispose();
 	});
 
-	test("归档后再删除会清空累计用量，且不影响其他凭据", () => {
+	test("归档后再删除会清空累计用量，且不影响其他凭据", async () => {
 		const { manager, tmpHome } = createManager([{ id: "retired" }, { id: "keep" }]);
 		tempHomes.push(tmpHome);
 		seedUsage("retired");
 		seedUsage("keep");
 
 		manager.archiveCredential("retired");
-		expect(getCredentialUsageTotals("codex", "retired", 50, db).requestCount).toBe(1);
+		expect((await getCredentialUsageTotals("codex", "retired", 50, db)).requestCount).toBe(1);
 
 		// What DELETE /api/codex/credentials/:id does: remove, then drop the rollup.
 		manager.removeCredential("retired");
 		deleteCredentialUsageTotals("codex", "retired", db);
 
 		expect(manager.snapshot().archivedTotal).toBe(0);
-		expect(getCredentialUsageTotals("codex", "retired", 50, db).requestCount).toBe(0);
+		expect((await getCredentialUsageTotals("codex", "retired", 50, db)).requestCount).toBe(0);
 		// Deleting one credential must not disturb another's history.
-		expect(getCredentialUsageTotals("codex", "keep", 50, db).requestCount).toBe(1);
+		expect((await getCredentialUsageTotals("codex", "keep", 50, db)).requestCount).toBe(1);
 
 		manager.dispose();
 	});
 
-	test("批量删除清空每个被删凭据的累计，保留未删的", () => {
+	test("批量删除清空每个被删凭据的累计，保留未删的", async () => {
 		const { manager, tmpHome } = createManager([
 			{ id: "a" },
 			{ id: "b" },
@@ -460,15 +464,15 @@ describe("归档与删除对累计用量的影响", () => {
 		for (const id of result.removed) deleteCredentialUsageTotals("codex", id, db);
 
 		expect(result.removed.sort()).toEqual(["a", "c"]);
-		expect(getCredentialUsageTotals("codex", "a", 50, db).requestCount).toBe(0);
+		expect((await getCredentialUsageTotals("codex", "a", 50, db)).requestCount).toBe(0);
 		// An archived credential deleted explicitly by id loses its totals too.
-		expect(getCredentialUsageTotals("codex", "c", 50, db).requestCount).toBe(0);
-		expect(getCredentialUsageTotals("codex", "b", 50, db).requestCount).toBe(1);
+		expect((await getCredentialUsageTotals("codex", "c", 50, db)).requestCount).toBe(0);
+		expect((await getCredentialUsageTotals("codex", "b", 50, db)).requestCount).toBe(1);
 
 		manager.dispose();
 	});
 
-	test("unhealthy 批量清理不会碰归档凭据的累计", () => {
+	test("unhealthy 批量清理不会碰归档凭据的累计", async () => {
 		const { manager, tmpHome } = createManager([
 			{ id: "broken", disabled: true, disabledReason: "too_many_failures" },
 			{ id: "retired-broken", disabled: true, disabledReason: "too_many_failures" },
@@ -484,9 +488,11 @@ describe("归档与删除对累计用量的影响", () => {
 		for (const id of result.removed) deleteCredentialUsageTotals("codex", id, db);
 
 		expect(result.removed).toEqual(["broken"]);
-		expect(getCredentialUsageTotals("codex", "broken", 50, db).requestCount).toBe(0);
+		expect((await getCredentialUsageTotals("codex", "broken", 50, db)).requestCount).toBe(0);
 		// Archived + unhealthy still keeps its history: the sweep skips it.
-		expect(getCredentialUsageTotals("codex", "retired-broken", 50, db).requestCount).toBe(1);
+		expect((await getCredentialUsageTotals("codex", "retired-broken", 50, db)).requestCount).toBe(
+			1,
+		);
 
 		manager.dispose();
 	});

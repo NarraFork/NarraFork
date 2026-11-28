@@ -11,7 +11,7 @@ test.skipIf(!enabled)(
 	async () => {
 		const result = await withPostgres(async ({ port, credentials, exec }) => {
 			const migration = await readFile(
-				new URL("../../../drizzle-postgres/0079_plugin_provider_settings.sql", import.meta.url),
+				new URL("../../../drizzle-postgres/0087_plugin_provider_settings.sql", import.meta.url),
 				"utf8",
 			);
 			const applied = await exec(migration);

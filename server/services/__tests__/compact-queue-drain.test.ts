@@ -18,9 +18,11 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { getTestDb } from "../../../tests/setup";
+import * as pool from "../../lib/db-worker/pool";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -134,7 +136,8 @@ beforeEach(() => {
 
 afterEach(resetFixture);
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.module("../narrator-session", () => realNarratorSession);
 	mock.restore();
@@ -147,7 +150,7 @@ describe("queue admission during compaction", () => {
 			const result = await pushBufferedMessage(NARRATOR_ID, "typed while compacting");
 
 			expect(result.ok).toBe(true);
-			expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
 				"typed while compacting",
 			]);
 		} finally {
@@ -167,7 +170,7 @@ describe("queue admission during compaction", () => {
 		expect(result.ok).toBe(false);
 		expect(result.full).toBeUndefined();
 		// The message queued while the compact was live is untouched by the refusal.
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["during"]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual(["during"]);
 	});
 
 	test("a compact on ANOTHER narrator does not admit this one", async () => {
@@ -295,7 +298,7 @@ describe("the compact exit rechecks the unified mailbox without user input", () 
 	])("a completed watch notice is eligible after compact %s", async (exit) => {
 		const lock = installCompactLock(NARRATOR_ID);
 		enqueueTaskNotice();
-		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(await getBufferedMessages(NARRATOR_ID)).toEqual([]);
 		if (exit === "success") lock.settle();
 		else lock.fail(new Error(`compact ${exit}`));
 		compactLocks.delete(NARRATOR_ID);
@@ -423,4 +426,46 @@ describe("the compact exit rechecks the unified mailbox without user input", () 
 			injection.mockRestore();
 		}
 	});
+});
+
+test("an enqueue after the empty buffer observation is rechecked by the existing inbox wake", async () => {
+	let enter!: () => void;
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		enter = resolve;
+	});
+	const released = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const original = pool.runReadTask;
+	let armed = true;
+	const probe = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+		const result = original(path, params, options);
+		if (
+			armed &&
+			(params.kind === "selectRows" || params.kind === "selectValues") &&
+			params.sql.includes("narrator_buffered_messages")
+		) {
+			armed = false;
+			return result.then(async (rows) => {
+				enter();
+				await released;
+				return rows;
+			});
+		}
+		return result;
+	}) as typeof pool.runReadTask);
+	const work = drainQueuedMessagesAfterCompact(NARRATOR_ID);
+	try {
+		await entered;
+		await buffer.enqueueBufferedMessage(NARRATOR_ID, "arrived after observation");
+	} finally {
+		release();
+	}
+	await work;
+	probe.mockRestore();
+	expect(resumeCalls).toHaveLength(1);
+	expect((await getBufferedMessages(NARRATOR_ID)).map((message) => message.text)).toEqual([
+		"arrived after observation",
+	]);
 });

@@ -101,7 +101,8 @@ Configuration can also come from environment variables
 `NARRAFORK_EXECUTOR_TOKEN`, `NARRAFORK_EXECUTOR_TOKEN_FILE`,
 `NARRAFORK_EXECUTOR_TOKEN_STDIN`, `NARRAFORK_EXECUTOR_ALLOW_ROOTS`,
 `NARRAFORK_EXECUTOR_LISTEN`, `NARRAFORK_EXECUTOR_TLS_CERT`,
-`NARRAFORK_EXECUTOR_TLS_KEY`, `NARRAFORK_EXECUTOR_DISABLE_SHELL`) or a JSON file
+`NARRAFORK_EXECUTOR_TLS_KEY`, `NARRAFORK_EXECUTOR_DISABLE_SHELL`,
+`NARRAFORK_EXECUTOR_STATE_DIR`) or a JSON file
 passed with `--config`. Precedence is flags > environment > config file. Within
 one layer, configure exactly one of token, token-file, or token-stdin.
 
@@ -138,7 +139,8 @@ TLS; bind to `127.0.0.1` or `[::1]` only when NarraFork connects locally.
 | `--token-stdin` | Read the token once from stdin at startup; useful with a secret manager or supervisor credential pipe. |
 | `--tls-cert` / `--tls-key` | Direct-mode TLS certificate and private key PEM files. |
 | `--allow-root` | Comma-separated roots for structured filesystem/transfer/search paths and Git/command working directories. Symlink/junction targets are resolved before containment checks. **This is not a process sandbox.** |
-| `--disable-shell` | Disable the general `exec.start` (Bash) and `pty.open` command surfaces. Git and filesystem RPCs remain available. |
+| `--disable-shell` | Disable the general `exec.start` (Bash), `pty.open` and `session.*` command surfaces. Git and filesystem RPCs remain available. |
+| `--state-dir` | Where durable session records (output and exit) are kept, so a restarted executor still serves them. Default: `$XDG_STATE_HOME/narrafork-executor` (or `~/.local/state/narrafork-executor`) on Linux, `~/Library/Application Support/narrafork-executor` on macOS, `%LOCALAPPDATA%\narrafork-executor` on Windows; one subdirectory per device. Env: `NARRAFORK_EXECUTOR_STATE_DIR`; config: `stateDir`. |
 | `--cwd` | Default working directory reported to the server |
 | `--insecure` | Skip TLS certificate verification (self-signed reverse-dial servers only) |
 
@@ -181,8 +183,8 @@ overrides the JSON config file.
   targets are resolved before the containment check, so a symlink or Windows
   junction cannot redirect those checked paths outside an allowed root.
   Recursive glob/transfer scans do not follow directory symlinks.
-- **`--allow-root` is not a Bash or PTY sandbox.** For `exec.start` and
-  `pty.open`, it validates only the initial working directory. Command text can
+- **`--allow-root` is not a Bash or PTY sandbox.** For `exec.start`,
+  `pty.open` and `session.open`, it validates only the initial working directory. Command text can
   still use absolute paths, change directory, create links, launch other
   programs, access the network, and otherwise exercise every permission of the
   executor's OS account.
@@ -256,6 +258,13 @@ that is not yet present. Use `--dry-run` to build and digest without uploading, 
 - Streaming command execution (process-group kill + timeout)
 - Read-only git status/diff
 - Interactive PTY terminals (Unix; Windows ConPTY not yet supported)
+- **Durable sessions** (`session.durable.v1`, Unix): PTY sessions owned by the
+  executor process instead of a connection. A dropped connection only detaches;
+  output is kept in a bounded, byte-sequenced journal (4 MiB per session by
+  default) that the next connection resumes from with `session.attach { since }`,
+  and retried input carrying the same `writeId` is applied once. Sessions end
+  when killed (`session.kill`, which stops the whole process group) or when the
+  executor exits. See `docs/GENERAL_EXECUTOR-DESIGN.md` in the main repository.
 - **High-performance file transfer**: bidirectional (upload/download), chunked
   with per-chunk CRC-32C, resumable (crash/disconnect continues from the last
   durable chunk), parallel multi-chunk, and recursive directory transfer. File

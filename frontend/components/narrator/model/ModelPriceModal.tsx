@@ -10,6 +10,7 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
+import { timeOfUsePriceGroups } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -26,7 +27,7 @@ import {
 	ModelProtocolSelect,
 } from "../../providers/ModelProtocolSelect";
 import type { CustomApiProtocol } from "../../providers/types";
-import { ModelOverrideEditor } from "../../settings/ModelOverrideEditor";
+import { ModelOverrideEditor, TimeOfUsePrices } from "../../settings/ModelOverrideEditor";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
 function fmtPrice(value: number | string | undefined, unit: string): string {
@@ -88,6 +89,7 @@ export function ModelPriceModal({
 	});
 	const traceNarratorId = traceTarget?.narratorId ?? null;
 	const reference = actual.data ? modelProfile(actual.data).referencePricing : undefined;
+	const timeOfUsePrices = actual.data ? timeOfUsePriceGroups(actual.data.metadata) : [];
 	const [editorOpen, setEditorOpen] = useState(false);
 	const readOnly = user?.role !== "admin";
 	// 协议分两层，都与 catalog 快照无关，因此在这里读写：
@@ -192,10 +194,15 @@ export function ModelPriceModal({
 								? ts("catalog.matched", { name: actual.data.modelId })
 								: ts("catalog.unmatched")}
 						</Text>
-						<Text size="sm">
-							{ts("catalog.reference")}: {referencePrice(reference?.input)} /{" "}
-							{referencePrice(reference?.output)}
-						</Text>
+						{(!timeOfUsePrices.length ||
+							reference?.input !== undefined ||
+							reference?.output !== undefined) && (
+							<Text size="sm">
+								{ts("catalog.reference")}: {referencePrice(reference?.input)} /{" "}
+								{referencePrice(reference?.output)}
+							</Text>
+						)}
+						<TimeOfUsePrices groups={timeOfUsePrices} />
 						{modelValue && !readOnly && (
 							<Group gap="xs" align="center">
 								<Text size="sm">{ts("catalog.protocol")}</Text>

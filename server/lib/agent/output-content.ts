@@ -23,6 +23,7 @@ interface Lane {
 	citations: Map<string, ProviderTextCitation>;
 	revision: number;
 	publishedRevision: number;
+	sealedReasoningLength?: number;
 	completed: boolean;
 }
 
@@ -261,12 +262,25 @@ export class OutputContentAccumulator {
 		phase: "start" | "checkpoint" | "complete";
 		blockId?: string;
 		outputIndex?: number;
+		reasoningSummaryEnd?: number;
 	}): Generator<AgentEvent> {
 		if (event.phase === "start") {
 			yield* this.begin(event.kind, event);
 			return;
 		}
 		const lane = this.resolve(event.kind, event, true);
+		if (
+			lane.kind === "reasoning" &&
+			event.phase === "checkpoint" &&
+			event.reasoningSummaryEnd === lane.text.length &&
+			event.reasoningSummaryEnd > (lane.sealedReasoningLength ?? 0)
+		) {
+			lane.sealedReasoningLength = event.reasoningSummaryEnd;
+			if (lane.revision <= lane.publishedRevision) {
+				lane.revision++;
+				this.dirty.add(lane);
+			}
+		}
 		if (event.phase === "complete" && !lane.completed) {
 			lane.completed = true;
 			// Completion is a durable state transition, even without new text.
@@ -327,7 +341,11 @@ export class OutputContentAccumulator {
 	private *publish(lane: Lane): Generator<AgentEvent> {
 		if (lane.revision <= lane.publishedRevision || (!lane.text && !lane.metadata)) return;
 		const block = this.snapshot(lane);
-		yield { type: "block_complete", block };
+		yield {
+			type: "block_complete",
+			block,
+			...(lane.sealedReasoningLength ? { sealedReasoningLength: lane.sealedReasoningLength } : {}),
+		};
 		// Only reached when the event consumer has finished the awaited write.
 		lane.publishedRevision = block.revision as number;
 		if (lane.revision === lane.publishedRevision) this.dirty.delete(lane);

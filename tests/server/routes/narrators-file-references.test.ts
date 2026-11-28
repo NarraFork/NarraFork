@@ -24,6 +24,7 @@ import {
 } from "@server/lib/file-reference-input";
 import {
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	sendMessageSchema,
@@ -44,6 +45,7 @@ import {
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { type Context, Hono } from "hono";
+import { narratorSurfaceReadOptions } from "../../../server/services/narrator-surface-reads";
 
 // Execute the actual route bodies with injected boundaries. Importing the giant
 // router would initialize DB/migrations and agent services; this harness imports
@@ -214,9 +216,13 @@ function fixture(
 	);
 	child.get("/preview", (c) => c.json({ ok: true }));
 	const bindings = {
+		resolveNarratorMessageOnlyRevert: async (_id: string, skipRevert?: boolean) =>
+			skipRevert === true,
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
 		requestRecordingRoutes: new Hono(),
+		// This file isolates file-reference routes; communication registration has its own suite.
+		registerNarratorCommunicationRoutes: () => {},
 		requireNarratorAccess: acl,
 		AppError,
 		ValidationError,
@@ -240,6 +246,7 @@ function fixture(
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		clientSubmissionIdSchema,
 		updateBufferedMessageSchema,
 		editAndRegenerateJsonSchema,
 		editAssistantMessageSchema,
@@ -312,11 +319,18 @@ function fixture(
 		getUserLanguage: async () => "en",
 		getUserReplyInLanguage: async () => false,
 		readMessageLanguagePreferences: async () => ({ locale: "en", replyInUserLanguage: false }),
+		narratorSurfaceReadOptions,
+		readQueryFirst: async (query: Promise<unknown[]>) => (await query)[0],
 		logger: { warn: () => {} },
 		db: {
 			query: {
-				users: { findFirst: async () => undefined },
+				users: { findFirst: async () => undefined, findMany: async () => [] },
 				narratorMessageRefs: {
+					findMany: async ({ where }: { where: Array<[string, string]> }) =>
+						state.messageExists &&
+						where.some(([key, value]) => key === "messageId" && value === "message")
+							? [{ messageId: "message" }]
+							: [],
 					findFirst: async ({ where }: { where: Array<[string, string]> }) =>
 						state.messageExists &&
 						where.some(([key, value]) => key === "messageId" && value === "message")

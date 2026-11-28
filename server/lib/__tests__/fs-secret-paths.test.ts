@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	isPrivateRequestRecordingPath,
+	isSecretHomeRelativePath,
 	isSecretPlatformPath,
 	isSecretUserPath,
 } from "../fs-secret-paths";
@@ -35,6 +36,8 @@ describe("platform credential files", () => {
 		["settings.json", "the JWT signing secret"],
 		["codex-credentials.json", "provider credentials"],
 		["search-provider-secrets.json", "sensitive search request headers"],
+		["credentials.json", "unified model credentials"],
+		["credential-state.json", "account usage and failure state"],
 		["update-server.json", "the release upload token"],
 		["update-server-test.json", "the test upload token"],
 	])("refuses %s (%s)", (name) => {
@@ -52,10 +55,38 @@ describe("platform credential files", () => {
 		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
 	});
 
-	test("refuses everything under a credential directory", () => {
-		// Matched as a directory because the layout is the provider's business and may
-		// gain files this list has never heard of.
-		expect(isSecretPlatformPath(join(HOME, "codex-credentials.json"), HOME)).toBe(true);
+	test("refuses everything under the pre-migration backup directory", () => {
+		// The backups are older copies of settings.json and the credential stores.
+		for (const suffix of [
+			"",
+			"pre-sourcing-1/settings.json",
+			"pre-sourcing-1/provider-keys.json",
+		]) {
+			expect(isSecretPlatformPath(join(HOME, "credential-backups", suffix), HOME)).toBe(true);
+		}
+	});
+});
+
+// Applied to `.narrafork/...` on remote devices, where host path semantics are unavailable.
+describe("home-relative segment check", () => {
+	test.each([
+		[["settings.json"]],
+		[["Credentials.json"]],
+		[["search-provider-secrets.json"]],
+		[["narrafork.db-wal"]],
+		[["credential-backups", "pre-sourcing-1", "settings.json"]],
+		[["request-recordings", "a", "b.json"]],
+	])("refuses %j", (segments) => {
+		expect(isSecretHomeRelativePath(segments)).toBe(true);
+	});
+
+	test.each([
+		[[]],
+		[[""]],
+		[["malformed-request-dumps", "dump.json"]],
+		[["settings.json.example"]],
+	])("allows %j", (segments) => {
+		expect(isSecretHomeRelativePath(segments)).toBe(false);
 	});
 });
 

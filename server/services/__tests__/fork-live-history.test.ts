@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { testEnvironment } from "../../../tests/preload";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBlocks,
@@ -13,8 +13,11 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 // Preserve the existing service -> persistence import order across their cycle.
@@ -131,10 +134,11 @@ beforeEach(() => {
 	seedNarrator();
 });
 afterEach(() => activeNarrators.delete("source"));
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
 });
 
 for (const entry of ["full", "selected"] as const) {
@@ -274,8 +278,10 @@ for (const entry of ["full", "selected"] as const) {
 			);
 			expect(resumed.toolCall.id).toBe(sourceCall.id);
 			await expect(
-				narratorPersistence.prepareToolCallAttempt(child.id, clone.id, true),
-			).rejects.toThrow("COW tool rows cannot authorize");
+				await captureWorkerRejectionThrower(
+					narratorPersistence.prepareToolCallAttempt(child.id, clone.id, true),
+				),
+			).toThrow("COW tool rows cannot authorize");
 			const frozenVersion = versionsOf(child.id);
 			const frozenBody = bodyOf(snapshotId);
 			await narratorPersistence.updateToolCallResult(
@@ -399,11 +405,13 @@ test("duplicate UUID or lineage coordinates are rejected; an actual held message
 		seq: 2,
 	});
 	await expect(
-		narratorService.forkNarrator(child.id, "live-uuid", { inheritMode: "full" }),
-	).rejects.toThrow("ambiguous");
-	await expect(narratorService.forkFromMessages(child.id, [partial.id])).rejects.toThrow(
-		"ambiguous",
-	);
+		await captureWorkerRejectionThrower(
+			narratorService.forkNarrator(child.id, "live-uuid", { inheritMode: "full" }),
+		),
+	).toThrow("ambiguous");
+	await expect(
+		await captureWorkerRejectionThrower(narratorService.forkFromMessages(child.id, [partial.id])),
+	).toThrow("ambiguous");
 	const exact = await narratorService.forkNarrator(child.id, null, {
 		inheritMode: "full",
 		forkMessageId: actualId,
@@ -422,11 +430,13 @@ test("an unrelated producer's same UUID is not accepted as an old source coordin
 		session_id: "unrelated-conversation",
 	});
 	await expect(
-		narratorService.forkNarrator(child.id, null, {
-			inheritMode: "full",
-			forkMessageId: unrelated.id,
-		}),
-	).rejects.toThrow("not found in parent narrator");
+		await captureWorkerRejectionThrower(
+			narratorService.forkNarrator(child.id, null, {
+				inheritMode: "full",
+				forkMessageId: unrelated.id,
+			}),
+		),
+	).toThrow("not found in parent narrator");
 });
 
 for (const ancestorDepth of [0, 1, 2]) {
@@ -811,8 +821,10 @@ test("a detached owner scan counts actual refs and fails before opening any body
 		}
 	});
 	await expect(
-		narratorService.forkNarrator("source", null, { inheritMode: "full" }),
-	).rejects.toThrow("producer metadata exceeds its safe scan budget");
+		await captureWorkerRejectionThrower(
+			narratorService.forkNarrator("source", null, { inheritMode: "full" }),
+		),
+	).toThrow("producer metadata exceeds its safe scan budget");
 	expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 });
 
@@ -1066,8 +1078,10 @@ for (const tieCount of [497, 498]) {
 				}
 			});
 			await expect(
-				narratorService.forkNarrator("source", null, { inheritMode: "full" }),
-			).rejects.toThrow("safe copy budget");
+				await captureWorkerRejectionThrower(
+					narratorService.forkNarrator("source", null, { inheritMode: "full" }),
+				),
+			).toThrow("safe copy budget");
 			expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 		} else {
 			const child = await narratorService.forkNarrator("source", null, { inheritMode: "full" });
@@ -1090,8 +1104,10 @@ test("an oversized mutable old prefix still fails the snapshot byte preflight", 
 	await narratorPersistence.finalizeCompactingMessage(marker.id, "source", "summary");
 	await narratorPersistence.persistUserMessage("source", "tail");
 	await expect(
-		narratorService.forkNarrator("source", null, { inheritMode: "full" }),
-	).rejects.toThrow("safe copy budget");
+		await captureWorkerRejectionThrower(
+			narratorService.forkNarrator("source", null, { inheritMode: "full" }),
+		),
+	).toThrow("safe copy budget");
 	expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 });
 
@@ -1136,7 +1152,9 @@ describe("fork snapshot copy budgets", () => {
 		});
 		const sourceRefs = refsOf("source");
 		expectBudgetRejectionBeforeBodies();
-		await expect(fork("full", [partial.id])).rejects.toThrow("safe copy budget");
+		await expect(await captureWorkerRejectionThrower(fork("full", [partial.id]))).toThrow(
+			"safe copy budget",
+		);
 		expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 		expect(refsOf("source")).toEqual(sourceRefs);
 	});
@@ -1154,7 +1172,9 @@ describe("fork snapshot copy budgets", () => {
 			.prepare("UPDATE narrator_tool_calls SET output_json = ? WHERE id = ?")
 			.run(JSON.stringify("x".repeat(4 * 1024 * 1024)), callId as string);
 		expectBudgetRejectionBeforeBodies();
-		await expect(fork("selected", [partial.id])).rejects.toThrow("safe copy budget");
+		await expect(await captureWorkerRejectionThrower(fork("selected", [partial.id]))).toThrow(
+			"safe copy budget",
+		);
 		expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 		expect(callsOf(partial.id)[0].id).toBe(callId);
 	});
@@ -1207,14 +1227,18 @@ describe("fork snapshot copy budgets", () => {
 		});
 		expectBudgetRejectionBeforeBodies();
 		await expect(
-			narratorService.forkNarrator("source", null, { inheritMode: "full" }),
-		).rejects.toThrow("safe copy budget");
+			await captureWorkerRejectionThrower(
+				narratorService.forkNarrator("source", null, { inheritMode: "full" }),
+			),
+		).toThrow("safe copy budget");
 		const marker = await narratorPersistence.persistCompactingMessage("source");
 		await narratorPersistence.finalizeCompactingMessage(marker.id, "source", "summary");
 		await narratorPersistence.persistUserMessage("source", "tail");
 		await expect(
-			narratorService.forkNarrator("source", null, { inheritMode: "full" }),
-		).rejects.toThrow("safe copy budget");
+			await captureWorkerRejectionThrower(
+				narratorService.forkNarrator("source", null, { inheritMode: "full" }),
+			),
+		).toThrow("safe copy budget");
 		expect(db.select({ id: narrators.id }).from(narrators).all()).toEqual([{ id: "source" }]);
 	});
 

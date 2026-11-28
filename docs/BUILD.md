@@ -37,28 +37,28 @@ bun run build:linux-arm64
 
 ## 本机稳定运行
 
-`bun run start` 和 `bun run start:dev` 先构建本机单文件运行产物，再从该产物启动后端。
-主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。
-`start` 使用已构建的 `dist/frontend`；`start:dev` 保留源码 Vite 前端及原端口（前端 41221、后端默认 7778），不要求先构建整站前端。
-显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供这层隔离。
+`bun run start` 先构建本机单文件运行产物，再从该产物启动后端。
+主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。它要求先构建整站前端，并将 `dist/frontend` 嵌入产物。
+`bun run start:dev` 默认不构建冻结后端，而是在 production 模式运行源码后端，同时启动源码 Vite。后端默认 7778 直接读取磁盘上的 `dist/frontend`，因此执行 `bun run build` 后无需重启后端即可看到新前端；Vite 热重载入口为 41221。
+显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供 `start` 的运行隔离。
 
-构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移。
-构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
+`start` 的构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移；`start:dev` 则在启动源码后端前执行源码迁移。
+`start` 构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
 
 ### 构建一次，多次启动
 
 每次构建输出独占路径以及耗时、产物大小。**日常重启建议复用该路径，代码变更后再构建**：
 
 ```sh
-# 只构建后端，用于与 Vite 搭配
-bun run build:runtime
-bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
-
-# 连同已有的静态前端一起构建
+# 构建静态前端，并将它嵌入冻结后端
 bun run build
 bun run build:runtime --frontend
+
+# 通过冻结产物提供静态前端及后端
 bun run start --runtime="<构建输出的可执行文件绝对路径>"
 ```
+
+`start:dev` 默认不使用上述冻结产物，以便 7778 能直接看到后续前端构建。显式为 `start:dev` 传入 `--runtime` 可以改用指定冻结产物，但此时前端也会冻结在该产物中。
 
 `--runtime` 明确选择已有产物，跳过编译；找不到该文件会报错，不自动换一个版本。
 后端参数可继续传递，例如 `--no-auto-resume`。不要为了测试上述命令而停止承载会话的服务器；验证请使用独立 HOME、端口和数据库。
@@ -124,6 +124,10 @@ make build-alpha VERSION=0.9.16-alpha.2 ARCHIVE_DIR="$HOME/private-builds" BUN=b
 普通 compile 的 sourcemap 嵌入二进制，可用于异常堆栈的源码定位；测试删除相邻源文件和 `.map` 后仍验证映射。编译器另行生成的后端 `.map` 副产物只保留在私有构建目录，不放入 `dist/frontend/` 或公开分发。嵌入 map 的诊断二进制本身也可能包含源码，应按敏感构建产物保管。
 
 需要 CPU 采样时，仅在隔离数据目录、独立 loopback 端口的有界调试进程上，通过 `BUN_OPTIONS` 临时设置 `--cpu-prof --cpu-prof-dir=<私有目录> --cpu-prof-name=<名称>.cpuprofile`，正常退出后解析结果；不把采样参数嵌入交付二进制，不增加调试端口或常驻 profiler。保留名称不保证所有匿名函数都有业务名称，嵌入 map 也不保证 Linux perf 自动解析全部 JIT 原生地址。
+
+对正在运行的服务，管理员可用自己的会话 Bearer 令牌调用 `POST /api/diagnostics/cpu-profile`。发送空正文或 JSON `{"durationMs":5000}`（正文最多 1 KiB，默认 15 秒，范围 1–30000 毫秒）。请求等待采样完成并下载 `.cpuprofile`，只采样 HTTP 服务的 JS 线程，不包含独立 Worker 或子进程。每个服务进程同时只接受一次采样（忙时返回 409）；断开请求或正常关闭服务会停止本次采样。
+
+接口不开放调试端口。Bun 1.4.3 不支持与启动时的 `--cpu-prof` / `--cpu-prof-md` 或已启用的 Inspector 调试监听器并用（返回 503）；请勿同时运行其他进程内采样器。采样有开销，建议先用短窗口并在窗口内复现目标负载；空闲线程可能没有样本。文件可能包含函数名和本机源码路径，请存入私有目录，不要公开分享。
 
 ### fork 的默认更新仓库
 
@@ -260,4 +264,4 @@ chmod +x dist/narrafork-*
 - `bun run build:android-rootfs` — 构建 Android rootfs
 - `bun run build:runtime` — 构建本机冻结后端；加 `--frontend` 嵌入已有静态前端
 - `bun run start` — 构建并运行本机产物及静态前端；`--runtime=<path>` 复用已构建版本
-- `bun run start:dev` — 冻结后端搭配源码 Vite；同样支持 `--runtime=<path>`
+- `bun run start:dev` — 源码后端直接提供磁盘静态前端，额外提供源码 Vite 热重载入口；显式 `--runtime=<path>` 可改用冻结产物

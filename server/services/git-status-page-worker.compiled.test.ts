@@ -49,26 +49,34 @@ const root = Bun.argv[2];
 const scope = { actorId: "compiled", workspaceKey: "workspace", queryKey: JSON.stringify(["local", root]) };
 const source = { kind: "local" as const, cwd: root };
 try {
- let page = await pages.read({ scope, source, query: {} });
- const snapshotId = page.snapshotId;
- if (page.files.length !== 100 || !page.hasMore) throw new Error("first page must stay bounded");
+ const cold = await pages.read({ scope, source, query: {} });
+ if (cold.status !== "pending") throw new Error("cold cache must be pending");
  let sourceReads = 0;
  const readStats = async () => {
   sourceReads++;
   return { files: Array.from({ length: 562 }, (_, index) => ({ path: "files/file-" + String(index).padStart(4, "0") + ".txt", unstagedLinesAdded: sourceReads + 1, unstagedLinesRemoved: 1, complete: true })), linesAdded: 1124, linesRemoved: 562, complete: true };
  };
+ await pages.observe({ queryKey: scope.queryKey, source, readStats });
+ const first = await pages.read({ scope, source, query: {} });
+ if (first.status !== "ready") throw new Error("expected ready page");
+ let page = first;
+ const snapshotId = page.snapshotId;
+ if (page.files.length !== 100 || !page.hasMore) throw new Error("first page must stay bounded");
  const directory = { type: "directory" as const, section: "unstaged" as const, path: "files" };
  const measured = await pages.readStats({ scope, source, query: { snapshotId, rows: [directory] }, readStats });
- if (measured.snapshotId !== snapshotId) throw new Error("statistics snapshot changed");
+ if (measured.status !== "ready" || measured.snapshotId !== snapshotId) throw new Error("statistics snapshot changed");
  const laterFile = await pages.readStats({ scope, source, query: { snapshotId, rows: [{ type: "file", section: "unstaged", path: "files/file-0561.txt" }] }, readStats });
- if (sourceReads !== 1) throw new Error("measurement source not reused");
+ if (sourceReads !== 1 || laterFile.status !== "ready") throw new Error("measurement source not reused");
  pages.invalidateStats(scope.queryKey);
+ await pages.observe({ queryKey: scope.queryKey, source, readStats });
  const refreshed = await pages.readStats({ scope, source, query: { snapshotId, rows: [directory] }, readStats });
+ if (refreshed.status !== "ready") throw new Error("expected ready statistics");
  const paths = page.files.map(file => file.path);
  let pageCount = 1;
  while (page.nextCursor) {
-  page = await pages.read({ scope, source, query: { cursor: page.nextCursor } });
-  if (page.snapshotId !== snapshotId) throw new Error("snapshot changed");
+  const next = await pages.read({ scope, source, query: { cursor: page.nextCursor } });
+  if (next.status !== "ready" || next.snapshotId !== snapshotId) throw new Error("snapshot changed");
+  page = next;
   paths.push(...page.files.map(file => file.path));
   pageCount++;
  }

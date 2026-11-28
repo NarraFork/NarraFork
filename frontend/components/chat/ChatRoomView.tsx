@@ -29,8 +29,8 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconCopy, IconPaperclip, IconSend, IconSparkles, IconX } from "@tabler/icons-react";
-import { type InfiniteData, useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type InfiniteData, skipToken, useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
@@ -48,6 +48,7 @@ import {
 import type { ChatMessage, ChatMessagePage } from "../../lib/api/chat";
 import { ApiError } from "../../lib/api/client";
 import { copyTextToClipboard } from "../../lib/clipboard";
+import { useEditorPanelVisible } from "../narrator/narrator-panel-visibility";
 import { ChatComposerAttachments, type PendingChatAttachment } from "./ChatComposerAttachments";
 import { ChatMessageList } from "./ChatMessageList";
 import {
@@ -71,6 +72,8 @@ const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
 
 export interface ChatRoomViewProps {
 	roomId: string | undefined;
+	/** Pause reads/subscriptions without discarding the composer or scroll anchor. */
+	suspended?: boolean;
 	/**
 	 * Forward text to the narrator beside this room, as a normal user message.
 	 * Absent on surfaces with no narrator (the standalone `/messages` page), where
@@ -103,30 +106,40 @@ export interface ChatRoomViewProps {
 
 export function ChatRoomView({
 	roomId,
+	suspended = false,
 	onForwardToNarrator,
 	narratorId,
 	title,
 	headerActions,
-	readOnlyReason,
+	readOnlyReason: providedReadOnlyReason,
 	renderComposer,
 }: ChatRoomViewProps) {
 	const { t } = useTranslation("chat");
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = (currentUser as { id?: string } | undefined)?.id ?? null;
 
-	useChatRoomLive(roomId);
+	const active = useEditorPanelVisible(!suspended);
+	const messageWindowId = useId();
+	const messageCacheKey = useMemo(
+		() => [...chatKeys.messages(roomId ?? ""), messageWindowId],
+		[roomId, messageWindowId],
+	);
+	// The list owns the one ref-counted room join and ACK barrier.
+	useChatRoomLive(roomId, active, false);
 	// The message list reads through the vlist's own paging (ChatMessageList's
 	// fetchPage writes each page into this cache); the view subscribes passively
 	// for the selection/forward/delete actions — no fetch ever starts here.
 	const messagesQuery = useQuery<InfiniteData<ChatMessagePage>>({
-		queryKey: chatKeys.messages(roomId ?? ""),
+		queryKey: messageCacheKey,
+		queryFn: skipToken,
 		enabled: false,
+		gcTime: 0,
 	});
 	const messages = useFlatChatMessages(messagesQuery.data);
-	const sendMessage = useSendChatMessage(roomId);
+	const sendMessage = useSendChatMessage(roomId, false);
 	const deleteMessage = useDeleteChatMessage(roomId);
 	const summarize = useSummarizeChat(roomId);
-	const markRead = useMarkChatRead(roomId);
+	const markRead = useMarkChatRead(roomId, active);
 	const uploadAttachment = useUploadChatAttachment(roomId);
 	const discardAttachment = useDiscardChatAttachment();
 	const materializeAttachments = useMaterializeChatAttachments(roomId);
@@ -137,6 +150,17 @@ export function ChatRoomView({
 	const anchorIndexRef = useRef<number | null>(null);
 	const [summaryPreview, setSummaryPreview] = useState<string | null>(null);
 	const [pending, setPending] = useState<PendingChatAttachment[]>([]);
+	const [accessDenied, setAccessDenied] = useState(false);
+	const readOnlyReason = providedReadOnlyReason ?? (accessDenied ? t("roomLoadFailed") : undefined);
+	const handleAuthorizationChange = useCallback((allowed: boolean) => {
+		setAccessDenied(!allowed);
+		if (!allowed) {
+			setReplyTo(null);
+			setSelectedIds(new Set());
+			setSummaryPreview(null);
+			anchorIndexRef.current = null;
+		}
+	}, []);
 
 	// ── Composer draft persistence ──────────────────────────────────────────
 	//
@@ -562,8 +586,12 @@ export function ChatRoomView({
 				{roomId ? (
 					<ChatMessageList
 						roomId={roomId}
+						permissionNarratorId={narratorId}
+						messageCacheKey={messageCacheKey}
+						suspended={!active}
 						currentUserId={currentUserId}
 						onVisibleSeq={markRead}
+						onAuthorizationChange={handleAuthorizationChange}
 						selectedIds={selectedIds}
 						onToggleSelect={toggleSelect}
 						onReply={readOnlyReason ? undefined : setReplyTo}

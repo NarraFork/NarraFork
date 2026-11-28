@@ -17,6 +17,7 @@ import {
 	updateDevice,
 } from "../device-service";
 import { integrationResourceBindingService } from "../integration-resource-binding-service";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const projectIds: string[] = [];
 const deviceIds: string[] = [];
@@ -65,21 +66,25 @@ describe("remote device configuration", () => {
 		const projectId = await insertProject("Scoped project");
 		const device = await createTestDevice({ name: "Editable", scope: "global" });
 
-		await expect(updateDevice(device.id, { connectionMode: "direct" })).rejects.toThrow(
-			"directUrl is required",
-		);
-		await expect(
-			updateDevice(device.id, { connectionMode: "direct", directUrl: "https://invalid" }),
-		).rejects.toThrow("must use wss://");
-		await expect(
-			updateDevice(device.id, {
-				connectionMode: "direct",
-				directUrl: "ws://192.168.1.20:7900/ws/device",
-			}),
-		).rejects.toThrow("loopback IP literal");
-		await expect(updateDevice(device.id, { scope: "project" })).rejects.toThrow(
-			"projectId is required",
-		);
+		expect(
+			await captureWorkerRejectionThrower(updateDevice(device.id, { connectionMode: "direct" })),
+		).toThrow("directUrl is required");
+		expect(
+			await captureWorkerRejectionThrower(
+				updateDevice(device.id, { connectionMode: "direct", directUrl: "https://invalid" }),
+			),
+		).toThrow("must use wss://");
+		expect(
+			await captureWorkerRejectionThrower(
+				updateDevice(device.id, {
+					connectionMode: "direct",
+					directUrl: "ws://192.168.1.20:7900/ws/device",
+				}),
+			),
+		).toThrow("loopback IP literal");
+		expect(
+			await captureWorkerRejectionThrower(updateDevice(device.id, { scope: "project" })),
+		).toThrow("projectId is required");
 
 		const scoped = await updateDevice(device.id, {
 			connectionMode: "direct",
@@ -126,15 +131,17 @@ describe("remote device configuration", () => {
 	});
 
 	test("rejects a project-scoped device for an unknown project", async () => {
-		await expect(
-			createDevice({
-				name: "Unknown project",
-				connectionMode: "reverse",
-				scope: "project",
-				projectId: "missing-project",
-				createdBy: "device-service-test",
-			}),
-		).rejects.toThrow("Project not found");
+		expect(
+			await captureWorkerRejectionThrower(
+				createDevice({
+					name: "Unknown project",
+					connectionMode: "reverse",
+					scope: "project",
+					projectId: "missing-project",
+					createdBy: "device-service-test",
+				}),
+			),
+		).toThrow("Project not found");
 	});
 
 	test("uses one fail-closed project authorization rule for global and scoped devices", async () => {
@@ -151,15 +158,17 @@ describe("remote device configuration", () => {
 		expect(isDeviceAuthorizedForProject(scoped, projectA)).toBe(true);
 		expect(isDeviceAuthorizedForProject(scoped, projectB)).toBe(false);
 		expect(isDeviceAuthorizedForProject(scoped, null)).toBe(false);
-		await expect(requireAuthorizedDeviceForProject(scoped.id, projectA)).resolves.toMatchObject({
+		expect(await requireAuthorizedDeviceForProject(scoped.id, projectA)).toMatchObject({
 			id: scoped.id,
 		});
-		await expect(requireAuthorizedDeviceForProject(scoped.id, projectB)).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(requireAuthorizedDeviceForProject(scoped.id, projectB)),
+		).toMatchObject({
 			code: "DEVICE_SCOPE_FORBIDDEN",
 		});
-		await expect(requireAuthorizedDeviceForProject(scoped.id, null)).rejects.toThrow(
-			"Standalone terminals may only use global",
-		);
+		expect(
+			await captureWorkerRejectionThrower(requireAuthorizedDeviceForProject(scoped.id, null)),
+		).toThrow("Standalone terminals may only use global");
 	});
 
 	test("recognizes negotiated feature strings without weakening missing-feature checks", () => {

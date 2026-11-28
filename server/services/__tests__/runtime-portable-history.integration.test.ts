@@ -464,7 +464,7 @@ async function send(text: string, index: number) {
 }
 for (const delegated of [false, true])
 	test(`real executor → loop → provider adopts Send at two consecutive boundaries (${delegated ? "delegated" : "unrelated"})`, async () => {
-		narrator("sender");
+		narrator("sender", { ownerUserId: "sender-user" });
 		narrator("caller");
 		db.insert(narratorMessages)
 			.values({
@@ -494,9 +494,23 @@ for (const delegated of [false, true])
 		narrator(
 			"recipient",
 			delegated
-				? { type: "subagent", variant: "subagent:general", parentNarratorId: "caller" }
+				? {
+						type: "subagent",
+						variant: "subagent:general",
+						parentNarratorId: "caller",
+						aclRootNarratorId: "caller",
+					}
 				: {},
 		);
+		const { ensureCommunicationNodeTx, grantFixtureNarratorWrite, seedFixtureCommunicationPeer } =
+			await import("./runtime-communication-fixtures");
+		db.transaction((tx) => {
+			ensureCommunicationNodeTx(tx, "sender", null);
+			ensureCommunicationNodeTx(tx, "caller", null);
+			ensureCommunicationNodeTx(tx, "recipient", delegated ? "caller" : null);
+			grantFixtureNarratorWrite(tx, delegated ? "caller" : "recipient", "sender-user");
+			seedFixtureCommunicationPeer(tx, "sender", "recipient", "sender-user");
+		});
 		script = async function* (_params, index) {
 			if (index < 2) {
 				await send(index === 0 ? "first report" : "second report", index);

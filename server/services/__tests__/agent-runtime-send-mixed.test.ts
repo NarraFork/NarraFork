@@ -1,18 +1,22 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
+	narratorCommunicationNodes,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../../db/schema";
+import { shutdownDbWorkerPool } from "../../lib/db-worker/pool";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+// Communication projection reads the production file path through its own Worker.
+// Use the preload-isolated database so both readers observe the same committed rows.
+const { db, sqlite } = await import("../../db");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 const broadcasts: Array<{ narratorId: string; type: string; model?: string }> = [];
 mock.module("../../websocket/narrator-ws", () => ({
@@ -23,6 +27,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 }));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
 const inbox = await import("../agent-runtime/inbox");
+const runtimeRun = await import("../agent-runtime/run");
 const settingsModule = await import("../../lib/settings");
 const modelSwitch = await import("../subagent-model-switch");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
@@ -60,6 +65,9 @@ beforeEach(() => {
 		activeNarrators.delete(id);
 	}
 	cleanDb(sqlite);
+	db.insert(users)
+		.values({ id: "sender-user", username: "sender", passwordHash: "test", createdAt: time })
+		.run();
 	for (const id of ids) {
 		const primary = id.endsWith("root");
 		const parent = primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root";
@@ -70,6 +78,8 @@ beforeEach(() => {
 				type: primary ? "primary" : "subagent",
 				variant: primary ? "primary" : "subagent:general",
 				parentNarratorId: parent,
+				ownerUserId: "sender-user",
+				aclRootNarratorId: parent,
 				policySourceNarratorId: parent,
 				runtimeRegistrationJson: parent ? delegationRegistration(parent, "general") : null,
 				traits: withRuntimePolicyTrait(
@@ -82,16 +92,24 @@ beforeEach(() => {
 				updatedAt: time,
 			})
 			.run();
+		db.insert(narratorCommunicationNodes)
+			.values({
+				narratorId: id,
+				parentNarratorId: parent,
+				originalParentNarratorId: parent,
+				version: 1,
+			})
+			.run();
 	}
 	tryClaimExecution("parent-root", "run");
 });
-afterAll(() => {
+afterAll(async () => {
 	for (const id of ids) {
 		setRunHold(id, undefined);
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
-	sqlite.close();
+	await shutdownDbWorkerPool();
 });
 function input(
 	callerNarratorId = "sender-child",
@@ -221,17 +239,38 @@ test("parent/main/id and sibling alias/title/id deduplicate by actual recipient"
 test("whole-call selector authorization rejects foreign or missing targets before any parent enqueue", async () => {
 	for (const target of ["foreign-child", "nonexistent"]) {
 		await expect(
-			sendSubagentMessageDetailed(input("sender-child", ["parent", target])),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed(input("sender-child", ["parent", target])),
+			),
+		).toThrow();
 		expect(rows()).toHaveLength(0);
 	}
 });
 
-test("one archived target retains both earlier parent and later sibling successes", async () => {
+test("a reachable archived exact ID fails individually, but an archived alias is not addressable", async () => {
 	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
-	const result = await sendSubagentMessageDetailed(
-		input("sender-child", ["parent", "sibling-a", "sibling-b"]),
-	);
+	expect(
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed(input("sender-child", ["parent", "alpha"])),
+		),
+	).toThrow("No accessible communication target");
+	expect(rows()).toHaveLength(0);
+	const result = await sendSubagentMessageDetailed(input());
+	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+		["parent-root", "queued"],
+		["sibling-a", "failed"],
+	]);
+	expect(result.targets[1]?.error).toContain("archived");
+	expect(rows("sibling-a")).toHaveLength(0);
+	expect(rows("parent-root")).toHaveLength(1);
+});
+
+test("a target archived after preflight retains earlier parent and later sibling successes", async () => {
+	const request = input("sender-child", ["parent", "sibling-a", "sibling-b"]);
+	request.onTargetsResolved = () => {
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
+	};
+	const result = await sendSubagentMessageDetailed(request);
 	expect(result.targets.map((target) => target.status)).toEqual(["queued", "failed", "queued"]);
 	expect(
 		rows()
@@ -285,13 +324,19 @@ test("doInterrupt is ignored for a taken-over child: queued, user's turn untouch
 });
 
 test("child interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
-	await expect(sendSubagentMessageDetailed({ ...input(), doInterrupt: true })).rejects.toThrow();
 	await expect(
-		sendSubagentMessageDetailed({
-			...input("parent-root", ["sibling-a", "foreign-child"]),
-			doInterrupt: true,
-		}),
-	).rejects.toThrow();
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({ ...input(), doInterrupt: true }),
+		),
+	).toThrow();
+	await expect(
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a", "foreign-child"]),
+				doInterrupt: true,
+			}),
+		),
+	).toThrow();
 	expect(rows()).toHaveLength(0);
 });
 
@@ -331,10 +376,13 @@ test("database failure at one recipient preserves before/after recipient success
 });
 
 test("retry after one archived recipient becomes eligible preserves previous successes", async () => {
-	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
 	const request = input();
+	request.onTargetsResolved = () => {
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
+	};
 	const first = await sendSubagentMessageDetailed(request);
 	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "sibling-a")).run();
+	request.onTargetsResolved = undefined;
 	const second = await sendSubagentMessageDetailed(request);
 	expect(first.targets.map((target) => target.status)).toEqual(["queued", "failed"]);
 	expect(second.targets.map((target) => target.status)).toEqual(["queued", "queued"]);
@@ -407,6 +455,104 @@ test("resume=true restarts an error-stopped child through the explicit override 
 	}
 });
 
+test.each([false, true])("duplicate idle Send never wakes again (held=%s)", async (held) => {
+	db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "sibling-a")).run();
+	if (held) setRunHold("sibling-a", { released: false });
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(held);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("parent-root", ["sibling-a"]);
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]?.status).toBe("started");
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(held ? 0 : 1);
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(held ? 0 : 1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "queued",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test.each([
+	"error",
+	"user_interrupt",
+] as const)("duplicate Send cannot resume a subsequently %s-stopped child", async (reason) => {
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(false);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("parent-root", ["sibling-a"]);
+		const first = await sendSubagentMessageDetailed(request);
+		stopTarget(reason);
+		wakeHeld.mockClear();
+		wake.mockClear();
+		const repeated = await sendSubagentMessageDetailed({ ...request, resume: true });
+		expect(wakeHeld).not.toHaveBeenCalled();
+		expect(wake).not.toHaveBeenCalled();
+		expect(repeated.targets[0]).toMatchObject({
+			status: "blocked",
+			blockedReason: reason,
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test("duplicate of an accepted resume does not restart an error-stopped child again", async () => {
+	stopTarget("error");
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(false);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = { ...input("parent-root", ["sibling-a"]), resume: true };
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]).toMatchObject({ status: "started", resumed: true });
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "blocked",
+			blockedReason: "error",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test("duplicate child-to-parent Send never wakes an idle parent again", async () => {
+	getExecutionOwner("parent-root")?.release();
+	db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "parent-root")).run();
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("sender-child", ["parent"]);
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]?.status).toBe("started");
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "queued",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(rows("parent-root")).toHaveLength(1);
+	} finally {
+		wake.mockRestore();
+	}
+});
+
 test("resume=true cannot override a stop the user made", async () => {
 	stopTarget("user_interrupt");
 	const result = await sendSubagentMessageDetailed({
@@ -422,8 +568,10 @@ test("resume and model require control of the target: a child cannot steer its s
 	stopTarget("error");
 	for (const extra of [{ resume: true }, { model: "test:other" }])
 		await expect(
-			sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
-		).rejects.toThrow("not a direct child");
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
+			),
+		).toThrow("not a direct child");
 	expect(rows()).toHaveLength(0);
 });
 
@@ -536,22 +684,26 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 	const before = siblingModels();
 	try {
 		await expect(
-			sendSubagentMessageDetailed({
-				...input("parent-root", ["sibling-a", "sibling-b"]),
-				model: "test:missing",
-			}),
-		).rejects.toThrow("not available to subagents");
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({
+					...input("parent-root", ["sibling-a", "sibling-b"]),
+					model: "test:missing",
+				}),
+			),
+		).toThrow("not available to subagents");
 		settingsModule.settings.agent.subagentAllowedModels = {
 			explore: [],
 			plan: [],
 			general: ["test:pooled"],
 		};
 		await expect(
-			sendSubagentMessageDetailed({
-				...input("parent-root", ["sibling-a"]),
-				model: "test:model",
-			}),
-		).rejects.toThrow('not in the allowed "general" subagent model pool');
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({
+					...input("parent-root", ["sibling-a"]),
+					model: "test:model",
+				}),
+			),
+		).toThrow('not in the allowed "general" subagent model pool');
 		expect(rows()).toHaveLength(0);
 		expect(siblingModels()).toEqual(before);
 		const allowed = await sendSubagentMessageDetailed({
@@ -565,11 +717,79 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 	}
 });
 
+test("restoring an archived target before delivery still requires steer", async () => {
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const turn = new AbortController();
+	liveTurn("sibling-b", turn);
+	tryClaimExecution("sibling-b", "run");
+	const restore = () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "sibling-b")).run();
+	};
+	const denied = await sendSubagentMessageDetailed({
+		...input("sender-child", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(denied.targets.map((target) => target.status)).toEqual(["failed"]);
+	expect(denied.targets[0]?.error).toContain("not a direct child");
+	expect(turn.signal.aborted).toBe(false);
+	expect(rows("sibling-b")).toHaveLength(0);
+
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const allowed = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(allowed.targets[0]?.status).toBe("queued");
+	expect(turn.signal.aborted).toBe(true);
+	expect(rows("sibling-b")).toHaveLength(1);
+});
+
+test("an archived child's rejected model does not drop the live recipient", async () => {
+	db.update(narrators)
+		.set({
+			status: "archived",
+			runtimeRegistrationJson: delegationRegistration("parent-root", "explore"),
+		})
+		.where(eq(narrators.id, "sibling-b"))
+		.run();
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:live-only",
+		"test:explore-only",
+	]);
+	const pools = settingsModule.settings.agent.subagentAllowedModels;
+	settingsModule.settings.agent.subagentAllowedModels = {
+		explore: ["test:explore-only"],
+		plan: [],
+		general: ["test:live-only"],
+	};
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a", "sibling-b"]),
+			model: "test:live-only",
+		});
+		expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+			["sibling-a", "queued"],
+			["sibling-b", "failed"],
+		]);
+		expect(result.targets[1]?.error).toContain("archived");
+		expect(result.targets[0]).toMatchObject({ model: "test:live-only" });
+		expect(rows("sibling-a")).toHaveLength(1);
+		expect(rows("sibling-b")).toHaveLength(0);
+	} finally {
+		settingsModule.settings.agent.subagentAllowedModels = pools;
+		visible.mockRestore();
+	}
+});
+
 test("model cannot change a child the user has taken over", async () => {
 	setRunHold("sibling-a", { released: false });
 	await expect(
-		sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
-	).rejects.toThrow("taken over by the user");
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
+		),
+	).toThrow("taken over by the user");
 	expect(rows()).toHaveLength(0);
 });
 

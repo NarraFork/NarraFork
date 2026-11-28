@@ -214,7 +214,7 @@ export function computePretextVListLayout(
 	};
 	const first = segmentsOrUnits[0];
 	const specs =
-		first && (first.kind === "segment" || first.kind === "activity")
+		first && (first.kind === "segment" || first.kind === "activity" || first.kind === "element")
 			? adaptRenderUnits(segmentsOrUnits as readonly AdapterRenderUnit[], ctx)
 			: adaptSegments(segmentsOrUnits as readonly AdapterSegment[], ctx);
 

@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { integrationResourceBindings, narrators, oauthGrants, remoteDevices } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -165,17 +166,25 @@ async function resourceExists(
 ): Promise<boolean> {
 	if (resourceType === "device") {
 		return Boolean(
-			await db.query.remoteDevices.findFirst({
-				where: eq(remoteDevices.id, resourceId),
-				columns: { id: true },
-			}),
+			await readQueryFirst(
+				db.query.remoteDevices.findMany({
+					limit: 1,
+					where: eq(remoteDevices.id, resourceId),
+					columns: { id: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			),
 		);
 	}
 	return Boolean(
-		await db.query.narrators.findFirst({
-			where: eq(narrators.id, resourceId),
-			columns: { id: true },
-		}),
+		await readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, resourceId),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		),
 	);
 }
 
@@ -446,14 +455,23 @@ export class IntegrationResourceBindingService {
 		);
 	}
 
-	async get(resourceType: IntegrationResourceType, resourceId: string) {
+	async get(
+		resourceType: IntegrationResourceType,
+		resourceId: string,
+		readOptions?: ReadQueryOptions,
+	) {
+		readOptions?.signal?.throwIfAborted();
 		return (
-			(await db.query.integrationResourceBindings.findFirst({
-				where: and(
-					eq(integrationResourceBindings.resourceType, resourceType),
-					eq(integrationResourceBindings.resourceId, resourceId),
-				),
-			})) ?? null
+			(await readQueryFirst(
+				db.query.integrationResourceBindings.findMany({
+					limit: 1,
+					where: and(
+						eq(integrationResourceBindings.resourceType, resourceType),
+						eq(integrationResourceBindings.resourceId, resourceId),
+					),
+				}),
+				{ ...readOptions, executionPolicy: "worker-required" },
+			)) ?? null
 		);
 	}
 
@@ -465,21 +483,25 @@ export class IntegrationResourceBindingService {
 		state?: IntegrationResourceBindingState;
 	}): Promise<IntegrationResourceBinding | null> {
 		return (
-			(await db.query.integrationResourceBindings.findFirst({
-				where: and(
-					eq(integrationResourceBindings.authorityType, input.authorityType),
-					eq(
-						integrationResourceBindings.authorityId,
-						normalizeId(input.authorityId, "authorityId"),
+			(await readQueryFirst(
+				db.query.integrationResourceBindings.findMany({
+					limit: 1,
+					where: and(
+						eq(integrationResourceBindings.authorityType, input.authorityType),
+						eq(
+							integrationResourceBindings.authorityId,
+							normalizeId(input.authorityId, "authorityId"),
+						),
+						eq(integrationResourceBindings.resourceType, input.resourceType),
+						eq(
+							integrationResourceBindings.provisionKey,
+							normalizeId(input.provisionKey, "provisionKey"),
+						),
+						input.state ? eq(integrationResourceBindings.state, input.state) : undefined,
 					),
-					eq(integrationResourceBindings.resourceType, input.resourceType),
-					eq(
-						integrationResourceBindings.provisionKey,
-						normalizeId(input.provisionKey, "provisionKey"),
-					),
-					input.state ? eq(integrationResourceBindings.state, input.state) : undefined,
-				),
-			})) ?? null
+				}),
+				{ executionPolicy: "worker-required" },
+			)) ?? null
 		);
 	}
 
@@ -491,16 +513,19 @@ export class IntegrationResourceBindingService {
 		const limit = normalizeLimit(options.limit);
 		const cursor = options.cursor ? normalizeId(options.cursor, "cursor") : null;
 		const states = [...new Set(options.states ?? [])];
-		const rows = await db.query.integrationResourceBindings.findMany({
-			where: and(
-				eq(integrationResourceBindings.authorityType, authorityType),
-				eq(integrationResourceBindings.authorityId, normalizeId(authorityId, "authorityId")),
-				cursor ? gt(integrationResourceBindings.id, cursor) : undefined,
-				states.length > 0 ? inArray(integrationResourceBindings.state, states) : undefined,
-			),
-			orderBy: [asc(integrationResourceBindings.id)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.integrationResourceBindings.findMany({
+				where: and(
+					eq(integrationResourceBindings.authorityType, authorityType),
+					eq(integrationResourceBindings.authorityId, normalizeId(authorityId, "authorityId")),
+					cursor ? gt(integrationResourceBindings.id, cursor) : undefined,
+					states.length > 0 ? inArray(integrationResourceBindings.state, states) : undefined,
+				),
+				orderBy: [asc(integrationResourceBindings.id)],
+				limit: limit + 1,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const hasMore = rows.length > limit;
 		const items = hasMore ? rows.slice(0, limit) : rows;
 		return { items, nextCursor: hasMore ? (items.at(-1)?.id ?? null) : null };
@@ -513,16 +538,19 @@ export class IntegrationResourceBindingService {
 		const normalizedAuthorityId = normalizeId(authorityId, "authorityId");
 		let affectedCount = 0;
 		for (;;) {
-			const candidates = await db.query.integrationResourceBindings.findMany({
-				where: and(
-					eq(integrationResourceBindings.authorityType, authorityType),
-					eq(integrationResourceBindings.authorityId, normalizedAuthorityId),
-					inArray(integrationResourceBindings.state, ["active", "revoked"]),
-				),
-				columns: { id: true },
-				orderBy: [asc(integrationResourceBindings.id)],
-				limit: MAX_PAGE_LIMIT,
-			});
+			const candidates = await readQuery(
+				db.query.integrationResourceBindings.findMany({
+					where: and(
+						eq(integrationResourceBindings.authorityType, authorityType),
+						eq(integrationResourceBindings.authorityId, normalizedAuthorityId),
+						inArray(integrationResourceBindings.state, ["active", "revoked"]),
+					),
+					columns: { id: true },
+					orderBy: [asc(integrationResourceBindings.id)],
+					limit: MAX_PAGE_LIMIT,
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			if (candidates.length === 0) break;
 			const now = nowIso();
 			const rows = await db
@@ -653,24 +681,27 @@ export class IntegrationResourceBindingService {
 		let hasMore = false;
 
 		if (!cursor || cursor.resourceType === "device") {
-			const rows = await db
-				.select({
-					id: remoteDevices.id,
-					grantId: remoteDevices.oauthOwnerGrantId,
-					provisionKey: remoteDevices.oauthProvisionKey,
-					projectId: remoteDevices.projectId,
-					revokedAt: remoteDevices.revokedAt,
-				})
-				.from(remoteDevices)
-				.where(
-					and(
-						isNotNull(remoteDevices.oauthOwnerGrantId),
-						authorityId ? eq(remoteDevices.oauthOwnerGrantId, authorityId) : undefined,
-						cursor?.resourceType === "device" ? gt(remoteDevices.id, cursor.id) : undefined,
-					),
-				)
-				.orderBy(asc(remoteDevices.id))
-				.limit(limit + 1);
+			const rows = await readQuery(
+				db
+					.select({
+						id: remoteDevices.id,
+						grantId: remoteDevices.oauthOwnerGrantId,
+						provisionKey: remoteDevices.oauthProvisionKey,
+						projectId: remoteDevices.projectId,
+						revokedAt: remoteDevices.revokedAt,
+					})
+					.from(remoteDevices)
+					.where(
+						and(
+							isNotNull(remoteDevices.oauthOwnerGrantId),
+							authorityId ? eq(remoteDevices.oauthOwnerGrantId, authorityId) : undefined,
+							cursor?.resourceType === "device" ? gt(remoteDevices.id, cursor.id) : undefined,
+						),
+					)
+					.orderBy(asc(remoteDevices.id))
+					.limit(limit + 1),
+				{ executionPolicy: "worker-required" },
+			);
 			const oauthRows = rows.filter((row) => row.grantId !== null);
 			for (const row of oauthRows.slice(0, limit)) {
 				candidates.push({
@@ -703,23 +734,26 @@ export class IntegrationResourceBindingService {
 		}
 		if (remaining > 0) {
 			const narratorCursor = cursor?.resourceType === "narrator" ? cursor.id : null;
-			const rows = await db
-				.select({
-					id: narrators.id,
-					grantId: narrators.oauthOwnerGrantId,
-					provisionKey: narrators.oauthProvisionKey,
-					projectId: narrators.contextProjectId,
-				})
-				.from(narrators)
-				.where(
-					and(
-						isNotNull(narrators.oauthOwnerGrantId),
-						authorityId ? eq(narrators.oauthOwnerGrantId, authorityId) : undefined,
-						narratorCursor ? gt(narrators.id, narratorCursor) : undefined,
-					),
-				)
-				.orderBy(asc(narrators.id))
-				.limit(remaining + 1);
+			const rows = await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						grantId: narrators.oauthOwnerGrantId,
+						provisionKey: narrators.oauthProvisionKey,
+						projectId: narrators.contextProjectId,
+					})
+					.from(narrators)
+					.where(
+						and(
+							isNotNull(narrators.oauthOwnerGrantId),
+							authorityId ? eq(narrators.oauthOwnerGrantId, authorityId) : undefined,
+							narratorCursor ? gt(narrators.id, narratorCursor) : undefined,
+						),
+					)
+					.orderBy(asc(narrators.id))
+					.limit(remaining + 1),
+				{ executionPolicy: "worker-required" },
+			);
 			const oauthRows = rows.filter((row) => row.grantId !== null);
 			for (const row of oauthRows.slice(0, remaining)) {
 				candidates.push({
@@ -753,10 +787,14 @@ export class IntegrationResourceBindingService {
 		let created = 0;
 		let skipped = 0;
 		for (const candidate of candidates) {
-			const grant = await db.query.oauthGrants.findFirst({
-				where: eq(oauthGrants.id, candidate.grantId),
-				columns: { oauthClientId: true, revokedAt: true },
-			});
+			const grant = await readQueryFirst(
+				db.query.oauthGrants.findMany({
+					limit: 1,
+					where: eq(oauthGrants.id, candidate.grantId),
+					columns: { oauthClientId: true, revokedAt: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			if (!grant) {
 				skipped++;
 				continue;

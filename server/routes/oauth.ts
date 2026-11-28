@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "../db/worker-read";
 /**
  * OAuth 2.0 provider endpoints (RFC 6749 + RFC 7636 PKCE + RFC 8414 metadata).
  *
@@ -16,7 +17,7 @@ import { db } from "../db";
 import { oauthGrants, projects, users } from "../db/schema";
 import { verifyToken } from "../lib/auth";
 import { getClientIp } from "../lib/client-ip";
-import { ValidationError } from "../lib/errors";
+import { AppError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
 	ACCESS_TOKEN_TTL_SECONDS,
@@ -50,8 +51,8 @@ function oauthErrorResponse(c: Context, err: OAuthError) {
 }
 
 /**
- * Resolve the signed-in user from the session token without throwing. OAuth
- * access tokens are deliberately NOT accepted on the consent endpoints — a
+ * Resolve the signed-in user; unknown credentials return null and storage failures propagate.
+ * OAuth access tokens are deliberately NOT accepted on the consent endpoints — a
  * third-party token must never be able to mint new grants.
  */
 async function getSessionUser(c: Context): Promise<{ id: string; username: string } | null> {
@@ -61,14 +62,24 @@ async function getSessionUser(c: Context): Promise<{ id: string; username: strin
 	// Skip the lookup for anything that is not a session token, like OAuth access tokens.
 	if (!isOpaqueSessionToken(token)) return null;
 	try {
-		const payload = await verifyToken(token);
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, payload.sub),
-			columns: { id: true, username: true },
-		});
+		const payload = await verifyToken(token, { signal: c.req.raw.signal });
+		const row = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, payload.sub),
+				columns: { id: true, username: true },
+			}),
+			{ executionPolicy: "worker-required", signal: c.req.raw.signal },
+		);
 		return row ?? null;
-	} catch {
-		return null;
+	} catch (error) {
+		if (
+			(error instanceof AppError && error.statusCode === 401) ||
+			(error instanceof Error &&
+				["SessionTokenRevoked", "SessionTokenExpired"].includes(error.name))
+		)
+			return null;
+		throw error;
 	}
 }
 
@@ -160,13 +171,17 @@ async function validateAuthorizationRequest(
 }
 
 async function getActiveGrant(userId: string, oauthClientId: string) {
-	return db.query.oauthGrants.findFirst({
-		where: and(
-			eq(oauthGrants.userId, userId),
-			eq(oauthGrants.oauthClientId, oauthClientId),
-			isNull(oauthGrants.revokedAt),
-		),
-	});
+	return readQueryFirst(
+		db.query.oauthGrants.findMany({
+			limit: 1,
+			where: and(
+				eq(oauthGrants.userId, userId),
+				eq(oauthGrants.oauthClientId, oauthClientId),
+				isNull(oauthGrants.revokedAt),
+			),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 }
 
 function auditContext(c: Context): {
@@ -209,11 +224,14 @@ async function validateProjectIds(projectIds: unknown): Promise<string[]> {
 		);
 	}
 	if (normalized.length === 0) return normalized;
-	const rows = await db.query.projects.findMany({
-		where: inArray(projects.id, normalized),
-		columns: { id: true },
-		limit: MAX_OAUTH_PROJECTS,
-	});
+	const rows = await readQuery(
+		db.query.projects.findMany({
+			where: inArray(projects.id, normalized),
+			columns: { id: true },
+			limit: MAX_OAUTH_PROJECTS,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const existing = new Set(rows.map((project) => project.id));
 	const missing = normalized.find((projectId) => !existing.has(projectId));
 	if (missing) throw new OAuthError("invalid_request", `Unknown project: ${missing}`);
@@ -291,12 +309,15 @@ oauthRoutes.get("/authorize", oauthRateLimit("authorize"), async (c) => {
 			: null;
 		const existingScopes = activeGrantView?.scopes ?? [];
 		const selectedProjectIds = activeGrantView?.projectIds ?? [];
-		const availableProjects = await db.query.projects.findMany({
-			where: eq(projects.status, "active"),
-			columns: { id: true, name: true },
-			orderBy: (table, { asc }) => [asc(table.name), asc(table.id)],
-			limit: MAX_OAUTH_PROJECTS,
-		});
+		const availableProjects = await readQuery(
+			db.query.projects.findMany({
+				where: eq(projects.status, "active"),
+				columns: { id: true, name: true },
+				orderBy: (table, { asc }) => [asc(table.name), asc(table.id)],
+				limit: MAX_OAUTH_PROJECTS,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 
 		return c.json({
 			client: {

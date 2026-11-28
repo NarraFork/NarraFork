@@ -5,6 +5,7 @@ import type { GitWorkspace, GitWorkspaceState } from "@shared/git-workspace";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -291,26 +292,52 @@ export async function resolveNarratorGitTarget(
 	recoverWorktreeList = false,
 	/** File-only discovery reuse; the caller must still perform every authorization gate. */
 	metadataDiscovery: boolean | GitWorkspaceTarget = false,
+	readOptions?: ReadQueryOptions,
+	/** Trusted row loaded by the same authorization, never a cached verdict. */
+	loadedNarrator?: Pick<
+		typeof narrators.$inferSelect,
+		| "id"
+		| "cwd"
+		| "workspaceRevision"
+		| "workspaceContext"
+		| "contextProjectId"
+		| "defaultDeviceId"
+		| "traits"
+	>,
 ): Promise<GitWorkspaceTarget> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			cwd: true,
-			workspaceRevision: true,
-			workspaceContext: true,
-			contextProjectId: true,
-			defaultDeviceId: true,
-			traits: true,
-		},
-	});
+	signal ??= readOptions?.signal;
+	signal?.throwIfAborted();
+	const narrator =
+		loadedNarrator?.id === narratorId
+			? loadedNarrator
+			: await readQueryFirst(
+					db.query.narrators.findMany({
+						limit: 1,
+						where: eq(narrators.id, narratorId),
+						columns: {
+							id: true,
+							cwd: true,
+							workspaceRevision: true,
+							workspaceContext: true,
+							contextProjectId: true,
+							defaultDeviceId: true,
+							traits: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required", maxRows: 1, signal },
+				);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	const projectId = (await resolveNarratorProjectId(narrator)) ?? undefined;
+	const projectId = (await resolveNarratorProjectId(narrator, readOptions)) ?? undefined;
+	signal?.throwIfAborted();
 	const project = projectId
-		? await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { gitPath: true },
-			})
+		? await readQueryFirst(
+				db.query.projects.findMany({
+					limit: 1,
+					where: eq(projects.id, projectId),
+					columns: { gitPath: true },
+				}),
+				{ ...readOptions, executionPolicy: "worker-required", maxRows: 1, signal },
+			)
 		: undefined;
 	if (projectId && !project) throw new NotFoundError("Project", projectId);
 	const active = activeNarrators.get(narratorId);

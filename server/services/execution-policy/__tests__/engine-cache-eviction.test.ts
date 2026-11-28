@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { ReadQueryOptions } from "@server/db/worker-read";
 import type { PathIdentity } from "@server/lib/agent/execution/backend";
 import { targetPathSemantics } from "@server/lib/agent/execution/path-semantics";
 import type { ToolExecutionTarget } from "@server/lib/agent/types";
@@ -108,6 +109,56 @@ describe("execution policy engine cache eviction on failure", () => {
 		};
 		(engine as any).loadedCache.set(narratorId, entry);
 	}
+
+	test("budgeted facts isolate callers and leave the in-flight shared load intact", async () => {
+		const shared = Promise.withResolvers<LoadedExecutionPolicy>();
+		const surviving = Promise.withResolvers<LoadedExecutionPolicy>();
+		const a = new AbortController();
+		const b = new AbortController();
+		const seen: (ReadQueryOptions | AbortSignal | undefined)[] = [];
+		const load = spyOn(executionPolicyRepository, "load").mockImplementation((_id, options) => {
+			seen.push(options);
+			if (!options || options instanceof AbortSignal) return shared.promise;
+			if (options.signal === b.signal) return surviving.promise;
+			return new Promise((_, reject) => {
+				options.signal?.addEventListener("abort", () => reject(options.signal?.reason), {
+					once: true,
+				});
+			});
+		});
+		const deadlineAt = Date.now() + 1000;
+		const ordinary = engine.compile("test-narrator", null);
+		const first = engine.compile("test-narrator", null, [], a.signal, {
+			signal: a.signal,
+			deadlineAt,
+		});
+		const second = engine.compile("test-narrator", null, [], b.signal, {
+			signal: b.signal,
+			deadlineAt,
+		});
+		void first.catch(() => {});
+		try {
+			expect(seen).toHaveLength(3);
+			expect(seen[0]).toBeInstanceOf(AbortSignal);
+			expect(seen[1]).toMatchObject({ signal: a.signal, deadlineAt });
+			a.abort(new Error("first facts consumer left"));
+			await expect(first).rejects.toThrow("first facts consumer left");
+			expect(b.signal.aborted).toBe(false);
+			surviving.resolve(makeMinimalPolicy());
+			const policy = await second;
+			const otherOrdinary = engine.compile("test-narrator", null);
+			expect(load).toHaveBeenCalledTimes(3);
+			shared.resolve(makeMinimalPolicy());
+			expect(await ordinary).toBe(policy);
+			expect(await otherOrdinary).toBe(policy);
+		} finally {
+			a.abort();
+			shared.resolve(makeMinimalPolicy());
+			surviving.resolve(makeMinimalPolicy());
+			await Promise.allSettled([ordinary, first, second]);
+			load.mockRestore();
+		}
+	});
 
 	test("compile failure does not permanently cache the rejected promise", async () => {
 		const narratorId = "test-narrator";
@@ -280,7 +331,23 @@ describe("execution policy engine cache eviction on failure", () => {
 		}
 	});
 
-	test("a policy invalidated while the Worker is reading cannot repopulate the cache", async () => {
+	test("fails closed if the one retry is also invalidated", async () => {
+		const narratorId = "pending-narrator";
+		const load = spyOn(executionPolicyRepository, "load").mockImplementation(async () => {
+			// Yield so the engine registers the pending entry before it is invalidated.
+			await Promise.resolve();
+			engine.invalidate(narratorId);
+			return makeMinimalPolicy({ narratorId });
+		});
+		try {
+			await expect(engine.compile(narratorId, null)).rejects.toThrow("changed while loading");
+			expect(load).toHaveBeenCalledTimes(2);
+		} finally {
+			load.mockRestore();
+		}
+	});
+
+	test("an invalidated load joins the fresh snapshot without using stale policy", async () => {
 		const narratorId = "pending-narrator";
 		const pending = Promise.withResolvers<LoadedExecutionPolicy>();
 		const load = spyOn(executionPolicyRepository, "load")
@@ -289,9 +356,10 @@ describe("execution policy engine cache eviction on failure", () => {
 		try {
 			const first = engine.compile(narratorId, null);
 			engine.invalidate("parent");
+			const current = engine.compile(narratorId, null);
 			pending.resolve(makeMinimalPolicy({ narratorId, ownerNarratorId: "old-parent" }));
-			await expect(first).rejects.toThrow("changed while loading");
-			expect((await engine.compile(narratorId, null)).ownerNarratorId).toBe("parent");
+			await expect(first).resolves.toMatchObject({ ownerNarratorId: "parent" });
+			await expect(current).resolves.toMatchObject({ ownerNarratorId: "parent" });
 			expect(load).toHaveBeenCalledTimes(2);
 		} finally {
 			load.mockRestore();

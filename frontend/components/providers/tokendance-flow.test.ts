@@ -89,6 +89,18 @@ describe("TokenDance same-tab security and claim lifecycle", () => {
 			draftSnapshot: snapshot,
 		});
 	});
+	test.each([
+		{ mode: "add" },
+		{ mode: "replace", credentialId: "old-login-slot" },
+	] as const)("the explicit $mode choice travels in the existing OAuth start request only", async (loginChoice) => {
+		await startTokenDanceLogin(snapshot, loginChoice);
+		expect(api.tokenDanceOAuthStart).toHaveBeenCalledWith({
+			callbackUrl: tokenDanceCallbackUrl(),
+			draftSnapshot: snapshot,
+			loginChoice,
+		});
+		expect([...storage]).toEqual([[TOKENDANCE_FLOW_MARKER, "random-flow"]]);
+	});
 	test("navigation failure cancels pending flow and preserves input snapshot", async () => {
 		window.location.assign = () => {
 			throw new Error("blocked");

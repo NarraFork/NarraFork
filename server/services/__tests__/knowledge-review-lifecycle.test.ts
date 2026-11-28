@@ -30,6 +30,7 @@ import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 /**
  * Seed knowledge grants into the unified `acl_grants` table.
@@ -181,7 +182,11 @@ describe("withdrawSubmission", () => {
 	test("a stranger cannot withdraw someone else's request (NotFound, no existence leak)", async () => {
 		const { submissionId } = await makePendingSubmission("NotYours");
 
-		expect(knowledgeBranchService.withdrawSubmission(stranger, submissionId)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.withdrawSubmission(stranger, submissionId),
+			),
+		).toThrow();
 		// Still open and untouched.
 		expect((await statusOf(submissionId))?.status).toBe("pending");
 	});
@@ -200,7 +205,11 @@ describe("withdrawSubmission", () => {
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "approve" });
 		expect((await statusOf(submissionId))?.status).toBe("approved");
 
-		expect(knowledgeBranchService.withdrawSubmission(author, submissionId)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.withdrawSubmission(author, submissionId),
+			),
+		).toThrow();
 		expect((await statusOf(submissionId))?.status).toBe("approved");
 		// The publish archived the personal entry; withdraw must not have resurrected it.
 		const personal = await knowledgeBranchService.getMine(author, entry.id);
@@ -232,7 +241,11 @@ describe("withdrawSubmission", () => {
 
 		// Withdraw is terminal for that row: the way back in is a fresh publish, not a resubmit
 		// chain hanging off a request the author already abandoned.
-		expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.resubmit(author, submissionId, {}),
+			),
+		).toThrow();
 	});
 });
 
@@ -307,13 +320,21 @@ describe("resubmit after changes_requested", () => {
 	test("only a changes_requested request can be re-submitted", async () => {
 		const { submissionId } = await makePendingSubmission("ResubmitPending");
 		// Still pending → refused (a second open request would be a duplicate anyway).
-		expect(knowledgeBranchService.resubmit(author, submissionId, {})).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.resubmit(author, submissionId, {}),
+			),
+		).toThrow();
 	});
 
 	test("a stranger cannot re-submit someone else's bounced request", async () => {
 		const { submissionId } = await makePendingSubmission("ResubmitNotYours");
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "request_changes" });
-		expect(knowledgeBranchService.resubmit(stranger, submissionId, {})).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.resubmit(stranger, submissionId, {}),
+			),
+		).toThrow();
 	});
 });
 
@@ -499,8 +520,10 @@ describe("rebaseDraft strategy=theirs", () => {
 			content: "body\n",
 		});
 		expect(
-			knowledgeBranchService.rebaseDraft(author, standalone.id, { strategy: "theirs" }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.rebaseDraft(author, standalone.id, { strategy: "theirs" }),
+			),
+		).toThrow();
 	});
 });
 
@@ -738,11 +761,13 @@ describe("resolveConflict self-review guard", () => {
 	test("the submitter cannot resolve their own conflicted submission", async () => {
 		const { submissionId } = await makeConflictSubmission();
 
-		await expect(
-			knowledgeBranchService.resolveConflict(author, submissionId, {
-				resolvedContent: "sneaky self-approved content\n",
-			}),
-		).rejects.toThrow("You cannot resolve your own submission");
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.resolveConflict(author, submissionId, {
+					resolvedContent: "sneaky self-approved content\n",
+				}),
+			),
+		).toThrow("You cannot resolve your own submission");
 
 		// The submission must remain in conflict — nothing was merged.
 		expect((await statusOf(submissionId))?.status).toBe("conflict");
@@ -816,8 +841,10 @@ describe("listSubmissions agrees with countReviewInbox on own submissions", () =
 		expect(inbox.count).toBe(0);
 
 		expect(
-			knowledgeBranchService.review(author, submissionId, { verdict: "approve" }),
-		).rejects.toThrow(/your own/i);
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.review(author, submissionId, { verdict: "approve" }),
+			),
+		).toThrow(/your own/i);
 
 		// The author still reads it through their own publish history.
 		const history = await knowledgeBranchService.listSubmissionsForDraft(author, mine.id);

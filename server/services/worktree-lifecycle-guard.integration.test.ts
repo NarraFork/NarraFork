@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -31,6 +32,7 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import * as spawn from "../lib/spawn";
 import { projectRoutes } from "../routes/projects";
+import { captureWorkerRejection } from "./__tests__/narrator-worker-fixture";
 import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
 import * as narratorSession from "./narrator-session";
 import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
@@ -474,7 +476,7 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 		expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		await withProjectRetirement(projectId, async () => {
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
@@ -524,7 +526,7 @@ for (const kind of ["create", "subagent", "extract"] as const) {
 					})
 					.where(eq(narrators.id, narratorId));
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
@@ -665,7 +667,9 @@ for (const deviceId of [undefined, "local", "remote-fixture"] as const) {
 					admitted = true;
 				});
 			if (deviceId === "remote-fixture") await run();
-			else await expect(run()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+			// Settle natively first: Bun's `.rejects` matcher stalls on a reused read Worker.
+			else
+				expect(await captureWorkerRejection(run())).toMatchObject({ code: "RESOURCE_PROTECTED" });
 			expect(admitted).toBe(deviceId === "remote-fixture");
 			for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
 			expect(changes()).toBe(before);
@@ -746,8 +750,16 @@ async function shadowBirthFixture() {
 	// Keep that separate observer inert so total_changes measures the actual sink.
 	spyOn(observations, "begin").mockResolvedValue(null);
 	spyOn(observations, "finish").mockResolvedValue(undefined);
-	const capture = () =>
-		withSnapshotCaptureReceipts(observations, () => worktreeTreeSnapshot.capture(path));
+	const capture = async () => {
+		const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+		try {
+			return await withSnapshotCaptureReceipts(observations, () =>
+				worktreeTreeSnapshot.capture(path),
+			);
+		} finally {
+			policy.mockRestore();
+		}
+	};
 	const assertRetained = (before: number | undefined, capturedHash?: string) => {
 		if (capturedHash) expect(changes()).toBeGreaterThan(before ?? 0);
 		else expect(changes()).toBe(before);
@@ -1357,6 +1369,8 @@ test("reserving one checkout does not block a sibling session using the same rep
 });
 
 test("actual cold snapshot initialization allows shared subagents and unrelated local/remote admissions", async () => {
+	// Exercise the retained capture algorithm independently of local production policy.
+	spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
 	const initialized = await spawn.safeSpawn({
 		cmd: ["git", "init", path],
 		timeout: 5000,

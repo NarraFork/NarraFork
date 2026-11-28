@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 import { HUMAN_ATTENTION_DETAIL_MAX_BYTES } from "@shared/human-attention";
 import { eq } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	aclGrants,
 	narratorMessages,
@@ -13,10 +13,17 @@ import {
 	projects,
 	users,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
 import type { PendingDangerReflection, PendingPermission } from "../narrator-session-state";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-// tests/preload isolates even the restored module. All fixture data below is in-memory.
-const { db, sqlite } = getTestDb();
+const dbFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = dbFixture;
+await dbFixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { listHumanAttentionForPrincipal: list, getHumanAttentionForPrincipal: detail } =
@@ -172,7 +179,7 @@ beforeEach(async () => {
 	});
 });
 
-afterAll(() => {
+afterAll(async () => {
 	for (const id of tasks) cleanupTaskReflection(id);
 	for (const id of plans) cleanupExitPlanReflection(id);
 	for (const controller of controllers) controller.abort();
@@ -183,6 +190,7 @@ afterAll(() => {
 	mock.restore();
 	mock.module("../../db", () => realDb);
 	cleanDb(sqlite);
+	await dbFixture.close();
 });
 
 describe("human attention discovery", () => {
@@ -217,7 +225,9 @@ describe("human attention discovery", () => {
 			inputJson: { command: "pwd" },
 		});
 		expect((await list(outsider)).items).toHaveLength(0);
-		await expect(detail(outsider, `permission:${p.row.id}`)).rejects.toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(outsider, `permission:${p.row.id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
 	});
 
 	test("ordinary forks do not inherit grouping or parent ACL", async () => {
@@ -255,7 +265,9 @@ describe("human attention discovery", () => {
 		await db.delete(aclGrants).where(eq(aclGrants.id, "grant-write"));
 		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, "root"));
 		expect((await list(reader)).items).toHaveLength(0);
-		await expect(detail(reader, `question:${id}`)).rejects.toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(reader, `question:${id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
 	});
 
 	test("project membership gates read and write separately, for cwd-derived and explicit project context", async () => {
@@ -329,15 +341,21 @@ describe("human attention discovery", () => {
 			.set({ status: "answered" })
 			.where(eq(narratorQuestions.id, id));
 		expect((await list(owner)).items).toHaveLength(0);
-		await expect(detail(owner, `permission:${p.row.id}`)).rejects.toBeInstanceOf(NotFoundError);
-		await expect(detail(owner, `question:${id}`)).rejects.toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(owner, `permission:${p.row.id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
+		expect(await captureWorkerRejection(detail(owner, `question:${id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
 		await db
 			.update(narratorToolCalls)
 			.set({ status: "pending" })
 			.where(eq(narratorToolCalls.id, p.row.id));
 		p.controller.abort();
 		expect((await list(owner)).items).toHaveLength(0);
-		await expect(detail(owner, `permission:${p.row.id}`)).rejects.toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(owner, `permission:${p.row.id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
 	});
 
 	test("task takeover uses synthetic decision id, hides automatic reflection and resolves through the existing registry", async () => {
@@ -369,7 +387,9 @@ describe("human attention discovery", () => {
 				expect.objectContaining({ type: "task_reflection", status: "awaiting_user", requestId }),
 			],
 		});
-		await expect(detail(owner, `permission:${row.id}`)).rejects.toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(owner, `permission:${row.id}`))).toBeInstanceOf(
+			NotFoundError,
+		);
 		await confirmTaskReflection(requestId, "User approved the protected work", undefined, "user");
 		expect((await decision).action).toBe("confirm");
 		expect((await list(owner)).items).toHaveLength(0);
@@ -415,9 +435,9 @@ describe("human attention discovery", () => {
 			live: { questionReflectionAbort: new AbortController() },
 		});
 		expect((await list(owner)).items).toHaveLength(0);
-		await expect(detail(owner, "permission:exit_plan_synthetic")).rejects.toBeInstanceOf(
-			NotFoundError,
-		);
+		expect(
+			await captureWorkerRejection(detail(owner, "permission:exit_plan_synthetic")),
+		).toBeInstanceOf(NotFoundError);
 		danger.reflectionStoppedByUser = true;
 		ask.pending.questionReflectionStoppedByUser = true;
 		expect((await list(owner)).items.map((i) => i.kind).sort()).toEqual([
@@ -433,6 +453,26 @@ describe("human attention discovery", () => {
 });
 
 describe("bounded paging and detail", () => {
+	test("a plan approval carries 计划反思 availability only while its runner is live", async () => {
+		await narrator("n");
+		const plan = await permission("n", {
+			toolName: "ExitPlanMode",
+			input: { plan: "real approvable plan" },
+			live: {
+				planReflection: async (input) => ({ decision: { action: "manual" }, input }),
+			},
+		});
+		const available = await detail(owner, `permission:${plan.row.id}`);
+		expect(available.permission?.planReflectionAvailable).toBe(true);
+		plan.pending.planReflectionRunning = true;
+		const running = await detail(owner, `permission:${plan.row.id}`);
+		expect(running.permission?.planReflectionAvailable).toBe(false);
+		const bash = await permission("n");
+		const other = await detail(owner, `permission:${bash.row.id}`);
+		expect(other.permission).toBeDefined();
+		expect(other.permission && "planReflectionAvailable" in other.permission).toBe(false);
+	});
+
 	test("more than 200 unreadable async rows cannot hide a readable question", async () => {
 		await narrator("a-hidden", { ownerUserId: outsider.userId });
 		await narrator("z-visible");
@@ -475,13 +515,20 @@ describe("bounded paging and detail", () => {
 		const p = await permission("b", { id: "urgent" });
 		const abort = new AbortController();
 		controllers.push(abort);
+		const registered = Promise.withResolvers<void>();
+		setQuestionServiceSeam({
+			isLoopRunning: () => false,
+			broadcastToNarrator: () => {},
+			emitAttention: () => registered.resolve(),
+			emitAttentionResolved: () => {},
+		});
 		const wait = awaitAsyncQuestion({
 			questionId: awaitedId,
 			narratorId: "b",
 			timeoutMs: 0,
 			signal: abort.signal,
 		});
-		for (let i = 0; i < 20 && !isAsyncQuestionAwaited(awaitedId); i++) await Promise.resolve();
+		await registered.promise;
 		expect(isAsyncQuestionAwaited(awaitedId)).toBe(true);
 		const seen: string[] = [];
 		let cursor: string | undefined;
@@ -497,10 +544,14 @@ describe("bounded paging and detail", () => {
 	});
 
 	test("invalid IDs/cursors fail closed, limit is clamped, cancellation is honored", async () => {
-		await expect(detail(owner, "tool:123")).rejects.toBeInstanceOf(NotFoundError);
-		await expect(detail(owner, "permission:")).rejects.toBeInstanceOf(NotFoundError);
-		await expect(list(owner, { cursor: "!bad" })).rejects.toThrow("Invalid human attention cursor");
-		await expect(list(owner, { cursor: "x".repeat(1025) })).rejects.toThrow(
+		expect(await captureWorkerRejection(detail(owner, "tool:123"))).toBeInstanceOf(NotFoundError);
+		expect(await captureWorkerRejection(detail(owner, "permission:"))).toBeInstanceOf(
+			NotFoundError,
+		);
+		expect(await captureWorkerRejectionThrower(list(owner, { cursor: "!bad" }))).toThrow(
+			"Invalid human attention cursor",
+		);
+		expect(await captureWorkerRejectionThrower(list(owner, { cursor: "x".repeat(1025) }))).toThrow(
 			"Invalid human attention cursor",
 		);
 		await narrator("n");
@@ -509,7 +560,9 @@ describe("bounded paging and detail", () => {
 		expect((await list(owner, { limit: 0 })).items).toHaveLength(1);
 		const controller = new AbortController();
 		controller.abort();
-		await expect(list(owner, { signal: controller.signal })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(list(owner, { signal: controller.signal })),
+		).toThrow();
 	});
 
 	test("list rows never read input, plans or forms; titles and summaries are clamped", async () => {
@@ -663,13 +716,14 @@ describe("bounded paging and detail", () => {
 	test("query plan seeks narrators then probes open-question index, never historical question bodies", async () => {
 		await narrator("n");
 		await question("n");
-		const all = db.all.bind(db);
+		// The page query runs through the Worker read bridge; capture it there.
+		const all = workerRead.readDbAll;
 		const queries: { sql: string; params: unknown[] }[] = [];
 		const dialect = new SQLiteSyncDialect();
-		const capture = spyOn(db, "all").mockImplementation((query) => {
-			if (typeof query !== "string") queries.push(dialect.sqlToQuery(query.getSQL()));
-			return all(query);
-		});
+		const capture = spyOn(workerRead, "readDbAll").mockImplementation(((source, query, options) => {
+			queries.push(dialect.sqlToQuery(query.getSQL()));
+			return all(source, query, options);
+		}) as typeof workerRead.readDbAll);
 		try {
 			await list(owner);
 		} finally {

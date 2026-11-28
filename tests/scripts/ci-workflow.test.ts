@@ -4,6 +4,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
@@ -42,7 +43,7 @@ type Job = {
 	"timeout-minutes": number;
 	needs?: string[];
 	if?: string;
-	strategy?: { "fail-fast": boolean; matrix: { shard: number[] } };
+	strategy?: { "fail-fast": boolean; matrix: Record<string, number[] | string[]> };
 	steps: Step[];
 	"continue-on-error"?: boolean;
 	env?: Record<string, string>;
@@ -205,6 +206,8 @@ describe("generic CI workflow", () => {
 			for (const valueStep of value.steps) {
 				expect(valueStep["continue-on-error"]).toBeUndefined();
 				const isReport = id === "tests" && valueStep.uses === pins.upload;
+				const isFailureSummary =
+					id === "tests" && valueStep.name === "Summarize test shard failure";
 				const isDeclaredRemoteAsset =
 					(id === "build" &&
 						[
@@ -216,9 +219,11 @@ describe("generic CI workflow", () => {
 				expect(valueStep.if).toBe(
 					isReport
 						? expression("always()")
-						: isDeclaredRemoteAsset
-							? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
-							: undefined,
+						: isFailureSummary
+							? expression("failure() || cancelled()")
+							: isDeclaredRemoteAsset
+								? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
+								: undefined,
 				);
 				if (valueStep.uses) {
 					expect(valueStep.uses).toMatch(/^[\w-]+\/[\w-]+@[a-f0-9]{40}$/);
@@ -407,7 +412,7 @@ describe("generic CI workflow", () => {
 	});
 
 	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
-		let checked = 0;
+		const checked: string[] = [];
 		for (const name of [
 			"remote-executor.yml",
 			"file-revert-cross-platform.yml",
@@ -421,7 +426,7 @@ describe("generic CI workflow", () => {
 					(entry) => entry.run?.trim() === "bunx tsgo --noEmit",
 				);
 				if (typecheck < 0) continue;
-				checked++;
+				checked.push(`${name}:${id}`);
 				const before = value.steps.slice(0, typecheck);
 				const install = before.findIndex(
 					(entry) => entry.run?.trim() === "bun install --frozen-lockfile",
@@ -439,13 +444,18 @@ describe("generic CI workflow", () => {
 				}
 			}
 		}
-		expect(checked).toBe(4);
+		expect(checked).toEqual([
+			"remote-executor.yml:integration-typescript",
+			"file-revert-cross-platform.yml:file-revert",
+			"plugin-platform-acceptance.yml:contract-tests",
+		]);
 	});
-	test("enforces migration assets, whole-repository lint and translation checks", () => {
+	test("enforces migration assets, whole-repository lint, translation and knowledge tree checks", () => {
 		for (const run of [
 			"bun scripts/check-sqlite-migration-assets.ts",
 			"bunx @biomejs/biome check .",
 			"bun run i18n:check",
+			"bun scripts/knowledge.ts check",
 		]) {
 			expect(command("static-checks", run).if).toBeUndefined();
 		}
@@ -534,6 +544,8 @@ describe("generic CI workflow", () => {
 
 	test("installs the exact official Chrome146 build and probes a real headless launch before tests", () => {
 		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
+		const installer = readFileSync(join(repository, "scripts/install-ci-chrome.ts"), "utf8");
+		expect(install.run).toBe("bun scripts/install-ci-chrome.ts");
 		for (const required of [
 			'from "@puppeteer/browsers"',
 			'const buildId = "146.0.7680.31"',
@@ -547,13 +559,13 @@ describe("generic CI workflow", () => {
 			"Google Chrome for Testing",
 			"process.env.GITHUB_ENV",
 		])
-			expect(install.run).toContain(required);
+			expect(installer).toContain(required);
 		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"])
-			expect(install.run).toContain(`${variable}=\${executablePath}`);
-		expect(install.run?.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
-			install.run?.indexOf("appendFileSync(environmentFile") ?? -1,
+			expect(installer).toContain(`${variable}=\${executablePath}`);
+		expect(installer.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
+			installer.indexOf("appendFileSync("),
 		);
-		expect(install.run).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
+		expect(installer).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
 		expect(install.if).toBeUndefined();
 		const probe = step("tests", (value) => !!value.run?.includes("puppeteer.launch"));
 		expect(probe.run).toContain("process.env.PUPPETEER_EXECUTABLE_PATH");
@@ -565,6 +577,8 @@ describe("generic CI workflow", () => {
 			"devtools.timeline",
 			"disabled-by-default-v8.gc",
 			"blink.user_timing",
+			"dumpio: true",
+			"timeout: 15000",
 		])
 			expect(probe.run).toContain(required);
 		expect(probe.run).toContain("await page.goto(");
@@ -578,6 +592,94 @@ describe("generic CI workflow", () => {
 		expect(steps.indexOf(probe)).toBeLessThan(
 			steps.indexOf(command("tests", "bun test --isolate tests/preload-isolation.test.ts")),
 		);
+		const plugin = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
+		) as Workflow;
+		for (const event of ["push", "pull_request"])
+			expect(plugin.on[event]?.paths).toContain("scripts/install-ci-chrome.ts");
+		for (const id of ["contract-tests", "browser-smoke"]) {
+			const steps = plugin.jobs[id].steps;
+			const setup = steps.find((value) => value.name === "Install and verify pinned Chrome");
+			const probe = steps.find((value) => value.name === "Probe headless Chrome");
+			expect(setup?.run).toBe(install.run);
+			expect(setup?.if).toBeUndefined();
+			expect(
+				steps.findIndex((value) => value.name === "Install and verify pinned Chrome"),
+			).toBeLessThan(steps.findIndex((value) => value.name === "Probe headless Chrome"));
+			for (const required of [
+				"dumpio: true",
+				"timeout: 15000",
+				"await page.goto(",
+				"await browser.close()",
+			])
+				expect(probe?.run).toContain(required);
+			expect(probe?.if).toBeUndefined();
+			expect(steps.map((value) => value.run).join("\n")).not.toContain("command -v google-chrome");
+		}
+	});
+
+	test("plugin types have a required owner while every native security platform remains mandatory", () => {
+		const plugin = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
+		) as Workflow;
+		const contract = plugin.jobs["contract-tests"];
+		const typecheck = contract.steps.find((value) => value.name === "Check TypeScript");
+		expect(typecheck?.run).toBe("bunx tsgo --noEmit");
+		expect(typecheck?.if).toBeUndefined();
+		expect(typecheck?.["continue-on-error"]).toBeUndefined();
+		expect(contract.if).toBeUndefined();
+		expect(contract["continue-on-error"]).toBeUndefined();
+		const native = plugin.jobs["cross-platform-security"];
+		expect(native.strategy).toEqual({
+			"fail-fast": false,
+			matrix: { os: ["ubuntu-latest", "macos-latest", "windows-latest"] },
+		});
+		expect(native["runs-on"]).toBe(expression("matrix.os"));
+		expect(native["timeout-minutes"]).toBe(20);
+		expect(native.if).toBeUndefined();
+		expect(native["continue-on-error"]).toBeUndefined();
+		expect(native.steps.some((value) => value.run?.includes("tsgo --noEmit"))).toBe(false);
+		const security = native.steps.find(
+			(value) => value.name === "Run path and runner security tests",
+		);
+		expect(security?.if).toBeUndefined();
+		expect(security?.["continue-on-error"]).toBeUndefined();
+		expect(security?.run).toContain("bun test --isolate");
+		for (const path of [
+			"server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+			"tests/server/services/plugin-manager.test.ts",
+			"tests/server/services/plugin-runtime-windows-job.test.ts",
+			"server/lib/plugins/windows-plugin-launcher.compiled.test.ts",
+			"server/services/__tests__/plugin-podman-runner.test.ts",
+			"server/services/__tests__/plugin-process-runner.test.ts",
+			"server/services/__tests__/plugin-signature.test.ts",
+			"server/services/__tests__/plugin-sbom.test.ts",
+		])
+			expect(security?.run).toContain(path);
+		const gate = plugin.jobs["plugin-platform-gate"];
+		expect(gate.if).toBe("always()");
+		expect(gate.needs).toContain("contract-tests");
+		expect(gate.needs).toContain("cross-platform-security");
+		const script = gate.steps.find(
+			(value) => value.name === "Require every acceptance lane to pass",
+		)?.run;
+		expect(script).toBeDefined();
+		for (const [change, success] of [
+			[{}, true],
+			[{ CONTRACT: "failure" }, false],
+			[{ CROSS_PLATFORM: "skipped" }, false],
+		] as const) {
+			const result = shell(script ?? "", {
+				CONTRACT: "success",
+				HARDENING: "success",
+				CROSS_PLATFORM: "success",
+				RELEASE: "success",
+				BROWSER: "success",
+				...change,
+			});
+			expect(result.error).toBeUndefined();
+			expect(result.status === 0).toBe(success);
+		}
 	});
 
 	test("a missing or failing pinned Chrome installer cannot export a browser environment", () => {
@@ -596,6 +698,55 @@ describe("generic CI workflow", () => {
 		expect(broken.error).toBeUndefined();
 		expect(broken.status).toBe(42);
 		expect(existsSync(githubEnv)).toBe(false);
+		for (const [name, status, stdout] of [
+			["failed-version", 1, ""],
+			["wrong-version", 0, "Google Chrome 158.0.8127.36\n"],
+			["verified-version", 0, "Google Chrome for Testing 146.0.7680.31\n"],
+		] as const) {
+			const environmentFile = join(root, name);
+			const executablePath = join(root, `${name}-chrome`);
+			writeFileSync(
+				executablePath,
+				`#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(stdout)}); process.exit(${status});\n`,
+				{ mode: 0o700 },
+			);
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--eval",
+					`
+				import { mock } from "bun:test";
+				mock.module("@puppeteer/browsers", () => ({
+					Browser: { CHROME: "chrome" },
+					install: async () => ({ executablePath: ${JSON.stringify(executablePath)} }),
+				}));
+				await import(${JSON.stringify(join(repository, "scripts/install-ci-chrome.ts"))});
+			`,
+				],
+				{
+					cwd: repository,
+					env: { ...process.env, RUNNER_TEMP: root, GITHUB_ENV: environmentFile },
+					encoding: "utf8",
+					timeout: 5000,
+					maxBuffer: 8192,
+				},
+			);
+			expect(result.error).toBeUndefined();
+			if (name === "verified-version") {
+				expect(result.status).toBe(0);
+				expect(readFileSync(environmentFile, "utf8")).toBe(
+					`NF_TEST_CHROMIUM_PATH=${executablePath}\nPUPPETEER_EXECUTABLE_PATH=${executablePath}\n`,
+				);
+			} else {
+				expect(result.status).not.toBe(0);
+				expect(result.stderr).toContain(
+					name === "failed-version"
+						? "Chrome version command failed"
+						: "Expected Google Chrome for Testing",
+				);
+				expect(existsSync(environmentFile)).toBe(false);
+			}
+		}
 	});
 
 	test("covers all four native shards without fail-fast or artifact name collisions", () => {
@@ -638,6 +789,8 @@ describe("generic CI workflow", () => {
 			"artifacts/ci-tests.xml",
 			"artifacts/ci-test-timings.json",
 			"artifacts/native-tests*.log",
+			"artifacts/native-tests*-diagnostics.jsonl",
+			"artifacts/ci-stage*.jsonl",
 		]);
 		// Logs alone satisfy upload-artifact; a separate normal step must require JUnit.
 		expect(report.with?.["if-no-files-found"]).toBe("error");
@@ -645,7 +798,10 @@ describe("generic CI workflow", () => {
 		expect(verify.name).toBe("Verify test report");
 		expect(verify.if).toBeUndefined();
 		expect(job("tests").steps.indexOf(run)).toBeLessThan(job("tests").steps.indexOf(verify));
-		expect(job("tests").steps.indexOf(verify)).toBeLessThan(job("tests").steps.indexOf(report));
+		const summary = step("tests", (value) => value.name === "Summarize test shard failure");
+		expect(summary.if).toBe(expression("failure() || cancelled()"));
+		expect(job("tests").steps.indexOf(verify)).toBeLessThan(job("tests").steps.indexOf(summary));
+		expect(job("tests").steps.indexOf(summary)).toBeLessThan(job("tests").steps.indexOf(report));
 		// Render Actions expressions first: a shell substitution error is not test failure evidence.
 		for (const shard of [1, 2, 3, 4]) {
 			const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), String(shard));
@@ -726,6 +882,20 @@ function privateRunnerRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "ci-file-stdio-"));
 	roots.push(root);
 	return root;
+}
+
+const fixtureDiagnostics = { shardIndex: 2, shardTotal: 4, parallel: 2 };
+
+function readDiagnostics(cwd: string, shard = 2) {
+	const raw = readFileSync(
+		join(cwd, `artifacts/native-tests-${shard}-of-4-diagnostics.jsonl`),
+		"utf8",
+	);
+	const records = raw
+		.trimEnd()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	return { raw, records };
 }
 
 function fixture(source: string, options: Partial<FileStdioOptions> = {}) {
@@ -945,14 +1115,20 @@ test("discovered file ${i} has a fresh global", () => {
 			}
 			const original = readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8");
 			const args = balancedArgs(shard);
-			await prepareNativeTestTimings(args, root);
-			const result = await runWithFileStdio({
-				command: buildNativeTestCommand(args),
-				cwd: root,
-				timeoutMs: 10_000,
-			});
-			expectReleased(result);
-			expect(result.exitCode, readFileSync(result.stderrLog, "utf8")).toBe(0);
+			const result = spawnSync(
+				process.execPath,
+				[join(repository, "scripts/run-ci-tests.ts"), ...args],
+				{
+					cwd: root,
+					timeout: 10_000,
+					encoding: "utf8",
+				},
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.status, result.stderr).toBe(0);
+			const { records } = readDiagnostics(root, shard);
+			expect(records[0]).toMatchObject({ event: "start", shard: `${shard}/4`, parallel: 2 });
+			expect(records.at(-1)).toMatchObject({ event: "exit", exitCode: 0, failure: null });
 			expect(readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8")).toBe(original);
 			if (existsSync(marker))
 				seen.push(...readFileSync(marker, "utf8").trim().split("\n").map(Number));
@@ -961,6 +1137,7 @@ test("discovered file ${i} has a fresh global", () => {
 		expect(seen.sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
 	}, 20_000);
 	test("child fds are real private regular files and raw stdout/stderr plus nonzero exit survive", async () => {
+		const cwd = privateRunnerRoot();
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		const result = await fixture(
@@ -971,6 +1148,8 @@ test("discovered file ${i} has a fresh global", () => {
 			writeSync(2, Buffer.from([255, 0, 129, 10]));
 			process.exit(23);`,
 			{
+				cwd,
+				diagnostics: fixtureDiagnostics,
 				onStdout: (chunk) => {
 					stdoutChunks.push(Buffer.from(chunk));
 				},
@@ -990,6 +1169,17 @@ test("discovered file ${i} has a fresh global", () => {
 		expect(Buffer.concat(stdoutChunks)).toEqual(out);
 		expect(Buffer.concat(stderrChunks)).toEqual(err);
 		expect(result.exitCode).toBe(23);
+		const { records } = readDiagnostics(cwd);
+		expect(records.find((record) => record.event === "child-exit")).toMatchObject({
+			exitCode: 23,
+			failure: "nonzero-exit",
+		});
+		expect(records.at(-1)).toMatchObject({
+			event: "exit",
+			exitCode: 23,
+			stdoutBytes: out.length,
+			stderrBytes: err.length,
+		});
 		expect(result.error).toBeUndefined();
 		expect(result.timedOut || result.cancelled || result.outputLimitExceeded).toBe(false);
 		for (const path of [result.stdoutLog, result.stderrLog]) {
@@ -1008,6 +1198,7 @@ test("discovered file ${i} has a fresh global", () => {
 			writeSync(1, Buffer.alloc(196_731, 65)); writeSync(2, Buffer.alloc(131_077, 66));`,
 			{
 				cwd,
+				diagnostics: fixtureDiagnostics,
 				onStdout: (chunk) => {
 					out.push(Buffer.from(chunk));
 				},
@@ -1016,7 +1207,19 @@ test("discovered file ${i} has a fresh global", () => {
 				},
 			},
 		);
-		const second = await fixture('console.log("another run")', { cwd });
+		const firstDiagnostics = readDiagnostics(cwd).raw;
+		const second = await fixture('console.log("another run")', {
+			cwd,
+			diagnostics: fixtureDiagnostics,
+		});
+		expect(readDiagnostics(cwd).raw).toBe(firstDiagnostics);
+		const artifacts = join(cwd, "artifacts");
+		const retryDiagnostics = readdirSync(artifacts).find((name) =>
+			/^native-tests-2-of-4-.+-diagnostics\.jsonl$/.test(name),
+		);
+		expect(retryDiagnostics).toBeDefined();
+		if (retryDiagnostics)
+			expect(statSync(join(artifacts, retryDiagnostics)).mode & 0o777).toBe(0o600);
 		expect(first.exitCode).toBe(0);
 		expect(second.exitCode).toBe(0);
 		expect(first.stdoutLog).not.toBe(second.stdoutLog);
@@ -1031,25 +1234,105 @@ test("discovered file ${i} has a fresh global", () => {
 
 	test("watchdog fails and kills its stubborn leader and owned descendants", async () => {
 		const started = Date.now();
-		const result = await fixture(ownedGroupFixture, { timeoutMs: 500 });
+		const cwd = privateRunnerRoot();
+		const secret = "must-not-leak-private-command-or-stdio";
+		const result = await fixture(
+			`${ownedGroupFixture}\nprocess.env.CI_PRIVATE_FIXTURE = ${JSON.stringify(secret)}; console.error(${JSON.stringify(secret)});`,
+			{
+				cwd,
+				timeoutMs: 600,
+				diagnostics: { ...fixtureDiagnostics, quietMs: 75, heartbeatMs: 100 },
+			},
+		);
 		expect(result.exitCode).not.toBe(0);
 		expect(result.timedOut).toBe(true);
 		expect(result.cancelled).toBe(false);
 		expect(Date.now() - started).toBeLessThan(3_000);
 		expectGroupReleased(result);
+		const { raw, records } = readDiagnostics(cwd);
+		expect(raw).not.toContain(secret);
+		expect(records[0]).toMatchObject({ schemaVersion: 1, event: "start", bunVersion: Bun.version });
+		expect(records.find((record) => record.event === "spawn")).toMatchObject({ pid: result.pid });
+		const quiet = records.find(
+			(record) => record.event === "quiet" && record.lastOutputElapsedMs !== null,
+		);
+		expect(quiet).toMatchObject({
+			stdoutBytes: result.stdoutBytes,
+			stderrBytes: result.stderrBytes,
+		});
+		expect(quiet.elapsedMs - quiet.lastOutputElapsedMs).toBeGreaterThanOrEqual(75);
+		expect(records.find((record) => record.event === "timeout")).toMatchObject({
+			failure: "timeout",
+		});
+		expect(records.at(-1)).toMatchObject({
+			event: "exit",
+			failure: "timeout",
+			exitCode: result.exitCode,
+		});
+		if (process.platform === "linux") {
+			const timeoutSample = records.find(
+				(record) => record.event === "sample" && record.reason === "timeout",
+			);
+			const snapshots = records.filter((record) => record.event === "sample");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("cpu");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("memory");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("io");
+			expect(
+				snapshots.some((sample) =>
+					sample.resources.processes.some((entry: { ppid: number }) => entry.ppid === result.pid),
+				),
+			).toBe(true);
+			for (const sample of snapshots) {
+				expect(sample.resources.processes.length).toBeLessThanOrEqual(24);
+				for (const entry of sample.resources.processes) {
+					expect(entry.pid).not.toBe(process.pid);
+					expect(entry.session).toBe(result.pid);
+				}
+			}
+		}
+	});
+
+	test("regular heartbeat records activity without requiring a quiet interval", async () => {
+		const cwd = privateRunnerRoot();
+		const result = await fixture(
+			`
+			const timer = setInterval(() => { console.log("out"); console.error("err"); }, 15);
+			setTimeout(() => clearInterval(timer), 250);
+		`,
+			{ cwd, diagnostics: { ...fixtureDiagnostics, quietMs: 1_000, heartbeatMs: 75 } },
+		);
+		expect(result.exitCode).toBe(0);
+		const { records } = readDiagnostics(cwd);
+		expect(records.some((record) => record.event === "quiet")).toBe(false);
+		const beat = records.find(
+			(record) => record.event === "heartbeat" && record.stdoutBytes && record.stderrBytes,
+		);
+		expect(beat.lastStdoutElapsedMs).toBeGreaterThanOrEqual(0);
+		expect(beat.lastStderrElapsedMs).toBeGreaterThanOrEqual(0);
 	});
 
 	test("abort after real child startup fails and releases the entire owned group", async () => {
+		const cwd = privateRunnerRoot();
 		const controller = new AbortController();
+		let sawEarlyAbort = false;
 		const result = await fixture(ownedGroupFixture, {
+			cwd,
+			diagnostics: fixtureDiagnostics,
 			signal: controller.signal,
 			onStdout: (chunk) => {
-				if (Buffer.from(chunk).toString().includes("pids:")) controller.abort();
+				if (!Buffer.from(chunk).toString().includes("pids:")) return;
+				controller.abort();
+				const { records } = readDiagnostics(cwd);
+				sawEarlyAbort =
+					records.some((record) => record.event === "abort") &&
+					!records.some((record) => record.event === "exit");
 			},
 		});
 		expect(result.exitCode).not.toBe(0);
 		expect(result.cancelled).toBe(true);
 		expect(result.timedOut).toBe(false);
+		expect(sawEarlyAbort).toBe(true);
+		expect(readDiagnostics(cwd).records.at(-1)).toMatchObject({ event: "exit", failure: "abort" });
 		expectGroupReleased(result);
 	});
 
@@ -1086,10 +1369,15 @@ test("discovered file ${i} has a fresh global", () => {
 			import { writeFileSync, writeSync } from "node:fs";
 			writeFileSync("fixture-data", Buffer.alloc(128 * 1024));
 			setInterval(() => writeSync(2, Buffer.alloc(1024)), 10);`,
-			{ cwd, maxOutputBytes: 4096 },
+			{ cwd, maxOutputBytes: 4096, diagnostics: fixtureDiagnostics },
 		);
 		expect(result.outputLimitExceeded).toBe(true);
 		expect(result.exitCode).not.toBe(0);
+		const { records } = readDiagnostics(cwd);
+		expect(records.find((record) => record.event === "output-limit")).toMatchObject({
+			failure: "output-limit",
+		});
+		expect(records.at(-1)).toMatchObject({ event: "exit", failure: "output-limit" });
 		expect(statSync(join(cwd, "fixture-data")).size).toBe(128 * 1024);
 		expectGroupReleased(result);
 	});
@@ -1119,9 +1407,17 @@ test("discovered file ${i} has a fresh global", () => {
 			command: [join(cwd, "nonexistent-executable")],
 			timeoutMs: 1_000,
 			killGraceMs: 100,
+			diagnostics: fixtureDiagnostics,
 		});
 		expect(missing.exitCode).not.toBe(0);
 		expect(missing.error).toBeDefined();
+		const { raw, records } = readDiagnostics(cwd);
+		expect(raw).not.toContain("nonexistent-executable");
+		expect(records.find((record) => record.event === "error")).toMatchObject({
+			failure: "error",
+			pid: null,
+		});
+		expect(records.at(-1)).toMatchObject({ event: "exit", failure: "error" });
 	});
 
 	test("invalid low-level budgets reject before spawning a real fixture", async () => {

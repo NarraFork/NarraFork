@@ -8,6 +8,11 @@ import {
 	type SideCarKnowledgeHit,
 	sideCarBodyToPlainText,
 } from "../sidecar-body";
+import {
+	type WatchNoticeOutcome,
+	watchNoticeFromTask,
+	watchNoticeIdentity,
+} from "../watch-command";
 import type { InjectionTarget } from "./injection-target";
 import type { ToolDetailData, ToolStructuredEntry } from "./tool-detail";
 
@@ -253,6 +258,23 @@ export function auxiliaryVisualStatus(status?: string | null): AuxiliaryContentD
 	return "success";
 }
 
+const WATCH_OUTCOME_LABELS: Record<WatchNoticeOutcome, [key: string, fallback: string]> = {
+	deadline: ["watchNoticeDeadline", "deadline reached"],
+	matched: ["watchNoticeMatched", "matched"],
+	ended: ["watchNoticeEnded", "target finished"],
+	replaced: ["watchNoticeReplaced", "run replaced"],
+	stopped: ["watchNoticeStopped", "target stopped"],
+	failed: ["watchNoticeFailed", "failed"],
+};
+
+export function watchNoticeOutcomeLabel(
+	outcome: WatchNoticeOutcome,
+	labels?: Record<string, string>,
+): string {
+	const [key, fallback] = WATCH_OUTCOME_LABELS[outcome];
+	return labels?.[key] ?? fallback;
+}
+
 /** Summary construction is bounded; full projection happens only for an actually visible body. */
 export function buildAuxiliaryContentData(
 	projection: AuxiliaryContentProjection,
@@ -273,14 +295,36 @@ export function buildAuxiliaryContentData(
 	let sourceTruncated = false;
 	let format: "text" | "markdown" = "markdown";
 	let detail: ToolDetailData | undefined;
+	let category = sourceCategory(source);
 	if (body?.kind === "tasksDone") {
 		const task = body.items[0];
+		const watch = body.flavor === "bash" && task ? watchNoticeIdentity(task) : null;
 		label = body.flavor === "agent" ? "Agent" : "Bash";
 		summary = task ? short(task.alias || task.title || task.id) : summary;
 		sourceStatus =
 			body.items.find((item) => ["fail", "failed", "error"].includes(item.status))?.status ||
 			task?.status ||
 			sourceStatus;
+		if (watch) {
+			// The folded row never reads the output: the producer recorded the outcome, and
+			// older rows fall back to what their status says.
+			label = opts.labels?.watchNoticeLabel ?? "Watch";
+			category = "watch";
+			const outcome =
+				task?.watchOutcome ??
+				(sourceStatus === "timeout"
+					? "deadline"
+					: ["fail", "failed", "error"].includes(sourceStatus ?? "")
+						? "failed"
+						: null);
+			summary = short(
+				[watch.targetName ?? summary, outcome && watchNoticeOutcomeLabel(outcome, opts.labels)]
+					.filter(Boolean)
+					.join(" · "),
+			);
+			// A deadline ends only the observation; the summary says so, no failure mark.
+			if (outcome === "deadline") sourceStatus = "completed";
+		}
 		if (body.flavor === "agent" && task?.id)
 			target = { kind: "narrator", narratorId: task.id, messageId: task.resultMessageId };
 		if (opts.includeDetail)
@@ -380,7 +424,7 @@ export function buildAuxiliaryContentData(
 		auxiliary: true,
 		toolName: label,
 		summary,
-		category: sourceCategory(source),
+		category,
 		status: auxiliaryVisualStatus(sourceStatus),
 		...(sourceStatus ? { sourceStatus } : {}),
 		source,

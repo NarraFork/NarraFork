@@ -27,6 +27,14 @@ export const modelTraceOptionsSchema = z.strictObject({
 	calibrate: z.boolean().optional(),
 });
 
+export const modelTraceCalibrationSchema = z.strictObject({
+	resultId: z
+		.string()
+		.min(1)
+		.max(128)
+		.regex(/^[A-Za-z0-9_-]+$/),
+});
+
 const composerDocumentSchema = z
 	.unknown()
 	.transform((value, ctx) => {
@@ -196,9 +204,12 @@ export const codexFingerprintSchema = z.object({
 export const bufferQueueModeSchema = z.enum(["turn", "tool", "interrupt"]);
 export const updateBufferedMessageModeSchema = z.object({ mode: bufferQueueModeSchema }).strict();
 
+export const clientSubmissionIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
+
 export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
+		clientSubmissionId: clientSubmissionIdSchema.optional(),
 		priority: z.boolean().optional(),
 		interrupt: z.boolean().optional(),
 		queueMode: bufferQueueModeSchema.optional(),
@@ -520,6 +531,11 @@ export const updateBlacklistCmdSchema = z.object({
  * `basename` so names are unique there, but a taken-over subagent's queue holds
  * the original File objects where two same-named files can coexist.
  */
+export const bufferEditLeaseSchema = z.object({
+	token: z.string().min(1).max(200),
+	expectedRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+});
+
 export const updateBufferedMessageSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),

@@ -33,6 +33,7 @@ import {
 	getRuntimeTestDb,
 	prepareRuntimeTestDb,
 } from "./agent-runtime-test-database";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
@@ -859,6 +860,7 @@ describe("planned update recovery snapshot", () => {
 	test("a sibling mount failure keeps a live owner's interrupt controller until it finishes", async () => {
 		loadMode = "idle";
 		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
 		const live = continuationRecord("live-permission", "live", { kind: "pending_permission" });
 		const failed = continuationRecord("bad-agent", "failed", { kind: "foreground_agent" });
 		continuationRows = [live, failed];
@@ -867,15 +869,28 @@ describe("planned update recovery snapshot", () => {
 			recoveryItem(failed, "failed-message", 0),
 		];
 		executePersistedToolCallImpl = async () => {
+			entered.resolve();
 			await gate.promise;
 			return { ok: true, shouldContinue: true };
 		};
 		const startup = await prepareRecovery();
-		await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow("missing subagentId");
-		expect(executePersistedCalls).toBe(1);
-		expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
-		gate.resolve();
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		try {
+			await expect(restoreNarratorsAfterPlannedUpdate(startup)).rejects.toThrow(
+				"missing subagentId",
+			);
+			await entered.promise;
+			expect(executePersistedCalls).toBe(1);
+			expect(realNarratorSessionModule.interruptNarrator("live")).toBe(true);
+		} finally {
+			gate.resolve();
+		}
+		const deadlineAt = Date.now() + 2_000;
+		while (
+			continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state !== "cancelled" &&
+			Date.now() < deadlineAt
+		) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
 		expect(continuationRows.find((row) => row.toolCallId === live.toolCallId)?.state).toBe(
 			"cancelled",
 		);
@@ -1641,9 +1656,7 @@ describe("planned update continuation scheduling", () => {
 		let recovery: Awaited<ReturnType<typeof restoreNarratorsAfterPlannedUpdate>> = null;
 		try {
 			recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-			await expect(recovery?.completion.then(() => "completed" as const)).resolves.toBe(
-				"completed",
-			);
+			expect(await recovery?.completion.then(() => "completed" as const)).toBe("completed");
 			expect(terminalReleased).toBe(false);
 			expect(terminalSettled).toBe(false);
 			expect(updatedToolResults).toHaveLength(0);
@@ -1951,6 +1964,7 @@ describe("planned update continuation scheduling", () => {
 		const { activeNarrators, hasNarratorRuntimeClaim } = await import("../narrator-session-state");
 		const runtime = await import("../agent-runtime/orchestrator");
 		const finishLoop = Promise.withResolvers<void>();
+		const loopEntered = Promise.withResolvers<void>();
 		const buffer = await import("../narrator-buffer");
 		if (input !== "plain") {
 			sqlite
@@ -2001,6 +2015,7 @@ describe("planned update continuation scheduling", () => {
 			async (current, owner, _text, _images, _run, prePromptBashCommand) => {
 				expect(owner.isCurrent()).toBe(true);
 				current._loopRunning = true;
+				loopEntered.resolve();
 				if (prePromptBashCommand)
 					await narratorModule.handleBashCommand(
 						"owner",
@@ -2017,6 +2032,7 @@ describe("planned update continuation scheduling", () => {
 		try {
 			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
 			await recovery?.completion;
+			await loopEntered.promise;
 			expect(runtimeSpy).toHaveBeenCalledTimes(1);
 			expect(active._currentUserId).toBe(input === "plain" ? "acl-user" : "queued-user");
 			expect(bashSpy).toHaveBeenCalledTimes(input.includes("bash") ? 1 : 0);
@@ -2036,9 +2052,10 @@ describe("planned update continuation scheduling", () => {
 				]);
 			}
 		} finally {
+			const { getRunControl } = await import("../agent-runtime/ownership");
+			const terminal = getRunControl("owner")?.terminal;
 			finishLoop.resolve();
-			// Serialize with runtime ownership release before the next isolated case.
-			await new Promise<void>((resolve) => setImmediate(resolve));
+			await terminal;
 			expect(realNarratorSessionModule.isLoopRunning("owner")).toBe(false);
 			activeNarrators.delete("owner");
 			historySpy.mockRestore();
@@ -2364,7 +2381,10 @@ describe("planned update continuation scheduling", () => {
 			throw new Error("foreground continuation failed");
 		};
 		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		await expect(recovery?.completion).rejects.toThrow("Failed to mount 1 legacy narrator");
+		if (!recovery) throw new Error("Missing recovery completion");
+		expect(await captureWorkerRejectionThrower(recovery.completion)).toThrow(
+			"Failed to mount 1 legacy narrator",
+		);
 		expect(continueNarratorCalls).toBe(1);
 		const row = sqlite
 			.prepare("SELECT status, substatus, error_message FROM narrators WHERE id = 'owner'")

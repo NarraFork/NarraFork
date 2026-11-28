@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { normalizeLegacyUltra } from "@shared/reasoning-effort";
 import { getInstallationId } from "../installation-id";
 
 /**
@@ -73,7 +74,7 @@ export function applyCodexStableRequestFields(
 	body: Record<string, unknown>,
 	options: {
 		identity: CodexRequestIdentity;
-		reasoningEffort: string;
+		reasoningEffort?: string;
 	},
 ): void {
 	body.prompt_cache_key = options.identity.conversationId;
@@ -84,8 +85,9 @@ export function applyCodexStableRequestFields(
 	// tools. Sending `false` outside that contract has no upstream justification and
 	// silently degrades every Codex turn to one tool call at a time.
 	body.parallel_tool_calls = true;
+	const effort = normalizeLegacyUltra(options.reasoningEffort);
 	body.reasoning = {
-		effort: options.reasoningEffort,
+		...(effort !== undefined ? { effort } : {}),
 		// Without an explicit summary mode the Responses API emits no
 		// reasoning_summary_text events, and encrypted_content is opaque — the
 		// narrator's visible thinking would go blank across all three transports.

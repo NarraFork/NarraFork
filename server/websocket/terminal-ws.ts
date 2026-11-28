@@ -126,6 +126,11 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 					// noop
 				}
 			}
+		})
+		.catch((error: unknown) => {
+			// Fire-and-forget replay: a refused attach, a vanished terminal or a closed read
+			// must not become an unhandled rejection. The client just gets no scrollback.
+			logger.debug("Terminal scrollback replay skipped", { terminalId, error: String(error) });
 		});
 }
 
@@ -199,11 +204,24 @@ function enqueueInput(
  */
 export async function dropUnauthorizedTerminalSubscriptions(
 	sockets: Iterable<TerminalWS> = connections,
+	isCurrent: (ws: TerminalWS) => boolean = () => true,
 ): Promise<number> {
 	const verdicts = new Map<string, Promise<boolean>>();
 	let dropped = 0;
 	for (const ws of [...sockets]) {
-		for (const terminalId of [...ws.data.subscribedTerminals]) {
+		const data = ws.data;
+		const { userId, sessionUserId, sessionId, userRole, subscribedTerminals } = data;
+		const current = () =>
+			ws.readyState === 1 &&
+			ws.data === data &&
+			data.userId === userId &&
+			data.sessionUserId === sessionUserId &&
+			data.sessionId === sessionId &&
+			data.userRole === userRole &&
+			data.subscribedTerminals === subscribedTerminals &&
+			isCurrent(ws);
+		for (const terminalId of [...subscribedTerminals]) {
+			if (!current()) break;
 			const principal = principalOf(ws);
 			const key = `${principal.userId}:${principal.isAdmin}:${terminalId}`;
 			let verdict = verdicts.get(key);
@@ -211,8 +229,10 @@ export async function dropUnauthorizedTerminalSubscriptions(
 				verdict = terminalAccessAllowed(terminalId, principal, "write").catch(() => false);
 				verdicts.set(key, verdict);
 			}
-			if (await verdict) continue;
-			if (!ws.data.subscribedTerminals.delete(terminalId)) continue;
+			const allowed = await verdict;
+			if (!current()) break;
+			if (allowed) continue;
+			if (!subscribedTerminals.delete(terminalId)) continue;
 			if (lastActiveClient.get(terminalId) === ws) lastActiveClient.delete(terminalId);
 			sendTerminalNotFound(ws, terminalId);
 			dropped++;

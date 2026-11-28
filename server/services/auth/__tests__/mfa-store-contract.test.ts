@@ -17,26 +17,29 @@
  *   - `clearFactors` removes the enrollment and the backup codes together;
  *   - the MFA flag and the passkey existence read round-trip.
  *
- * ISOLATION: the store runs on `tests/setup`'s in-memory database, mocked over
+ * ISOLATION: the store runs on a file-backed fixture, mocked over
  * `server/db`. No real NarraFork database is touched.
  */
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../../tests/setup";
+import { cleanDb } from "../../../../tests/setup";
 import { userMfaBackupCodes, userPasskeys, users, userTotp } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 import type { BackupCodeDraft } from "../mfa-store";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ db, sqlite }));
 
 const { sqliteAuthMfaStore: store } = await import("../sqlite-mfa-store");
 const { authMfaStore } = await import("../store");
 
-afterAll(() => {
+afterAll(async () => {
+	await close();
 	mock.module("../../../db", () => realDbModule);
 	mock.restore();
 });

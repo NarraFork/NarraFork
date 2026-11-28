@@ -37,18 +37,20 @@ import {
 	ApiError,
 	apiBase,
 	authorizedFetch,
-	clearTokenOnSessionFailure,
+	getAuthSnapshot,
 	getToken,
 	postBodyWithProgress,
 	postFormDataWithProgress,
 	readFetchError,
 	request,
+	subscribeAuth,
 } from "./client";
 import { mediaUploadError } from "./media-upload-validation";
 import type {
 	ApiEntity,
 	BlacklistCmd,
 	BlacklistDir,
+	BufferedMessageEditLease,
 	BufferMessageSummary,
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -73,6 +75,15 @@ import type {
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
 
+export interface NarratorSubmissionReceipt {
+	status: "accepted";
+	id: string;
+	bufferedAt: string;
+	state: string;
+	messageId: string | null;
+	dedupeExpiresAt: string;
+}
+
 export interface ComposerDocumentDetail {
 	composerDocument?: ComposerDocument;
 	/** These summaries are read together with the document, never from a stale list row. */
@@ -94,7 +105,18 @@ export interface ComposerDocumentDetail {
 	bodyRevision?: number;
 }
 
+const panelReadScopeBrand = Symbol("NarratorPanelReadScope");
+/** Opaque mount/principal lifetime. Never serialize it into request URLs. */
+export type NarratorPanelReadScope = Readonly<{ [panelReadScopeBrand]: true }>;
+const panelReadGenerations = new WeakMap<NarratorPanelReadScope, number>();
+export function createNarratorPanelReadScope(): NarratorPanelReadScope {
+	const scope = Object.freeze({ [panelReadScopeBrand]: true as const });
+	panelReadGenerations.set(scope, getAuthSnapshot().generation);
+	return scope;
+}
+
 export interface NarratorPanelStateOptions extends SharedReadOptions {
+	readScope?: NarratorPanelReadScope;
 	permissionsCursor?: string;
 	bufferCursor?: string;
 }
@@ -129,36 +151,62 @@ export interface FastModeResolution {
 export type NarratorDetail = ApiEntity &
 	Partial<FastModeResolution> & {
 		navigationSummary?: NarratorNavigationSummary;
+		/** Whether the session's run delivers its result to a caller (takeover target). */
+		deliversResult?: boolean;
 	};
 
-const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+const panelStateReads = new WeakMap<
+	NarratorPanelReadScope,
+	ReturnType<typeof createSharedInflight<NarratorPanelStateResponse>>
+>();
 
 /** Live-request deduplication only; safety reconciliation never adopts query-cache permissions. */
 export function getNarratorPanelState(id: string, options: NarratorPanelStateOptions = {}) {
 	const { permissionsCursor, bufferCursor } = options;
-	const scope = getToken();
-	const key = JSON.stringify([scope, id, permissionsCursor ?? null, bufferCursor ?? null]);
+	// Callers without an explicit mount scope remain isolated rather than borrowing
+	// a request that predates their event subscription.
+	const readScope = options.readScope ?? createNarratorPanelReadScope();
+	let sharePanelStateRead = panelStateReads.get(readScope);
+	if (!sharePanelStateRead) {
+		sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+		panelStateReads.set(readScope, sharePanelStateRead);
+	}
+	const generation = panelReadGenerations.get(readScope);
+	if (generation === undefined || getAuthSnapshot().generation !== generation)
+		return Promise.reject(new DOMException("Principal changed", "AbortError"));
+	const key = JSON.stringify([generation, id, permissionsCursor ?? null, bufferCursor ?? null]);
 	return sharePanelStateRead(
 		key,
 		async (signal) => {
 			const controller = new AbortController();
 			const abort = () => controller.abort(signal.reason);
+			const checkGeneration = () => {
+				if (getAuthSnapshot().generation !== generation)
+					controller.abort(new DOMException("Principal changed", "AbortError"));
+			};
+			const unsubscribe = subscribeAuth(checkGeneration);
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) abort();
+			checkGeneration();
 			const timer = setTimeout(
 				() => controller.abort(new Error("Panel state read timed out")),
 				10_000,
 			);
 			try {
+				controller.signal.throwIfAborted();
 				const params = new URLSearchParams();
 				if (permissionsCursor) params.set("permissionsCursor", permissionsCursor);
 				if (bufferCursor) params.set("bufferCursor", bufferCursor);
 				const query = params.toString();
-				return await request<NarratorPanelStateResponse>(
+				const snapshot = await request<NarratorPanelStateResponse>(
 					`/narrators/${encodeURIComponent(id)}/panel-state${query ? `?${query}` : ""}`,
 					{ signal: controller.signal },
 				);
+				checkGeneration();
+				controller.signal.throwIfAborted();
+				return snapshot;
 			} finally {
+				unsubscribe();
 				clearTimeout(timer);
 				signal.removeEventListener("abort", abort);
 			}
@@ -814,6 +862,11 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
 			method: "POST",
 		}),
+	calibrateModelTrace: (narratorId: string, resultId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/calibrate`, {
+			method: "POST",
+			body: JSON.stringify({ resultId }),
+		}),
 	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
 	getModelTraceNarrator: (model: string) =>
 		request<{ narratorId: string | null }>(
@@ -918,7 +971,6 @@ export const narratorsApi = {
 			{ signal },
 		);
 		if (!response.ok) {
-			await clearTokenOnSessionFailure(response.clone());
 			const error = await readFetchError(response, "Git summary read failed");
 			throw new ApiError(error.message, response.status, error.data);
 		}
@@ -1124,6 +1176,23 @@ export const narratorsApi = {
 		}),
 	// Named narrators (@handle mention targets)
 	listNamedNarrators: () => request<ApiEntity[]>("/narrators/named"),
+	listNamedNarratorSuggestions: (
+		params: { q?: string; limit?: number; cursor?: string } = {},
+		opts?: { signal?: AbortSignal },
+	) => {
+		const query = new URLSearchParams({ view: "suggestions" });
+		if (params.q !== undefined) query.set("q", params.q);
+		if (params.limit !== undefined) query.set("limit", String(params.limit));
+		if (params.cursor !== undefined) query.set("cursor", params.cursor);
+		const timeout = AbortSignal.timeout(5_000);
+		return request<import("@shared/named-narrator-suggestions").NamedNarratorSuggestionsPage>(
+			`/narrators/named?${query}`,
+			{
+				signal: opts?.signal ? AbortSignal.any([opts.signal, timeout]) : timeout,
+				maxResponseBytes: 48 * 1024,
+			},
+		);
+	},
 	getNarratorByHandle: (handle: string) =>
 		request<ApiEntity>(`/narrators/by-handle/${encodeURIComponent(handle)}`),
 	updateNarratorHandle: (id: string, handle: string | null) =>
@@ -1360,6 +1429,26 @@ export const narratorsApi = {
 		),
 	getBufferedMessages: (id: string, signal?: AbortSignal) =>
 		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
+	beginBufferedMessageEdit: (
+		narratorId: string,
+		messageId: string,
+		token: string,
+		expectedRevision?: number,
+	) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "POST", body: JSON.stringify({ token, expectedRevision }) },
+		),
+	renewBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "PATCH", body: JSON.stringify({ token }) },
+		),
+	releaseBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "DELETE", headers: { "X-Buffer-Edit-Token": token }, keepalive: true },
+		),
 	/**
 	 * Edit a queued message's text and/or its attachments.
 	 *
@@ -1381,6 +1470,7 @@ export const narratorsApi = {
 			fileReferences?: FileReference[];
 			composerDocument?: ComposerDocument;
 		},
+		editToken?: string,
 	) => {
 		const uploadError = mediaUploadError({
 			media: opts?.newMedia,
@@ -1394,9 +1484,11 @@ export const narratorsApi = {
 		});
 		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
+		const headers = editToken ? { "X-Buffer-Edit-Token": editToken } : undefined;
 		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
+				headers,
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
@@ -1433,7 +1525,11 @@ export const narratorsApi = {
 		// Content-Type is left unset so the browser adds the multipart boundary.
 		let res: Response;
 		try {
-			res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
+			res = await authorizedFetch(`${apiBase()}${path}`, {
+				method: "PATCH",
+				headers,
+				body: formData,
+			});
 		} catch (error) {
 			discardStagedAttachments(narratorId, staged);
 			throw error;
@@ -1614,6 +1710,15 @@ export const narratorsApi = {
 				method: "POST",
 			},
 		),
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval. Answers as soon
+	 * as the review starts; its outcome arrives through the `plan_reflection_*` WS frames and
+	 * the permission resolution that follows them.
+	 */
+	reflectPlan: (requestId: string) =>
+		request<{ ok: boolean; started: boolean }>(`/narrators/permissions/${requestId}/reflect-plan`, {
+			method: "POST",
+		}),
 	disarmQuestionReflection: (requestId: string) =>
 		request<{ ok: boolean; disarmed: boolean }>(
 			`/narrators/permissions/${requestId}/disarm-question-reflection`,
@@ -1716,13 +1821,13 @@ export const narratorsApi = {
 			`/narrators/${id}/custom-traits/blocked-skills`,
 			{ method: "DELETE" },
 		),
-	getNarratorExecutionDevices: (id: string) =>
+	getNarratorExecutionDevices: (id: string, signal?: AbortSignal) =>
 		request<{
 			defaultDeviceId: string | null;
 			devices: NarratorExecutionDevice[];
 			/** Working directory recorded per device; absence means "not configured". */
 			directories?: WorkspaceDirectoryMap;
-		}>(`/narrators/${id}/execution-devices`),
+		}>(`/narrators/${id}/execution-devices`, { signal }),
 	/**
 	 * Browse one level of a device's filesystem through a narrator's device
 	 * authorization, so non-admin users can use the remote path picker.
@@ -1947,7 +2052,7 @@ export const narratorsApi = {
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
-		options?: { composerDocument?: ComposerDocument },
+		options?: { composerDocument?: ComposerDocument; clientSubmissionId?: string },
 		media?: File[],
 	) => {
 		// Only files that ride inside the multipart body count against its budget;
@@ -1993,6 +2098,8 @@ export const narratorsApi = {
 				: [];
 			const formData = new FormData();
 			formData.append("message", message);
+			if (options?.clientSubmissionId)
+				formData.append("clientSubmissionId", options.clientSubmissionId);
 			if (images) {
 				for (const img of images) formData.append("images", img);
 			}
@@ -2010,24 +2117,18 @@ export const narratorsApi = {
 			if (options?.composerDocument !== undefined) {
 				formData.append("composerDocument", JSON.stringify(options.composerDocument));
 			}
-			// Use XHR-backed upload so we can surface real upload progress to the UI.
-			try {
-				res = await postFormDataWithProgress(url, formData, {
-					headers,
-					onProgress: onUploadProgress
-						? (fraction) =>
-								onUploadProgress(
-									totalBytes ? (streamedBytes + fraction * requestBytes) / totalBytes : fraction,
-								)
-						: undefined,
-					signal,
-				});
-			} catch (error) {
-				// The send failed, so nothing will claim these uploads. Dropping them now
-				// keeps the staging area from holding gigabytes until the TTL sweep.
-				discardStagedAttachments(narratorId, staged);
-				throw error;
-			}
+			// Transport failure does not prove rejection: admission may already own these
+			// uploads. Keep them for receipt reconciliation / the bounded staging TTL.
+			res = await postFormDataWithProgress(url, formData, {
+				headers,
+				onProgress: onUploadProgress
+					? (fraction) =>
+							onUploadProgress(
+								totalBytes ? (streamedBytes + fraction * requestBytes) / totalBytes : fraction,
+							)
+					: undefined,
+				signal,
+			});
 		} else {
 			headers["Content-Type"] = "application/json";
 			res = await authorizedFetch(url, {
@@ -2040,6 +2141,7 @@ export const narratorsApi = {
 					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
 					composerDocument: options?.composerDocument,
+					clientSubmissionId: options?.clientSubmissionId,
 				}),
 				signal,
 			});
@@ -2050,12 +2152,21 @@ export const narratorsApi = {
 			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
-			discardStagedAttachments(narratorId, staged);
+			if (res.status < 500 && res.status !== 408) discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
 		return res.json();
 	},
+	getNarratorSubmissionReceipt: (
+		narratorId: string,
+		clientSubmissionId: string,
+		signal?: AbortSignal,
+	) =>
+		request<NarratorSubmissionReceipt>(
+			`/narrators/${encodeURIComponent(narratorId)}/submissions/${encodeURIComponent(clientSubmissionId)}`,
+			{ signal },
+		),
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	continueNarrator: (narratorId: string, recoveryMessageId?: string) =>

@@ -16,6 +16,11 @@
  *
  * Panels move, split and resize, so the marks are recomputed (once per frame at most)
  * on layout changes inside the root. Everything is inert without the overlay.
+ *
+ * While such a root is mounted the hook also sets `data-nf-wco-titlebar-page` on <html>,
+ * which hides the shell's own drag strips (wco.css). A `.nf-app-shell:has(...)` selector
+ * did that before, but Chrome then re-matched it on every node inserted anywhere in the
+ * shell and recalculated the style of the whole page each time the session list scrolled.
  */
 
 import { useEffect, useState } from "react";
@@ -29,6 +34,16 @@ export const WCO_TITLEBAR_ROW_SELECTOR =
 	"[data-narrator-header-layout], .nf-panel-header, .dv-tabs-and-actions-container, [data-nf-titlebar-candidate]";
 
 export const WCO_BELOW_CONTROLS_ATTRIBUTE = "data-nf-wco-below-controls";
+
+export const WCO_TITLEBAR_ROOT_ATTRIBUTE = "data-nf-wco-titlebar";
+/** On <html> while a mounted page root carries `data-nf-wco-titlebar`. */
+export const WCO_TITLEBAR_PAGE_ATTRIBUTE = "data-nf-wco-titlebar-page";
+
+const titlebarPages = new Set<HTMLElement>();
+
+function syncTitlebarPageAttribute(): void {
+	document.documentElement.toggleAttribute(WCO_TITLEBAR_PAGE_ATTRIBUTE, titlebarPages.size > 0);
+}
 
 const MARKS = ["data-nf-titlebar-row", "data-nf-titlebar-end", "data-nf-titlebar-start"] as const;
 /** Sub-pixel layout tolerance. */
@@ -85,6 +100,17 @@ function clear(root: HTMLElement): void {
  */
 export function useWcoTitlebarRows(enabled: boolean): (el: HTMLElement | null) => void {
 	const [root, setRoot] = useState<HTMLElement | null>(null);
+	// `enabled` re-runs this after a page toggles the root attribute (the workspace's chrome).
+	// biome-ignore lint/correctness/useExhaustiveDependencies: see above
+	useEffect(() => {
+		if (!root?.hasAttribute(WCO_TITLEBAR_ROOT_ATTRIBUTE) || typeof document === "undefined") return;
+		titlebarPages.add(root);
+		syncTitlebarPageAttribute();
+		return () => {
+			titlebarPages.delete(root);
+			syncTitlebarPageAttribute();
+		};
+	}, [root, enabled]);
 	useEffect(() => {
 		if (!enabled || !root || typeof window === "undefined") return;
 		const html = document.documentElement;

@@ -6,11 +6,12 @@
  * session, with the questions as text.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { initTeamRepo } from "../../services/teams/__tests__/team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-board-tree-"));
@@ -156,7 +157,7 @@ function seedOldSubagents(templateId: string, count: number, status = "idle") {
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	for (const id of [OWNER, MEMBER, READER, OUTSIDER])
 		await db
@@ -227,7 +228,13 @@ describe("a tree of hundreds of finished subagents", () => {
 		const summary = (await call(MEMBER, teamPath("summary"))).body;
 		expect(summary.runningCount).toBe(1);
 		expect(summary.runningAgents).toEqual([
-			{ id: workerId, title: "new worker", status: "waiting" },
+			{
+				id: workerId,
+				title: "new worker",
+				status: "waiting",
+				// What it is doing now: the call waiting for a person.
+				activity: { toolName: "Bash", preview: "rm -rf build", at: expect.any(String) },
+			},
 		]);
 		expect(summary.pendingApprovalCount).toBe(1);
 		const approvals = (await call(MEMBER, teamPath("approvals"))).body;

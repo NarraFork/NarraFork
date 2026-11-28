@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import type { IMarker } from "@xterm/headless";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
@@ -12,6 +13,7 @@ import {
 	MIN_WATCH_TIMEOUT_MS,
 	normalizeWatchPattern,
 	startTerminalWatch,
+	terminalLifecycleReader,
 	type WatchStart,
 } from "../../../services/terminal-watch-service";
 import { cancelWatchRegistration } from "../../../services/watch-observation";
@@ -140,10 +142,13 @@ async function assertTerminalAccess(
 	| { allowed: true; terminal: { id: string; name: string; status: string | null } }
 	| { allowed: false; error: string }
 > {
-	const terminal = await db.query.terminals.findFirst({
-		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true, narratorId: true },
-	});
+	const terminal = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { id: true, name: true, status: true, narratorId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!terminal) {
 		return { allowed: false, error: `Terminal not found: ${terminalId}` };
 	}
@@ -172,22 +177,32 @@ async function resolveTerminalId(
 	narratorId: string,
 ): Promise<{ id: string } | { error: string }> {
 	// 1. Try exact ID match
-	const byId = await db.query.terminals.findFirst({
-		where: eq(terminals.id, idOrName),
-		columns: { id: true },
-	});
+	const byId = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, idOrName),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (byId) return { id: byId.id };
 
 	// 2. Fallback: by name (case-insensitive) among this narrator's terminals, running ones
 	// first (only they take input; an exited one may share the name), then the newest exited.
 	const nameLower = idOrName.toLowerCase();
 	for (const status of ["running", "exited"] as const) {
-		const candidates = await db.query.terminals.findMany({
-			where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
-			columns: { id: true, name: true },
-			orderBy: (t, { desc }) => [desc(t.createdAt)],
-			limit: TERMINAL_NAME_LOOKUP_LIMIT,
-		});
+		const candidates = await readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
+				columns: { id: true, name: true },
+				orderBy: (t, { desc }) => [desc(t.createdAt)],
+				limit: TERMINAL_NAME_LOOKUP_LIMIT,
+			}),
+			{
+				executionPolicy: "worker-required",
+				maxRows: TERMINAL_NAME_LOOKUP_LIMIT,
+				timeoutMs: 30_000,
+			},
+		);
 		const match = candidates.find((t) => t.name.toLowerCase() === nameLower);
 		if (match) return { id: match.id };
 	}
@@ -345,10 +360,13 @@ export const terminalTool: ToolDefinition = {
 
 async function listTerminals(narratorId: string): Promise<ToolResult> {
 	// Find terminals associated with this narrator
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
-	});
+	const narratorTerminals = await readQuery(
+		db.query.terminals.findMany({
+			where: eq(terminals.narratorId, narratorId),
+			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 10_000, timeoutMs: 30_000 },
+	);
 
 	// Exclude exited terminals
 	const all = narratorTerminals.filter((t) => t.status !== "exited");
@@ -524,21 +542,16 @@ async function startWatch(
 		buffer,
 		readLifecycleState:
 			pattern === undefined
-				? async () => {
-						const current = await db.query.terminals.findFirst({
-							where: eq(terminals.id, terminalId),
-							columns: { status: true },
-						});
-						if (current?.status === "exited") return "exited";
-						if (
-							!current ||
-							!terminalService.isAttached(terminalId) ||
-							(buffer && terminalService.getActiveBuffer(terminalId) !== buffer)
-						) {
-							return "disconnected";
-						}
-						return "running";
-					}
+				? terminalLifecycleReader(terminalId, buffer, terminalService, async () => {
+						const current = await readQuery(
+							db.query.terminals.findFirst({
+								where: eq(terminals.id, terminalId),
+								columns: { status: true },
+							}),
+							{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+						);
+						return current?.status;
+					})
 				: undefined,
 		cursor: point,
 		matchFrame,
@@ -549,13 +562,31 @@ async function startWatch(
 		prefixUnknown: point?.prefixUnknown,
 		start,
 		toolUseId: ctx.currentToolUseId,
+		principal: { userId: ctx.userId ?? null },
 		registrationSignal: ctx.signal,
 	});
 	if (ctx.signal.aborted) {
-		if (started.status === "started") await cancelWatchRegistration(started.observation);
+		if (started.status === "started" && !started.reused)
+			await cancelWatchRegistration(started.observation);
 		return makeAbortedResult(terminalName);
 	}
 	if (started.status === "error") return { output: started.message, isError: true };
+	if (started.reused) {
+		return {
+			output: `Already watching terminal "${terminalName}" until exit or deadline (background task "${started.alias}"); no second watch was added. Its deadline is now in ${Math.round(started.remainingMs / 1000)}s. Stop({ type: "bash", id: "${started.alias}" }) cancels only the observation.`,
+			title: terminalName,
+			metadata: {
+				kind: "watch",
+				type: "terminal",
+				id: terminalId,
+				targetId: terminalId,
+				watchId: started.taskId,
+				watchAlias: started.alias,
+				status: "watching",
+				reused: true,
+			},
+		};
+	}
 	return {
 		output:
 			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +
@@ -606,10 +637,13 @@ export async function watchTerminal(
 		// reattachment fail. Do not mislabel that lifecycle boundary as a detach.
 		const current =
 			pattern === undefined
-				? await db.query.terminals.findFirst({
-						where: eq(terminals.id, terminalId),
-						columns: { status: true },
-					})
+				? await readQuery(
+						db.query.terminals.findFirst({
+							where: eq(terminals.id, terminalId),
+							columns: { status: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+					)
 				: undefined;
 		if (current?.status === "exited") {
 			return {

@@ -405,6 +405,12 @@ export interface McpToolPermission {
 	enabled?: boolean;
 }
 
+export interface McpOAuthConfig {
+	/** Pre-registered client id; omitted means dynamic client registration. */
+	clientId?: string;
+	scope?: string;
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -424,6 +430,8 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
+	/** sse/streamable-http: OAuth client settings; tokens and secrets live in mcp-oauth.json. */
+	oauth?: McpOAuthConfig;
 	/** Authoritative loading policy; absent only on legacy input. */
 	mode?: McpLoadingMode;
 	/** Compatibility projection of mode !== disabled. */
@@ -683,7 +691,7 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
-	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	/** How credential files (e.g. credentials.json) are stored. See lib/secret-store.ts. */
 	secrets?: {
 		/** Encrypt credential files with the instance key in secret.key. Default true. */
 		encrypt?: boolean;
@@ -1021,13 +1029,9 @@ export interface NarraForkSettings {
 	};
 	workspace: {
 		/**
-		 * Whether tool calls / external edits capture content-addressed whole-tree
-		 * snapshots of the workspace (the precise rollback boundary). When off, the
-		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
-		 * degrade automatically when a worktree proves too large to scan within the
-		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
-		 * were removed; migrated on load.
+		 * Legacy compatibility field, default false. Local file-history and whole-tree
+		 * capture stay disabled regardless of this value. Previously stored as
+		 * `chapters.treeSnapshotsEnabled`; still migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
@@ -1106,7 +1110,7 @@ export interface NarraForkSettings {
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.
-	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
+	 * Credentials are managed separately (credentials.json; codex-credentials.json before it).
 	 */
 	codex?: {
 		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */

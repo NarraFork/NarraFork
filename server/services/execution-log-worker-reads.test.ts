@@ -46,7 +46,7 @@ const previousWorker = process.env.NARRAFORK_DB_WORKER;
 const previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 beforeEach(async () => {
 	delete process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	await pool.resetDbWorkerPoolForTest();
 	cleanDb(sqlite);
 	cleanDb(memory.sqlite);

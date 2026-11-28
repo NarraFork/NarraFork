@@ -11,10 +11,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -155,11 +159,12 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	await backgroundOccupancyStore.drain();
 	if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
 	await flushDeltas();
 	cleanDb(sqlite);
 	// An emptied case cannot leave an outbox page cursor positioned in the next case.
-	runtimePublication.flushPage();
+	await runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
@@ -239,9 +244,137 @@ function transitions(values: unknown[]): unknown[] {
 async function flushDeltas(): Promise<void> {
 	do {
 		if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		await Promise.all([...pendingBroadcasts]);
 	} while (pendingBroadcasts.size > 0);
 }
+
+describe("maintained background task list invalidation semantics", () => {
+	test("ordinary primary/child reasoning and reflecting publish no list deltas", async () => {
+		const { eq } = await import("drizzle-orm");
+		await seedParent();
+		const now = new Date().toISOString();
+		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, PARENT));
+		backgroundOccupancyStore.refreshNarrator(PARENT);
+		await seedNarrators({
+			id: "semantic-child",
+			parentNarratorId: PARENT,
+			type: "subagent",
+			variant: "subagent:general",
+			status: "working",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-agent",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "completed",
+			subagentNarratorId: "semantic-child",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-child-work",
+			parentNarratorId: "semantic-child",
+			type: "bash",
+			status: "running",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await flushDeltas();
+		const version = backgroundTaskService.getListVersion(PARENT);
+		for (const substatus of [["reasoning"], ["reflecting"], ["reasoning"]]) {
+			broadcasts.length = 0;
+			for (const id of [PARENT, "semantic-child"]) {
+				await db
+					.update(narrators)
+					.set({ substatus: JSON.stringify(substatus) })
+					.where(eq(narrators.id, id));
+				backgroundOccupancyStore.refreshNarrator(id);
+			}
+			await flushDeltas();
+			expect(listDeltas()).toEqual([]);
+			expect(backgroundTaskService.getListVersion(PARENT)).toBe(version);
+		}
+		// The owner's own lifecycle is not a change to its list of tasks.
+		await db.update(narrators).set({ status: "waiting" }).where(eq(narrators.id, PARENT));
+		backgroundOccupancyStore.refreshNarrator(PARENT);
+		await flushDeltas();
+		expect(listDeltas()).toEqual([]);
+		// continued -> child_running keeps counts equal but must update the parent.
+		await db
+			.update(narrators)
+			.set({ status: "idle", substatus: "[]" })
+			.where(eq(narrators.id, "semantic-child"));
+		backgroundOccupancyStore.refreshNarrator("semantic-child");
+		await flushDeltas();
+		expect(listDeltas()).toEqual([
+			expect.objectContaining({ narratorId: PARENT, invalidate: true, activeCount: 1 }),
+		]);
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]).toMatchObject({
+			id: "semantic-agent",
+			effectiveStatus: "child_running",
+			activeChildTaskCount: 1,
+		});
+	});
+
+	test("worker display flags cover terminal status derivation without full substatus/error columns", async () => {
+		const { eq } = await import("drizzle-orm");
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedNarrators({
+			id: "semantic-terminal",
+			parentNarratorId: PARENT,
+			type: "subagent",
+			variant: "subagent:general",
+			status: "idle",
+			isBackground: false,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedTasks({
+			id: "semantic-terminal-task",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "timeout",
+			subagentNarratorId: "semantic-terminal",
+			createdAt: now,
+			startedAt: now,
+			updatedAt: now,
+		});
+		await flushDeltas();
+		for (const [substatus, errorMessage, expected] of [
+			[["error"], "ordinary failure", "failed"],
+			[["error"], "execution timeout while waiting", "timeout"],
+			[["unread"], null, "completed"],
+			[["interrupted"], null, "cancelled"],
+			[["timeout"], null, "timeout"],
+			[["taken_over"], null, "taken_over"],
+		] as const) {
+			broadcasts.length = 0;
+			await db
+				.update(narrators)
+				.set({ substatus: JSON.stringify(substatus), errorMessage })
+				.where(eq(narrators.id, "semantic-terminal"));
+			backgroundOccupancyStore.refreshNarrator("semantic-terminal");
+			await flushDeltas();
+			expect(listDeltas()).toEqual([
+				expect.objectContaining({ narratorId: PARENT, invalidate: true }),
+			]);
+			expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+				expected,
+			);
+			const [row] = await databaseBackgroundOccupancySource.getNarrators(["semantic-terminal"]);
+			expect(row?.hasError).toBe(!!errorMessage);
+			expect(row?.errorTimeout).toBe(errorMessage?.includes("timeout") ?? false);
+			expect(row).not.toHaveProperty("substatus");
+			expect(row).not.toHaveProperty("errorMessage");
+		}
+	});
+});
 
 describe("background task list cursor paging", () => {
 	test("merges unified and legacy rows into one createdAt-descending stream with no gaps or repeats", async () => {
@@ -779,9 +912,11 @@ describe("background task batch active count", () => {
 			spyOn(databaseBackgroundOccupancySource, "getProjections"),
 		];
 		try {
-			await expect(backgroundTaskService.countActiveKindsByParentBatch([PARENT])).rejects.toThrow(
-				"not initialized",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(
+					backgroundTaskService.countActiveKindsByParentBatch([PARENT]),
+				),
+			).toThrow("not initialized");
 			for (const read of reads) expect(read).not.toHaveBeenCalled();
 		} finally {
 			for (const read of reads) read.mockRestore();
@@ -1844,7 +1979,7 @@ describe("background task list deltas", () => {
 		expect(upsert.status).toBe("cancelled");
 		expect(upsert.effectiveStatus).toBe("continued");
 		expect(deltas[0]?.activeCount).toBe(1);
-		await expect(backgroundTaskService.getById(subagentId)).resolves.toMatchObject({
+		await expect(await backgroundTaskService.getById(subagentId)).toMatchObject({
 			status: "cancelled",
 			completedAt: stored?.completedAt ?? null,
 		});

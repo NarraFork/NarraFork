@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import {
 	CodexUsageFetchError,
 	type CodexUsagePayload,
@@ -9,6 +11,7 @@ import {
 	hasSpendableCodexCredits,
 	identifyCodexUsageWindowType,
 	parseCodexUsagePayload,
+	projectCodexUsageSnapshot,
 } from "../codex-usage";
 
 const DAY_SECONDS = 24 * 60 * 60;
@@ -538,5 +541,83 @@ describe("Codex reset credits", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+});
+
+describe("Codex quota snapshot projection", () => {
+	test("windows and plan project from usage while all private fields stay in detail", async () => {
+		const usage = parseCodexUsagePayload(
+			payload({
+				plan_type: "plus",
+				rate_limit: {
+					allowed: true,
+					limit_reached: false,
+					primary_window: rateLimitWindow(40, 18_000),
+					secondary_window: rateLimitWindow(20, 604_800),
+				},
+				credits: {
+					has_credits: true,
+					unlimited: false,
+					balance: "123.456789012345678",
+				},
+				rate_limit_reset_credits: { available_count: 2 },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-11-01T00:00:00.000Z",
+		);
+		usage.code_review = {
+			used_percent: 10,
+			remaining_percent: 90,
+			reset_at: 1_800_000_100,
+			reset_after_seconds: 100,
+		};
+		const expected: QuotaSnapshot = {
+			fetchedAt: Date.parse(usage.queriedAt),
+			scope: "subscription",
+			windows: [
+				{ kind: "5h", usedRatio: 0.4, resetsAt: 1_800_000_000_000 },
+				{ kind: "weekly", usedRatio: 0.2, resetsAt: 1_800_000_000_000 },
+			],
+			balances: [],
+			plan: "plus",
+			detail: usage,
+		};
+		expect(projectCodexUsageSnapshot(usage)).toEqual(expected);
+
+		const { __setCodexManagerForTests } = await import("../codex-manager");
+		const { getNarraforkPath } = await import("../narrafork-home");
+		const { getServiceTemplate } = await import("../sourcing/templates");
+		__setCodexManagerForTests({
+			usageOf: (id: string) => (id === "codex-one" ? usage : undefined),
+			dispose: () => {},
+		} as never);
+		try {
+			expect(getServiceTemplate("codex").projectQuota?.("codex-one")).toEqual(expected);
+			expect(getServiceTemplate("codex").projectQuota?.("missing")).toBeUndefined();
+			expect(existsSync(getNarraforkPath("quota-snapshots.json"))).toBe(false);
+		} finally {
+			__setCodexManagerForTests(undefined);
+		}
+	});
+
+	test("unknown windows and invalid queriedAt degrade without inventing data", () => {
+		const usage: CodexUsageResult = {
+			plan_type: "unknown",
+			primary_window: {
+				used_percent: 50,
+				remaining_percent: 50,
+				reset_at: 100,
+				reset_after_seconds: 10,
+				window_type: "unknown",
+			},
+			queriedAt: "not-a-date",
+		};
+		expect(projectCodexUsageSnapshot(usage)).toEqual({
+			fetchedAt: 0,
+			scope: "subscription",
+			windows: [{ kind: "other", usedRatio: 0.5, resetsAt: 100_000 }],
+			balances: [],
+			plan: "unknown",
+			detail: usage,
+		});
 	});
 });

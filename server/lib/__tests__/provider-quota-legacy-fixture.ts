@@ -13,7 +13,7 @@ import {
 	providerQuotaService,
 } from "../../services/provider-quota-service";
 import { CustomApiQuotaTargetDirectory } from "../../services/provider-quota-targets";
-import { type CustomApiProviderConfig, settings } from "../settings";
+import { type CustomApiProviderConfig, saveSettings, settings } from "../settings";
 
 export function quotaConfig(
 	overrides: Partial<CustomApiProviderConfig> = {},
@@ -119,6 +119,12 @@ export function legacyQuotaFixture(
 	service.sync();
 	spyOn(providerQuotaService, "sync").mockImplementation(() => service.sync());
 	spyOn(providerQuotaService, "peek").mockImplementation((id) => service.peek(id));
+	spyOn(providerQuotaService, "peekGeneration").mockImplementation((id) =>
+		service.peekGeneration(id),
+	);
+	spyOn(providerQuotaService, "isStreamSnapshotCurrent").mockImplementation((keyId, generation) =>
+		service.isStreamSnapshotCurrent(keyId, generation),
+	);
 	spyOn(providerQuotaService, "peekKey").mockImplementation((id) => service.peekKey(id));
 	spyOn(providerQuotaService, "keySnapshots").mockImplementation(() => service.keySnapshots());
 	spyOn(providerQuotaService, "refreshKey").mockImplementation((id, options) =>
@@ -138,8 +144,8 @@ export function legacyQuotaFixture(
 	spyOn(providerQuotaService, "refreshStale").mockImplementation((ids) =>
 		service.refreshStale(ids),
 	);
-	spyOn(providerQuotaService, "manualRetryAfterMs").mockImplementation((id) =>
-		service.manualRetryAfterMs(id),
+	spyOn(providerQuotaService, "manualRetryAfterMs").mockImplementation((id, keyId) =>
+		service.manualRetryAfterMs(id, keyId),
 	);
 	spyOn(providerQuotaService, "noteActivity").mockImplementation((id) => service.noteActivity(id));
 	return {
@@ -281,6 +287,7 @@ export async function archivedQuotaFixture(
 	options: {
 		fetch?: typeof import("../net/outbound-fetch").outboundFetch;
 		requestTimeoutMs?: number;
+		approveSettings?: boolean;
 	} = {},
 ) {
 	const { mkdtemp, realpath, rm } = await import("node:fs/promises");
@@ -288,7 +295,9 @@ export async function archivedQuotaFixture(
 	const { join } = await import("node:path");
 	const { PluginManager } = await import("../../services/plugin-manager");
 	const { PluginStateStore } = await import("../../services/plugin-state-store");
-	const { PluginPermissionStore } = await import("../../services/plugin-permission-store");
+	const { PluginPermissionStore, permissionGrantPayload } = await import(
+		"../../services/plugin-permission-store"
+	);
 	const { RuntimeSupervisor } = await import("../../services/plugin-runtime");
 	const { PluginProviderConnectionService } = await import(
 		"../../services/plugin-provider-connection-service"
@@ -297,11 +306,19 @@ export async function archivedQuotaFixture(
 	const { PluginProviderRegistry } = await import("../../services/plugin-provider-registry");
 	const { PluginSecretVault } = await import("../../services/plugin-secret-vault");
 	const { CapabilityBroker } = await import("../../services/plugin-capability-broker");
+	const { ProviderSettingsBindings } = await import("../../services/provider-settings-bindings");
+	const { forgetQuotaSettingsProjection, projectQuotaSettings } = await import(
+		"../../services/provider-quota-settings-projection"
+	);
+	const { getProviderKeyStore, quotaKeyOwner } = await import("../provider-keys");
+	const { sqlite } = await import("../../db");
 	const root = await realpath(await mkdtemp(join(tmpdir(), "quota-archived-test-")));
 	const storeRoot = join(root, "installed");
+	const savedProviders = structuredClone(settings.customApiProviders);
+	const fixtureProviderIds = new Set<string>();
 	let providers: CustomApiProviderConfig[] = [];
 	const directory = new CustomApiQuotaTargetDirectory({
-		providers: () => providers,
+		providers: () => providers.map(projectQuotaSettings),
 		globalProxy: () => ({ mode: "direct" }),
 		userAgent: () => "Quota-archived-test",
 	});
@@ -323,6 +340,9 @@ export async function archivedQuotaFixture(
 		permissionStore,
 		quotaService: service,
 		providerConnectionService: connection,
+		providerSettingsBindings: new ProviderSettingsBindings({
+			fetch: (...args: Parameters<typeof outboundFetch>) => testHttp(...args),
+		}),
 		providerRegistry: new PluginProviderRegistry(),
 		capabilityBroker: new CapabilityBroker({ kernelEnforcement: true }),
 		storageRoot: join(root, "storage"),
@@ -336,13 +356,44 @@ export async function archivedQuotaFixture(
 		runtimeSupervisor: supervisor,
 		hostServices: platform.hostServices,
 		quotaRegistry: platform.quotaRegistry,
+		contributionRegistry: platform.contributionRegistry,
 		contributionCoordinator: platform.contributionCoordinator,
 		lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 		restorePluginLifecycle: platform.restorePlugin,
 		purgePluginSecrets: (id) => platform.secretVault.deletePlugin(id),
 	});
 	const pluginId = "io.narrafork.provider-quota";
+	const approveSettings = async () => {
+		const before = await manager.getPermissions(pluginId);
+		await manager.replacePermissions(pluginId, {
+			expectedRevision: before.revision,
+			grantedBy: "quota-archive-test",
+			grants: [
+				...before.grants.map(permissionGrantPayload),
+				...(["provider.settings.read_self", "provider.settings.connection.use"] as const)
+					.filter((capability) => !before.grants.some((grant) => grant.capability === capability))
+					.map((capability) => ({
+						capability,
+						scope: { type: "global" as const },
+						grantedBy: "quota-archive-test",
+					})),
+			],
+		});
+	};
+	const setProviders = (value: CustomApiProviderConfig[]) => {
+		for (const provider of value) fixtureProviderIds.add(provider.id);
+		saveSettings({ ...settings, customApiProviders: value });
+		providers = settings.customApiProviders;
+		service.sync();
+	};
+	const prepareProviders = async (value: CustomApiProviderConfig[]) => {
+		setProviders(value);
+		await platform.providerSettingsService.prepareQuotaMigrations();
+		service.sync();
+	};
 	await manager.install((await quotaTestPackage()).archivePath);
+	// Query fixtures explicitly act as an administrator; installation itself grants neither capability.
+	if (options.approveSettings !== false) await approveSettings();
 	await manager.enable(pluginId);
 	await manager.activate(pluginId);
 	service.start();
@@ -355,19 +406,16 @@ export async function archivedQuotaFixture(
 		supervisor,
 		platform,
 		pluginId,
+		approveSettings,
+		setProviders,
 		setTestHttp(value?: typeof outboundFetch) {
 			testHttp = value ?? options.fetch ?? outboundFetch;
 		},
 		setRequestTimeout(value?: number) {
 			connectionOptions.requestTimeoutMs = value;
 		},
-		setProviders(value: CustomApiProviderConfig[]) {
-			providers = value;
-			service.sync();
-		},
 		async query(config: CustomApiProviderConfig, mode: "probe" | "refresh" = "probe") {
-			providers = [config];
-			service.sync();
+			await prepareProviders([config]);
 			return service.refresh(config.id, { mode, manual: true });
 		},
 		async rpc(
@@ -376,8 +424,7 @@ export async function archivedQuotaFixture(
 			cursor?: string,
 			signal = AbortSignal.timeout(5000),
 		) {
-			providers = [config];
-			service.sync();
+			await prepareProviders([config]);
 			const target = directory.get(config.id)?.target;
 			const source = platform.quotaRegistry
 				.listSources()
@@ -401,6 +448,21 @@ export async function archivedQuotaFixture(
 				} finally {
 					service.dispose();
 					connection.dispose();
+					platform.providerSettingsService.close();
+					for (const providerId of fixtureProviderIds) {
+						forgetQuotaSettingsProjection(providerId);
+						if (!savedProviders.some(({ id }) => id === providerId)) {
+							getProviderKeyStore().removeProvider(providerId);
+							getProviderKeyStore().removeProvider(quotaKeyOwner(providerId));
+						}
+					}
+					saveSettings({ ...settings, customApiProviders: savedProviders });
+					for (const table of [
+						"plugin_provider_settings",
+						"plugin_resource_entries",
+						"plugin_resource_budgets",
+					])
+						sqlite.run(`DELETE FROM ${table} WHERE plugin_id=?`, [pluginId]);
 					await rm(root, { recursive: true, force: true });
 				}
 			}

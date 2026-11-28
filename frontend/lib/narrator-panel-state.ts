@@ -34,7 +34,7 @@ export function panelConnectionRead(
 					connectedOnce: false,
 					connected: false,
 				};
-	const read = connected && !state.connected ? "fresh" : !state.started ? "initial" : null;
+	const read = !state.started ? "initial" : connected && !state.connected ? "fresh" : null;
 	return {
 		state: { scope, started: true, connectedOnce: state.connectedOnce || connected, connected },
 		read,

@@ -1,10 +1,20 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { agentReferenceHref } from "@shared/agent-reference";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import { asc, eq } from "drizzle-orm";
-import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
+import { historyStrings, requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
-import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
+import {
+	narratorBufferedMessages,
+	narratorCommunicationNodes,
+	narratorMessages,
+	narrators,
+	users,
+} from "../../db/schema";
+import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -29,12 +39,28 @@ for (const statement of [
 }
 
 const providerCalls: string[] = [];
+// Identity regressions use the real provider history projection; only network streaming is scripted.
+let providerHistoryAdapter:
+	| Pick<ProviderAdapter, "buildHistory" | "injectSystemPrompt">
+	| undefined;
+const identityRequests: ChatParams[] = [];
+const identitySystemPrompts: string[] = [];
 let beforeResponse: ((params: ChatParams) => Promise<void>) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: rowsAsHistory,
-	injectSystemPrompt: () => {},
+	buildHistory: (messages, model, narratorId) =>
+		providerHistoryAdapter
+			? providerHistoryAdapter.buildHistory(messages, model, narratorId)
+			: rowsAsHistory(messages),
+	injectSystemPrompt: (history, prompt, model, locale) => {
+		if (providerHistoryAdapter) {
+			identitySystemPrompts.push(prompt);
+			providerHistoryAdapter.injectSystemPrompt(history, prompt, model, locale);
+		}
+	},
 	async *chat(params) {
+		if (providerHistoryAdapter)
+			identityRequests.push({ ...params, history: structuredClone(params.history) });
 		// Queue assertions address the task text, not the sender projection. Keep
 		// the real request signal/model while exposing the anonymous human body
 		// to fixture gates that otherwise never recognize their starting task.
@@ -143,7 +169,7 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 			providerCalls.length === expectedCalls &&
 			row?.status === "idle" &&
 			!getExecutionOwner(narratorId) &&
-			!hasPendingBufferedWork(narratorId)
+			!(await hasPendingBufferedWork(narratorId))
 		)
 			return;
 		await Bun.sleep(10);
@@ -157,6 +183,9 @@ beforeEach(async () => {
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	providerCalls.length = 0;
+	providerHistoryAdapter = undefined;
+	identityRequests.length = 0;
+	identitySystemPrompts.length = 0;
 	beforeResponse = undefined;
 });
 
@@ -203,6 +232,170 @@ test.each([
 	]);
 	expect(providerCalls.at(-1)).toBe("rich 😀");
 	closeNarrator(narratorId);
+});
+
+test.each([
+	false,
+	true,
+])("first real model history distinguishes same-label typed references even with truncated roster=%s", async (truncated) => {
+	const sourceId = `typed-reference-source-${truncated}`;
+	const ownerId = `typed-reference-person-${truncated}`;
+	const selected: [string, string] = [
+		`zz-selected-left-${truncated}`,
+		`zz-selected-right-${truncated}`,
+	];
+	const otherContacts = truncated
+		? Array.from({ length: 51 }, (_, index) => `aa-roster-${index.toString().padStart(2, "0")}`)
+		: [];
+	db.insert(users)
+		.values({ id: ownerId, username: ownerId, passwordHash: "test", role: "admin", createdAt: now })
+		.run();
+	for (const id of [sourceId, ...selected, ...otherContacts]) {
+		seedNarrator(id);
+		db.update(narrators)
+			.set({
+				ownerUserId: ownerId,
+				runtimeRegistrationJson: null,
+				title: selected.includes(id) ? "同名" : id,
+			})
+			.where(eq(narrators.id, id))
+			.run();
+		db.insert(narratorCommunicationNodes)
+			.values({
+				narratorId: id,
+				parentNarratorId: null,
+				originalParentNarratorId: null,
+				version: 1,
+			})
+			.run();
+	}
+	const { insertCommunicationPeerTx } = await import("../narrator-communication");
+	db.transaction((tx) => {
+		for (const id of otherContacts)
+			insertCommunicationPeerTx(tx, sourceId, id, { userId: ownerId, source: "manual" });
+	});
+	providerHistoryAdapter = new OpenAIProvider({
+		id: "reference-history",
+		name: "Reference history",
+		prefix: "reference-history",
+		apiKey: "not-used",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "test-model",
+		apiMode: "completions",
+	});
+	const document: ComposerDocument = {
+		version: 1,
+		assets: [],
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: "Compare these exact references: " },
+					{
+						type: "narratorReference",
+						id: "selected-left",
+						narratorId: selected[0],
+						label: "同名",
+					},
+					{ type: "text", text: " versus " },
+					{
+						type: "narratorReference",
+						id: "selected-right",
+						narratorId: selected[1],
+						label: "同名",
+					},
+				],
+			},
+		],
+	};
+	const wire = composerDocumentText(document).text;
+	const expectedLinks = selected.map((id) => `[@同名](${agentReferenceHref(id)})`);
+	for (const link of expectedLinks) expect(wire).toContain(link);
+	try {
+		await acceptUserMessage(sourceId, wire, { userId: ownerId, composerDocument: document });
+		await waitForIdle(sourceId);
+		expect(identityRequests).toHaveLength(1);
+		const firstRequest = identityRequests[0];
+		const userTurn = firstRequest?.history.find(
+			(row) =>
+				!!row &&
+				typeof row === "object" &&
+				"role" in row &&
+				row.role === "user" &&
+				historyStrings(row).includes("Compare these exact references:"),
+		);
+		expect(userTurn).toBeDefined();
+		const firstUserInput = historyStrings(userTurn);
+		for (const link of expectedLinks) expect(firstUserInput).toContain(link);
+		const stored = db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.contentText, wire))
+			.get();
+		expect(stored?.composerDocument).toEqual(document);
+		for (const link of expectedLinks) expect(stored?.contentText).toContain(link);
+		if (truncated) {
+			const prefix = identitySystemPrompts.join("\n");
+			expect(prefix).toContain("List truncated");
+			for (const id of selected) expect(prefix).not.toContain(id);
+			for (const id of selected) expect(firstUserInput).toContain(id);
+		}
+	} finally {
+		closeNarrator(sourceId);
+		providerHistoryAdapter = undefined;
+	}
+});
+
+test("a user submission replay neither claims an idle runtime nor wakes its queued receipt", async () => {
+	const narratorId = "user-receipt-replay-no-owner";
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({
+			id: "submission-human",
+			username: "submission-human",
+			passwordHash: "test",
+			createdAt: now,
+		})
+		.run();
+	const submission = {
+		clientSubmissionId: "user-snapshot",
+		fingerprint: "stable-original-content",
+	};
+	const original = await enqueueBufferedMessage(
+		narratorId,
+		"one input",
+		undefined,
+		undefined,
+		"submission-human",
+		undefined,
+		undefined,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		"turn",
+		undefined,
+		undefined,
+		undefined,
+		submission,
+	);
+	const ownership = await import("../agent-runtime/ownership");
+	const inbox = await import("../agent-runtime/inbox");
+	const claim = spyOn(ownership, "tryClaimExecution");
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	try {
+		expect(
+			await acceptUserMessage(narratorId, "one input", { userId: "submission-human", submission }),
+		).toMatchObject({ buffered: true, duplicate: true, id: original.id });
+		expect(claim).not.toHaveBeenCalled();
+		expect(wake).not.toHaveBeenCalled();
+		expect(providerCalls).toHaveLength(0);
+		expect(getExecutionOwner(narratorId)).toBeUndefined();
+	} finally {
+		claim.mockRestore();
+		wake.mockRestore();
+		closeNarrator(narratorId);
+	}
 });
 
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
@@ -1129,12 +1322,12 @@ test.each([
 	}
 });
 
-test("gates the synchronous pending-work probe on PostgreSQL", () => {
+test("gates the synchronous pending-work probe on PostgreSQL", async () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {
-		expect(() => hasPendingBufferedWork("mailbox-send-pg-gate")).toThrow(
-			"cannot inspect the PostgreSQL mailbox",
-		);
+		expect(
+			await captureWorkerRejectionThrower(hasPendingBufferedWork("mailbox-send-pg-gate")),
+		).toThrow("cannot inspect the PostgreSQL mailbox");
 	} finally {
 		bindRuntimeQueue({ backend: "sqlite" });
 	}
@@ -1187,7 +1380,7 @@ test.each([
 		} else {
 			expect(await updateBufferedMessageMode(narratorId, accepted.id, "turn")).toBe(true);
 		}
-		clearBufferedMessageSoftStopIfIdle(narratorId, false);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, false);
 		expect(providerCalls).toEqual([]);
 		releasePreflight.resolve();
 		await waitForIdle(narratorId, operation === "remove" ? 2 : 3);

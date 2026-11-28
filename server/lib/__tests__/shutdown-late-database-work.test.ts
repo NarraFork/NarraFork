@@ -28,6 +28,7 @@ import {
 	queueContextCharacterRefresh,
 	quiesceContextCharacterRefreshes,
 } from "../context-characters";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
 import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
@@ -90,6 +91,11 @@ function sandbox(options: {
 		stop(): Promise<void>;
 		snapshot(): { stopped: boolean; pending: number; failed: boolean };
 	};
+	databaseStartup?: {
+		stop(): void;
+		drain(): Promise<void>;
+		readonly pending: boolean;
+	};
 }) {
 	let tracker: ShutdownActivityTracker | undefined;
 	let cleanMarkers = 0;
@@ -132,6 +138,7 @@ function sandbox(options: {
 		markUpdateRestarting: nothing,
 		stopSessionCleanupTimer: settled,
 		gateway: { shutdown: settled },
+		stopAllNugRelayClients: () => trace.push("nugRelays.stop"),
 		stopPrefixSnapshotMaintenance: settled,
 		stopInboxWakes: () => {
 			trace.push("inbox.stop");
@@ -151,6 +158,11 @@ function sandbox(options: {
 		getTeamDatabaseMaintenanceStatus: () =>
 			options.teamMaintenance?.snapshot() ?? { stopped: true, pending: 0, failed: false },
 		backgroundOccupancyInitializer: { stop: nothing },
+		databaseStartup: options.databaseStartup ?? {
+			stop: () => trace.push("databaseStartup.stop"),
+			drain: settled,
+			pending: false,
+		},
 		stopBackgroundOccupancy: async () => {
 			trace.push("occupancy.stop");
 		},
@@ -160,6 +172,7 @@ function sandbox(options: {
 		},
 		httpRequestContext: { getStore: () => undefined },
 		httpLifecycle: createServerRequestLifecycle(),
+		cpuProfiler: { shutdown: settled },
 		stopRemoteAccess: settled,
 		closeAllConnections: () => {
 			trace.push("ws.close");
@@ -242,8 +255,11 @@ function sandbox(options: {
 			},
 			hasPendingShutdownWork: options.pluginManagerPending ?? (() => false),
 		},
-		providerQuotaService: { stop: () => trace.push("quota.stop") },
+		providerQuotaService: { stop: () => trace.push("quota.stop"), flushPersistence: settled },
 		stopPluginPlatformProducers: () => trace.push("pluginPlatform.stop"),
+		stopCommandCodeModelCatalog: () => {
+			trace.push("commandCode.models.stop");
+		},
 		unregisterExternalProviderResolver: nothing,
 		mcpManager: { shutdown: settled },
 		preservesRecoveryOnShutdown: () => false,
@@ -277,7 +293,10 @@ function sandbox(options: {
 			closeRevertBodyWorkers: settled,
 			closeRevertRewriteWorkers: settled,
 			closeSharePreviewHtmlWorkers: settled,
+			closeStructuralWorkers: settled,
 			closeSnapshotBuilds: settled,
+			closeProviderSettingsMigrations: settled,
+			closeLegacyQuotaReaders: settled,
 			closeTokenRecalculationWorkers: settled,
 			closeToolInputHistoricalWorkers: settled,
 			stopOutlineTaskLeaseJob: settled,
@@ -367,6 +386,69 @@ function sandbox(options: {
 	};
 }
 
+test("a pending recovered startup backfill retains database ownership after the shutdown budget", async () => {
+	const trace: string[] = [];
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	let attempts = 0;
+	let now = 0;
+	const startup = createDatabaseReaderStartup({
+		readiness: {
+			state: { status: "waiting" },
+			wait: async () =>
+				++attempts === 1 ? { ok: false, code: "DB_READERS_UNAVAILABLE" } : { ok: true },
+		},
+		initialize: async () => {
+			entered.resolve();
+			await release.promise;
+			trace.push("startup.backfill.write");
+		},
+		onUnavailable() {},
+		onError(error) {
+			throw error;
+		},
+		retryIntervalMs: 1,
+	});
+	await startup.start();
+	await entered.promise;
+	const runtime = sandbox({
+		trace,
+		databaseStartup: startup,
+		bufferedLifecycle: {
+			stop() {},
+			drain: async () => {},
+			hasPending: () => false,
+			status: () => ({ pending: 0, active: 0, waiting: 0, batches: 0, failed: 0 }),
+		},
+		now: () => now,
+		onHttpDrain: () => {
+			now = 30_000;
+		},
+		onPluginShutdown: async () => {},
+		onBufferedDrain() {},
+		communicationStatus: () => ({ pending: 0, failed: false }),
+	});
+	try {
+		const result = await runtime.run({
+			reason: "fixture-startup-deadline",
+			skipWindowsProcessTreeKill: true,
+		});
+		for (const released of [
+			"reader.close.begin",
+			"prefixSnapshots.close",
+			"postgres.close",
+			"clean",
+			"dirty",
+		])
+			expect(trace).not.toContain(released);
+		expect(result.success).toBe(false);
+		expect(trace).not.toContain("startup.backfill.write");
+	} finally {
+		startup.stop();
+		release.resolve();
+	}
+});
+
 test("shutdown deadline before native reader exit forbids clean marking and pool reuse", async () => {
 	const previous = {
 		disabled: process.env.NARRAFORK_DB_WORKER,
@@ -374,7 +456,7 @@ test("shutdown deadline before native reader exit forbids clean marking and pool
 		diagnostics: process.env.NF_DB_WORKER_SQL_DIAGNOSTICS,
 	};
 	delete process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	process.env.NF_DB_WORKER_SQL_DIAGNOSTICS = "1";
 	const directory = mkdtempSync(join(tmpdir(), "nf-shutdown-reader-deadline-"));
 	const path = join(directory, "reader.db");
@@ -672,9 +754,23 @@ test("late teardown buffered writes and communication reads finish before reader
 		expect(trace).not.toContain("reader.close.begin");
 		releaseRead.resolve();
 		expect((await operation).success).toBe(true);
+		expect(runtime.tracker?.summary().steps).toContainEqual({
+			label: "computeWorkers.close",
+			outcome: "ok",
+		});
+		expect(runtime.tracker?.summary().steps).toContainEqual({
+			label: "commandCode.models.stop",
+			outcome: "ok",
+		});
 		expect(runtime.tracker?.summary().clean).toBe(true);
 		expect(runtime.cleanMarkers).toBe(1);
 		const closed = trace.indexOf("reader.close.begin");
+		expect(trace.indexOf("nugRelays.stop")).toBeGreaterThan(trace.indexOf("http.drained"));
+		expect(trace.indexOf("nugRelays.stop")).toBeLessThan(closed);
+		expect(trace.indexOf("commandCode.models.stop")).toBeGreaterThan(
+			trace.indexOf("plugin.shutdown"),
+		);
+		expect(trace.indexOf("commandCode.models.stop")).toBeLessThan(closed);
 		expect(trace.indexOf("context.queued")).toBeGreaterThanOrEqual(0);
 		expect(trace.indexOf("context.drain")).toBeGreaterThan(trace.indexOf("context.queued"));
 		expect(trace.indexOf("context.drain")).toBeLessThan(closed);
@@ -929,6 +1025,7 @@ test("producer admission closes before request waits consume the entire business
 			"quota.stop",
 			"pluginPlatform.stop",
 			"pluginSource.stop",
+			"databaseStartup.stop",
 			"bash.stop",
 			"history.stop",
 			"occupancy.stop",

@@ -392,6 +392,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
+		"server/db/alias-selector-backfill.ts",
+		"fills narrators.title_slug and alias_selector with sync bun:sqlite prepares during SQLite startup and snapshot import",
+	],
+	[
 		"server/db/data-backfills.ts",
 		"repairs rows in SQLite databases written by older builds (status model, traits, handle fold, draft privacy); wired only into the SQLite lifecycle's backfill hook",
 	],
@@ -454,6 +458,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/backend/sqlite-lifecycle.ts": ["driver", "connectionModule", "sqliteCli"],
 	"server/db/backend/sqlite-maintenance.ts": ["driver", "pragma", "errorCode", "vacuum"],
 	"server/db/connection.ts": ["driver", "pragma"],
+	"server/db/alias-selector-backfill.ts": ["driver"],
 	"server/db/data-backfills.ts": ["driver", "sqliteCatalog", "json1"],
 	"server/db/ensure-columns.ts": ["driver", "drizzleDialect", "pragma", "sqliteCatalog"],
 	"server/db/fts.ts": ["driver", "pragma", "sqliteCatalog", "rowid", "fts5", "insertOr"],
@@ -485,9 +490,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"blobFn",
 	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
-	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
-	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["handle"],
+	// Recall dispatches through the search/read ports; dialect-specific access stays there.
 	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
@@ -497,8 +500,21 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/sql-trace.ts": ["driver"],
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
+	"server/db/worker-read-adapter.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/lib/db-worker/database-identity.ts": ["driver"],
+	"server/lib/db-worker/domain-task-registry.ts": ["driver"],
+	"server/lib/db-worker/file-read-snapshots.ts": ["driver"],
+	"server/services/tool-edit-preview-reader.ts": ["json1"],
+	"server/lib/db-worker/integration-authority-read-task.ts": ["driver"],
+	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
+	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	// These dual-backend readers dispatch the SQLite branch through the bounded Worker only.
+	"server/services/narrator-communication/reader.ts": ["connectionModule", "json1"],
+	"server/services/search/communication-candidates.ts": ["connectionModule", "rowid", "fts5"],
+	"server/services/agent-runtime/mailbox.ts": ["json1"],
 	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
+	"server/lib/db-worker/recall-tool-page.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
@@ -516,7 +532,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		// Session model remap filters the imported ids with json_each over a JSON parameter.
 		"json1",
 	],
-	"server/routes/user-preferences.ts": ["handle"],
+	// The per-narrator Spec projection and atomic patch use JSON1 to avoid loading
+	// the whole historical layout map. A PG port needs JSON operators, not a full-map read.
+	"server/routes/user-preferences.ts": ["handle", "json1"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
 	// History/display ports also have PG implementations. Register the SQLite branches
 	// and Database types without claiming these main-database modules are SQLite-only.
@@ -545,6 +563,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The injected occupancy source currently uses the SQLite builder; the maintained
 	// graph is backend-neutral, so this is not a permanently SQLite-only module.
 	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
+	"server/services/benchmark-read.ts": ["driver"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
@@ -584,10 +603,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/git-staging-kernel.ts": ["json1"],
 	"server/services/git-staging-worker.ts": ["driver", "pragma"],
 	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
-	"server/services/narrator-messages.ts": ["handle", "glob"],
+	"server/services/narrator-messages.ts": ["handle", "glob", "indexHint", "drizzleDialect"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Visible translation reads format-2 block history; PG envelopes are still legacy-format.
+	"server/services/reasoning-translation-runtime.ts": ["handle", "glob"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	// The broken-call flag of a tool result is read in SQL so the result itself is not.
 	"server/services/narrator-block-sync.ts": [
@@ -649,11 +670,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
-	"server/services/narrator-subagent-recovery.ts": ["handle"],
 	// The dependent scan reads a narrator's committed directory out of the JSON context column.
 	"server/services/narrator-worktree-retirement.ts": ["json1"],
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
-	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
@@ -684,7 +703,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",
 		"nativeClient",
@@ -714,10 +732,13 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/subagent-file-changes.ts": ["drizzleDialect", "indexHint"],
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/lib/db-worker/knowledge-entry-query.ts": ["driver"],
-	"server/services/knowledge/sqlite-read-store.ts": ["handle"],
+	"server/lib/db-worker/knowledge-entry-reader.ts": ["driver"],
+	"server/lib/db-worker/recall-reader.ts": ["driver", "json1"],
+	"server/services/knowledge/sqlite-read-store.ts": ["handle", "json1"],
+	"server/services/search/recall-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1", "handle"],
+	"server/services/tool-edit-preview.ts": ["handle"],
 	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
@@ -755,6 +776,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"sessionFn",
 	],
 	"server/services/storage-history-service.ts": ["rowid"],
+	// Exact upload-reference check; the PostgreSQL branch is written out beside it.
+	"server/services/storage/upload-reference-predicate.ts": ["json1"],
 	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };

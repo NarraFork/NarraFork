@@ -1,11 +1,13 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
 import { settings } from "../../lib/settings";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
@@ -55,7 +57,7 @@ beforeEach(() => {
 afterEach(() => {
 	settings.anthropicProviders = originalProviders;
 });
-afterAll(() => sqlite.close());
+afterAll(async () => closeRuntimeTestDb(sqlite));
 
 function options(official = false, narratorId = "primary") {
 	return {

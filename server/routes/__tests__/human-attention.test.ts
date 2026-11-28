@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { HUMAN_ATTENTION_DETAIL_MAX_BYTES, type HumanAttentionPage } from "@shared/human-attention";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessages,
 	narratorQuestions,
@@ -12,8 +12,12 @@ import {
 } from "../../db/schema";
 import type { PermissionResult } from "../../lib/agent";
 import { AppError } from "../../lib/errors";
+import { getNarratorWorkerTestDb } from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorRoutes } = await import("../narrators");

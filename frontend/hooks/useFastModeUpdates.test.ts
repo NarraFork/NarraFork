@@ -4,9 +4,10 @@ import { parseHTML } from "linkedom";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { api } from "../lib/api";
+import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { useFastModeUpdates } from "./useFastModeUpdates";
-import { useUpdateUserPreferences } from "./useUserPreferences";
+import { userPreferencesQueryKey, useUpdateUserPreferences } from "./useUserPreferences";
 
 let client: QueryClient;
 let root: Root;
@@ -54,7 +55,13 @@ async function flushHints() {
 }
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	const storage = new Map<string, string>();
 	for (const [key, value] of Object.entries({
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -63,6 +70,7 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	confirmAuthUser(setToken("fast-mode-fixture"), "a");
 	client = new QueryClient({
 		defaultOptions: { queries: { retry: false, gcTime: Infinity }, mutations: { retry: false } },
 	});
@@ -98,6 +106,7 @@ afterEach(async () => {
 	client.clear();
 	scheduled.clear();
 	mock.restore();
+	clearToken();
 	container.remove();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -112,7 +121,7 @@ describe("authenticated fast-mode invalidation", () => {
 		const disabled = watch(["narrators", "disabled"], false);
 		const body = watch(["narrators", "child", "messages"]);
 		const list = watch(["narrators", { standalone: true }]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(userPreferencesQueryKey("ui"));
 		client.setQueryData(["narrators", "hidden"], { revision: 0 });
 		const subscribe = spyOn(narratorWSManager, "subscribe");
 		await mount();
@@ -133,7 +142,7 @@ describe("authenticated fast-mode invalidation", () => {
 	});
 	test("targeted preferences hints merge with the global hint and only literal true refreshes preferences", async () => {
 		const detail = watch(["narrators", "child"]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(userPreferencesQueryKey("ui"));
 		await mount();
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed" });
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed", refreshPreferences: true });
@@ -148,7 +157,7 @@ describe("authenticated fast-mode invalidation", () => {
 	});
 	test("first connection and reconnect repair missed detail and preference changes; disconnect alone does not read", async () => {
 		const detail = watch(["narrators", "child"]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(userPreferencesQueryKey("ui"));
 		await mount();
 		connection(false, false);
 		expect(scheduled.size).toBe(0);
@@ -184,7 +193,9 @@ describe("authenticated fast-mode invalidation", () => {
 		expect(listen).not.toHaveBeenCalled();
 	});
 	test("successful default mutations invalidate details without requiring WS, unrelated or failed patches do not", async () => {
-		const update = spyOn(api, "updateUserPreferences").mockResolvedValue({});
+		const update = spyOn(api, "updateUIPreferences").mockResolvedValue(
+			{} as Awaited<ReturnType<typeof api.getUIPreferences>>,
+		);
 		await mount(false);
 		const key = ["narrators", "child"];
 		client.setQueryData(key, { revision: 0 });

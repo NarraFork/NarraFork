@@ -1,9 +1,12 @@
 import { Box, Modal } from "@mantine/core";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
+import type { FileTarget } from "@shared/file-reference";
 import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ToolCallDetailRef } from "../../lib/api/narrators";
 import { useFilePanelNavigation } from "./file-panel/file-panel-navigation";
 import type { ToolEditReference } from "./tool-call/tool-edit-reference";
+import { useToolFileNavigation } from "./tool-call/useToolFileNavigation";
 
 const ToolEditFileViewer = lazy(() =>
 	import("./tool-call/ToolEditFileViewer").then((module) => ({
@@ -18,13 +21,24 @@ export function useToolEditNavigation({
 	toolUseId,
 	toolDetailRef,
 	filePath,
+	fileTarget,
+	fileNarratorId,
 }: {
 	toolName?: string;
 	narratorId?: string;
 	toolUseId?: string;
 	toolDetailRef?: ToolCallDetailRef;
 	filePath?: string;
+	/** Persisted execution target, never the receiving panel's current device. */
+	fileTarget?: FileTarget | null;
+	fileNarratorId?: string;
 }) {
+	const targetDeviceId =
+		typeof fileTarget?.deviceId === "string" && fileTarget.deviceId.trim()
+			? fileTarget.deviceId
+			: undefined;
+	const localFile = !!targetDeviceId && !isFileHistoryEnabledForDevice(targetDeviceId);
+	const openCurrentFile = useToolFileNavigation(fileTarget, fileNarratorId);
 	const openFilePanel = useFilePanelNavigation();
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
@@ -33,7 +47,13 @@ export function useToolEditNavigation({
 	// Excluding it only denied a structural rewrite the review affordance its equivalent
 	// Edit already had.
 	const reference = useMemo<ToolEditReference | null>(() => {
-		if ((toolName !== "Edit" && toolName !== "StructSed") || !narratorId || !toolUseId || !filePath)
+		if (
+			(toolName !== "Edit" && toolName !== "StructSed") ||
+			!narratorId ||
+			!toolUseId ||
+			!filePath ||
+			!targetDeviceId
+		)
 			return null;
 		return {
 			narratorId,
@@ -41,12 +61,14 @@ export function useToolEditNavigation({
 			toolCallId: toolDetailRef?.toolCallId,
 			messageId: toolDetailRef?.messageId,
 			executionAttempt: toolDetailRef?.executionAttempt,
+			deviceId: targetDeviceId,
 		};
 	}, [
 		toolName,
 		narratorId,
 		toolUseId,
 		filePath,
+		targetDeviceId,
 		toolDetailRef?.toolCallId,
 		toolDetailRef?.messageId,
 		toolDetailRef?.executionAttempt,
@@ -57,9 +79,10 @@ export function useToolEditNavigation({
 		else setOpened(true);
 	}, [openFilePanel, reference, filePath]);
 	return {
-		open: reference ? open : undefined,
+		labelKey: localFile ? "contextMenu_openFilePanel" : "editPreview.open",
+		open: reference ? (localFile ? openCurrentFile : open) : undefined,
 		modal:
-			opened && reference && filePath ? (
+			!localFile && opened && reference && filePath ? (
 				<Modal opened onClose={() => setOpened(false)} title={t("editPreview.open")} size="90vw">
 					<Box h="75dvh" style={{ minHeight: 0 }}>
 						<Suspense fallback={null}>

@@ -50,9 +50,8 @@ import {
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
 import { QuotaWindowBars } from "./QuotaWindowBars";
+import type { ProviderBalanceBadge, ProviderQuotaBadge } from "./use-model-menu-provider-badges";
 import type { ProviderHeaderActions } from "./use-model-menu-refresh-props";
-import type { ProviderQuotaBadge } from "./use-opencode-provider-badges";
-import type { ProviderBalanceBadge } from "./use-provider-balance-badges";
 
 /** Model-menu meta groups; they are not providers, so they get no provider actions. */
 const META_GROUPS = new Set(["__default__", "__summary__", "__auto__", "__agg__", "unknown"]);

@@ -20,7 +20,8 @@
  * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
  * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
  *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
- * - team 的三张表（`project_teams` / `team_work_items` / `team_work_events`）不导出：它们记的是
+ * - team 的四张表（`project_teams` / `team_work_items` / `team_work_item_dependencies` /
+ *   `team_work_events`）不导出：它们记的是
  *   本机的 git 分支和 worktree。导入后会话的 `team` trait 以本机有没有 team 行为准
  *   （`reconcileImportedTeamTraits`）；清空会话时先删 team 表（team 行 RESTRICT 会话删除）；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
@@ -36,36 +37,37 @@ import { dirname, join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
+import { getCredentialStore } from "@server/lib/credential-store";
 import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
+import type { CredentialTransferData } from "@server/lib/credential-transfer/kinds";
 import { AppError, catalogError } from "@server/lib/errors";
 import { invalidateGitIdentityCache } from "@server/lib/git-identity";
-import { generateShortId } from "@server/lib/id";
+import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
 import { getProviderKeyStore } from "@server/lib/provider-keys";
 import { getSettingsRevision, saveSettings, settings } from "@server/lib/settings";
-import {
-	COMMAND_CODE_KEY_OWNER,
-	nugKeyOwner,
-	nugOAuthKeyOwner,
-	TOKENDANCE_KEY_OWNER,
-} from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
+import { createGroupAllocator } from "@server/lib/sourcing/allocate-group";
+import type { ServiceTemplateId } from "@server/lib/sourcing/templates";
 import {
-	collectProviderKeys,
-	countSingleKeys,
-	type ExportedKeys,
-	openProviderKeys,
-	restoreExtraKeys,
+	openProviderTransferItems,
 	SEALED_KEYS_ENTRY,
-	sealProviderKeys,
-	withFirstKeys,
+	sealProviderTransferItems,
 	withoutKeys,
 } from "@server/services/data-portability-keys";
+import type { NarratorPrincipal } from "@server/services/narrator-acl";
+import {
+	communicationWritePredicate,
+	currentCommunicationPrincipalTx,
+} from "@server/services/narrator-communication/access";
 import { resetSpecImportStateCache } from "@server/services/outline/spec-import/state";
 import { invalidateTaskBackend } from "@server/services/task-source/backend";
 import { forgetTeamSessions } from "@server/services/teams/team-session-memo";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
+import type { CommunicationImportReport } from "@shared/narrator-communication";
+import { COMMUNICATION_LIMITS } from "@shared/narrator-communication";
+import { identifyService } from "@shared/sourcing/identify";
 import {
 	MAX_IMPORT_BYTES,
 	MAX_IMPORT_LABEL,
@@ -73,7 +75,11 @@ import {
 	MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
 } from "@shared/storage-transfer";
 import archiver from "archiver";
-import { sqlite } from "../db";
+import { db, sqlite } from "../db";
+import {
+	backfillNarratorAliasSelectors,
+	recomputeNarratorAliasSelectors,
+} from "../db/alias-selector-backfill";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import {
@@ -88,8 +94,8 @@ import { PROVIDER_SETTINGS_SINGLETON_IDS } from "./provider-settings-targets";
 
 /** Archives without sealed provider keys; every version of this importer reads them. */
 const PLAIN_EXPORT_VERSION = 1;
-/** Archives whose provider keys are sealed in `provider-keys.sealed.json`. */
-const SEALED_KEYS_EXPORT_VERSION = 2;
+/** Archives whose unified credentials are sealed in `provider-keys.sealed.json`. */
+const SEALED_KEYS_EXPORT_VERSION = 3;
 /** The newest version this importer reads. */
 const PROVIDER_SETTINGS_EXPORT_VERSION = 3;
 const EXPORT_VERSION = PROVIDER_SETTINGS_EXPORT_VERSION;
@@ -125,6 +131,8 @@ const AGENT_PROVIDER_KEYS = [
 ] as const;
 
 type ProviderKey = (typeof PROVIDER_KEYS)[number] | (typeof AGENT_PROVIDER_KEYS)[number];
+const transferGroupKey = (templateId: ServiceTemplateId, groupId: string) =>
+	`${templateId}:${groupId}`;
 type ClearTarget = "requests" | "sessions" | "providers" | "all";
 
 interface ImportPreview {
@@ -484,7 +492,12 @@ export async function exportData(
 		// archiving starts, so a failure leaves no half-written ZIP.
 		const sealedKeys =
 			selection.providers && options.passphrase
-				? await sealProviderKeys(collectProviderKeys(collected), options.passphrase)
+				? await sealProviderTransferItems(
+						(await import("@server/lib/credential-transfer/kinds")).collectProviderTransferItems(
+							collected,
+						),
+						options.passphrase,
+					)
 				: null;
 		const providers = selection.providers ? withoutKeys(collected) : collected;
 		// 计数从快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
@@ -510,8 +523,8 @@ export async function exportData(
 			archive.file(join(dir, PROVIDER_SETTINGS_SEALED_ENTRY), {
 				name: PROVIDER_SETTINGS_SEALED_ENTRY,
 			});
-		// Only an archive with sealed keys is version 2: an older instance cannot read them and
-		// must refuse it, while archives without providers stay importable there.
+		// Unified credentials and provider extension settings both require v3. Plain archives
+		// without either remain readable by older instances.
 		archive.append(
 			JSON.stringify(
 				{
@@ -837,11 +850,14 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 					"PROVIDER_SETTINGS_IMPORT_INVALID",
 				);
 		}
+		// v3 also carries unified credentials alone. Require the extension inventory only
+		// when extension data or metadata is present; a credential-only v3 has neither.
 		if (
-			Number(manifest?.version) === PROVIDER_SETTINGS_EXPORT_VERSION &&
-			(!hasExtensionTable ||
+			(extensionHeader !== undefined || providerSettingsCount > 0 || providerSettingsSealedPath) &&
+			(Number(manifest?.version) !== PROVIDER_SETTINGS_EXPORT_VERSION ||
+				!hasExtensionTable ||
 				extensionHeader?.count !== providerSettingsCount ||
-				extensionHeader.sealed !== !!providerSettingsSealedPath)
+				extensionHeader?.sealed !== !!providerSettingsSealedPath)
 		)
 			throw new AppError(
 				"Incomplete provider settings archive",
@@ -906,6 +922,25 @@ export interface ImportOptions {
 	include?: Partial<TransferSelection>;
 	/** Opens the archive's sealed provider keys; required when it has them and providers are imported. */
 	passphrase?: string;
+	/** Authenticated server-side caller, never an archive/request-body claim. Missing identity denies links. */
+	importingUserId?: string;
+}
+
+export type CommunicationImportResult = CommunicationImportReport;
+
+function emptyCommunicationImportResult(): CommunicationImportResult {
+	return {
+		nodesInserted: 0,
+		nodesPreserved: 0,
+		parentsDetachedMissingEndpoints: 0,
+		parentsDetachedUnauthorized: 0,
+		peersRestored: 0,
+		peersSkipped: 0,
+		peersMissingEndpoints: 0,
+		peersUnauthorized: 0,
+		peersInvalid: 0,
+		peersAlreadyPresent: 0,
+	};
 }
 
 export interface ImportResult {
@@ -926,6 +961,8 @@ export interface ImportResult {
 	/** Existing local settings/tombstones or earlier records for the same mapped address win. */
 	providerSettingsSkipped?: number;
 	providerSettingsConflicts?: number;
+	/** Explicit link restoration/skipping report; archive relations are not portable ACL grants. */
+	communication: CommunicationImportResult;
 }
 
 function changesOf(run: { changes?: number }): number {
@@ -942,6 +979,8 @@ function tableColumns(schema: string, table: string): string[] {
 /** 导出包携带的表；其余表（projects/users/…）在目标库的存在性无法由导入保证。 */
 const IMPORTED_TABLES = [
 	"narrators",
+	"narrator_communication_nodes",
+	"narrator_communication_peers",
 	"narrator_messages",
 	"narrator_message_refs",
 	"narrator_tool_calls",
@@ -1216,6 +1255,205 @@ function copyTable(
 	);
 }
 
+/** Hard import budgets, separate from the much smaller topology display budgets. */
+const MAX_COMMUNICATION_IMPORT_NODES = 10_000;
+const MAX_COMMUNICATION_IMPORT_PEERS = 20_000;
+
+function invalidCommunicationImport(): never {
+	throw new AppError(
+		"Import contains an invalid communication forest (cycle, missing node, version or depth)",
+		400,
+		"IMPORT_COMMUNICATION_INVALID",
+	);
+}
+
+function resolveCommunicationImportPrincipal(userId: string | undefined): NarratorPrincipal | null {
+	if (!userId) return null;
+	try {
+		// Drizzle shares sqlite's active transaction. Never use the role cached at preview time.
+		return currentCommunicationPrincipalTx(db, userId);
+	} catch (error) {
+		// A deleted caller fails closed; operational/SQL failures still roll back the import.
+		if (!(error instanceof AppError) || ![403, 404].includes(error.statusCode)) throw error;
+		return null;
+	}
+}
+
+/**
+ * Runs on the same connection and inside the session import transaction. Only successfully
+ * imported sessions are mapped: a coincidentally existing/skipped target id is NOT an endpoint.
+ * Existing nodes are insert-only, including explicit NULL splits. Old archives create roots,
+ * never reconstructing a relationship from historical parent/controller/ACL columns.
+ */
+function restoreImportedCommunication(
+	attachName: string,
+	excludedNarrators: string[],
+	principal: NarratorPrincipal | null,
+): CommunicationImportResult {
+	const report = emptyCommunicationImportResult();
+	const mapping = `${attachName}_communication_map`;
+	const candidates = `${attachName}_communication_peers`;
+	const count = (from: string, where = "1 = 1") =>
+		Number(
+			(sqlite.prepare(`SELECT COUNT(*) AS n FROM ${from} WHERE ${where}`).get() as { n: number }).n,
+		);
+	const enforceBudget = (from: string, limit: number) => {
+		if (count(`(SELECT 1 FROM ${from} LIMIT ${limit + 1})`) > limit) {
+			throw new AppError(
+				"Communication import exceeds the bounded node or peer budget",
+				413,
+				"IMPORT_COMMUNICATION_TOO_LARGE",
+			);
+		}
+	};
+
+	sqlite.run(`CREATE TEMP TABLE ${mapping} (
+		narrator_id TEXT PRIMARY KEY, new_node INTEGER NOT NULL,
+		can_write INTEGER NOT NULL DEFAULT 0, source_node INTEGER NOT NULL DEFAULT 0
+	)`);
+	try {
+		const { groups, params } = chunkedInLists(excludedNarrators);
+		const excluded = groups.map((group) => `i.id NOT IN ${group}`).join(" AND ");
+		sqlite.run(
+			`INSERT OR IGNORE INTO temp.${mapping} (narrator_id, new_node)
+			 SELECT DISTINCT i.id, NOT EXISTS (SELECT 1 FROM main.narrator_communication_nodes n WHERE n.narrator_id = i.id)
+			 FROM ${attachName}.narrators i JOIN main.narrators n ON n.id = i.id
+			 ${excluded ? `WHERE ${excluded}` : ""} LIMIT ${MAX_COMMUNICATION_IMPORT_NODES + 1}`,
+			params,
+		);
+		enforceBudget(`temp.${mapping}`, MAX_COMMUNICATION_IMPORT_NODES);
+
+		if (principal) {
+			const writable = communicationWritePredicate("n", principal);
+			sqlite.run(
+				`UPDATE temp.${mapping} SET can_write = EXISTS (
+				 SELECT 1 FROM main.narrators n WHERE n.id = ${mapping}.narrator_id AND (${writable.sql})
+				)`,
+				writable.params,
+			);
+		}
+
+		const nodeColumns = tableColumns(attachName, "narrator_communication_nodes");
+		const hasNodes = nodeColumns.length > 0;
+		if (hasNodes) {
+			if (!nodeColumns.includes("narrator_id") || !nodeColumns.includes("parent_narrator_id")) {
+				invalidCommunicationImport();
+			}
+			enforceBudget(`${attachName}.narrator_communication_nodes`, MAX_COMMUNICATION_IMPORT_NODES);
+			sqlite.run(`UPDATE temp.${mapping} SET source_node = 1 WHERE narrator_id IN (
+			 SELECT narrator_id FROM ${attachName}.narrator_communication_nodes)`);
+		}
+		const original = nodeColumns.includes("original_parent_narrator_id")
+			? "i.original_parent_narrator_id"
+			: "NULL";
+		const version = nodeColumns.includes("version") ? "i.version" : "1";
+		if (
+			hasNodes &&
+			sqlite
+				.prepare(`SELECT 1 FROM ${attachName}.narrator_communication_nodes i
+				 JOIN temp.${mapping} m ON m.narrator_id = i.narrator_id AND m.new_node = 1
+				 GROUP BY i.narrator_id HAVING COUNT(*) > 1 OR
+				 MAX(typeof(${version}) <> 'integer' OR ${version} < 1 OR
+				 (i.parent_narrator_id IS NOT NULL AND typeof(i.parent_narrator_id) <> 'text') OR
+				 (${original} IS NOT NULL AND typeof(${original}) <> 'text') OR
+				 i.parent_narrator_id = i.narrator_id OR ${original} = i.narrator_id) = 1 LIMIT 1`)
+				.get()
+		) {
+			invalidCommunicationImport();
+		}
+
+		report.nodesPreserved = count(`temp.${mapping}`, "new_node = 0");
+		const source = hasNodes
+			? `LEFT JOIN ${attachName}.narrator_communication_nodes i ON i.narrator_id = m.narrator_id
+			 LEFT JOIN temp.${mapping} p ON p.narrator_id = i.parent_narrator_id
+			 LEFT JOIN temp.${mapping} o ON o.narrator_id = ${original}`
+			: "";
+		if (hasNodes) {
+			report.parentsDetachedMissingEndpoints = count(
+				`temp.${mapping} m ${source}`,
+				"m.new_node = 1 AND i.parent_narrator_id IS NOT NULL AND (p.narrator_id IS NULL OR p.source_node = 0)",
+			);
+			report.parentsDetachedUnauthorized = count(
+				`temp.${mapping} m ${source}`,
+				"m.new_node = 1 AND p.source_node = 1 AND NOT (m.can_write AND p.can_write)",
+			);
+		}
+		report.nodesInserted = changesOf(
+			sqlite.run(`INSERT INTO main.narrator_communication_nodes
+			 (narrator_id, parent_narrator_id, original_parent_narrator_id, version)
+			 SELECT m.narrator_id,
+			 ${hasNodes ? "CASE WHEN m.can_write AND p.can_write AND p.source_node THEN i.parent_narrator_id ELSE NULL END" : "NULL"},
+			 ${hasNodes ? `CASE WHEN m.can_write AND o.can_write THEN ${original} ELSE NULL END` : "NULL"},
+			 ${hasNodes ? `COALESCE(${version}, 1)` : "1"}
+			 FROM temp.${mapping} m ${source} WHERE m.new_node = 1`),
+		);
+
+		// At most sixteen indexed ancestor steps per new node. Cycles, broken retained
+		// ancestor chains and a seventeenth node all fail the whole session transaction.
+		if (
+			sqlite
+				.prepare(`WITH RECURSIVE paths(id, parent, depth) AS (
+				 SELECT n.narrator_id, n.parent_narrator_id, 1
+				 FROM main.narrator_communication_nodes n JOIN temp.${mapping} m
+				 ON m.narrator_id = n.narrator_id WHERE m.new_node = 1
+				 UNION ALL SELECT n.narrator_id, n.parent_narrator_id, p.depth + 1
+				 FROM paths p JOIN main.narrator_communication_nodes n ON n.narrator_id = p.parent
+				 WHERE p.depth < ${COMMUNICATION_LIMITS.maxDepth}
+			 ) SELECT 1 FROM paths p WHERE p.parent IS NOT NULL AND (
+				 p.depth >= ${COMMUNICATION_LIMITS.maxDepth} OR NOT EXISTS (
+				 SELECT 1 FROM main.narrator_communication_nodes n WHERE n.narrator_id = p.parent)) LIMIT 1`)
+				.get()
+		) {
+			invalidCommunicationImport();
+		}
+
+		const peerColumns = tableColumns(attachName, "narrator_communication_peers");
+		if (peerColumns.length === 0) return report;
+		const peerTable = `${attachName}.narrator_communication_peers`;
+		enforceBudget(peerTable, MAX_COMMUNICATION_IMPORT_PEERS);
+		const total = count(peerTable);
+		if (
+			!["endpoint_lo", "endpoint_hi", "source", "created_at"].every((c) => peerColumns.includes(c))
+		) {
+			report.peersSkipped = report.peersInvalid = total;
+			return report;
+		}
+		const optional = (name: string) => (peerColumns.includes(name) ? `i.${name}` : "NULL");
+		// The archive can even define a column named rowid; use a local, numeric ordinal.
+		sqlite.run(`CREATE TEMP TABLE ${candidates} AS SELECT ROW_NUMBER() OVER () AS local_ordinal,
+		 i.endpoint_lo, i.endpoint_hi, i.source, i.created_at,
+		 ${optional("admission_id")} AS admission_id, ${optional("message_id")} AS message_id,
+		 CASE WHEN typeof(i.endpoint_lo) <> 'text' OR typeof(i.endpoint_hi) <> 'text'
+		 OR i.endpoint_lo >= i.endpoint_hi OR i.source NOT IN ('manual', 'admission')
+		 OR i.source IS NULL OR typeof(i.created_at) <> 'text' THEN 'invalid'
+		 WHEN lo.narrator_id IS NULL OR hi.narrator_id IS NULL THEN 'missing'
+		 WHEN NOT (lo.can_write AND hi.can_write) THEN 'unauthorized' ELSE 'eligible' END AS reason
+		 FROM ${peerTable} i
+		 LEFT JOIN temp.${mapping} lo ON lo.narrator_id = i.endpoint_lo
+		 LEFT JOIN temp.${mapping} hi ON hi.narrator_id = i.endpoint_hi`);
+		report.peersMissingEndpoints = count(`temp.${candidates}`, "reason = 'missing'");
+		report.peersUnauthorized = count(`temp.${candidates}`, "reason = 'unauthorized'");
+		report.peersInvalid = count(`temp.${candidates}`, "reason = 'invalid'");
+		report.peersRestored = changesOf(
+			sqlite.run(
+				`INSERT OR IGNORE INTO main.narrator_communication_peers
+				 (id, endpoint_lo, endpoint_hi, created_by, source, admission_id, message_id, created_at)
+				 SELECT ? || '_' || local_ordinal, endpoint_lo, endpoint_hi, ?, source, admission_id, message_id, created_at
+				 FROM temp.${candidates} WHERE reason = 'eligible'`,
+				// Never reuse a source relation ID for an imported peer.
+				[generateId(), principal?.userId ?? null],
+			),
+		);
+		report.peersAlreadyPresent =
+			count(`temp.${candidates}`, "reason = 'eligible'") - report.peersRestored;
+		report.peersSkipped = total - report.peersRestored;
+		return report;
+	} finally {
+		sqlite.run(`DROP TABLE IF EXISTS temp.${candidates}`);
+		sqlite.run(`DROP TABLE temp.${mapping}`);
+	}
+}
+
 /**
  * 按预览 token 执行导入：全程用 SQLite 原生 SQL 合并。
  *
@@ -1236,39 +1474,43 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		providersRenamed: 0,
 		keysImported: 0,
 		keysFailed: 0,
+		communication: emptyCommunicationImportResult(),
 	};
 
 	await access(preview.snapshotPath).catch(() => {
 		throw catalogError("IMPORT_SNAPSHOT_EXPIRED");
 	});
 
-	// Sealed provider keys are opened before the transaction: scrypt is async and the import
-	// transaction is synchronous. A wrong passphrase stops here, before anything is written.
+	// Sealed credentials are opened before the transaction: scrypt is async and a wrong
+	// passphrase must stop here, before any database, settings or credential write.
 	const importProviders = options.include?.providers ?? true;
-	let sealedKeys: ExportedKeys | null = null;
+	let transferItems: CredentialTransferData[] = [];
+	if (importProviders && (preview.version ?? PLAIN_EXPORT_VERSION) === PLAIN_EXPORT_VERSION) {
+		transferItems = (
+			await import("@server/lib/sourcing/legacy-transfer")
+		).legacyProviderTransferItems(preview.providers);
+	}
 	if (preview.sealedKeys && importProviders) {
 		if (!options.passphrase) throw catalogError("IMPORT_PASSPHRASE_REQUIRED");
 		try {
-			sealedKeys = await openProviderKeys(preview.sealedKeys, options.passphrase);
+			transferItems = await openProviderTransferItems(
+				preview.sealedKeys,
+				options.passphrase,
+				preview.providers,
+			);
 		} catch (error) {
 			if (error instanceof BundleError) bundleCatalogError(error);
 			throw error;
 		}
 	}
-	// providers.json has no keys; the merge's same-endpoint check and the settings save need
-	// each provider's first key in place, as an old plain export had it.
-	const incomingProviders = sealedKeys
-		? (withFirstKeys(preview.providers, sealedKeys) as Partial<Record<ProviderKey, unknown>>)
-		: preview.providers;
-	/** Incoming custom API provider id → the local id it was added under. */
-	let addedProviders: ReadonlyMap<string, string> = new Map();
-	/** Single-key providers that were added; their key came in with the settings save. */
-	let addedSingleKeyOwners: ReadonlySet<string> = new Set();
+	const incomingProviders = withoutKeys(preview.providers) as Partial<Record<ProviderKey, unknown>>;
+	/** Exporting template/id → the local group created by this import. */
+	let addedGroups: ReadonlyMap<string, { id: string }> = new Map();
 
 	const preparedRevision = getSettingsRevision();
 	const preparedMerge =
 		importProviders && preview.providerSettingsCount
-			? mergeProviders(incomingProviders)
+			? mergeProviders(incomingProviders, transferItems)
 			: undefined;
 	let extensionStage: string | undefined;
 	let extensionStageCount = 0,
@@ -1330,6 +1572,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				providersRenamed: 0,
 				keysImported: 0,
 				keysFailed: 0,
+				communication: emptyCommunicationImportResult(),
 			};
 			// 批内互相引用（会话父子、消息↔引用）无法靠行序满足，统一延到提交时校验：
 			// 提交仍失败就整批回滚，主库不会被改坏。
@@ -1366,7 +1609,25 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			const rejected: string[] = [];
 			const skipped: string[] = [];
+			const touchedNarratorIds: string[] = [];
+			const principal = include.sessions
+				? resolveCommunicationImportPrincipal(options.importingUserId)
+				: null;
 			if (include.sessions) {
+				const writable =
+					principal && !principal.isAdmin ? communicationWritePredicate("n", principal) : null;
+				// Evaluate all colliding rows against the original ACL; an earlier overwrite must
+				// not change the ACL root used to authorize a later subagent overwrite.
+				const writableBeforeImport = writable
+					? new Set(
+							(
+								sqlite
+									.prepare(`SELECT n.id FROM main.narrators n
+									 WHERE n.id IN (SELECT id FROM ${attachName}.narrators) AND (${writable.sql})`)
+									.all(...writable.params) as Array<{ id: string }>
+							).map(({ id }) => id),
+						)
+					: null;
 				const existing = new Set(
 					(sqlite.prepare(`SELECT id FROM main.narrators`).all() as Array<{ id: string }>).map(
 						(row) => row.id,
@@ -1382,12 +1643,17 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						// 仍被其它唯一约束挡住时，会话进不来，它的子行必须一起跳过。
 						if (sqlite.prepare(`SELECT 1 FROM main.narrators WHERE id = ?`).get(id)) {
 							counts.sessionsInserted += 1;
+							touchedNarratorIds.push(id);
 						} else {
 							rejected.push(id);
 						}
 						continue;
 					}
-					if (decision === "skip") {
+					if (
+						decision === "skip" ||
+						(options.importingUserId !== undefined &&
+							(!principal || (writableBeforeImport && !writableBeforeImport.has(id))))
+					) {
 						counts.sessionsSkipped += 1;
 						skipped.push(id);
 						continue;
@@ -1417,6 +1683,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						[id],
 					);
 					counts.sessionsOverwritten += 1;
+					touchedNarratorIds.push(id);
 				}
 				counts.sessionsRejected = rejected.length;
 				if (rejected.length > 0) {
@@ -1447,6 +1714,11 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				reconcileImportedTeamTraits(attachName);
+				// Overwrite keeps destination selector columns when the snapshot predates
+				// them. Recompute from the title and traits just written; skip leaves
+				// those rows alone. The null-only backfill still fills every other row.
+				recomputeNarratorAliasSelectors(sqlite, touchedNarratorIds);
+				backfillNarratorAliasSelectors(sqlite, { ownTransaction: false });
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
@@ -1478,6 +1750,14 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			// 4) 自检：只处理本次新增行，兜住无法预见的悬空引用（日志会写明表与数量）
 			repairDanglingReferences(baselines);
+			if (include.sessions) {
+				// Map only sessions still present after FK repair, never a rejected/deleted endpoint.
+				counts.communication = restoreImportedCommunication(
+					attachName,
+					excludedNarrators,
+					principal,
+				);
+			}
 			// 本次新增的请求计入用量日账本（按 rowid 基线，重复导入被主键跳过的行不会重复计数）
 			if (include.requests)
 				addImportedRequestsToUsageDaily(sqlite, baselines.get("api_requests") ?? 0);
@@ -1485,7 +1765,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			// 5) 供应商合并：`saveSettings` 是原子写（临时文件 + rename），放在事务末尾，
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
 			if (include.providers) {
-				const merge = preparedMerge ?? mergeProviders(incomingProviders);
+				const merge = preparedMerge ?? mergeProviders(incomingProviders, transferItems);
 				if (extensionStage) {
 					// The source contains at most 512 verified, re-encrypted rows. No local row
 					// or tombstone is overwritten; grants and resource receipts are not imported.
@@ -1523,8 +1803,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					counts.providerSettingsConflicts = counts.providerSettingsSkipped;
 				}
 				// Read after the transaction commits; a retried transaction recomputes them.
-				addedProviders = merge.addedCustomApiProviders;
-				addedSingleKeyOwners = merge.addedSingleKeyOwners;
+				addedGroups = merge.addedGroups;
 				// 改名的供应商：本次写入的会话跟着指向新前缀，不留在本地同名的另一个服务上。
 				if (include.sessions) {
 					remapImportedNarratorModels(
@@ -1533,6 +1812,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					);
 				}
 				if (merge.changed) {
+					// The catalog owns its separate file; apply only after the staged extension
+					// payload has passed validation and the import revision still matches.
+					if (merge.merged.modelCatalog) importModelCatalogSettings(merge.merged.modelCatalog);
 					const next = structuredClone(settings) as NarraForkSettings;
 					for (const key of PROVIDER_KEYS) {
 						if (merge.merged[key] !== undefined) {
@@ -1541,7 +1823,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					const agentPatch: Record<string, unknown> = {};
 					for (const key of AGENT_PROVIDER_KEYS) {
-						if (merge.merged[key] !== undefined) agentPatch[key] = merge.merged[key];
+						if (key !== "modelCatalog" && merge.merged[key] !== undefined)
+							agentPatch[key] = merge.merged[key];
 					}
 					if (Object.keys(agentPatch).length > 0) {
 						next.agent = { ...next.agent, ...agentPatch } as NarraForkSettings["agent"];
@@ -1599,15 +1882,16 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		forgetTeamSessions();
 	}
 
-	// The key store is a file outside the SQLite transaction, so the remaining keys are
-	// written only once the transaction committed. The first key of each provider (and the
-	// single key of NUG / TokenDance / Command Code) was stored by the settings save above.
-	if (sealedKeys) {
-		const restored = restoreExtraKeys(sealedKeys, addedProviders);
-		result.keysImported = restored.imported + countSingleKeys(sealedKeys, addedSingleKeyOwners);
+	// Credential files live outside the SQLite transaction. Restore them only after the
+	// configuration and sessions committed, under the ids chosen by the shared allocator.
+	if (transferItems.length) {
+		const restored = (
+			await import("@server/lib/credential-transfer/kinds")
+		).restoreProviderTransferItems(transferItems, addedGroups);
+		result.keysImported = restored.imported;
 		result.keysFailed = restored.failed;
 		if (restored.failed > 0) {
-			logger.warn("Import could not restore some provider keys", restored);
+			logger.warn("Import could not restore some provider credentials", restored);
 		}
 	}
 
@@ -1622,23 +1906,18 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 // ── 供应商合并 ───────────────────────────────────────────────────────────
 
 /** 同一端点判定：同 apiKey + 同 baseUrl 即视为同一供应商（忽略结尾斜杠）。 */
-function sameProvider(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-	const keyA = String(a.apiKey ?? "").trim();
-	const keyB = String(b.apiKey ?? "").trim();
+function sameProvider(
+	a: Record<string, unknown>,
+	b: Record<string, unknown>,
+	keyA: string | undefined,
+	keyB: string | undefined,
+): boolean {
 	if (!keyA || keyA !== keyB) return false;
 	const url = (value: unknown) =>
 		String(value ?? "")
 			.trim()
 			.replace(/\/+$/, "");
 	return url(a.baseUrl) === url(b.baseUrl);
-}
-
-/** 列表内不重复的供应商 id：id 重复会让前端按 id 的编辑/删除串行到别的条目。 */
-function uniqueProviderId(taken: Set<string>): string {
-	for (;;) {
-		const id = generateShortId();
-		if (!taken.has(id)) return id;
-	}
 }
 
 /**
@@ -1778,17 +2057,20 @@ function mergeAgentModelSettings(
 		changed = true;
 	}
 
-	// Overrides are merged into the catalog's own file (incoming wins per entry); the
-	// catalog keeps owning `agent.modelCatalog`, so nothing goes into the settings patch.
+	// Stage overrides with the merge plan. Extension decryption/validation may still fail,
+	// so the catalog's own file must not be touched during import preparation.
 	if (incoming.modelCatalog && typeof incoming.modelCatalog === "object") {
-		importModelCatalogSettings(incoming.modelCatalog);
+		out.modelCatalog = incoming.modelCatalog;
 		changed = true;
 	}
 
 	return changed;
 }
 
-function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
+function mergeProviders(
+	incoming: Partial<Record<ProviderKey, unknown>>,
+	transferItems: readonly CredentialTransferData[],
+): {
 	merged: Partial<Record<ProviderKey, unknown>>;
 	changed: boolean;
 	added: number;
@@ -1796,13 +2078,9 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	skipped: number;
 	/** Incoming prefix → the prefix it was imported under, for providers that were renamed. */
 	prefixRemaps: Map<string, string>;
-	/**
-	 * Incoming custom API provider id → the local id it was added under. Providers merged
-	 * into a local one (same key and base URL) are absent: they keep their local keys.
-	 */
-	addedCustomApiProviders: Map<string, string>;
-	/** Exporting-instance owner ids of single-key providers that were added (NUG, TokenDance, Command Code). */
-	addedSingleKeyOwners: Set<string>;
+	/** Only newly added groups receive credentials; merged local groups keep their own. */
+	addedGroups: Map<string, { id: string }>;
+	/** Extension rows also follow reused local endpoints; existing local rows always win. */
 	providerSettingsMappings: Array<{ kind: string; from: string; to: string }>;
 } {
 	const current = structuredClone(settings) as NarraForkSettings;
@@ -1812,9 +2090,16 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	let renamed = 0;
 	let skipped = 0;
 	const prefixRemaps = new Map<string, string>();
-	const addedCustomApiProviders = new Map<string, string>();
-	const addedSingleKeyOwners = new Set<string>();
 	const providerSettingsMappings: Array<{ kind: string; from: string; to: string }> = [];
+	const addedGroups = new Map<string, { id: string }>();
+	const allocator = createGroupAllocator();
+	const store = getProviderKeyStore();
+	const firstIncomingKeys = new Map<string, string>();
+	for (const item of transferItems) {
+		if (item.credential?.auth.kind !== "api_key") continue;
+		const key = transferGroupKey(item.templateId, item.group.id);
+		if (!firstIncomingKeys.has(key)) firstIncomingKeys.set(key, item.credential.auth.apiKey);
+	}
 
 	const listKeys = ["customApiProviders", "nugProviders"] as const;
 	for (const key of listKeys) {
@@ -1826,18 +2111,18 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			>),
 		];
 		const existingNames = new Set(currentList.map((item) => String(item.name ?? "")));
-		// `auto` is reserved for auto:<model> values; an older export may still use it.
-		const existingPrefixes = new Set([
-			"auto",
-			...currentList.map((item) => String(item.prefix ?? "")),
-		]);
-		const existingIds = new Set(currentList.map((item) => String(item.id ?? "")));
 		for (const item of incomingList as Array<Record<string, unknown>>) {
 			const copy = { ...item };
 			const incomingId = typeof item.id === "string" ? item.id : "";
+			const templateId: ServiceTemplateId =
+				key === "nugProviders" ? "nug" : identifyService(copy as never).templateId;
+			const sourceKey = transferGroupKey(templateId, String(copy.id ?? ""));
+			const incomingKey = firstIncomingKeys.get(sourceKey);
 			// 同一端点（同 apiKey + 同 baseUrl）已在本地：默认不导入，避免出现一堆
 			// 内容相同、id 也相同的副本——那会让整个供应商列表无法编辑。
-			const sameEndpoint = currentList.find((existing) => sameProvider(existing, copy));
+			const sameEndpoint = currentList.find((existing) =>
+				sameProvider(existing, copy, store.firstGroupKey(String(existing.id ?? "")), incomingKey),
+			);
 			if (sameEndpoint) {
 				// 同一端点留在本地供应商上。两边前缀不同时，模型设置要改挂到本地前缀。
 				rememberPrefixRemap(
@@ -1854,24 +2139,21 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
-			if (!copy.id || existingIds.has(String(copy.id))) {
-				copy.id = uniqueProviderId(existingIds);
-			}
-			existingIds.add(String(copy.id));
+			const incomingPrefix = String(copy.prefix ?? "");
+			const allocated = allocator.allocate({
+				id: String(copy.id ?? ""),
+				prefix: incomingPrefix,
+			});
+			copy.id = allocated.id;
+			copy.prefix = allocated.prefix;
+			addedGroups.set(sourceKey, { id: allocated.id });
+			rememberPrefixRemap(prefixRemaps, incomingPrefix, allocated.prefix);
 			if (incomingId)
 				providerSettingsMappings.push({
 					kind: key === "customApiProviders" ? "custom-api" : "nug",
 					from: incomingId,
-					to: String(copy.id),
+					to: allocated.id,
 				});
-			if (key === "customApiProviders" && incomingId) {
-				addedCustomApiProviders.set(incomingId, String(copy.id));
-			}
-			// NUG credentials were filled before the merge, so settings saves both under the new id.
-			if (key === "nugProviders" && incomingId) {
-				addedSingleKeyOwners.add(nugKeyOwner(incomingId));
-				addedSingleKeyOwners.add(nugOAuthKeyOwner(incomingId));
-			}
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1887,21 +2169,6 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			} else {
 				existingNames.add(name);
 			}
-			// prefix 冲突 → 自动编号（prefix 是内部标识，必须唯一）
-			const prefix = String(copy.prefix ?? "");
-			if (prefix && existingPrefixes.has(prefix)) {
-				let n = 2;
-				let candidate = `${prefix}-${n}`;
-				while (existingPrefixes.has(candidate)) {
-					n += 1;
-					candidate = `${prefix}-${n}`;
-				}
-				copy.prefix = candidate;
-				existingPrefixes.add(candidate);
-				rememberPrefixRemap(prefixRemaps, prefix, candidate);
-			} else if (prefix) {
-				existingPrefixes.add(prefix);
-			}
 			currentList.push(copy);
 			added += 1;
 		}
@@ -1915,12 +2182,6 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	if (Array.isArray(incomingInstances) && incomingInstances.length > 0) {
 		const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
 		const currentList = [...((agent.platformInstances ?? []) as Array<Record<string, unknown>>)];
-		const existingIds = new Set(currentList.map((entry) => String(entry.id ?? "")));
-		// `auto` is reserved for auto:<model> values, like the provider lists above.
-		const existingPrefixes = new Set([
-			"auto",
-			...currentList.map((entry) => String(entry.prefix ?? "")),
-		]);
 		for (const item of incomingInstances as Array<Record<string, unknown>>) {
 			const copy = { ...item };
 			const platform = String(copy.platform ?? "");
@@ -1935,22 +2196,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
-			if (!copy.id || existingIds.has(String(copy.id))) copy.id = uniqueProviderId(existingIds);
-			existingIds.add(String(copy.id));
-			if (prefix && existingPrefixes.has(prefix)) {
-				let n = 2;
-				let candidate = `${prefix}-${n}`;
-				while (existingPrefixes.has(candidate)) {
-					n += 1;
-					candidate = `${prefix}-${n}`;
-				}
-				copy.prefix = candidate;
-				existingPrefixes.add(candidate);
-				rememberPrefixRemap(prefixRemaps, prefix, candidate);
-				renamed += 1;
-			} else if (prefix) {
-				existingPrefixes.add(prefix);
-			}
+			const allocated = allocator.allocate({ id: String(copy.id ?? ""), prefix });
+			copy.id = allocated.id;
+			copy.prefix = allocated.prefix;
+			rememberPrefixRemap(prefixRemaps, prefix, allocated.prefix);
+			if (prefix !== allocated.prefix) renamed += 1;
 			currentList.push(copy);
 			added += 1;
 		}
@@ -1973,14 +2223,22 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		const id = PROVIDER_SETTINGS_SINGLETON_IDS[key === "commandCode" ? "commandcode" : key];
 		// Reused singleton slots can still receive a missing extension; local rows win below.
 		providerSettingsMappings.push({ kind: "platform", from: id, to: id });
-		if ((current as unknown as Record<string, unknown>)[key] !== undefined) {
+		const configured =
+			key === "tokendance"
+				? !!store.firstGroupKey("tokendance")
+				: (current as unknown as Record<string, unknown>)[key] !== undefined;
+		if (configured) {
 			skipped += 1;
 			continue;
 		}
 		added += 1;
 		(merged as Record<string, unknown>)[key] = value;
-		if (key === "tokendance") addedSingleKeyOwners.add(TOKENDANCE_KEY_OWNER);
-		if (key === "commandCode") addedSingleKeyOwners.add(COMMAND_CODE_KEY_OWNER);
+		if (key === "tokendance") {
+			addedGroups.set(transferGroupKey("tokendance", "tokendance"), { id: "tokendance" });
+		}
+		if (key === "commandCode") {
+			addedGroups.set(transferGroupKey("command-code", "CommandCode"), { id: "CommandCode" });
+		}
 		changed = true;
 	}
 
@@ -1991,8 +2249,7 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		renamed,
 		skipped,
 		prefixRemaps,
-		addedCustomApiProviders,
-		addedSingleKeyOwners,
+		addedGroups,
 		providerSettingsMappings,
 	};
 }
@@ -2045,6 +2302,11 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 	const clearRequests = target === "requests" || target === "all";
 	const clearSessions = target === "sessions" || target === "all";
 	const clearProviders = target === "providers" || target === "all";
+	// Loaded on demand: data-portability is also used by lightweight import/export entrypoints,
+	// where eagerly loading CodexManager would cycle through settings and credential migration.
+	const codex = clearProviders
+		? (await import("@server/lib/codex-manager")).getCodexManager()
+		: null;
 
 	if (clearRequests || clearSessions || clearProviders) {
 		const transaction = sqlite.transaction(() => {
@@ -2083,8 +2345,12 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// Teams are their coordinator sessions: the team row restricts the session delete, and
 				// its work items and events cascade with it. Children first, explicitly.
 				sqlite.run(`DELETE FROM team_work_events`);
+				sqlite.run(`DELETE FROM team_work_item_dependencies`);
 				sqlite.run(`DELETE FROM team_work_items`);
 				sqlite.run(`DELETE FROM project_teams`);
+				// Exact peers first, then inheritance nodes; never reconnect children during clear.
+				sqlite.run(`DELETE FROM narrator_communication_peers`);
+				sqlite.run(`DELETE FROM narrator_communication_nodes`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}
@@ -2118,14 +2384,28 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 						agent[key] = {};
 					}
 				}
-				const customIds = (settings.customApiProviders ?? []).map((provider) => provider.id);
+				const groupIds = [
+					...(settings.customApiProviders ?? []).map((provider) => provider.id),
+					...(settings.nugProviders ?? []).map((provider) => provider.id),
+					...(settings.tokendance ? ["tokendance"] : []),
+					...(settings.commandCode ? ["CommandCode"] : []),
+				];
+				const snapshot = codex?.snapshot();
+				const codexIds = [...(snapshot?.entries ?? []), ...(snapshot?.archivedEntries ?? [])].map(
+					(entry) => entry.id,
+				);
 				saveSettings(next);
-				// Every key of the cleared providers, not only the first one settings held.
-				for (const id of customIds) getProviderKeyStore().removeProvider(id);
+				for (const id of groupIds) getProviderKeyStore().removeGroup(id);
+				if (codexIds.length) codex?.removeCredentials(codexIds);
+				const credentials = getCredentialStore();
+				if (credentials.unified) credentials.savePlugins([]);
 				deleted.providers = removed;
 			}
 		});
 		transaction();
+		if (clearProviders) {
+			await (await import("@server/lib/credential-transfer/plugin")).clearPluginCredentialSecrets();
+		}
 		if (clearSessions) {
 			invalidateGitIdentityCache();
 			invalidateTaskBackend();

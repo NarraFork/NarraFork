@@ -1,9 +1,12 @@
 import { isOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
 import type { ProviderQuotaSnapshot, ProviderQuotaWindow } from "@shared/provider-quota";
-import { providerQuotaService } from "../services/provider-quota-service";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { providerQuotaService, toQuotaSnapshot } from "../services/provider-quota-service";
 import { shownSubjectId, usageSubjects } from "./provider-key-subjects";
+import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 
-/** Compatibility DTOs; normalization and fetching now live in quota-source plugins. */
+/** Compatibility DTOs; normalization and fetching live in quota-source plugins. */
 export interface OpencodeUsageWindow {
 	status: "ok" | "rate-limited" | null;
 	percent: number | null;
@@ -25,7 +28,6 @@ export interface OpencodeUsageCache extends OpencodeUsagePayload {
 	error: string | null;
 }
 
-/** Retained for the existing wait policy; the service owns refresh cadence. */
 export const OPENCODE_USAGES_STALE_MS = 60_000;
 
 export function isOpencodeCustomApiProvider(config: {
@@ -33,6 +35,14 @@ export function isOpencodeCustomApiProvider(config: {
 	disabled?: boolean;
 }): boolean {
 	return !config.disabled && !!config.baseUrl && isOpencodeGoBaseUrl(config.baseUrl);
+}
+
+export function opencodeQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
 }
 
 function legacyWindow(window: ProviderQuotaWindow | undefined): OpencodeUsageWindow | null {
@@ -70,6 +80,14 @@ const opencodeSubjects = () => usageSubjects(isOpencodeCustomApiProvider);
 export function syncOpencodeUsageCache(): void {
 	providerQuotaService.sync();
 }
+export function getOpencodeQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	return toQuotaSnapshot(providerQuotaService.peekKey(keyId));
+}
+export const isOpencodeQuotaRefreshing = (keyId: string): boolean =>
+	providerQuotaService.peekKey(keyId)?.status === "probing";
+export const peekOpencodeUsageGeneration = (providerId: string): string | undefined =>
+	providerQuotaService.peekGeneration(providerId);
+
 export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache | null {
 	const id = shownSubjectId(opencodeSubjects(), providerId);
 	const snapshot = id ? providerQuotaService.peekKey(id) : null;

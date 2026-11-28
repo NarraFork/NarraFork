@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ReadQueryOptions } from "@server/db/worker-read";
 import { hotSafe } from "@server/lib/hot-safe";
 import { robotDiagnosticRuleSet } from "@server/lib/robot-diagnostic-policy";
 import { getSettingsRevision } from "@server/lib/settings";
@@ -39,11 +40,7 @@ interface LoadedCacheEntry extends PolicyCacheEntry<LoadedExecutionPolicy> {
 }
 type CompiledCacheEntry = PolicyCacheEntry<ResolvedExecutionPolicy>;
 
-class ProjectPolicyChangedError extends Error {
-	constructor() {
-		super("Project execution policy changed while loading; retry the operation");
-	}
-}
+class PolicyChangedWhileLoadingError extends Error {}
 
 /** One waiter may leave without cancelling another caller's shared work. */
 function waitForPolicy<T>(entry: PolicyCacheEntry<T>, signal?: AbortSignal): Promise<T> {
@@ -198,7 +195,7 @@ export class ExecutionPolicyEngine {
 
 	private load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy> {
 		return this.loadCached(narratorId, signal).catch((error) => {
-			if (!(error instanceof ProjectPolicyChangedError)) throw error;
+			if (!(error instanceof PolicyChangedWhileLoadingError)) throw error;
 			signal?.throwIfAborted();
 			// Retry once after a confirmed invalidation. All waiters share the new Worker read.
 			return this.loadCached(narratorId, signal);
@@ -229,10 +226,14 @@ export class ExecutionPolicyEngine {
 					this.loadedCache.get(narratorId) !== entry ||
 					settingsRevision !== getSettingsRevision()
 				) {
-					throw new Error("Execution policy changed while loading; retry the operation");
+					throw new PolicyChangedWhileLoadingError(
+						"Execution policy changed while loading; retry the operation",
+					);
 				}
 				if (projectIds.some((id) => entry.changedProjects?.has(id))) {
-					throw new ProjectPolicyChangedError();
+					throw new PolicyChangedWhileLoadingError(
+						"Project execution policy changed while loading; retry the operation",
+					);
 				}
 				entry.ownerNarratorId = policy.ownerNarratorId;
 				entry.inheritedNarratorIds = policy.inheritedNarratorIds;
@@ -258,9 +259,15 @@ export class ExecutionPolicyEngine {
 		context: ExecutionTargetContext | null,
 		presets: readonly ExecutionPolicyPreset[] = [],
 		signal?: AbortSignal,
+		readOptions?: ReadQueryOptions,
 	): Promise<ResolvedExecutionPolicy> {
+		signal ??= readOptions?.signal;
 		signal?.throwIfAborted();
-		const loaded = await this.load(narratorId, signal);
+		// Request-budgeted facts never join or replace a cross-request in-flight load.
+		// Ordinary callers still share the cancellable cache entry.
+		const loaded = await (readOptions
+			? executionPolicyRepository.load(narratorId, { ...readOptions, signal })
+			: this.load(narratorId, signal));
 		signal?.throwIfAborted();
 		const revision = compiledRevision(loaded, presets);
 		const contextKey = context ? executionTargetContextKey(context) : "unrouted";

@@ -248,6 +248,19 @@ export class CustomApiQuotaTargetDirectory {
 			this.identity(withProviderKey(config, key), key.id) === connection.identity
 		);
 	}
+	/** Validate a provider view without changing selection, cache state or generations. */
+	isProviderIdentityCurrent(connection: CustomApiQuotaConnection): boolean {
+		const config = this.provider(connection.target.providerId);
+		if (!config) return false;
+		if (!connection.target.siteQuota)
+			return this.isKeyIdentityCurrent(connection.target.keyId ?? config.id, connection);
+		if (!hasSiteQuotaConfig(config)) return false;
+		const keys = this.storedKeys(config).filter((key) => !key.disabled);
+		return [config, ...keys.map((key) => withProviderKey(config, key))].some(
+			(candidate) => this.identity(candidate) === connection.identity,
+		);
+	}
+
 	/** Already reconciled by list(); no second selection while publishing a page. */
 	primaryEntries(): readonly { providerId: string; cacheId: string }[] {
 		return [...this.aliases].map(([providerId, cacheId]) => ({ providerId, cacheId }));

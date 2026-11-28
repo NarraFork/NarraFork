@@ -9,12 +9,19 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, userGitIdentities, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
+await ready;
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
 	getNarratorPresenceBatch: () => new Map(),
@@ -81,9 +88,9 @@ beforeEach(async () => {
 	narratorId = await makeNarrator();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	invalidateGitIdentityCache();
-	sqlite.close();
+	await close();
 });
 
 describe("legacy profile compatibility", () => {

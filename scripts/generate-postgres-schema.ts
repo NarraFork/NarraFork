@@ -280,6 +280,12 @@ export function generatePostgresSchema(
 				sql += `"${column.name}"${span.literal.text}`;
 			}
 		}
+		// Communication canonical pairs use JS/SQLite binary ASCII order, not the host PG locale.
+		if (table.name === "narrator_communication_peers")
+			sql = sql.replace(
+				/"endpoint_lo"\s*<\s*"endpoint_hi"/g,
+				'("endpoint_lo" COLLATE "C") < ("endpoint_hi" COLLATE "C")',
+			);
 		// The historical ISO-like text default remains text, not a PG timestamp column.
 		sql = sql.replace(/\(datetime\('now'\)\)/g, "CURRENT_TIMESTAMP::text");
 		// Byte budgets, not character counts: SQLite BLOB length maps to PG octet_length(text).
@@ -838,6 +844,12 @@ export function generatePostgresSchema(
 						`primaryKey({${p.name ? `name: ${q(p.name)}, ` : ""}columns: [${p.columns.map((c) => `table.${c}`).join(", ")}]})`,
 				),
 			];
+			const configUsesTable =
+				table.indexes.some((index) => index.columns.length > 0) ||
+				table.columns.some((column) => column.references && column.emitAsTableConstraint) ||
+				table.foreignKeys.length > 0 ||
+				table.uniqueConstraints.length > 0 ||
+				table.primaryKeys.length > 0;
 			return [
 				`export const ${table.exportName} = pgTable(${q(table.name)}, {`,
 				...table.columns.map((c) => {
@@ -849,7 +861,9 @@ export function generatePostgresSchema(
 								: c.pgType;
 					return `${c.property}: ${builder}(${q(c.name)}${c.pgType === "bigint" ? ', { mode: "number" }' : ""})${c.primary ? ".primaryKey()" : ""}${c.notNull ? ".notNull()" : ""}${c.unique ? `.unique(${c.uniqueName ? q(c.uniqueName) : ""})` : ""}${c.defaultExpression !== undefined ? `.default(${c.defaultExpression})` : ""}${c.references && !c.emitAsTableConstraint ? `.references((): PgColumn => ${c.references.table}.${c.references.column}, {${c.references.onDelete ? `onDelete: ${q(c.references.onDelete)},` : ""}${c.references.onUpdate ? `onUpdate: ${q(c.references.onUpdate)},` : ""}})` : ""}${c.generated ? `.generatedAlwaysAs(sql.raw(${q(c.generated.expression)}))` : ""}${c.identity ? (c.identity.type === "byDefault" ? ".generatedByDefaultAsIdentity()" : ".generatedAlwaysAsIdentity()") : ""},`;
 				}),
-				config.length ? `}, (table) => [${config.join(",\n")}]);` : "});",
+				config.length
+					? `}, (${configUsesTable ? "table" : ""}) => [${config.join(",\n")}]);`
+					: "});",
 				"",
 			];
 		}),

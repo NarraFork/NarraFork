@@ -25,8 +25,10 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
-test("local and release builds share all 23 unique, existing worker entries", () => {
-	expect(COMPILED_WORKER_ENTRIES).toHaveLength(23);
+test("local and release builds share the same unique, explicitly covered worker entries", () => {
+	// Every entry has an explicit owner, including concurrent additions.
+	const registeredEntries: string[] = [...COMPILED_WORKER_ENTRIES];
+	expect(registeredEntries.sort()).toEqual(Object.keys(entryOwners).sort());
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
 	expect(compiledWorkerBuildEntrypoints()).toEqual(
 		COMPILED_WORKER_ENTRIES.map((entry) => `./server/${entry}`),
@@ -154,6 +156,7 @@ test("eval/Blob text, namespace aliases and Reflect cannot grant a file-wide con
 // Static coverage evidence, never a runtime registry or business protocol dispatch table.
 const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly string[]> = {
 	"lib/db-worker/worker-entry.ts": ["lib/db-worker/pool.ts"],
+	"lib/db-worker/recall-pg-projection-worker.ts": ["lib/db-worker/recall-pg-projection-client.ts"],
 	"lib/fs-scan-worker/fs-scan-worker-entry.ts": ["lib/fs-scan-worker/client.ts"],
 	"lib/browser/memory-snapshot-worker.ts": [
 		"lib/browser/memory-snapshot.ts",
@@ -164,12 +167,15 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 		"lib/browser/memory-job.ts",
 	],
 	"lib/share-preview-worker.ts": ["lib/share-preview-html.ts"],
+	"lib/attachment-digest-worker.ts": ["lib/attachment-digest.ts"],
 	"lib/request-recorder-worker.ts": ["lib/request-recorder.ts"],
 	"lib/startup-status/worker.ts": ["lib/startup-status/index.ts"],
 	"lib/agent/request-json-worker.ts": ["lib/agent/request-json.ts"],
+	"lib/agent/structural/worker-entry.ts": ["lib/agent/structural/worker-client.ts"],
 	"lib/agent/image-generation-response-worker.ts": ["lib/agent/image-generation-response.ts"],
 	"lib/document-preview/worker.ts": ["lib/document-preview/client.ts"],
 	"lib/modeltrace/worker.ts": ["lib/modeltrace/worker-client.ts"],
+	"lib/model-options-worker.ts": ["lib/model-options.ts"],
 	"services/editor-document-worker.ts": ["services/editor-document-jobs.ts"],
 	"services/editor-document-stream-worker.ts": ["services/editor-document-streams.ts"],
 	"services/outline/edit-text-worker.ts": ["services/outline/edit-text-runner.ts"],
@@ -184,8 +190,16 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"services/revert-transaction-manifest-worker.ts": ["services/revert-transaction-worker.ts"],
 	"services/token-recalculation-worker.ts": ["services/token-recalculation-worker-client.ts"],
 	"services/plugin-package-stage-worker.ts": ["services/plugin-runtime.ts"],
+	"services/provider-settings-migration-worker.ts": [
+		"services/provider-settings-migration-client.ts",
+	],
 };
 const evalOwners = [
+	{
+		kind: "legacy-quota-cache",
+		owners: ["services/provider-quota-legacy-cache.ts"],
+		marker: "WorkerHandle.thread",
+	},
 	{
 		kind: "Body",
 		owners: ["services/revert-selection-service.ts"],
@@ -239,11 +253,16 @@ function ownerText(paths: readonly string[]): string {
 }
 const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
-test("all 34 families have explicit common-runtime coverage: 23 entries, 6 trusted evals, 5 processes", () => {
-	expect(Object.keys(entryOwners)).toHaveLength(23);
-	expect(evalOwners).toHaveLength(6);
+test("all registered entry, trusted-eval and process families have explicit common-runtime coverage", () => {
+	expect(Object.keys(entryOwners).sort()).toEqual([...COMPILED_WORKER_ENTRIES].sort());
+	expect(evalOwners).toHaveLength(7);
 	expect(processOwners).toHaveLength(5);
-	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(34);
+	const families = [
+		...COMPILED_WORKER_ENTRIES.map((entry) => `entry:${entry}`),
+		...evalOwners.map(({ kind }) => `eval:${kind}`),
+		...processOwners.map(({ kind }) => `process:${kind}`),
+	];
+	expect(new Set(families).size).toBe(families.length);
 	for (const entry of COMPILED_WORKER_ENTRIES) {
 		const text = ownerText(entryOwners[entry]);
 		expect(text.includes(entry), entry).toBe(true);
@@ -257,7 +276,12 @@ test("all 34 families have explicit common-runtime coverage: 23 entries, 6 trust
 		expect(text.includes(marker), `${kind}: ${marker}`).toBe(true);
 		expect(admission.test(text), `${kind}: admission`).toBe(true);
 		expect(text.includes("inlineFallback"), kind).toBe(false);
-		if (kind === "Body" || kind === "Rewrite" || kind === "historical-input")
+		if (
+			kind === "Body" ||
+			kind === "Rewrite" ||
+			kind === "historical-input" ||
+			kind === "legacy-quota-cache"
+		)
 			expect(/\beval:\s*true/.test(text), `${kind}: trusted eval`).toBe(true);
 		else expect(text.includes("URL.createObjectURL"), `${kind}: trusted Blob`).toBe(true);
 	}

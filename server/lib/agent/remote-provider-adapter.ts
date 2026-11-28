@@ -20,6 +20,7 @@ import { ProviderRpcError } from "@server/services/plugin-provider-rpc";
 import type { NativeMediaInput } from "@shared/media-attachments";
 import { parseModelId } from "@shared/model-id";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
+import { normalizeLegacyUltra } from "@shared/reasoning-effort";
 import { redactNativeMediaForDump, visitNativeMedia } from "./native-media";
 import { type NeutralTurn, projectHistory, type ResolvedImage } from "./projection";
 import type {
@@ -737,7 +738,9 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				...(params.reasoningEffort || params.serviceTier || params.metadata
 					? {
 							options: {
-								...(params.reasoningEffort ? { reasoningEffort: params.reasoningEffort } : {}),
+								...(params.reasoningEffort
+									? { reasoningEffort: normalizeLegacyUltra(params.reasoningEffort) }
+									: {}),
 								...(params.serviceTier ? { serviceTier: params.serviceTier } : {}),
 								...(params.metadata ? { metadata: safeJsonObject(params.metadata) } : {}),
 							},
@@ -784,7 +787,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				...(await this.baseParams(input.model)),
 				request: cloneJson(input.request),
 				...(input.options?.reasoningEffort
-					? { options: { reasoningEffort: input.options.reasoningEffort } }
+					? { options: { reasoningEffort: normalizeLegacyUltra(input.options.reasoningEffort) } }
 					: {}),
 			},
 			{ signal: input.options?.signal },

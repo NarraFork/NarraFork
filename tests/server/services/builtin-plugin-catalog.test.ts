@@ -4,6 +4,7 @@ import {
 	builtinPluginCatalog,
 	PROVIDER_QUOTA_BUILTIN_ID,
 } from "@server/services/builtin-plugin-catalog";
+import quotaManifest from "../../../plugins/provider-quota/manifest.json";
 
 const ID = PROVIDER_QUOTA_BUILTIN_ID;
 
@@ -87,7 +88,7 @@ test("builtin loads retain descriptor cancellation and byte/hash semantics", asy
 
 test("the default host registry exposes only the current pinned quota descriptor", () => {
 	expect(builtinPluginCatalog.list()).toHaveLength(1);
-	expect(builtinPluginCatalog.get(ID)?.version).toBe("1.0.3");
+	expect(builtinPluginCatalog.get(ID)?.version).toBe(quotaManifest.version);
 	expect(builtinPluginCatalog.get("com.narrafork.apikey-quota")).toBeUndefined();
 });
 

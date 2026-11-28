@@ -48,15 +48,14 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { usePluginContributions } from "../../hooks/usePluginContributions";
 import { usePluginOverlayVisibility } from "../../hooks/usePluginOverlayVisibility";
 import { buildPluginDockPanelParams } from "./PluginContributionPicker";
-import { pluginContributionStore } from "./PluginContributionStore";
 import { type PluginDockPanelHostApi, PluginDockPanelView } from "./PluginDockPanel";
 import classes from "./PluginOverlayHost.module.css";
 import { PluginUiSurfaceProvider } from "./PluginUiSurfaceContext";
 import { type PluginOverlayBounds, pluginOverlayBoundsStore } from "./plugin-overlay-bounds";
 import { useOptionalPluginUiRuntime } from "./plugin-ui-runtime-context";
-import { syncPluginUiContributions } from "./registry";
 import type { PluginContributionRecord } from "./types";
 
 /**
@@ -96,24 +95,13 @@ function selectOverlayContributions(
 export function PluginOverlayHost() {
 	const { t } = useTranslation("plugins");
 	const runtime = useOptionalPluginUiRuntime();
-	const contributionSnapshot = useSyncExternalStore(
-		pluginContributionStore.subscribe,
-		pluginContributionStore.getSnapshot,
-		pluginContributionStore.getSnapshot,
-	);
+	// Standalone hosts can bootstrap, while App + overlay share one Query read.
+	const contributionSnapshot = usePluginContributions();
 	const boundsSnapshot = useSyncExternalStore(
 		pluginOverlayBoundsStore.subscribe,
 		pluginOverlayBoundsStore.getSnapshot,
 		pluginOverlayBoundsStore.getSnapshot,
 	);
-
-	// A cold open can land before the app-level sync has run (same reason the
-	// settings-surface panel does this).
-	useEffect(() => {
-		if (contributionSnapshot.status === "idle") {
-			void syncPluginUiContributions().catch(() => {});
-		}
-	}, [contributionSnapshot.status]);
 
 	const declared = useMemo(
 		() => selectOverlayContributions(contributionSnapshot.contributions),

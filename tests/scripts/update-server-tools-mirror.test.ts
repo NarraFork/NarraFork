@@ -185,18 +185,26 @@ function fixture(kind: "helpers" | "executor" | "remote-peer", versionOverride?:
 		},
 	};
 }
-function pause(signal: AbortSignal | undefined, ms: number) {
+/** Wait for fixture progress, or hold an upload until its real cancellation signal. */
+function waitForGate(signal: AbortSignal | undefined, gate?: Promise<unknown>) {
+	if (!signal) throw new Error("Fixture upload requires a cancellation signal");
 	return new Promise<void>((resolve, reject) => {
 		const abort = () => {
-			clearTimeout(timer);
-			reject(signal?.reason);
+			signal.removeEventListener("abort", abort);
+			reject(signal.reason ?? new Error("cancelled"));
 		};
-		const timer = setTimeout(() => {
-			signal?.removeEventListener("abort", abort);
-			resolve();
-		}, ms);
-		signal?.addEventListener("abort", abort, { once: true });
-		if (signal?.aborted) abort();
+		signal.addEventListener("abort", abort, { once: true });
+		gate?.then(
+			() => {
+				signal.removeEventListener("abort", abort);
+				resolve();
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+		if (signal.aborted) abort();
 	});
 }
 function concurrencyProbe(f: ReturnType<typeof fixture>, limit: number) {
@@ -413,6 +421,10 @@ describe("canonical auxiliary binary mirror", () => {
 				const accepted = new Promise<void>((resolve) => {
 					success = resolve;
 				});
+				let releaseSibling: () => void = () => {};
+				const siblingInside = new Promise<void>((resolve) => {
+					releaseSibling = resolve;
+				});
 				let active = 0;
 				let canceled = 0;
 				let commits = 0;
@@ -435,11 +447,15 @@ describe("canonical auxiliary binary mirror", () => {
 							return result;
 						}
 						if (hash === failureHash) {
+							// Inject the failure only once a peer is inside transfer.
 							await accepted;
-							await pause(signal, 20);
+							await waitForGate(signal, siblingInside);
 							throw new Error("physical binary upload failed");
 						}
-						await pause(signal, 1000);
+						const pending = waitForGate(signal);
+						// The abort listener is installed before this peer is visible.
+						releaseSibling();
+						await pending;
 						return await action();
 					} catch (error) {
 						if (signal?.aborted) canceled++;
@@ -607,6 +623,7 @@ describe("canonical auxiliary binary mirror", () => {
 									webdav,
 									signingKey,
 									pollIntervalMs: 60_000,
+									downloadConcurrency: 3,
 									products: [{ product: "narrafork", repository }],
 								},
 								{ fetchImpl: dav.fetchImpl },

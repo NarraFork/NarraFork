@@ -3,21 +3,22 @@ import { MAX_COMPOSER_DOCUMENT_BYTES } from "@shared/composer-document";
 import { isMediaContentBlock } from "@shared/media-attachments";
 import { getFileReferenceSnapshots } from "../agent/file-reference-projection";
 import { boundedBodyText, hasBlockStorage, hasRowsOnlyBodies } from "../narrator-bodies";
+import { COMPOSER_DOCUMENT_RESULT_BYTES } from "./domain-protocol";
 
 export interface ComposerDocumentParams {
-	kind: "composerDocument";
 	narratorId: string;
 	messageId: string;
 	blockReads: boolean;
 }
 
-export type ComposerDocumentSnapshot =
+export type ComposerDocumentMetadata =
 	| { kind: "missing" }
 	| { kind: "rejected" }
-	| { kind: "found"; refId: string; bodyRevision: number; stateRevision: number; json: string };
+	| { kind: "found"; refId: string; bodyRevision: number; stateRevision: number };
+
+type ComposerDocumentSnapshot = ComposerDocumentMetadata & { json?: string };
 
 const BODY_BYTES = 4 * 1024 * 1024;
-const RESULT_BYTES = 24 * 1024 * 1024;
 
 export function readComposerDocument(
 	sqlite: Database,
@@ -78,7 +79,7 @@ export function readComposerDocument(
 			JSON.parse(snapshot.body),
 		),
 	);
-	if (Buffer.byteLength(json) > RESULT_BYTES) return { kind: "rejected" };
+	if (Buffer.byteLength(json) > COMPOSER_DOCUMENT_RESULT_BYTES) return { kind: "rejected" };
 	return {
 		kind: "found",
 		json,

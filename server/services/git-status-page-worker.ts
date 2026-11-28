@@ -11,7 +11,7 @@ import {
 	type GitStatusPageRequest,
 	type GitStatusPageWorkerInput,
 	type GitStatusPageWorkerOutput,
-	gitStatusPageScopesOverlap,
+	gitStatusPageSourceIdentity,
 } from "./git-status-page-protocol";
 
 interface Job {
@@ -36,8 +36,6 @@ if (port) {
 		}
 	>();
 	let nextStatisticsRead = 0;
-	// A late cancellation may arrive after a result was posted but before parent accepted it.
-	const completed = new Map<number, string>();
 	let closing = false;
 	const post = (message: GitStatusPageWorkerOutput) => port.postMessage(message);
 	const fail = (id: number, error: unknown) => {
@@ -91,26 +89,28 @@ if (port) {
 					post({ action: "stats", id: job.id, readId });
 				});
 			const value =
-				job.request.operation === "stats"
-					? await engine.readStats(job.request, job.controller.signal, readStats)
-					: job.request.operation === "validate"
-						? await engine.validateSnapshots(job.request, job.controller.signal, readRemote)
-						: job.request.operation === "assert"
-							? await engine.assertScope(job.request, job.controller.signal, readRemote)
-							: await engine.read(job.request, job.controller.signal, readRemote);
+				job.request.operation === "read-on-demand"
+					? await engine.readOnDemand(job.request, job.controller.signal, readRemote)
+					: job.request.operation === "stats-on-demand"
+						? await engine.readStatsOnDemand(job.request, job.controller.signal, readStats)
+						: job.request.operation === "observe"
+							? await engine.observe(
+									job.request,
+									job.controller.signal,
+									readRemote,
+									readStats,
+									(cache) => post({ action: "cache-published", id: job.id, cache }),
+								)
+							: job.request.operation === "cache-state"
+								? engine.cacheState(job.request)
+								: job.request.operation === "stats"
+									? await engine.readStats(job.request, job.controller.signal, readStats)
+									: job.request.operation === "validate"
+										? await engine.validateSnapshots(job.request, job.controller.signal, readRemote)
+										: job.request.operation === "assert"
+											? await engine.assertScope(job.request, job.controller.signal, readRemote)
+											: await engine.read(job.request, job.controller.signal, readRemote);
 			job.controller.signal.throwIfAborted();
-			if (
-				typeof value === "object" &&
-				"snapshotId" in value &&
-				!job.request.operation &&
-				!job.request.query.cursor
-			) {
-				completed.set(job.id, value.snapshotId);
-				if (completed.size > GIT_STATUS_PAGE_CONCURRENCY + GIT_STATUS_PAGE_QUEUE) {
-					const oldest = completed.keys().next().value;
-					if (oldest !== undefined) completed.delete(oldest);
-				}
-			}
 			post({ action: "result", id: job.id, value });
 		} catch (error) {
 			fail(job.id, job.controller.signal.aborted ? job.controller.signal.reason : error);
@@ -124,7 +124,19 @@ if (port) {
 	};
 	const pump = () => {
 		while (!closing && running.size < GIT_STATUS_PAGE_CONCURRENCY && queue.length) {
-			const job = queue.shift();
+			const index = queue.findIndex(
+				(candidate) =>
+					candidate.request.operation !== "read-on-demand" ||
+					![...running.values()].some(
+						(active) =>
+							active.request.operation === "read-on-demand" &&
+							active.request.scope.queryKey === candidate.request.scope.queryKey &&
+							gitStatusPageSourceIdentity(active.request.source) ===
+								gitStatusPageSourceIdentity(candidate.request.source),
+					),
+			);
+			if (index < 0) break;
+			const [job] = queue.splice(index, 1);
 			if (!job) break;
 			running.set(job.id, job);
 			void execute(job);
@@ -156,7 +168,6 @@ if (port) {
 		}
 		if (message.action === "close") {
 			closing = true;
-			completed.clear();
 			engine.close();
 			for (const job of queue.splice(0))
 				fail(job.id, new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
@@ -164,34 +175,33 @@ if (port) {
 			maybeClose();
 			return;
 		}
-		if (message.action === "invalidate" || message.action === "invalidate-stats") {
-			const statisticsOnly = message.action === "invalidate-stats";
-			if (statisticsOnly) engine.invalidateStats(message.queryKey);
-			else engine.invalidate(message.queryKey);
+		if (message.action === "invalidate-stats") {
+			engine.invalidateStats(message.queryKey);
+			return;
+		}
+		if (message.action === "invalidate") {
+			engine.invalidate(message.queryKey);
+			return;
+		}
+		if (message.action === "retain") {
+			engine.retain(message.queryKey, message.sourceIdentity);
+			return;
+		}
+		if (message.action === "release") {
+			engine.release(message.queryKey, message.sourceIdentity);
+			const owns = (job: Job) =>
+				job.request.scope.queryKey === message.queryKey &&
+				(message.sourceIdentity === undefined ||
+					gitStatusPageSourceIdentity(job.request.source) === message.sourceIdentity);
+			for (const job of running.values()) if (owns(job)) cancel(job, "GIT_STATUS_PAGE_CANCELLED");
 			for (let index = queue.length - 1; index >= 0; index--) {
-				const job = queue[index];
-				if (
-					(statisticsOnly && job.request.operation !== "stats") ||
-					!gitStatusPageScopesOverlap(job.request.scope.queryKey, message.queryKey)
-				)
-					continue;
-				queue.splice(index, 1);
-				fail(job.id, new GitStatusPageError("GIT_STATUS_PAGE_EXPIRED"));
+				if (!owns(queue[index])) continue;
+				const [job] = queue.splice(index, 1);
+				fail(job.id, new GitStatusPageError("GIT_STATUS_PAGE_CANCELLED"));
 			}
-			for (const job of running.values())
-				if (
-					(!statisticsOnly || job.request.operation === "stats") &&
-					gitStatusPageScopesOverlap(job.request.scope.queryKey, message.queryKey)
-				)
-					cancel(job, "GIT_STATUS_PAGE_EXPIRED");
 			return;
 		}
 		if (message.action === "cancel") {
-			const snapshotId = completed.get(message.id);
-			if (snapshotId) {
-				engine.releaseSnapshot(snapshotId);
-				completed.delete(message.id);
-			}
 			const index = queue.findIndex((job) => job.id === message.id);
 			if (index >= 0) {
 				queue.splice(index, 1);
@@ -204,6 +214,16 @@ if (port) {
 		if (message.action === "read") {
 			if (closing) {
 				fail(message.id, new GitStatusPageError("GIT_STATUS_PAGE_CLOSED"));
+				return;
+			}
+			if (
+				!["observe", "validate", "assert", "read-on-demand", "stats-on-demand"].includes(
+					message.request.operation ?? "",
+				)
+			) {
+				const job = { id: message.id, request: message.request, controller: new AbortController() };
+				running.set(job.id, job);
+				void execute(job);
 				return;
 			}
 			if (queue.length >= GIT_STATUS_PAGE_QUEUE && running.size >= GIT_STATUS_PAGE_CONCURRENCY) {

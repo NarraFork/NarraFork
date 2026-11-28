@@ -42,10 +42,18 @@ describe("PostgreSQL narrator WebSocket admission", () => {
 			"await startupReadiness.barrier",
 			"const rollout = getExternalWebSocketRolloutSettings()",
 			'const token = url.searchParams.get("token")',
-			"const userQuery = db",
+			"const user = await readQuery(",
 			"const upgraded = server.upgrade(req",
 		]) {
 			expect(source.indexOf(laterEffect, gate)).toBeGreaterThan(gate);
 		}
+		const userLookup = source.slice(
+			source.indexOf("const user = await readQuery(", gate),
+			source.indexOf("// `verifyToken` already rejected", gate),
+		);
+		expect(userLookup).toContain("db.query.users.findFirst({");
+		expect(userLookup).toContain(
+			'executionPolicy: "worker-required", maxRows: 1, signal: req.signal',
+		);
 	});
 });

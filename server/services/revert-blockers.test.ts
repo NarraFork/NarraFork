@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { assertDbReadersReady, closeReadDatabase } from "@server/lib/db-worker/pool";
 import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import {
 	fileChangeOperations,
 	fileChangeScopes,
@@ -19,6 +20,9 @@ const ids = {
 	other: generateId(),
 	message: generateId(),
 };
+
+beforeAll(() => assertDbReadersReady(sqlite.filename));
+afterAll(() => closeReadDatabase(sqlite.filename, { timeoutMs: 5_000 }));
 
 beforeEach(() => {
 	const timestamp = now();
@@ -70,7 +74,7 @@ describe("collectRevertBlockers", () => {
 	test("preview does not diagnose its own admission as unfinished work", async () => {
 		await withNarratorWorkAdmission(ids.narrator, async () => {
 			expect(hasNarratorAdmissionWork(ids.narrator)).toBe(true);
-			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
 		});
 		expect(hasNarratorAdmissionWork(ids.narrator)).toBe(false);
 	});
@@ -91,7 +95,7 @@ describe("collectRevertBlockers", () => {
 		await started;
 		try {
 			await withNarratorWorkAdmission(ids.narrator, async () => {
-				expect(collectRevertBlockers(ids.narrator)).toEqual([{ kind: "narrator_busy" }]);
+				expect(await collectRevertBlockers(ids.narrator)).toEqual([{ kind: "narrator_busy" }]);
 			});
 		} finally {
 			release();
@@ -99,8 +103,18 @@ describe("collectRevertBlockers", () => {
 		}
 	});
 
-	test("planner busy short-circuits to one high-signal blocker", () => {
-		const blockers = collectRevertBlockers(ids.narrator, "REVERT_PLANNER_BUSY");
+	test("cancellation stops diagnostic reads including the planner-busy shortcut", async () => {
+		const signal = AbortSignal.abort(new Error("diagnostic cancelled"));
+		await expect(collectRevertBlockers(ids.narrator, undefined, { signal })).rejects.toThrow(
+			"diagnostic cancelled",
+		);
+		await expect(
+			collectRevertBlockers(ids.narrator, "REVERT_PLANNER_BUSY", { signal }),
+		).rejects.toThrow("diagnostic cancelled");
+	});
+
+	test("planner busy short-circuits to one high-signal blocker", async () => {
+		const blockers = await collectRevertBlockers(ids.narrator, "REVERT_PLANNER_BUSY");
 		expect(blockers).toEqual([
 			{
 				kind: "planner_busy",
@@ -109,7 +123,7 @@ describe("collectRevertBlockers", () => {
 		]);
 	});
 
-	test("names this narrator's running tool without treating a foreign writer as a barrier", () => {
+	test("names this narrator's running tool without treating a foreign writer as a barrier", async () => {
 		const timestamp = now();
 		const mine = generateId();
 		const foreign = generateId();
@@ -138,7 +152,7 @@ describe("collectRevertBlockers", () => {
 				createdAt: timestamp,
 			})
 			.run();
-		const blockers = collectRevertBlockers(ids.narrator);
+		const blockers = await collectRevertBlockers(ids.narrator);
 		expect(blockers).toEqual([
 			{
 				kind: "running_tool",
@@ -153,7 +167,7 @@ describe("collectRevertBlockers", () => {
 	});
 
 	for (const status of ["initializing", "pending", "running"] as const)
-		test(`historical ${status} copies are not live tools, but an explicit new attempt is`, () => {
+		test(`historical ${status} copies are not live tools, but an explicit new attempt is`, async () => {
 			const timestamp = now();
 			const originId = generateId();
 			const copyId = generateId();
@@ -181,8 +195,8 @@ describe("collectRevertBlockers", () => {
 					},
 				])
 				.run();
-			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
-			expect(collectRevertBlockers(ids.other)).toEqual([
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
+			expect(await collectRevertBlockers(ids.other)).toEqual([
 				{
 					kind: "running_tool",
 					toolCallId: originId,
@@ -204,7 +218,7 @@ describe("collectRevertBlockers", () => {
 					createdAt: timestamp,
 				})
 				.run();
-			expect(collectRevertBlockers(ids.narrator)).toEqual([
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([
 				{
 					kind: "running_tool",
 					toolCallId: retryId,
@@ -290,11 +304,11 @@ describe("collectRevertBlockers", () => {
 			scopes: db.select().from(fileChangeScopes).all(),
 			operations: db.select().from(fileChangeOperations).all(),
 		});
-		expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
 		let continued = false;
 		await withNarratorWorkAdmission(ids.narrator, async () => {
 			continued = true;
-			expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+			expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
 		});
 		expect(continued).toBe(true);
 		expect(
@@ -306,7 +320,7 @@ describe("collectRevertBlockers", () => {
 		).toBe(archived);
 	});
 
-	test("settled history is not reported as a blocker", () => {
+	test("settled history is not reported as a blocker", async () => {
 		const timestamp = now();
 		db.insert(narratorToolCalls)
 			.values({
@@ -354,10 +368,10 @@ describe("collectRevertBlockers", () => {
 				updatedAt: timestamp,
 			})
 			.run();
-		expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
 	});
 
-	test("tool detail never leaks command, file_path, or huge input bodies", () => {
+	test("tool detail never leaks command, file_path, or huge input bodies", async () => {
 		const timestamp = now();
 		const pathOnly = generateId();
 		const commandOnly = generateId();
@@ -401,7 +415,7 @@ describe("collectRevertBlockers", () => {
 				createdAt: timestamp,
 			})
 			.run();
-		const blockers = collectRevertBlockers(ids.narrator);
+		const blockers = await collectRevertBlockers(ids.narrator);
 		const pathBlocker = blockers.find((item) => item.toolCallId === pathOnly);
 		const commandBlocker = blockers.find((item) => item.toolCallId === commandOnly);
 		const descriptionBlocker = blockers.find((item) => item.toolCallId === longDescription);
@@ -415,7 +429,7 @@ describe("collectRevertBlockers", () => {
 		expect(wire).not.toContain("y".repeat(50));
 	});
 
-	test("unrelated workspace lease and scope never appear in blockers", () => {
+	test("unrelated workspace lease and scope never appear in blockers", async () => {
 		const timestamp = now();
 		const foreignRoot = "/tmp/other-workspace-secret";
 		const foreignScopeId = generateId();
@@ -490,7 +504,7 @@ describe("collectRevertBlockers", () => {
 				updatedAt: timestamp,
 			})
 			.run();
-		const blockers = collectRevertBlockers(ids.narrator);
+		const blockers = await collectRevertBlockers(ids.narrator);
 		const wire = JSON.stringify(blockers);
 		expect(wire).not.toContain("other-workspace-secret");
 		expect(wire).not.toContain(foreignLeaseId);
@@ -501,7 +515,7 @@ describe("collectRevertBlockers", () => {
 		expect(wire).not.toContain("/tmp/revert-blockers-workspace");
 	});
 
-	test("scope rows can be inspected after insert", () => {
+	test("scope rows can be inspected after insert", async () => {
 		const timestamp = now();
 		const id = generateId();
 		db.insert(fileChangeScopes)
@@ -520,6 +534,6 @@ describe("collectRevertBlockers", () => {
 			.run();
 		const row = db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, id)).get();
 		expect(row?.status).toBe("needs_verification");
-		expect(collectRevertBlockers(ids.narrator)).toEqual([]);
+		expect(await collectRevertBlockers(ids.narrator)).toEqual([]);
 	});
 });

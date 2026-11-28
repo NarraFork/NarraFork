@@ -1,6 +1,7 @@
 {
 	"title": "Settings",
-
+	"dataImportCommunication": "Communication: restored {{restored}} links, skipped {{skipped}}, preserved {{preserved}} existing nodes.",
+	"dataImportCommunicationDetached": "{{count}} communication parent links were safely detached because endpoints or permissions were missing.",
 	"remoteAccessSection": "WebRTC remote access",
 	"remoteAccess": {
 		"description": "Connect a paired browser directly to this instance using the matching hosted remote frontend. Pairing does not replace administrator login. No business traffic is relayed through the signaling server.",
@@ -115,6 +116,11 @@
 		"enabled": "Enabled",
 		"refresh": "Refresh models",
 		"reauthorize": "Reauthorize",
+		"loginChoice": "Which existing key should authorization replace?",
+		"loginChoiceDescription": "These keys have no recorded login identity. Choose the old login key to replace only after authorization succeeds, or keep every existing key and its priority.",
+		"loginChoicePlaceholder": "Choose explicitly before authorizing",
+		"loginKeepKeys": "Keep existing keys and priorities; add a login",
+		"loginReplaceKey": "Replace old login key: {{key}}",
 		"delete": "Remove TokenDance",
 		"deleteDescription": "Remove this installation's TokenDance connection only? This does not revoke the upstream API key or delete conversation history.",
 		"top_up_balance": "Top up your TokenDance balance",
@@ -150,7 +156,7 @@
 			"context": "Context",
 			"output": "Max output",
 			"reasoning": "Reasoning",
-			"price": "Price in / out ($/M)"
+			"price": "Reference prices"
 		},
 		"edit": "Edit model parameters",
 		"editParameters": "Edit model parameters",
@@ -209,6 +215,8 @@
 		"details": "Model metadata and prices",
 		"actualPricing": "NUG actual channel quote",
 		"reference": "Reference $/M in / out",
+		"timeOfUseNote": "Catalog reference only. The applicable hours and actual charges depend on the provider.",
+		"aboveTokens": "Above {{count}} tokens",
 		"free": "0 (free)",
 		"unknown": "Unknown",
 		"unreported": "Not reported / inherited",
@@ -267,7 +275,9 @@
 			"standard": "Standard",
 			"batch": "Batch",
 			"flex": "Flex",
-			"priority": "Priority"
+			"priority": "Priority",
+			"peak": "Peak reference prices",
+			"off_peak": "Off-peak reference prices"
 		},
 		"basis": {
 			"full": "Above the threshold the whole request is charged at this tier",
@@ -286,6 +296,7 @@
 			"audio": "Audio",
 			"video": "Video",
 			"media": "Media",
+			"reasoning": "Reasoning",
 			"search_context_size_low": "Low search context",
 			"search_context_size_medium": "Medium search context",
 			"search_context_size_high": "High search context"
@@ -1380,6 +1391,10 @@
 	"pwaUpdating": "Updating...",
 	"unsavedSave": "Save Changes",
 	"unsavedDiscard": "Discard",
+	"credentialMigrationConflict": {
+		"title": "Credentials have not moved to the new storage yet",
+		"description": "These credentials share an id. Delete or re-add one of each pair, then restart NarraFork to finish the move. Until then everything keeps working as before."
+	},
 	"providersTitle": "AI Providers",
 	"providersTabPlatforms": "Platforms",
 	"providersTabCustom": "Custom Providers",
@@ -1486,6 +1501,7 @@
 	"addProviderSearch": "Search",
 	"addProviderSearchPlaceholder": "Search providers",
 	"addProviderCustom": "Custom",
+	"addProviderCatalogLoadFailed": "Could not load the provider presets",
 	"addProviderNoResults": "No matches",
 	"addProviderAttribution": "Presets: Cherry Studio (MIT). See Licenses.",
 	"addProviderConfigure": "Configure",
@@ -3054,6 +3070,7 @@
 		"none": "There are no credentials to export.",
 		"archived": "Archived",
 		"kinds": {
+			"credential": "Credential",
 			"codex": "Codex",
 			"api-key": "API key"
 		},

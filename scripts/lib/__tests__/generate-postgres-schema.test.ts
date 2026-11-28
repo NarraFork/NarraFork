@@ -1,4 +1,6 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { canonicalCommunicationPair } from "../../../shared/narrator-communication";
 import {
 	autoForeignKeyName,
 	generatePostgresSchema,
@@ -19,6 +21,30 @@ export const items = sqliteTable("items", {
   index("items_amount").on(table.amount).where(sql\`"items"."amount" = 1\`),
 ]);
 `;
+
+test("communication canonical pairs pin PG C collation to SQLite BINARY and JS ASCII ordering only", () => {
+	const fixture = `import {sql} from 'drizzle-orm'; import {text,check,sqliteTable} from 'drizzle-orm/sqlite-core';
+ export const peers=sqliteTable('narrator_communication_peers',{endpointLo:text('endpoint_lo'),endpointHi:text('endpoint_hi')},(table)=>[check('canonical',sql\`\${table.endpointLo} < \${table.endpointHi}\`)]);
+ export const ordinary=sqliteTable('ordinary',{endpointLo:text('endpoint_lo'),endpointHi:text('endpoint_hi')},(table)=>[check('ordinary_compare',sql\`\${table.endpointLo} < \${table.endpointHi}\`)]);`;
+	const { coverage } = generatePostgresSchema(fixture);
+	expect(coverage.tables[0].checkDefinitions[0].expression).toBe(
+		'("endpoint_lo" COLLATE "C") < ("endpoint_hi" COLLATE "C")',
+	);
+	expect(coverage.tables[1].checkDefinitions[0].expression).toBe('"endpoint_lo" < "endpoint_hi"');
+	const sqlite = new Database(":memory:");
+	try {
+		for (const a of ["A", "Z", "a", "z", "_", "-", "0", "9"])
+			for (const b of ["A", "Z", "a", "z", "_", "-", "0", "9"]) {
+				if (a === b) continue;
+				const [lo, hi] = canonicalCommunicationPair(a, b);
+				expect(
+					sqlite.query("SELECT (? COLLATE BINARY) < (? COLLATE BINARY) AS ordered").get(lo, hi),
+				).toEqual({ ordered: 1 });
+			}
+	} finally {
+		sqlite.close();
+	}
+});
 
 describe("PostgreSQL boolean expression conversion", () => {
 	test("converts boolean comparisons and IS predicates only for boolean columns", () => {
@@ -96,6 +122,14 @@ export const t = sqliteTable("t", { id: text("id"), payload: text("payload", { m
 export const t = sqliteTable("t", { id: text("id"), payload: text("payload", {mode: "json"}), count: integer("count") }, (table) => [
   check("bound", sql\`${expression}\`),
 ]);`;
+	test("only emits a table callback parameter when the executable config uses it", () => {
+		expect(generatePostgresSchema(checkFixture(`\${table.count} >= 0`)).source).toContain(
+			"}, () => [",
+		);
+		expect(generatePostgresSchema(fixture("sql`1`")).source).toContain("}, () => [");
+		const indexed = `${HEAD}export const t = sqliteTable("t", { id: text("id") }, (table) => [index("by_id").on(table.id)]);`;
+		expect(generatePostgresSchema(indexed).source).toContain("}, (table) => [");
+	});
 	test("preserves character length for text and JSON text, but maps byte budgets separately", () => {
 		for (const expression of [
 			`length(\${table.id}) <= 2048`,

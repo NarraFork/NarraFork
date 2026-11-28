@@ -1,12 +1,14 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	GIT_STATUS_PAGE_MAX_BYTES,
 	GIT_STATUS_PAGE_MAX_LIMIT,
-	type GitStatusPage,
+	type GitStatusPageCacheState,
+	type GitStatusPageResult,
 	type GitStatusPageScopeProof,
-	type GitStatusPageStatsResult,
+	type GitStatusPageStatsResponse,
 	type GitStatusPageStatsRow,
 } from "@shared/git-status-page";
 import { Hono } from "hono";
@@ -14,7 +16,7 @@ import { testEnvironment } from "../../../tests/preload";
 import { cleanDb } from "../../../tests/setup";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import * as spawn from "../../lib/spawn";
-import { GitStatusPageError } from "../../services/git-status-page";
+import { closeGitStatusPages, GitStatusPageError } from "../../services/git-status-page";
 
 const { db, sqlite } = await import("../../db");
 const realDbModule = { ...(await import("../../db")) };
@@ -24,10 +26,19 @@ const management = await import("../../services/git-management-service");
 const { gitService } = await import("../../services/git-service");
 const { narratorGitRoutes } = await import("../git");
 const root = await realpath(await mkdtemp(join(testEnvironment.isolatedHome, "git-pages-http-")));
-await mkdir(join(root, ".git"));
+execFileSync("git", ["init", "--quiet", root], { timeout: 15_000, maxBuffer: 4096 });
 const NOW = "2026-10-29T00:00:00.000Z";
 const BASE = "http://localhost/api/narrators/n1/git";
-const page: GitStatusPage = {
+const cache: GitStatusPageCacheState = {
+	status: "ready",
+	workerEpoch: "worker-epoch",
+	memberVersion: 1,
+	statsVersion: 2,
+	updating: false,
+};
+const page: Extract<GitStatusPageResult, { status: "ready" }> = {
+	status: "ready",
+	cache,
 	snapshotId: "snapshot",
 	expiresAt: Date.now() + 120_000,
 	files: [{ path: "a.ts", status: " M" }],
@@ -66,6 +77,7 @@ afterEach(() => mock.restore());
 afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDbModule);
+	await closeGitStatusPages();
 	await rm(root, { recursive: true, force: true });
 });
 function appFor(user = "reader") {
@@ -91,7 +103,9 @@ const statsRows: GitStatusPageStatsRow[] = [
 	{ type: "directory", section: "unstaged", path: "src/中文 dir" },
 	{ type: "file", section: "staged", path: "src/a.ts" },
 ];
-const statsResult: GitStatusPageStatsResult = {
+const statsResult: Extract<GitStatusPageStatsResponse, { status: "ready" }> = {
+	status: "ready",
+	cache,
 	snapshotId: "snapshot",
 	rows: statsRows.map((row) => ({ ...row, added: 3, removed: 2, complete: true })),
 };
@@ -104,6 +118,124 @@ function statsUrl(key: string, query: Record<string, string> = {}) {
 		...query,
 	});
 	return `${BASE}/status-page-stats?${search}`;
+}
+
+test("cold HTTP paging reads return pending without invoking background production or Git facts", async () => {
+	const app = appFor();
+	const key = await workspaceKey(app);
+	const io = spyOn(spawn, "safeSpawn");
+	const produce = spyOn(management, "observeGitWorkspaceStatusPages");
+	const status = spyOn(management, "getGitWorkspaceStatus");
+	const statistics = spyOn(management, "getGitWorkspaceLineStats");
+	for (const suffix of ["", "&filter=M", "&filter=A"]) {
+		const response = await app.request(
+			`${BASE}/status-files?workspaceKey=${encodeURIComponent(key)}${suffix}`,
+		);
+		expect(response.status).toBe(200);
+		const result = await response.json();
+		expect(result).toMatchObject({
+			status: "pending",
+			cache: { status: "pending", memberVersion: 0, statsVersion: 0, updating: false },
+		});
+		expect(result).not.toHaveProperty("files");
+		expect(result).not.toHaveProperty("counts");
+		expect(result).not.toHaveProperty("snapshotId");
+	}
+	expect(produce).not.toHaveBeenCalled();
+	expect(status).not.toHaveBeenCalled();
+	expect(statistics).not.toHaveBeenCalled();
+	expect(io.mock.calls.every(([options]) => options.cmd.includes("rev-parse"))).toBe(true);
+});
+
+for (const state of ["pending", "error"] as const) {
+	test(`HTTP page and statistics reads preserve the ${state} cache DTO with status 200`, async () => {
+		const app = appFor();
+		const key = await workspaceKey(app);
+		const result = {
+			status: state,
+			cache: {
+				...cache,
+				status: state,
+				memberVersion: 0,
+				statsVersion: 0,
+				...(state === "error" ? { errorCode: "GIT_STATUS_PAGE_SOURCE_FAILED" } : {}),
+			},
+		};
+		const pages = spyOn(management, "getGitWorkspaceStatusPage").mockResolvedValue(result);
+		const statistics = spyOn(management, "getGitWorkspaceStatusPageStats").mockResolvedValue(
+			result,
+		);
+		for (const url of [
+			`${BASE}/status-files?workspaceKey=${encodeURIComponent(key)}`,
+			statsUrl(key),
+		]) {
+			const response = await app.request(url);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual(result);
+		}
+		expect(pages).toHaveBeenCalledTimes(1);
+		expect(statistics).toHaveBeenCalledTimes(1);
+	});
+}
+
+test("HTTP statistics failures preserve the independently ready member page", async () => {
+	const app = appFor();
+	const key = await workspaceKey(app);
+	const member = {
+		...page,
+		cache: { ...cache, statsVersion: 0, statsErrorCode: "GIT_STATUS_PAGE_SOURCE_FAILED" },
+	};
+	const statistics: GitStatusPageStatsResponse = {
+		status: "error",
+		cache: { ...member.cache, status: "error" },
+	};
+	spyOn(management, "getGitWorkspaceStatusPage").mockResolvedValue(member);
+	spyOn(management, "getGitWorkspaceStatusPageStats").mockResolvedValue(statistics);
+	const memberResponse = await app.request(
+		`${BASE}/status-files?workspaceKey=${encodeURIComponent(key)}`,
+	);
+	expect(memberResponse.status).toBe(200);
+	const memberBody = await memberResponse.json();
+	expect(memberBody).toEqual(member);
+	expect(memberBody.cache).not.toHaveProperty("errorCode");
+	const statsResponse = await app.request(statsUrl(key));
+	expect(statsResponse.status).toBe(200);
+	expect(await statsResponse.json()).toEqual(statistics);
+});
+
+test("cold statistics reject an unknown snapshot instead of starting measurement", async () => {
+	const app = appFor();
+	const key = await workspaceKey(app);
+	const statistics = spyOn(management, "getGitWorkspaceLineStats");
+	const produce = spyOn(management, "observeGitWorkspaceStatusPages");
+	const response = await app.request(statsUrl(key));
+	expect(response.status).toBe(409);
+	expect((await response.json()).code).toBe("GIT_STATUS_PAGE_EXPIRED");
+	expect(statistics).not.toHaveBeenCalled();
+	expect(produce).not.toHaveBeenCalled();
+});
+
+for (const [code, status] of [
+	["GIT_STATUS_PAGE_INVALID_CURSOR", 400],
+	["GIT_STATUS_PAGE_BUSY", 429],
+	["GIT_STATUS_PAGE_CLOSED", 503],
+] as const) {
+	test(`HTTP page and statistics transport failures preserve ${code} and status ${status}`, async () => {
+		const app = appFor();
+		const key = await workspaceKey(app);
+		spyOn(management, "getGitWorkspaceStatusPage").mockRejectedValue(new GitStatusPageError(code));
+		spyOn(management, "getGitWorkspaceStatusPageStats").mockRejectedValue(
+			new GitStatusPageError(code),
+		);
+		for (const url of [
+			`${BASE}/status-files?workspaceKey=${encodeURIComponent(key)}`,
+			statsUrl(key),
+		]) {
+			const response = await app.request(url);
+			expect(response.status).toBe(status);
+			expect((await response.json()).code).toBe(code);
+		}
+	});
 }
 
 test("statistics uses read authorization and pins the workspace, actor, filter and request signal", async () => {
@@ -233,7 +365,7 @@ test("statistics retains paging expiration and cancellation error semantics", as
 	expect((await cancelled.json()).code).toBe("GIT_STATUS_PAGE_CANCELLED");
 });
 
-test("explicit HTTP facts refresh expires statistics without expiring status pages", async () => {
+test("explicit HTTP facts refresh dirties statistics without replacing status page membership", async () => {
 	const app = appFor();
 	const invalidated = spyOn(management, "invalidateGitWorkspaceFacts").mockImplementation(() => {});
 	const pages = spyOn(management, "invalidateGitWorkspace").mockImplementation(() => {});

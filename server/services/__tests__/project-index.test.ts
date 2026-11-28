@@ -60,9 +60,9 @@ function makeDir(...parts: string[]): string {
 	return dir;
 }
 
-function makeRepo(name: string): string {
+function makeRepo(name: string, branch = "main"): string {
 	const dir = makeDir(name);
-	git(dir, "init", "-q", "-b", "main");
+	git(dir, "init", "-q", "-b", branch);
 	writeFileSync(join(dir, "README.md"), "x");
 	git(dir, "add", ".");
 	git(dir, "commit", "-q", "-m", "init");
@@ -204,6 +204,31 @@ describe("git repositories without a project", () => {
 			{ projectId: created[0].id, role: "primary", source: "cwd" },
 		]);
 		expect(await projectsAt(repo)).toHaveLength(1);
+	});
+
+	test("the new project's default branch is the main checkout's branch", async () => {
+		const defaultOf = async (repo: string) =>
+			(await db.query.projects.findFirst({ where: eq(projects.gitPath, repo) }))?.defaultBranch;
+
+		// Only `master`, and a session in a linked worktree on another branch: the main
+		// checkout's HEAD decides, not the session's.
+		const master = makeRepo("repo-master", "master");
+		const worktree = join(master, ".worktrees", "topic");
+		git(master, "worktree", "add", "-q", "-b", "topic", worktree);
+		await syncNarratorProjectLinks(await makeNarrator({ cwd: worktree }));
+		expect(await defaultOf(master)).toBe("master");
+
+		// No commits yet: HEAD still names its branch.
+		const unborn = makeDir("repo-unborn");
+		git(unborn, "init", "-q", "-b", "trunk");
+		await syncNarratorProjectLinks(await makeNarrator({ cwd: unborn }));
+		expect(await defaultOf(unborn)).toBe("trunk");
+
+		// A detached HEAD names no branch: the schema default stays.
+		const detached = makeRepo("repo-detached", "develop");
+		git(detached, "checkout", "-q", "--detach");
+		await syncNarratorProjectLinks(await makeNarrator({ cwd: detached }));
+		expect(await defaultOf(detached)).toBe("main");
 	});
 
 	test("a directory outside every repository creates nothing", async () => {

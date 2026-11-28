@@ -9,6 +9,7 @@ import {
 	narratorWhitelistDirs,
 	permissionRuleRequests,
 } from "@server/db/schema";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { ToolCallBinding } from "@server/lib/agent/types";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
@@ -39,7 +40,10 @@ import {
 	permissionRuleConflictKey,
 	permissionRuleService,
 } from "./permission-rule-service";
-import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
+import {
+	resolveNarratorRuntimePolicy,
+	resolveNarratorRuntimePolicyNow,
+} from "./trait-layer-service";
 
 export const PERMISSION_RULE_REQUEST_TTL_MS = 300_000;
 function requestExpired(createdAt: string): boolean {
@@ -91,15 +95,16 @@ export interface PermissionRuleRequestIdentity {
 	actingUserId?: string | null;
 }
 /** Read-only ceilings (traits, including a followed policy source) cannot add mutable policy. */
-async function assertMutablePolicyCeiling(identity: PermissionRuleRequestIdentity): Promise<void> {
-	const ceiling = await resolveNarratorRuntimePolicy(
-		identity.narratorId,
-		identity.actingUserId ?? null,
-	);
+function assertMutablePolicy(ceiling: ReturnType<typeof resolveNarratorRuntimePolicyNow>): void {
 	if (ceiling.tools.readOnly || ceiling.readOnlyGitShell)
 		throw new ValidationError(
 			"Review/read-only/OAuth capability ceilings cannot request mutable policy",
 		);
+}
+async function assertMutablePolicyCeiling(identity: PermissionRuleRequestIdentity): Promise<void> {
+	assertMutablePolicy(
+		await resolveNarratorRuntimePolicy(identity.narratorId, identity.actingUserId ?? null),
+	);
 }
 export interface PreparedPermissionRuleRequest {
 	requestId: string;
@@ -139,8 +144,10 @@ const contextColumns = {
 	traits: narrators.traits,
 	oauthPolicySnapshotJson: narrators.oauthPolicySnapshotJson,
 };
-function loadIdentity(narratorId: string) {
-	const row = db.select(contextColumns).from(narrators).where(eq(narrators.id, narratorId)).get();
+function identityQuery(narratorId: string, store: Pick<typeof db, "select">) {
+	return store.select(contextColumns).from(narrators).where(eq(narrators.id, narratorId)).limit(1);
+}
+function validateIdentity(row: ReturnType<ReturnType<typeof identityQuery>["get"]>) {
 	if (!row) throw new ValidationError("Narrator no longer exists");
 	if (row.oauthPolicySnapshotJson) {
 		throw new ValidationError(
@@ -156,11 +163,23 @@ function loadIdentity(narratorId: string) {
 		throw new ValidationError("Strict plan capability ceiling cannot request mutable policy");
 	return row;
 }
+async function loadIdentity(narratorId: string) {
+	return validateIdentity(
+		await readQueryFirst(identityQuery(narratorId, db), {
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			timeoutMs: 30_000,
+		}),
+	);
+}
+function loadIdentityInTransaction(narratorId: string, tx: Pick<typeof db, "select">) {
+	return validateIdentity(identityQuery(narratorId, tx).get());
+}
 async function liveRevision(
 	identity: PermissionRuleRequestIdentity,
 	context: ExecutionTargetContext,
 ) {
-	const narrator = loadIdentity(identity.narratorId);
+	const narrator = await loadIdentity(identity.narratorId);
 	await assertMutablePolicyCeiling(identity);
 	const current = await createExecutionTargetContext({
 		backend: context.backend,
@@ -177,11 +196,8 @@ async function liveRevision(
 		}),
 	};
 }
-function assertBinding(
-	identity: PermissionRuleRequestIdentity,
-	store: Pick<typeof db, "select"> = db,
-) {
-	const row = store
+function bindingQuery(identity: PermissionRuleRequestIdentity, store: Pick<typeof db, "select">) {
+	return store
 		.select({
 			id: narratorToolCalls.id,
 			attempt: narratorToolCalls.executionAttempt,
@@ -199,7 +215,12 @@ function assertBinding(
 				eq(narratorToolCalls.toolUseId, identity.toolUseId),
 			),
 		)
-		.get();
+		.limit(1);
+}
+function validateBinding(
+	row: ReturnType<ReturnType<typeof bindingQuery>["get"]>,
+	identity: PermissionRuleRequestIdentity,
+) {
 	if (
 		!row ||
 		row.attempt !== identity.binding.attempt ||
@@ -210,12 +231,25 @@ function assertBinding(
 		throw new PermissionRuleRequestError("Stale tool execution binding");
 	return row;
 }
+function assertBinding(identity: PermissionRuleRequestIdentity, store: Pick<typeof db, "select">) {
+	return validateBinding(bindingQuery(identity, store).get(), identity);
+}
+async function readBinding(identity: PermissionRuleRequestIdentity) {
+	return validateBinding(
+		await readQueryFirst(bindingQuery(identity, db), {
+			executionPolicy: "worker-required",
+			maxRows: 1,
+			timeoutMs: 30_000,
+		}),
+		identity,
+	);
+}
 export async function preparePermissionRuleRequest(
 	identity: PermissionRuleRequestIdentity,
 	raw: unknown,
 	context: ExecutionTargetContext,
 ): Promise<PreparedPermissionRuleRequest> {
-	assertBinding(identity);
+	await readBinding(identity);
 	const input = requestPermissionRuleSchema.parse(raw);
 	if (input.device && input.device !== context.target.deviceId)
 		throw new ValidationError("Device differs from frozen execution target");
@@ -270,11 +304,14 @@ export async function preparePermissionRuleRequest(
 		})
 		.onConflictDoNothing()
 		.run();
-	const stored = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
+	const stored = await readQueryFirst(
+		db
+			.select()
+			.from(permissionRuleRequests)
+			.where(eq(permissionRuleRequests.id, requestId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (
 		!stored ||
 		stored.proposalHash !== proposalHash ||
@@ -295,15 +332,15 @@ export function recordPermissionRuleRequestDecision(
 	userId?: string,
 	conclusion?: string,
 ): boolean {
-	if (source === "user" && !userId) return false;
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
-	if (!row || row.status !== "pending" || row.approvalSource || requestExpired(row.createdAt))
-		return false;
 	return db.transaction((tx) => {
+		if (source === "user" && !userId) return false;
+		const row = tx
+			.select()
+			.from(permissionRuleRequests)
+			.where(eq(permissionRuleRequests.id, requestId))
+			.get();
+		if (!row || row.status !== "pending" || row.approvalSource || requestExpired(row.createdAt))
+			return false;
 		const now = new Date().toISOString();
 		const changed = tx
 			.update(permissionRuleRequests)
@@ -353,19 +390,19 @@ export function completePermissionRuleRequestReflection(
 	requestId: string,
 	result: PermissionRuleReflectionCompletion,
 ): boolean {
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
-	if (!row || row.status !== "pending") return false;
-	const approved =
-		row.approvalSource === "reflection" &&
-		result.completedNormally &&
-		result.validToolDecision &&
-		!result.usedTextFallback &&
-		!requestExpired(row.createdAt);
 	return db.transaction((tx) => {
+		const row = tx
+			.select()
+			.from(permissionRuleRequests)
+			.where(eq(permissionRuleRequests.id, requestId))
+			.get();
+		if (!row || row.status !== "pending") return false;
+		const approved =
+			row.approvalSource === "reflection" &&
+			result.completedNormally &&
+			result.validToolDecision &&
+			!result.usedTextFallback &&
+			!requestExpired(row.createdAt);
 		const now = new Date().toISOString();
 		const changed = tx
 			.update(permissionRuleRequests)
@@ -454,7 +491,7 @@ export function terminatePermissionRuleRequest(terminal: PermissionRuleRequestTe
 }
 
 /** Bounded primary-key pages; the caller yields between pages during startup/expiry maintenance. */
-export function recoverPermissionRuleRequests(options: {
+export async function recoverPermissionRuleRequests(options: {
 	after?: string;
 	limit?: number;
 	reason: string;
@@ -463,20 +500,22 @@ export function recoverPermissionRuleRequests(options: {
 	const limit = Number.isFinite(options.limit)
 		? Math.max(1, Math.min(100, Math.trunc(options.limit as number)))
 		: 100;
-	const rows = db
-		.select({
-			id: permissionRuleRequests.id,
-			narratorId: permissionRuleRequests.narratorId,
-			toolCallId: permissionRuleRequests.toolCallId,
-			attempt: permissionRuleRequests.attempt,
-			status: permissionRuleRequests.status,
-			createdAt: permissionRuleRequests.createdAt,
-		})
-		.from(permissionRuleRequests)
-		.where(options.after ? gt(permissionRuleRequests.id, options.after) : undefined)
-		.orderBy(permissionRuleRequests.id)
-		.limit(limit)
-		.all();
+	const rows = await readQuery(
+		db
+			.select({
+				id: permissionRuleRequests.id,
+				narratorId: permissionRuleRequests.narratorId,
+				toolCallId: permissionRuleRequests.toolCallId,
+				attempt: permissionRuleRequests.attempt,
+				status: permissionRuleRequests.status,
+				createdAt: permissionRuleRequests.createdAt,
+			})
+			.from(permissionRuleRequests)
+			.where(options.after ? gt(permissionRuleRequests.id, options.after) : undefined)
+			.orderBy(permissionRuleRequests.id)
+			.limit(limit),
+		{ executionPolicy: "worker-required", maxRows: limit, timeoutMs: 30_000 },
+	);
 	let terminated = 0;
 	for (const row of rows) {
 		if (
@@ -546,7 +585,26 @@ export function failPermissionRuleRequest(
 	});
 }
 
+const pendingApplications = new Map<string, Promise<PermissionRuleRequestResult>>();
+
 export async function consumePermissionRuleRequest(
+	identity: PermissionRuleRequestIdentity,
+	raw: unknown,
+	context: ExecutionTargetContext,
+): Promise<PermissionRuleRequestResult> {
+	const key = hash({ identity, raw, target: executionTargetContextKey(context) });
+	const pending = pendingApplications.get(key);
+	if (pending) return pending;
+	const work = applyPermissionRuleRequest(identity, raw, context);
+	pendingApplications.set(key, work);
+	try {
+		return await work;
+	} finally {
+		pendingApplications.delete(key);
+	}
+}
+
+async function applyPermissionRuleRequest(
 	identity: PermissionRuleRequestIdentity,
 	raw: unknown,
 	context: ExecutionTargetContext,
@@ -586,14 +644,17 @@ export async function validatePermissionRuleRequestApproval(
 	raw: unknown,
 	context: ExecutionTargetContext,
 ) {
-	const call = assertBinding(identity);
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(
-			eq(permissionRuleRequests.id, `${identity.binding.toolCallId}:${identity.binding.attempt}`),
-		)
-		.get();
+	const call = await readBinding(identity);
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(permissionRuleRequests)
+			.where(
+				eq(permissionRuleRequests.id, `${identity.binding.toolCallId}:${identity.binding.attempt}`),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (
 		!row ||
 		row.status !== "approved" ||
@@ -643,13 +704,16 @@ async function consumeBoundPermissionRuleRequest(
 	raw: unknown,
 	context: ExecutionTargetContext,
 ) {
-	assertBinding(identity);
+	await readBinding(identity);
 	const requestId = `${identity.binding.toolCallId}:${identity.binding.attempt}`;
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(permissionRuleRequests)
+			.where(eq(permissionRuleRequests.id, requestId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!row || row.narratorId !== identity.narratorId || row.toolUseId !== identity.toolUseId)
 		throw new PermissionRuleRequestError("Missing bound approval receipt");
 	const proposal = row.proposalJson as unknown as {
@@ -685,7 +749,15 @@ async function consumeBoundPermissionRuleRequest(
 			approvalUserId: row.approvalUserId,
 			rule: { ...proposal.rule, id: row.ruleId ?? undefined },
 		});
-	await validatePermissionRuleRequestApproval(identity, raw, context);
+	let validationFailure: PermissionRuleRequestError | undefined;
+	try {
+		await validatePermissionRuleRequestApproval(identity, raw, context);
+	} catch (error) {
+		if (!(error instanceof PermissionRuleRequestError)) throw error;
+		// An identical concurrent consumption may have committed while the worker read.
+		// Only the final transaction can establish that bound terminal receipt.
+		validationFailure = error;
+	}
 	const saved = {
 		...proposal.rule,
 		id: generateId(),
@@ -695,7 +767,7 @@ async function consumeBoundPermissionRuleRequest(
 	// The ceiling can narrow between approval and commit; re-check it last.
 	await assertMutablePolicyCeiling(identity);
 	const result = db.transaction((tx) => {
-		assertBinding(identity, tx);
+		const boundCall = assertBinding(identity, tx);
 		const latest = tx
 			.select()
 			.from(permissionRuleRequests)
@@ -736,10 +808,22 @@ async function consumeBoundPermissionRuleRequest(
 			});
 			return latest;
 		}
+		if (validationFailure) throw validationFailure;
 		if (latest?.status !== "approved")
 			throw new PermissionRuleRequestError("Approval receipt already consumed");
+		if (
+			requestExpired(latest.createdAt) ||
+			boundCall.decidedBy !== latest.approvalSource ||
+			!boundCall.decidedAt
+		)
+			throw new PermissionRuleRequestError("Approval receipt expired or lost its decision binding");
+		// Worker snapshots are preflight only. Re-evaluate the current inherited
+		// capability ceiling from this transaction before committing a new rule.
+		assertMutablePolicy(
+			resolveNarratorRuntimePolicyNow(identity.narratorId, identity.actingUserId ?? null, tx),
+		);
 		const commitRevision = hash({
-			narrator: loadIdentity(identity.narratorId),
+			narrator: loadIdentityInTransaction(identity.narratorId, tx),
 			target: executionTargetContextKey(context),
 			policy: executionPolicyRevision(executionPolicyRepository.loadNow(identity.narratorId, tx)),
 			settingsRevision: getSettingsRevision(),
@@ -829,7 +913,7 @@ export const permissionRuleRequestListQuerySchema = z.object({
 	cursor: z.string().max(200).optional(),
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 });
-export function listPermissionRuleRequests(narratorId: string, query: unknown = {}) {
+export async function listPermissionRuleRequests(narratorId: string, query: unknown = {}) {
 	const { cursor, limit } = permissionRuleRequestListQuerySchema.parse(query);
 	const after = cursor
 		? z
@@ -837,38 +921,40 @@ export function listPermissionRuleRequests(narratorId: string, query: unknown = 
 				.strict()
 				.parse(JSON.parse(cursor))
 		: undefined;
-	const rows = db
-		.select({
-			id: permissionRuleRequests.id,
-			status: permissionRuleRequests.status,
-			reason: permissionRuleRequests.reason,
-			proposalHash: permissionRuleRequests.proposalHash,
-			deviceId: permissionRuleRequests.deviceId,
-			scope: permissionRuleRequests.scope,
-			ruleId: permissionRuleRequests.ruleId,
-			approvalSource: permissionRuleRequests.approvalSource,
-			approvalUserId: permissionRuleRequests.approvalUserId,
-			error: permissionRuleRequests.error,
-			createdAt: permissionRuleRequests.createdAt,
-		})
-		.from(permissionRuleRequests)
-		.where(
-			and(
-				eq(permissionRuleRequests.narratorId, narratorId),
-				after
-					? or(
-							lt(permissionRuleRequests.createdAt, after.createdAt),
-							and(
-								eq(permissionRuleRequests.createdAt, after.createdAt),
-								lt(permissionRuleRequests.id, after.id),
-							),
-						)
-					: undefined,
-			),
-		)
-		.orderBy(desc(permissionRuleRequests.createdAt), desc(permissionRuleRequests.id))
-		.limit(limit + 1)
-		.all();
+	const rows = await readQuery(
+		db
+			.select({
+				id: permissionRuleRequests.id,
+				status: permissionRuleRequests.status,
+				reason: permissionRuleRequests.reason,
+				proposalHash: permissionRuleRequests.proposalHash,
+				deviceId: permissionRuleRequests.deviceId,
+				scope: permissionRuleRequests.scope,
+				ruleId: permissionRuleRequests.ruleId,
+				approvalSource: permissionRuleRequests.approvalSource,
+				approvalUserId: permissionRuleRequests.approvalUserId,
+				error: permissionRuleRequests.error,
+				createdAt: permissionRuleRequests.createdAt,
+			})
+			.from(permissionRuleRequests)
+			.where(
+				and(
+					eq(permissionRuleRequests.narratorId, narratorId),
+					after
+						? or(
+								lt(permissionRuleRequests.createdAt, after.createdAt),
+								and(
+									eq(permissionRuleRequests.createdAt, after.createdAt),
+									lt(permissionRuleRequests.id, after.id),
+								),
+							)
+						: undefined,
+				),
+			)
+			.orderBy(desc(permissionRuleRequests.createdAt), desc(permissionRuleRequests.id))
+			.limit(limit + 1),
+		{ executionPolicy: "worker-required", maxRows: limit + 1, timeoutMs: 30_000 },
+	);
 	return {
 		items: rows.slice(0, limit),
 		nextCursor:

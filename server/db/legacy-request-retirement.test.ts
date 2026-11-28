@@ -7,6 +7,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import {
+	clearLegacyRequestDumpBatch,
+	completeDeferredLegacyRequestRetirement,
+	hasPendingLegacyRequestRetirement,
+} from "./legacy-request-storage";
 import { applyPendingMigrationsByHash } from "./run-migrations";
 import { apiRequests, narrators, users } from "./schema";
 
@@ -145,6 +150,51 @@ describe("populated legacy request storage upgrade", () => {
 			expect(database.prepare("SELECT hash, created_at FROM __drizzle_migrations").all()).toEqual(
 				ledger,
 			);
+		} finally {
+			database.close();
+		}
+	}, 30_000);
+});
+
+describe("deferred legacy request cleanup after the current journal", () => {
+	test("keeps token_accounting_version that 0226 re-added once the dumps are cleared", () => {
+		const database = legacyDatabase();
+		try {
+			database.run(`INSERT INTO api_requests
+				(id, created_at, provider, model, input_tokens, raw_dump_json, token_accounting_version)
+				VALUES ('old', '2026-10-01', 'synthetic', 'old-model', 123, 'private-history', 1)`);
+			applyPendingMigrationsByHash(database, source);
+			expect(completeDeferredLegacyRequestRetirement(database)).toBe(false);
+
+			let cursor = 0;
+			for (;;) {
+				const batch = clearLegacyRequestDumpBatch(database, cursor, 100);
+				if (!batch) break;
+				cursor = batch.lastRowid;
+			}
+			expect(completeDeferredLegacyRequestRetirement(database)).toBe(true);
+
+			const columns = (
+				database.prepare("PRAGMA table_info(api_requests)").all() as Array<{ name: string }>
+			).map((column) => column.name);
+			expect(columns).toContain("token_accounting_version");
+			expect(columns).not.toContain("token_accounting_review_version");
+			expect(columns).not.toContain("raw_dump_json");
+			expect(
+				database
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name = 'idx_api_requests_token_accounting_pending'",
+					)
+					.get(),
+			).toEqual({ name: "idx_api_requests_token_accounting_pending" });
+			expect(
+				database
+					.prepare("SELECT input_tokens, token_accounting_version FROM api_requests WHERE id='old'")
+					.get(),
+			).toEqual({ input_tokens: 123, token_accounting_version: 1 });
+			expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+			expect(hasPendingLegacyRequestRetirement(database)).toBe(false);
+			expect(completeDeferredLegacyRequestRetirement(database)).toBe(false);
 		} finally {
 			database.close();
 		}

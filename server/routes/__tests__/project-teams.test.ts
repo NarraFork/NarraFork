@@ -10,11 +10,14 @@
  *  - a coordinator with live work items cannot be deleted, nor a project that has teams.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { setNoLazyFetchSupportForTests } from "../../lib/git-exec-hardening";
+import { initTeamRepo } from "../../services/teams/__tests__/team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-project-teams-"));
@@ -34,6 +37,8 @@ const { createTeam, readTeamBrief, startTeamStatusSync } = await import(
 	"../../services/teams/team-service"
 );
 const { runAsTeamStatusActor } = await import("../../services/teams/team-records");
+const { isGitWorkTree, teamGit } = await import("../../services/teams/team-git");
+const { resetProjectIndexStateForTests } = await import("../../services/project-index");
 const { interruptAndArchiveSubagent } = await import("../../services/subagent-lifecycle");
 
 const OWNER = "team-owner";
@@ -120,7 +125,7 @@ async function statusEvents(teamId: string) {
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo, "trunk");
 	const now = new Date().toISOString();
 	for (const id of [OWNER, MEMBER, READER, OUTSIDER]) {
 		await db.insert(users).values({
@@ -191,6 +196,67 @@ describe("creating a team", () => {
 		).rejects.toThrow();
 		const leftover = await db.query.narrators.findFirst({ where: eq(narrators.title, name) });
 		expect(leftover).toBeUndefined();
+	});
+
+	test("a partial clone on a git without lazy-fetch protection: GIT_TOO_OLD_FOR_PARTIAL_CLONE, not 'not git' (Devin)", async () => {
+		// A work tree whose repository names a promisor remote; its upload-pack would leave a mark.
+		const dir = join(testHome, `promisor-${generateId()}`);
+		initTeamRepo(dir, "trunk");
+		const marker = join(testHome, `promisor-ran-${generateId()}`);
+		const helper = join(testHome, `upload-pack-${generateId()}`);
+		writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+		chmodSync(helper, 0o755);
+		for (const [key, value] of [
+			["core.repositoryformatversion", "1"],
+			["extensions.partialClone", "evil"],
+			["remote.evil.url", join(testHome, "nowhere.git")],
+			["remote.evil.promisor", "true"],
+			["remote.evil.uploadpack", helper],
+		])
+			expect(spawnSync("git", ["-C", dir, "config", key, value]).status).toBe(0);
+		const now = new Date().toISOString();
+		const promisorProject = generateId();
+		await db.insert(projects).values({
+			id: promisorProject,
+			name: "partial clone",
+			gitPath: dir,
+			defaultBranch: "trunk",
+			ownerUserId: OWNER,
+			visibility: "private",
+			createdAt: now,
+			updatedAt: now,
+		});
+		// The project row was inserted directly: the directory index reads it afresh.
+		resetProjectIndexStateForTests();
+		setNoLazyFetchSupportForTests(false);
+		try {
+			// Still a work tree: the new-session dialog offers a team…
+			expect(await isGitWorkTree(dir)).toBe(true);
+			const resolved = await call(OWNER, "/projects/resolve-directory", {
+				method: "POST",
+				body: { cwd: dir },
+			});
+			expect(resolved.body).toMatchObject({
+				status: "project",
+				project: { id: promisorProject, gitWorkTree: true },
+			});
+			// …and creating it says why it cannot be: resolving the base reads objects.
+			await expect(teamGit(dir).resolveCommit("trunk")).rejects.toMatchObject({
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+			const refused = await call(OWNER, `/projects/${promisorProject}/teams`, {
+				method: "POST",
+				body: { name: "On a partial clone" },
+			});
+			expect(refused.status).toBe(409);
+			expect(refused.body.code).toBe("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+			expect(
+				await db.query.narrators.findFirst({ where: eq(narrators.title, "On a partial clone") }),
+			).toBeUndefined();
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
 	});
 
 	test("needs project write; validates the body", async () => {

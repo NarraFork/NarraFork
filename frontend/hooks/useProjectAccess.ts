@@ -8,6 +8,8 @@ const PROJECT_ACCESS_GC_TIME_MS = 60_000;
 
 export const projectAccessKeys = {
 	access: (projectId: string) => ["projects", projectId, "access"] as const,
+	/** Under `["projects"]`, so a membership change (here or broadcast) refreshes it. */
+	memberCount: (projectId: string) => ["projects", projectId, "member-count"] as const,
 };
 
 /**
@@ -48,6 +50,22 @@ export function useProjectAccess(projectId: string | undefined, enabled = true) 
 		queryKey: projectAccessKeys.access(projectId ?? ""),
 		queryFn: () => api.getProjectAccess(projectId as string),
 		enabled: enabled && !!projectId,
+		gcTime: PROJECT_ACCESS_GC_TIME_MS,
+	});
+}
+
+/**
+ * The project header's 「N 位成员」: a small count the server bounds, never the member list. A
+ * reader who lost the project gets 404 and is not retried.
+ */
+export function useProjectMemberCount(projectId: string | undefined, enabled = true) {
+	installProjectAccessListener();
+	return useQuery({
+		queryKey: projectAccessKeys.memberCount(projectId ?? ""),
+		queryFn: ({ signal }) => api.getProjectMemberCount(projectId as string, signal),
+		enabled: enabled && !!projectId,
+		retry: (count, error) => (error as { status?: unknown } | null)?.status !== 404 && count < 1,
+		staleTime: 30_000,
 		gcTime: PROJECT_ACCESS_GC_TIME_MS,
 	});
 }

@@ -10,7 +10,7 @@
  * Both query paths matter because they are different SQL: three characters or more
  * use the trigram FTS index, shorter queries fall back to LIKE.
  */
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import {
 	aclGrants,
 	knowledgeCollections,
@@ -19,10 +19,23 @@ import {
 	knowledgeLevels,
 	users,
 } from "../../../server/db/schema";
-import { getTestDb } from "../../setup";
+import { getNarratorWorkerTestDb } from "../../../server/services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
+const realDb = { ...(await import("../../../server/db")) };
+mock.module("../../../server/db", () => ({
+	...realDb,
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+}));
+afterAll(async () => {
+	await fixture.close();
+	mock.module("../../../server/db", () => realDb);
+	mock.restore();
+});
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>

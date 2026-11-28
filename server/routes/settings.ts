@@ -25,20 +25,15 @@ import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import { peekCommandCodeModels } from "../lib/commandcode-models";
-import {
-	getAllCustomApiCachedQuotas,
-	purgeCustomApiQuotaCache,
-} from "../lib/custom-api-quota-cache";
-import { getDeepSeekBalanceGenerations } from "../lib/deepseek-balance-cache";
+import { getCredentialMigrationConflicts } from "../lib/credential-migration";
+import { purgeCustomApiQuotaCache } from "../lib/custom-api-quota-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
-import { getAllKimiCachedUsages } from "../lib/kimi-usage-cache";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
-import { getOpencodeUsageGenerations } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import { getProviderBalanceGenerations } from "../lib/provider-balance-cache";
@@ -73,6 +68,7 @@ import {
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { buildRuntimeSettings } from "../lib/settings/runtime";
 import { isSensitiveHeaderName } from "../lib/settings/search-header-secrets";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
@@ -986,8 +982,9 @@ function publicAuthSettings(auth: NarraForkSettings["auth"]) {
 
 async function buildSettingsResponse(
 	source: NarraForkSettings,
-	extra?: { serverRestarting?: boolean; newUrl?: string },
+	extra?: { serverRestarting?: boolean; newUrl?: string; admin?: boolean },
 ) {
+	const admin = extra?.admin === true;
 	source = {
 		...source,
 		customApiProviders: source.customApiProviders.map((provider) => ({ ...provider })),
@@ -1006,11 +1003,13 @@ async function buildSettingsResponse(
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
 		providerQuotaGenerations: providerQuotaService.generations(),
-		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// The provider page must use the same quota-service capability gate as its routes before
 		// rendering site-account fields or quota rows.
 		providerBalanceCapability: { enabled: providerQuotaService.capabilityEnabled() },
+		// Credentials that stopped the move to credentials.json; the providers page lists them.
+		// Labels can be account emails, so only admins see them.
+		...(admin ? { credentialMigrationConflicts: getCredentialMigrationConflicts() } : {}),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1069,12 +1068,6 @@ async function buildSettingsResponse(
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
-		customApiQuotas: getAllCustomApiCachedQuotas(),
-		kimiUsages: getAllKimiCachedUsages(),
-		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
-		// them so an allowance fetched for a replaced account is never rendered
-		// under the new one.
-		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		commandcodeAvailable: hasConfiguredCommandCodeProvider(),
@@ -1227,8 +1220,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
-	// A deleted provider takes all of its keys with it, not just the one settings showed.
-	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(
@@ -1240,6 +1231,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
+	// Quota purge resolves the first credential id before a deleted provider loses its keys.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	// Collect prefixes of removed providers — needed to purge agent-level fields
 	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
@@ -1269,8 +1262,12 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 }
 
 settingsRoutes.get("/", async (c) => {
-	return c.json(await buildSettingsResponse(settings));
+	return c.json(await buildSettingsResponse(settings, { admin: c.get("user").role === "admin" }));
 });
+
+settingsRoutes.get("/runtime", (c) =>
+	c.json(buildRuntimeSettings(settings, c.get("user").role === "admin")),
+);
 
 settingsRoutes.get("/context-thresholds", (c) => {
 	const model = c.req.query("model") ?? "";
@@ -1966,12 +1963,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 
 		const responseStartedAt = performance.now();
-		const response = c.json(
-			await buildSettingsResponse(merged, {
-				serverRestarting: needsRestart,
-				newUrl,
-			}),
-		);
+		const response =
+			c.req.query("view") === "runtime"
+				? c.json(buildRuntimeSettings(merged, true))
+				: c.json(
+						await buildSettingsResponse(merged, {
+							serverRestarting: needsRestart,
+							newUrl,
+							admin: true,
+						}),
+					);
 		const finishedAt = performance.now();
 		if (finishedAt - requestStartedAt >= 500) {
 			// Timings only: never log settings contents or provider credentials.

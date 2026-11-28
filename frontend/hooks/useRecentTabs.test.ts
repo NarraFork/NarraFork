@@ -1,6 +1,8 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tabs";
 import { QueryClient } from "@tanstack/react-query";
+import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
+import { getRecentTabsScope } from "../lib/recent-tabs-owner";
 import {
 	buildRecentTabUpsert,
 	buildSubagentRecentTab,
@@ -56,12 +58,185 @@ const {
 	clearLoadedTabs,
 	collectRecentTabsDeltaFrame,
 	recentTabsDataRevision,
-	recentTabsSectionQueryKey,
+	recentTabsFlatQueryKey,
+	recentTabsSectionQueryKey: scopedSectionKey,
 	recordRecentTabVisit,
+	refreshRecentTabsAfterReconnect,
 	refreshRecentTabsLoadedWindow,
+	removeRecentTabCascade,
 } = await import("./useRecentTabs");
 const { api } = await import("../lib/api");
 const { queryClient: globalQC } = await import("../lib/query-client");
+
+const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+beforeEach(() => {
+	const storage = new Map<string, string>();
+	Object.defineProperty(globalThis, "localStorage", {
+		configurable: true,
+		value: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
+	});
+	confirmAuthUser(setToken("recent-tabs-test"), "recent-tabs-user");
+});
+afterEach(() => {
+	clearToken();
+	if (storageDescriptor) Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+	else Reflect.deleteProperty(globalThis, "localStorage");
+});
+function scope() {
+	const current = getRecentTabsScope();
+	if (!current) throw Error("Missing test scope");
+	return current;
+}
+const recentTabsSectionQueryKey = (section: "projects" | "work") =>
+	scopedSectionKey(scope(), section);
+
+test("manual pagination cannot apply old A results or continue the old cursor after A → B → A", async () => {
+	const qc = new QueryClient();
+	const oldScope = scope();
+	const oldTab: RecentTab = { type: "narrator", id: "same-id", title: "Old", lastVisitedAt: 1 };
+	const oldKey = scopedSectionKey(oldScope, "work");
+	const seed = {
+		pages: [
+			{ items: [oldTab], revision: 1, hasMore: true, nextCursor: "loaded-next" },
+			{ items: [], revision: 1, hasMore: false },
+		],
+		pageParams: [undefined, "loaded-next"],
+	};
+	qc.setQueryData(oldKey, seed);
+	const original = api.getRecentTabsPage;
+	let finish!: (page: RecentTabsInfiniteData["pages"][number]) => void;
+	let started!: () => void;
+	const requestStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const pageRequest = mock(
+		() =>
+			new Promise<RecentTabsInfiniteData["pages"][number]>((resolve) => {
+				finish = resolve;
+				started();
+			}),
+	);
+	api.getRecentTabsPage = pageRequest;
+	try {
+		const refresh = refreshRecentTabsLoadedWindow(qc, {}, oldScope);
+		await requestStarted;
+		confirmAuthUser(setToken("different-credential"), "different-user");
+		confirmAuthUser(setToken("recent-tabs-test"), "recent-tabs-user");
+		const newKey = recentTabsSectionQueryKey("work");
+		const current = {
+			pages: [{ items: [{ ...oldTab, title: "Current" }], revision: 1, hasMore: false }],
+			pageParams: [undefined],
+		};
+		qc.setQueryData(newKey, current);
+		finish({
+			items: [{ ...oldTab, title: "Late" }],
+			revision: 2,
+			hasMore: true,
+			nextCursor: "third",
+		});
+		await refresh;
+		expect(pageRequest).toHaveBeenCalledTimes(1);
+		expect(qc.getQueryData(oldKey)).toBe(seed);
+		expect(qc.getQueryData(newKey)).toBe(current);
+	} finally {
+		api.getRecentTabsPage = original;
+		qc.clear();
+	}
+});
+
+test("a late cascade mutation rollback cannot restore old layout after same-account token rotation", async () => {
+	const qc = new QueryClient();
+	const original = api.removeRecentTab;
+	const oldScope = scope();
+	const oldKey = scopedSectionKey(oldScope, "work");
+	const oldTab: RecentTab = { type: "narrator", id: "same-id", title: "Old", lastVisitedAt: 1 };
+	qc.setQueryData(oldKey, {
+		pages: [{ items: [oldTab], revision: 1, hasMore: false }],
+		pageParams: [undefined],
+	});
+	let fail!: (error: Error) => void;
+	let started!: () => void;
+	const requestStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	api.removeRecentTab = () =>
+		new Promise((_resolve, reject) => {
+			fail = reject;
+			started();
+		});
+	try {
+		const removal = removeRecentTabCascade(qc, "narrator", oldTab.id, {}, oldScope);
+		await requestStarted;
+		expect(qc.getQueryData<RecentTabsInfiniteData>(oldKey)?.pages[0].items).toEqual([]);
+		confirmAuthUser(setToken("rotated-credential"), "recent-tabs-user");
+		const newKey = recentTabsSectionQueryKey("work");
+		const current = {
+			pages: [{ items: [{ ...oldTab, title: "Current" }], revision: 1, hasMore: false }],
+			pageParams: [undefined],
+		};
+		qc.setQueryData(newKey, current);
+		fail(new Error("Old removal failed"));
+		await removal;
+		expect(qc.getQueryData<RecentTabsInfiniteData>(oldKey)?.pages[0].items).toEqual([]);
+		expect(qc.getQueryData(newKey)).toBe(current);
+	} finally {
+		api.removeRecentTab = original;
+		qc.clear();
+	}
+});
+
+describe("recent tabs reconnect recovery", () => {
+	test("refetches an errored section with no data and clears the error", async () => {
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const queryKey = recentTabsSectionQueryKey("work");
+		let online = false;
+		const data: RecentTabsInfiniteData = { pages: [], pageParams: [] };
+		const queryFn = mock(async () => {
+			if (!online) throw Error("offline");
+			return data;
+		});
+		try {
+			await expect(qc.fetchQuery({ queryKey, queryFn })).rejects.toThrow("offline");
+			expect(qc.getQueryData(queryKey)).toBeUndefined();
+			expect(qc.getQueryState(queryKey)?.status).toBe("error");
+			online = true;
+			await refreshRecentTabsAfterReconnect(qc);
+			expect(queryFn).toHaveBeenCalledTimes(2);
+			expect(qc.getQueryState(queryKey)?.status).toBe("success");
+			expect(qc.getQueryState(queryKey)?.error).toBeNull();
+			expect(qc.getQueryData(queryKey)).toEqual(data);
+		} finally {
+			qc.clear();
+		}
+	});
+
+	test("does nothing when no sections have been queried", async () => {
+		const qc = new QueryClient();
+		await refreshRecentTabsAfterReconnect(qc);
+		expect(qc.getQueryCache().getAll()).toHaveLength(0);
+		qc.clear();
+	});
+
+	test("propagates failed refetches to the reconnect error notification", async () => {
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const queryFn = mock(async () => {
+			throw Error("still offline");
+		});
+		try {
+			await expect(
+				qc.fetchQuery({ queryKey: recentTabsSectionQueryKey("projects"), queryFn }),
+			).rejects.toThrow("still offline");
+			await expect(refreshRecentTabsAfterReconnect(qc)).rejects.toThrow("still offline");
+			expect(queryFn).toHaveBeenCalledTimes(2);
+		} finally {
+			qc.clear();
+		}
+	});
+});
 
 describe("isRecentTabBackgroundActive", () => {
 	const tab = (activeBackgroundTaskCount?: number): RecentTab =>
@@ -1397,7 +1572,7 @@ describe("recent tab identity preservation", () => {
 			{ key: "narrator:n1", patch: { status: "working", substatus: ["reasoning"] } },
 		]);
 		const windowBefore = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"));
-		const flatBefore = qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"]);
+		const flatBefore = qc.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope()));
 
 		applyRecentTabsRuntimePatches(qc, [
 			// Same values, freshly allocated array — exactly what a runtime poll returns.
@@ -1407,7 +1582,7 @@ describe("recent tab identity preservation", () => {
 		expect(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))).toBe(
 			windowBefore,
 		);
-		expect(qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"])).toBe(flatBefore);
+		expect(qc.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope()))).toBe(flatBefore);
 
 		// A real change must still produce new objects, or the rows would never update.
 		applyRecentTabsRuntimePatches(qc, [
@@ -1416,7 +1591,7 @@ describe("recent tab identity preservation", () => {
 		expect(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))).not.toBe(
 			windowBefore,
 		);
-		expect(qc.getQueryData<RecentTab[]>(["user-preferences", "recent-tabs"])).not.toBe(flatBefore);
+		expect(qc.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope()))).not.toBe(flatBefore);
 	});
 
 	test("an applied delta that changes nothing observable keeps the window object", () => {

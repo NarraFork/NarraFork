@@ -62,6 +62,8 @@ test("real Worker returns SDK decisions and softmax weights normalized over the 
 		{ text: "I cannot comply.", expected_count: 300 },
 	]);
 	expect(partial.decision).toBe("partial");
+	expect(partial.acceptedSampleIndexes).toEqual([0]);
+	expect(scored.acceptedSampleIndexes).toEqual([0, 1, 2]);
 	expect(partial.results).toHaveLength(5);
 	const sdk = await loadDetector({ source: import.meta.dir });
 	const source = sdk.analyze([full[0]]).results;
@@ -76,10 +78,11 @@ test("real Worker returns SDK decisions and softmax weights normalized over the 
 	expect(partial.results.reduce((sum, row) => sum + (row.probability ?? 0), 0)).toBeLessThan(1);
 
 	expect(await makeModelTraceRunner()([{ text: "I cannot comply.", expected_count: 300 }])).toEqual(
-		{ decision: "unscorable", results: [] },
+		{ decision: "unscorable", results: [], acceptedSampleIndexes: [] },
 	);
 	expect(await makeModelTraceRunner()([sample(300, (i) => i + 1)])).toEqual({
 		decision: "not_model",
+		acceptedSampleIndexes: [0],
 		results: [],
 	});
 });
@@ -145,6 +148,14 @@ for (const [name, fault] of [
 					decision: "partial",
 					results: [{ model: "bad", displayName: "bad", probability: 1.01 }],
 				},
+			}),
+	],
+	[
+		"invalid accepted sample indices",
+		(worker: EventEmitter) =>
+			worker.emit("message", {
+				type: "ranked",
+				ranking: { decision: "unscorable", results: [], acceptedSampleIndexes: [0, 0] },
 			}),
 	],
 	["load failure", (worker: EventEmitter) => worker.emit("message", { type: "unavailable" })],

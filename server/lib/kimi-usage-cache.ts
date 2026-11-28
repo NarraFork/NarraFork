@@ -1,6 +1,9 @@
 import type { ProviderQuotaSnapshot, ProviderQuotaWindow } from "@shared/provider-quota";
-import { providerQuotaService } from "../services/provider-quota-service";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { providerQuotaService, toQuotaSnapshot } from "../services/provider-quota-service";
 import { shownSubjectId, usageSubjects } from "./provider-key-subjects";
+import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 
 /** Legacy DTOs used by the Kimi wait policy and older HTTP clients. */
 export interface KimiUsageWindow {
@@ -40,6 +43,9 @@ export function isKimiCustomApiProvider(config: { baseUrl?: string; disabled?: b
 	}
 }
 
+export const kimiQuotaIdentity = (config: CustomApiProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
+
 function legacyWindow(window: ProviderQuotaWindow | undefined): KimiUsageWindow | null {
 	return window
 		? {
@@ -52,8 +58,6 @@ function legacyWindow(window: ProviderQuotaWindow | undefined): KimiUsageWindow 
 }
 
 export function toKimiUsageCache(snapshot: ProviderQuotaSnapshot): KimiUsageCache {
-	// Disabled/unavailable sources must not provide apparently recovered allowance
-	// or a reset inferred from an account whose source is no longer active.
 	const data =
 		snapshot.status === "unavailable" || snapshot.status === "unsupported" ? null : snapshot.data;
 	const windows = data?.windows ?? [];
@@ -80,7 +84,13 @@ export function toKimiUsageCache(snapshot: ProviderQuotaSnapshot): KimiUsageCach
 
 const kimiSubjects = () => usageSubjects(isKimiCustomApiProvider);
 
-/** Provider reads keep the upstream's first non-disabled subject view. */
+export function getKimiQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	return toQuotaSnapshot(providerQuotaService.peekKey(keyId));
+}
+export const isKimiQuotaRefreshing = (keyId: string): boolean =>
+	providerQuotaService.peekKey(keyId)?.status === "probing";
+
+/** Provider reads retain the first non-disabled subject view used by quota waits. */
 export function getKimiCachedUsage(providerId: string): KimiUsageCache | undefined {
 	const id = shownSubjectId(kimiSubjects(), providerId);
 	const snapshot = id ? providerQuotaService.peekKey(id) : null;

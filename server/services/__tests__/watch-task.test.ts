@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { parseWatchCommand } from "@shared/watch-command";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
@@ -7,12 +8,16 @@ import {
 	narratorBufferedMessages,
 	narrators,
 	runtimePublicationOutbox,
+	userPreferences,
+	users,
 } from "../../db/schema";
 import { stopTool } from "../../lib/agent/tools/stop";
 import { watchTool } from "../../lib/agent/tools/watch";
 import type { ToolContext, ToolResult } from "../../lib/agent/types";
 import * as workerPool from "../../lib/db-worker/pool";
 import { eventBus } from "../../lib/event-bus";
+import { upsertEncodedTrait } from "../../lib/narrator-custom-traits";
+import { RUNTIME_POLICY_TRAIT_PREFIX } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { MAILBOX_LIMITS } from "../agent-runtime/limits";
 import { createMailboxStore } from "../agent-runtime/mailbox";
@@ -23,15 +28,22 @@ import {
 	runtimePublication,
 } from "../agent-runtime/publication";
 import { backgroundTaskService } from "../background-task-service";
-import { clearAliasRegistry } from "../subagent-alias";
+import { projectPendingInjection } from "../parent-injection-queue";
+import { clearAliasRegistry, resolveTaskAlias, restoreTaskAlias } from "../subagent-alias";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
+import { invalidateUserTraitLayer } from "../trait-layer-service";
 import {
 	createWatchObservation,
 	MAX_PUBLISH_RETRY_DELAY_MS,
+	MAX_WATCHES_PER_NARRATOR,
 	PUBLISH_RETRY_DELAYS_MS,
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 } from "../watch-observation";
+import { restartResumableWatch } from "../watch-restart";
+import { resumeWatchAfterRestart } from "../watch-service";
+import { activeWatchSourceCount, subscribeWatchSource } from "../watch-source";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const PARENT = "watch-task-parent";
 const CHILD = "watch-task-child";
@@ -43,8 +55,8 @@ const wakes: string[] = [];
 runtimePublication.stop();
 backgroundTaskService.setBroadcastFnForTests(() => {});
 
-const context = (narratorId = PARENT): ToolContext =>
-	({ narratorId, signal: new AbortController().signal }) as ToolContext;
+const context = (narratorId = PARENT, userId?: string): ToolContext =>
+	({ narratorId, userId, signal: new AbortController().signal }) as ToolContext;
 
 function task(id: string) {
 	return db.select().from(backgroundTasks).where(eq(backgroundTasks.id, id)).get();
@@ -73,12 +85,12 @@ async function settled(id: string) {
 	}
 }
 
-async function notices() {
-	await flushRuntimePublications(PARENT);
+async function notices(narratorId = PARENT) {
+	await flushRuntimePublications(narratorId);
 	return db
 		.select()
 		.from(narratorBufferedMessages)
-		.where(eq(narratorBufferedMessages.narratorId, PARENT))
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
 		.all();
 }
 
@@ -160,13 +172,24 @@ function acceleratePublicationRetries(): number[] {
 	const delays: number[] = [];
 	spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
 		const [handler, delay, ...rest] = args;
+		const caller = new Error().stack
+			?.split("\n")
+			.find((frame) => frame.includes("/server/") && !frame.includes("/__tests__/"));
 		const retry =
-			delay === MAX_PUBLISH_RETRY_DELAY_MS || PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay);
+			(caller?.includes("/watch-observation.ts:") ?? false) &&
+			(delay === MAX_PUBLISH_RETRY_DELAY_MS || PUBLISH_RETRY_DELAYS_MS.some((ms) => ms === delay));
 		if (retry && delay !== undefined) delays.push(delay);
 		return schedule(handler, retry ? 5 : delay, ...rest);
 	}) as typeof setTimeout);
 	return delays;
 }
+
+test("publication retry acceleration leaves unrelated Worker deadlines unchanged", () => {
+	const delays = acceleratePublicationRetries();
+	const timer = setTimeout(() => {}, MAX_PUBLISH_RETRY_DELAY_MS);
+	clearTimeout(timer);
+	expect(delays).toEqual([]);
+});
 
 test("ordinary task cancellation still resolves its kill handler after abort side effects", async () => {
 	await bashTask();
@@ -572,9 +595,12 @@ describe("Watch observes Bash without owning its execution", () => {
 		expect(wakes).toEqual([PARENT]);
 	});
 
-	test("observations have independent deadlines and a later completion remains ordinary", async () => {
+	test("observations of different conditions have independent deadlines and a later completion remains ordinary", async () => {
 		await bashTask();
-		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		const first = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
 		const second = await watchTool.execute({ type: "bash", id: BASH, timeout: 5_000 }, context());
 		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
 		expect(task(watchId(second))?.status).toBe("running");
@@ -689,7 +715,7 @@ describe("Watch observes Bash without owning its execution", () => {
 			"CREATE TRIGGER watch_mailbox_write_fault BEFORE INSERT ON narrator_buffered_messages WHEN NEW.notice_kind = 'bash' BEGIN SELECT RAISE(ABORT, 'transient watch mailbox fault'); END;",
 		);
 		try {
-			await expect(flushRuntimePublications(PARENT)).rejects.toThrow(
+			await expect(await captureWorkerRejectionThrower(flushRuntimePublications(PARENT))).toThrow(
 				"transient watch mailbox fault",
 			);
 			expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
@@ -734,7 +760,9 @@ describe("Watch observes Bash without owning its execution", () => {
 	test("the observation budget is reserved across parallel registrations", async () => {
 		await bashTask();
 		const results = await Promise.all(
-			Array.from({ length: 21 }, () => watchTool.execute({ type: "bash", id: BASH }, context())),
+			Array.from({ length: 21 }, (_, i) =>
+				watchTool.execute({ type: "bash", id: BASH, pattern: `never-${i}` }, context()),
+			),
 		);
 		expect(results.filter((result) => !result.isError)).toHaveLength(20);
 		expect(results.filter((result) => result.isError)).toHaveLength(1);
@@ -802,9 +830,9 @@ describe("Watch follows an agent's registered current run", () => {
 		const setting = process.env.NARRAFORK_DB_WORKER;
 		try {
 			process.env.NARRAFORK_DB_WORKER = "off";
-			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBeInstanceOf(
-				workerPool.WorkersUnavailableError,
-			);
+			await expect(
+				await captureWorkerRejection(publication.readAgentTerminalResult(run, {}, {})),
+			).toBeInstanceOf(workerPool.WorkersUnavailableError);
 		} finally {
 			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = setting;
@@ -815,15 +843,21 @@ describe("Watch follows an agent's registered current run", () => {
 			new workerPool.DbReadTaskTimeoutError("timed out"),
 		]) {
 			dispatch.mockRejectedValueOnce(error);
-			await expect(publication.readAgentTerminalResult(run, {}, {})).rejects.toBe(error);
+			await expect(
+				await captureWorkerRejection(publication.readAgentTerminalResult(run, {}, {})),
+			).toBe(error);
 		}
 		const interrupted = AbortSignal.abort();
 		await expect(
-			publication.readAgentTerminalResult(run, {}, { signal: interrupted }),
-		).rejects.toBe(interrupted.reason);
+			await captureWorkerRejection(
+				publication.readAgentTerminalResult(run, {}, { signal: interrupted }),
+			),
+		).toBe(interrupted.reason);
 		await expect(
-			sqlite.transaction(() => publication.readAgentTerminalResult(run, {}, {}))(),
-		).rejects.toBeInstanceOf(workerPool.WorkersUnavailableError);
+			await captureWorkerRejection(
+				sqlite.transaction(() => publication.readAgentTerminalResult(run, {}, {}))(),
+			),
+		).toBeInstanceOf(workerPool.WorkersUnavailableError);
 		expect(inline).not.toHaveBeenCalled();
 
 		dispatch.mockRejectedValueOnce(new workerPool.DbReadTaskExecutionError("worker exited"));
@@ -855,7 +889,7 @@ describe("Watch follows an agent's registered current run", () => {
 		expect((await notices()).some((notice) => notice.noticeKind === "agent")).toBe(true);
 	});
 
-	test("a running background agent can still be watched with SQLite Workers disabled", async () => {
+	test("a running background agent cannot be watched with required authority Workers disabled", async () => {
 		await backgroundTaskService.createAgentTask({
 			id: CHILD,
 			subagentNarratorId: CHILD,
@@ -868,25 +902,16 @@ describe("Watch follows an agent's registered current run", () => {
 		try {
 			process.env.NARRAFORK_DB_WORKER = "off";
 			const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
-			expect(result.metadata).toMatchObject({ status: "watching" });
-			expect(await backgroundTaskService.markCompleted(CHILD, "background agent output")).toBe(
-				true,
-			);
-			db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, CHILD)).run();
-			eventBus.emit({
-				type: "narrator:status_changed",
-				narratorId: CHILD,
-				status: "idle",
-				substatus: [],
-			});
-			expect(await settled(watchId(result))).toMatchObject({
-				status: "completed",
-				output: expect.stringContaining("fulfilled by the ordinary agent completion notice"),
-			});
+			expect(result.isError).toBe(true);
+			expect(result.metadata).toMatchObject({ kind: "watch", status: "failed" });
+			expect(result.output).toContain("workers unavailable");
+			expect(result.output).not.toContain("Watching");
+			expect(observations()).toHaveLength(0);
+			expect(task(CHILD)?.status).toBe("running");
 			expect(
 				dispatch.mock.calls.some(([, task]) => task.kind === "publicationTerminalResult"),
 			).toBe(false);
-			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(1);
+			expect((await notices()).filter((notice) => notice.noticeKind === "agent")).toHaveLength(0);
 		} finally {
 			if (setting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = setting;
@@ -896,17 +921,22 @@ describe("Watch follows an agent's registered current run", () => {
 	test("an already settled Watch rechecks team ownership after the Worker responds", async () => {
 		completeAgent("must stay private after reassignment");
 		const read = workerPool.runReadTask;
-		spyOn(workerPool, "runReadTask").mockImplementationOnce(
+		let reassigned = false;
+		spyOn(workerPool, "runReadTask").mockImplementation(
 			async <T>(...args: Parameters<typeof read>) => {
 				const result = await read<T>(...args);
-				db.update(narrators)
-					.set({ runtimeRegistrationJson: delegationRegistration(OTHER, "general") })
-					.where(eq(narrators.id, CHILD))
-					.run();
+				if (args[1].kind === "publicationTerminalResult" && !reassigned) {
+					reassigned = true;
+					db.update(narrators)
+						.set({ runtimeRegistrationJson: delegationRegistration(OTHER, "general") })
+						.where(eq(narrators.id, CHILD))
+						.run();
+				}
 				return result;
 			},
 		);
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(reassigned).toBe(true);
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("access was revoked");
 		expect(result.output).not.toContain("must stay private after reassignment");
@@ -1050,18 +1080,469 @@ describe("Watch follows an agent's registered current run", () => {
 		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
 	});
 
-	test("shutdown releases an observation and restart reports interruption without stopping the agent", async () => {
+	test("shutdown releases an observation and restart reports interruption when no process can re-attach it", async () => {
 		const result = await watchTool.execute({ type: "agent", id: CHILD }, context());
 		const id = watchId(result);
+		// Still suspended: this process is shutting down, so re-attachment is refused and
+		// the row ends exactly as before re-attachment existed.
 		suspendWatchObservationsForShutdown();
 		await backgroundTaskService.killAll();
 		expect(task(id)?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
 		expect(task(id)?.status).toBe("failed");
 		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
-		expect(task(id)?.output).toContain("target was not stopped");
+		expect(task(id)?.output).toContain("The watch did not stop the target");
 		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
 			"working",
+		);
+	});
+});
+
+const OWNER = "watch-task-owner";
+
+/** Give the watcher a known execution identity: re-attachment authorizes as it. */
+function ownWatcher(traits: string[] = []) {
+	const now = new Date().toISOString();
+	db.insert(users).values({ id: OWNER, username: OWNER, passwordHash: "x", createdAt: now }).run();
+	if (traits.length)
+		db.insert(userPreferences)
+			.values({ id: `${OWNER}-prefs`, userId: OWNER, traits, createdAt: now, updatedAt: now })
+			.run();
+	db.update(narrators).set({ ownerUserId: OWNER }).where(eq(narrators.id, PARENT)).run();
+	// Preference writes invalidate the cached user layer; this direct insert must too.
+	invalidateUserTraitLayer(OWNER);
+}
+
+/** Shut down, then recover as a fresh process would: observation state starts empty. */
+async function restart(): Promise<void> {
+	suspendWatchObservationsForShutdown();
+	await backgroundTaskService.killAll();
+	resumeWatchObservationsForTests();
+	clearAliasRegistry(PARENT);
+	await backgroundTaskService.recoverStaleTasksAfterRestart();
+}
+
+describe("lifecycle watches are re-attached after a restart", () => {
+	beforeEach(() => ownWatcher());
+
+	test("an agent watch keeps its row and reports the agent's later completion", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		expect(observations().filter((row) => row.status === "running")).toHaveLength(1);
+		completeAgent("finished after the restart");
+		const row = await settled(id);
+		// The agent's own completion notice fulfils the observation: one notice, no duplicate.
+		expect(row?.status).toBe("completed");
+		expect(row?.output).toContain("Observation fulfilled by the ordinary agent completion notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("an agent watch keeps its original deadline instead of restarting the clock", async () => {
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD, timeout: 60_000 }, context()),
+		);
+		// The row was registered 59.7s ago: only ~300ms of its 60s deadline remain.
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(Date.now() - 59_700).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		const row = await settled(id);
+		expect(row?.status).toBe("completed");
+		expect(row?.output).toMatch(/deadline/i);
+		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
+			"working",
+		);
+	});
+
+	test("a watch whose deadline passed while the server was down ends as interrupted", async () => {
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context()),
+		);
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(Date.now() - 5_000).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("an agent watch is not moved onto a different run of the same agent", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		db.update(narrators).set({ logicalRunId: "a-later-run" }).where(eq(narrators.id, CHILD)).run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a Bash watch whose target did not survive the restart ends with a waking interruption", async () => {
+		await bashTask();
+		const id = watchId(await watchTool.execute({ type: "bash", id: BASH }, context()));
+		await restart();
+		// Shutdown cancelled the ordinary command; its cancelled notice never wakes the
+		// watcher, so the watch must still report the interruption itself.
+		expect(task(BASH)?.status).toBe("cancelled");
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+		wakes.length = 0;
+		const texts = (await notices()).map((notice) => notice.text ?? "");
+		// The watch publishes its own failed notice, which wakes the watcher.
+		const alias = task(id)?.alias ?? id;
+		expect(texts.some((text) => text.includes(`(ID: ${alias}) failed`))).toBe(true);
+		expect(wakes).toContain(PARENT);
+	});
+
+	test("an agent watch whose agent the restart cancelled ends with a waking interruption", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		db.update(narrators)
+			.set({ status: "idle", backgroundStatus: "cancelled" })
+			.where(eq(narrators.id, CHILD))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a Bash watch of a still-running target is re-attached and completes once", async () => {
+		await bashTask();
+		const id = watchId(await watchTool.execute({ type: "bash", id: BASH }, context()));
+		// Drop in-memory observation state as a new process would, keeping both rows running
+		// (as for a durable service that restart recovery re-attached).
+		suspendWatchObservationsForShutdown();
+		resumeWatchObservationsForTests();
+		clearAliasRegistry(PARENT);
+		const row = task(id);
+		const target = parseWatchCommand(row?.command);
+		if (!row || !restartResumableWatch(target, row.createdAt)) throw new Error("not resumable");
+		expect(
+			await resumeWatchAfterRestart(
+				{
+					id,
+					parentNarratorId: PARENT,
+					alias: row.alias,
+					createdAt: row.createdAt,
+					principal: { userId: null },
+				},
+				target,
+			),
+		).toBe(true);
+		expect(observations().filter((watch) => watch.status === "running")).toHaveLength(1);
+		await backgroundTaskService.markCompleted(BASH, "service output");
+		const done = await settled(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("Observation fulfilled by the ordinary bash completion notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a Bash text watch still ends as interrupted: missed output cannot be replayed", async () => {
+		await bashTask();
+		const id = watchId(
+			await watchTool.execute({ type: "bash", id: BASH, pattern: "READY" }, context()),
+		);
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a re-attached watch can still be cancelled with Stop", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		await restart();
+		expect(task(id)?.status).toBe("running");
+		expect(await backgroundTaskService.cancel(id)).toBe(true);
+		expect(task(id)?.status).toBe("cancelled");
+		expect(observations().filter((row) => row.status === "running")).toHaveLength(0);
+		expect(db.select().from(narrators).where(eq(narrators.id, CHILD)).get()?.status).toBe(
+			"working",
+		);
+	});
+});
+
+describe("re-attachment keeps identity, authority and extended deadlines", () => {
+	test("a watch row that does not record its registrant is not re-attached", async () => {
+		const id = watchId(await watchTool.execute({ type: "agent", id: CHILD }, context()));
+		expect(task(id)?.principalJson).toEqual({ userId: null });
+		db.update(backgroundTasks).set({ principalJson: null }).where(eq(backgroundTasks.id, id)).run();
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("the registrant's user-level revocation applies to re-attachment", async () => {
+		ownWatcher();
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD }, context(PARENT, OWNER)),
+		);
+		expect(task(id)?.principalJson).toEqual({ userId: OWNER });
+		db.insert(userPreferences)
+			.values({
+				id: `${OWNER}-prefs`,
+				userId: OWNER,
+				traits: upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, {
+					version: 1,
+					deny: ["watchAgent"],
+				}),
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			})
+			.run();
+		invalidateUserTraitLayer(OWNER);
+		await restart();
+		expect(task(id)?.status).toBe("failed");
+		expect(task(id)?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a later collaborator's policy is never borrowed for another user's watch", async () => {
+		ownWatcher();
+		const id = watchId(
+			await watchTool.execute({ type: "agent", id: CHILD }, context(PARENT, OWNER)),
+		);
+		// A collaborator whose own policy denies agent watches now drives the session.
+		const now = new Date().toISOString();
+		db.insert(users)
+			.values({ id: "collab", username: "collab", passwordHash: "x", createdAt: now })
+			.run();
+		db.insert(userPreferences)
+			.values({
+				id: "collab-prefs",
+				userId: "collab",
+				traits: upsertEncodedTrait([], RUNTIME_POLICY_TRAIT_PREFIX, {
+					version: 1,
+					deny: ["watchAgent"],
+				}),
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		invalidateUserTraitLayer("collab");
+		db.update(narrators).set({ ownerUserId: "collab" }).where(eq(narrators.id, PARENT)).run();
+		await restart();
+		// Re-authorized as the registrant, whose policy still allows it.
+		expect(task(id)?.status).toBe("running");
+	});
+
+	test("a repeated watch's extended deadline survives a restart", async () => {
+		ownWatcher();
+		const first = await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		const id = watchId(first);
+		await watchTool.execute({ type: "agent", id: CHILD, timeout: 60_000 }, context());
+		expect(parseWatchCommand(task(id)?.command)?.timeoutMs).toBeGreaterThanOrEqual(60_000);
+		// Restart after the first deadline but well before the extended one.
+		const createdAt = Date.parse(task(id)?.createdAt ?? "");
+		db.update(backgroundTasks)
+			.set({ createdAt: new Date(createdAt - 5_000).toISOString() })
+			.where(eq(backgroundTasks.id, id))
+			.run();
+		await restart();
+		expect(task(id)?.status).toBe("running");
+	});
+
+	test("persisted handles are restored exactly, whatever order rows are recovered in", () => {
+		const long = "w".repeat(40);
+		// Registered first: `long`; registered second: `long-2`. Recovered in reverse order.
+		expect(restoreTaskAlias(PARENT, "second", `${long}-2`).alias).toBe(`${long}-2`);
+		expect(restoreTaskAlias(PARENT, "first", long).alias).toBe(long);
+		expect(resolveTaskAlias(PARENT, long)).toBe("first");
+		expect(resolveTaskAlias(PARENT, `${long}-2`)).toBe("second");
+	});
+});
+
+describe("repeated watches by one watcher are deduplicated", () => {
+	test("a repeated Bash watch reuses its observation and extends the deadline to the later one", async () => {
+		await bashTask();
+		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		const repeat = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_500 }, context());
+		expect(watchId(repeat)).toBe(watchId(first));
+		expect(repeat.metadata).toMatchObject({ status: "watching", reused: true });
+		expect(repeat.output).toContain("no second watch was added");
+		expect(observations()).toHaveLength(1);
+		await Bun.sleep(1_200);
+		expect(task(watchId(first))?.status).toBe("running");
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+		expect(task(BASH)?.status).toBe("running");
+	});
+
+	test("a repeated Bash watch never shortens the existing deadline", async () => {
+		await bashTask();
+		const first = await watchTool.execute({ type: "bash", id: BASH, timeout: 1_500 }, context());
+		await watchTool.execute({ type: "bash", id: BASH, timeout: 1_000 }, context());
+		await Bun.sleep(1_200);
+		expect(task(watchId(first))?.status).toBe("running");
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("concurrent identical registrations create one observation and one source waiter", async () => {
+		await bashTask();
+		const results = await Promise.all(
+			Array.from({ length: MAX_WATCHES_PER_NARRATOR + 5 }, () =>
+				watchTool.execute({ type: "bash", id: BASH }, context()),
+			),
+		);
+		expect(results.every((result) => !result.isError)).toBe(true);
+		expect(new Set(results.map(watchId)).size).toBe(1);
+		expect(results.filter((result) => result.metadata?.reused)).toHaveLength(
+			MAX_WATCHES_PER_NARRATOR + 4,
+		);
+		expect(observations()).toHaveLength(1);
+		expect(activeWatchSourceCount()).toBe(1);
+		await backgroundTaskService.markCompleted(BASH, "done once");
+		expect((await settled(watchId(results[0] as ToolResult)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(activeWatchSourceCount()).toBe(0);
+	});
+
+	test("different patterns stay separate observations and the completion notifies once", async () => {
+		await bashTask();
+		const ready = await watchTool.execute({ type: "bash", id: BASH, pattern: "READY" }, context());
+		const done = await watchTool.execute({ type: "bash", id: BASH, pattern: "DONE" }, context());
+		const end = await watchTool.execute({ type: "bash", id: BASH }, context());
+		expect(new Set([ready, done, end].map(watchId)).size).toBe(3);
+		expect(activeWatchSourceCount()).toBe(3);
+		await backgroundTaskService.markCompleted(BASH, "finished without either marker");
+		for (const result of [ready, done, end])
+			expect((await settled(watchId(result)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a repeated agent watch reuses its observation and one completion notifies once", async () => {
+		const first = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		const repeat = await watchTool.execute({ type: "agent", id: CHILD }, context());
+		expect(watchId(repeat)).toBe(watchId(first));
+		expect(observations()).toHaveLength(1);
+		completeAgent("agent final once");
+		expect((await settled(watchId(first)))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+		expect(wakes).toEqual([PARENT]);
+	});
+
+	test("a repeated agent watch times out once", async () => {
+		const first = await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		await watchTool.execute({ type: "agent", id: CHILD, timeout: 1_000 }, context());
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("a new watch after the first one settled is registered afresh", async () => {
+		await bashTask();
+		const first = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
+		expect((await settled(watchId(first)))?.output).toMatch(/deadline/i);
+		const again = await watchTool.execute(
+			{ type: "bash", id: BASH, pattern: "NEVER", timeout: 1_000 },
+			context(),
+		);
+		expect(watchId(again)).not.toBe(watchId(first));
+		expect(again.metadata?.reused).toBeUndefined();
+	});
+});
+
+describe("watch results coalesce per watcher", () => {
+	const observe = (narratorId = PARENT) =>
+		createWatchObservation({ narratorId, title: "coalesce", command: "bash fixture" });
+
+	test("one watcher's observations of the same outcome publish one notice", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await first.finish({ status: "completed", output: "ended", coalesceKey: "run-1 end" });
+		await second.finish({ status: "completed", output: "ended", coalesceKey: "run-1 end" });
+		expect((await settled(first.taskId))?.status).toBe("completed");
+		const silent = await settled(second.taskId);
+		expect(silent?.status).toBe("completed");
+		expect(silent?.output).toContain("fulfilled by an earlier notice");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("repeated timeout notices of one key publish once", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await Promise.all([
+			first.finish({ status: "timeout", output: "deadline", coalesceKey: "run-2 deadline" }),
+			second.finish({ status: "timeout", output: "deadline", coalesceKey: "run-2 deadline" }),
+		]);
+		expect((await settled(second.taskId))?.status).toBe("completed");
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("different watchers of one target each receive their own notice", async () => {
+		const [mine, theirs] = await Promise.all([observe(PARENT), observe(OTHER)]);
+		await mine.finish({ status: "completed", output: "ended", coalesceKey: "run-3 end" });
+		await theirs.finish({ status: "completed", output: "ended", coalesceKey: "run-3 end" });
+		expect(await notices(PARENT)).toHaveLength(1);
+		expect(await notices(OTHER)).toHaveLength(1);
+	});
+
+	test("different outcome keys are not merged", async () => {
+		const [first, second] = await Promise.all([observe(), observe()]);
+		await first.finish({ status: "completed", output: "READY", coalesceKey: "run-4 READY" });
+		await second.finish({ status: "completed", output: "DONE", coalesceKey: "run-4 DONE" });
+		expect(await notices()).toHaveLength(2);
+	});
+
+	test("a duplicate waiting on a holder that is cancelled before delivery publishes instead", async () => {
+		const original = backgroundTaskService.markCompleted.bind(backgroundTaskService);
+		const [holder, follower] = await Promise.all([observe(), observe()]);
+		const blocked = spyOn(backgroundTaskService, "markCompleted").mockImplementation(
+			async (id, ...rest) => {
+				if (id === holder.taskId) throw new Error("storage unavailable");
+				return original(id, ...rest);
+			},
+		);
+		acceleratePublicationRetries();
+		await holder.finish({ status: "completed", output: "holder", coalesceKey: "run-5 end" });
+		await follower.finish({ status: "completed", output: "follower", coalesceKey: "run-5 end" });
+		expect(task(follower.taskId)?.status).toBe("running");
+		expect(await backgroundTaskService.cancel(holder.taskId)).toBe(true);
+		const done = await settled(follower.taskId);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toBe("follower");
+		const delivered = (await notices()).map((row) => projectPendingInjection(row));
+		expect(
+			delivered.filter(
+				(notice) => notice?.kind === "bg_bash" && notice.task.id === follower.taskId,
+			),
+		).toHaveLength(1);
+		blocked.mockRestore();
+	});
+});
+
+describe("shared watch sources", () => {
+	test("subscribers share one waiter, which stops only when the last one leaves", async () => {
+		let starts = 0;
+		let sourceSignal: AbortSignal | undefined;
+		const start = (signal: AbortSignal) => {
+			starts++;
+			sourceSignal = signal;
+			return new Promise<string>(() => {});
+		};
+		const first = new AbortController();
+		const second = new AbortController();
+		const a = subscribeWatchSource("shared-test", start, first.signal);
+		const b = subscribeWatchSource("shared-test", start, second.signal);
+		await Bun.sleep(0);
+		expect(starts).toBe(1);
+		first.abort();
+		expect(await a).toBeUndefined();
+		expect(sourceSignal?.aborted).toBe(false);
+		second.abort();
+		expect(await b).toBeUndefined();
+		expect(sourceSignal?.aborted).toBe(true);
+		expect(activeWatchSourceCount()).toBe(0);
+	});
+
+	test("every subscriber receives the shared result and a later one starts afresh", async () => {
+		let starts = 0;
+		const start = async () => `result ${++starts}`;
+		const results = await Promise.all([
+			subscribeWatchSource("shared-result", start, new AbortController().signal),
+			subscribeWatchSource("shared-result", start, new AbortController().signal),
+		]);
+		expect(results).toEqual(["result 1", "result 1"]);
+		expect(await subscribeWatchSource("shared-result", start, new AbortController().signal)).toBe(
+			"result 2",
 		);
 	});
 });

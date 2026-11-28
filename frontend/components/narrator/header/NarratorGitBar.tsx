@@ -5,8 +5,8 @@ import {
 	useGitWorkspace,
 } from "@frontend/hooks/useGit";
 import { useWorkspaceContext } from "@frontend/hooks/useWorkspaceContext";
-import { Badge, Group, Skeleton, Text, Tooltip } from "@mantine/core";
-import { IconFolder, IconGitBranch } from "@tabler/icons-react";
+import { ActionIcon, Badge, Group, Skeleton, Text, Tooltip } from "@mantine/core";
+import { IconFolder, IconGitBranch, IconRefresh } from "@tabler/icons-react";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { GitLineStatsSummary } from "../../git/GitLineStatsSummary";
@@ -36,6 +36,17 @@ export function NarratorGitBar({
 	const status = useGitStatus(target, "summary");
 	const lineStats = useGitLineStats(target, "summary");
 	const workspaceState = workspace.data?.state;
+	const authorizationState = workspace.authorizationState;
+	const authorizationLabel =
+		authorizationState === "paused" || authorizationState === "workspace_changed"
+			? "recovering"
+			: authorizationState === "refresh_required"
+				? "refresh_required"
+				: authorizationState === "denied"
+					? "access_denied"
+					: !workspace.data && authorizationState === "waiting"
+						? "loading"
+						: undefined;
 	useEffect(() => {
 		if (status.data) workspace.rememberCounts?.(status.data);
 	}, [status.data, workspace.rememberCounts]);
@@ -90,7 +101,9 @@ export function NarratorGitBar({
 							? executionContext?.cwd
 							: workspaceState === "ready"
 								? status.data?.branch || workspace.data?.branch || t("workspace.ready")
-								: t(`workspace.${workspace.isError ? "error" : (workspaceState ?? "error")}`)}
+								: t(
+										`workspace.${authorizationLabel ?? (workspace.isError ? "error" : (workspaceState ?? "error"))}`,
+									)}
 					</Text>
 				)}
 			</Group>
@@ -109,10 +122,28 @@ export function NarratorGitBar({
 					</Badge>
 				</Tooltip>
 			)}
+			{authorizationState === "refresh_required" && (
+				<ActionIcon
+					size="xs"
+					variant="subtle"
+					aria-label={t("workspace.retry")}
+					onClick={(event) => {
+						event.stopPropagation();
+						workspace.refreshAuthorization();
+					}}
+				>
+					<IconRefresh size={13} />
+				</ActionIcon>
+			)}
 			<NarratorWorktreeControls
 				key={narratorId}
 				narratorId={narratorId}
 				onRequirement={onRequirement}
+				canCreateWorktree={
+					!!target &&
+					workspace.authorizationState === "authorized" &&
+					workspace.data?.capabilities.write === true
+				}
 			/>
 			{target && !workspace.data?.capabilities.write && (
 				<Text size="xs" c="dimmed">

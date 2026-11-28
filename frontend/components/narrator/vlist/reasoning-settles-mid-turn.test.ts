@@ -27,7 +27,7 @@ import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { type AdapterSegment, adaptSegment } from "./segment-adapter";
-import { projectPendingEmptyReasoning } from "./streaming-handoff";
+import { projectPendingReasoning } from "./streaming-handoff";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -202,7 +202,7 @@ describe("the latest sealed empty reasoning stays live at every LOD", () => {
 			);
 			const layout = (active: boolean) =>
 				buildPretextDocumentLayout(
-					projectPendingEmptyReasoning(messages, active) as unknown as NarratorMsg[],
+					projectPendingReasoning(messages, active) as unknown as NarratorMsg[],
 					{
 						lod,
 						contentWidth: 800,

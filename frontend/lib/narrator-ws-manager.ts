@@ -20,6 +20,7 @@ import {
 } from "@shared/recent-tabs";
 import type { BusinessSocket } from "@shared/remote-access/business-transport";
 import { getToken } from "./api";
+import { getAuthSnapshot, onTokenChange } from "./api/client";
 import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
@@ -93,6 +94,24 @@ interface ListenerEntry {
 	id: number;
 	opts: ListenerOptions;
 	cb: MessageCallback;
+	statusRevisions: Map<string, number>;
+}
+
+interface NarratorStatusVersion {
+	statusEpoch: string;
+	statusRevision: number;
+}
+
+function readStatusVersion(data: Record<string, unknown>): NarratorStatusVersion | undefined {
+	if (
+		typeof data.statusEpoch !== "string" ||
+		data.statusEpoch.length === 0 ||
+		typeof data.statusRevision !== "number" ||
+		!Number.isSafeInteger(data.statusRevision) ||
+		data.statusRevision < 0
+	)
+		return undefined;
+	return { statusEpoch: data.statusEpoch, statusRevision: data.statusRevision };
 }
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
@@ -189,6 +208,7 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 /** Server close code for "the session token that opened this socket expired". */
 const SESSION_EXPIRED_CLOSE_CODE = 4001;
 /** Server close code for graceful shutdown ("Going Away") — the common case is a restart. */
@@ -387,8 +407,15 @@ export function setNarratorWSShareAuth(auth: { shareId: string; token: string } 
 
 export class NarratorWSManager {
 	private ws: BusinessSocket | null = null;
+	private connectTimer: ReturnType<typeof setTimeout> | undefined;
+	private connectingAt = 0;
 	private _connected = false;
 	private _disconnected = false;
+	private credentialIdentity = 0;
+	private credentialIds = new Map<string, number>();
+	private connectionCredentialIdentity: number | undefined;
+	private connectionAuthGeneration: number | undefined;
+	private unsubscribeTokenChange: (() => void) | undefined;
 	private hasConnectedOnce = false;
 	private networkOffline = false;
 	private reconnectAttempts = 0;
@@ -453,9 +480,12 @@ export class NarratorWSManager {
 	// --- Listeners ---
 	private nextId = 1;
 	private listeners = new Map<number, ListenerEntry>();
+	private statusEpoch: string | undefined;
+	private liveStatusRevisions = new Map<string, number>();
 
 	// --- Connection change callbacks ---
 	private connectionChangeCallbacks = new Set<ConnectionChangeCallback>();
+	private controlPlaneRecoveryCallbacks = new Set<() => void>();
 	/** Receivers of binary frames (outline live sessions); text frames never reach them. */
 	private binaryListeners = new Set<(bytes: Uint8Array) => void>();
 
@@ -482,6 +512,9 @@ export class NarratorWSManager {
 	connect(): void {
 		if (this.ws) return; // already connected / connecting
 		this.cancelled = false;
+		this.unsubscribeTokenChange ??= onTokenChange(() => {
+			if (!shareAuth) this.reconnect();
+		});
 		this._listenVisibility();
 		this._listenNetwork();
 		this.networkOffline = this._browserReportsOffline();
@@ -489,7 +522,10 @@ export class NarratorWSManager {
 	}
 
 	disconnect(): void {
+		this._clearConnectTimeout();
 		this.cancelled = true;
+		this.unsubscribeTokenChange?.();
+		this.unsubscribeTokenChange = undefined;
 		this._unlistenVisibility();
 		this._unlistenNetwork();
 		clearTimeout(this.reconnectTimer);
@@ -499,6 +535,7 @@ export class NarratorWSManager {
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
 		this._socketDiscarded = false;
+		this._clearStatusVersionState();
 		this.pendingDispatchQueue = [];
 		this.dispatchScheduled = false;
 		removeWSStatus(WS_STATUS_ID);
@@ -601,6 +638,7 @@ export class NarratorWSManager {
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
 				this._clearMessageVersionState(nId);
+				this._clearNarratorStatusVersions(nId);
 				if (this.catchUpCursors.has(nId)) this.legacyCatchUpCursors.add(nId);
 				this.realtimeEpochs.delete(nId);
 				this.structuralEpochs.delete(nId);
@@ -666,6 +704,7 @@ export class NarratorWSManager {
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(narratorId);
 				this._clearMessageVersionState(narratorId);
+				this._clearNarratorStatusVersions(narratorId);
 				if (this.catchUpCursors.has(narratorId)) this.legacyCatchUpCursors.add(narratorId);
 				this.realtimeEpochs.delete(narratorId);
 				this.structuralEpochs.delete(narratorId);
@@ -755,16 +794,18 @@ export class NarratorWSManager {
 	 * page can both show the same narrator room) share one server subscription,
 	 * and replayed on reconnect by `_restoreSubscriptions`.
 	 */
-	joinChatRoom(roomId: string, handleId: number): void {
+	joinChatRoom(roomId: string, handleId: number, requestId?: string): void {
 		let refs = this.chatRoomRefCounts.get(roomId);
+		const first = !refs;
 		if (!refs) {
 			refs = new Set();
 			this.chatRoomRefCounts.set(roomId, refs);
-			if (this.ws?.readyState === 1) {
-				this.ws.send(JSON.stringify({ type: "chat_subscribe", roomIds: [roomId] }));
-			}
 		}
 		refs.add(handleId);
+		// ACK requests re-authorize even when another visible reader owns a ref.
+		if ((first || requestId) && this.ws?.readyState === 1) {
+			this.ws.send(JSON.stringify({ type: "chat_subscribe", roomIds: [roomId], requestId }));
+		}
 	}
 
 	leaveChatRoom(roomId: string, handleId: number): void {
@@ -803,7 +844,7 @@ export class NarratorWSManager {
 
 	addListener(opts: ListenerOptions, cb: MessageCallback): ListenerHandle {
 		const id = this.nextId++;
-		this.listeners.set(id, { id, opts, cb });
+		this.listeners.set(id, { id, opts, cb, statusRevisions: new Map() });
 		return { _id: id };
 	}
 
@@ -1393,8 +1434,66 @@ export class NarratorWSManager {
 		return () => this.connectionChangeCallbacks.delete(cb);
 	}
 
+	/**
+	 * Reconcile small HTTP control-plane snapshots after a coalesced foreground
+	 * recovery that kept the live socket. Reconnects use onConnectionChange;
+	 * ordinary frames and heartbeat traffic never trigger this signal.
+	 */
+	onControlPlaneRecovery(callback: () => void): () => void {
+		this.controlPlaneRecoveryCallbacks.add(callback);
+		return () => this.controlPlaneRecoveryCallbacks.delete(callback);
+	}
+
+	/** Read-only gate for lightweight list snapshots; they must not advance detail watermarks. */
+	isStatusVersionStale(narratorId: string, data: Record<string, unknown>): boolean {
+		const version = readStatusVersion(data);
+		if (!version) return false; // Compatibility with older servers/sparse producers.
+		return (
+			(this.statusEpoch !== undefined && version.statusEpoch !== this.statusEpoch) ||
+			version.statusRevision < (this.liveStatusRevisions.get(narratorId) ?? -1)
+		);
+	}
+
+	private _clearStatusVersionState(): void {
+		this.statusEpoch = undefined;
+		this.liveStatusRevisions.clear();
+		for (const entry of this.listeners.values()) entry.statusRevisions.clear();
+	}
+
+	private _clearNarratorStatusVersions(narratorId: string): void {
+		this.liveStatusRevisions.delete(narratorId);
+		for (const entry of this.listeners.values()) entry.statusRevisions.delete(narratorId);
+	}
+
 	/** Force a reconnect (e.g. from the UI reconnect button). */
+	/** Opaque credential identity: equal credential values reuse the same private identity. */
+	getCredentialIdentity(): number | undefined {
+		const token = getToken();
+		const credentialKey = shareAuth
+			? `share:${shareAuth.shareId}:${shareAuth.token}`
+			: token
+				? `token:${token}`
+				: undefined;
+		if (!credentialKey) return undefined;
+		let identity = this.credentialIds.get(credentialKey);
+		if (identity === undefined) {
+			identity = ++this.credentialIdentity;
+			this.credentialIds.set(credentialKey, identity);
+		}
+		return identity;
+	}
+	onCredentialChange(callback: () => void): () => void {
+		return onTokenChange(() => callback());
+	}
+	getConnectionCredentialIdentity(): number | undefined {
+		return this._connected ? this.connectionCredentialIdentity : undefined;
+	}
+	getConnectionAuthGeneration(): number | undefined {
+		return this._connected && this.ws ? this.connectionAuthGeneration : undefined;
+	}
 	reconnect(): void {
+		this.pendingDispatchQueue = [];
+		this._clearConnectTimeout();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
 		this._clearSyncProbe();
@@ -1432,6 +1531,7 @@ export class NarratorWSManager {
 		// when the fallback reconnect actually wins, so close-code handling still has
 		// priority when the browser delivers onclose in time.
 		const staleWs = this.ws;
+		this._clearConnectTimeout();
 		if (staleWs) {
 			this.ws = null;
 			safeCloseWs(staleWs);
@@ -1462,19 +1562,38 @@ export class NarratorWSManager {
 		const tokenQuery = shareAuth
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
+		this.connectionCredentialIdentity = this.getCredentialIdentity();
+		const authGeneration = shareAuth ? undefined : getAuthSnapshot().generation;
+		this.connectionAuthGeneration = authGeneration;
+		const isCurrentAuth = () =>
+			authGeneration === undefined || authGeneration === getAuthSnapshot().generation;
 		const ws = businessTransport.openSocket("/ws/narrator", tokenQuery);
 		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
+		this.connectingAt = Date.now();
+		this.connectTimer = setTimeout(() => {
+			if (this.cancelled || this.ws !== ws || ws.readyState !== 0) return;
+			this._clearConnectTimeout();
+			this.ws = null;
+			safeCloseWs(ws);
+			this._setConnected(false, false, true);
+			this._scheduleReconnect();
+		}, CONNECT_TIMEOUT_MS);
 
 		ws.onopen = () => {
-			if (this.cancelled || this.ws !== ws) {
+			if (this.cancelled || this.ws !== ws || !isCurrentAuth()) {
 				ws.close();
 				return;
 			}
+			this._clearConnectTimeout();
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = undefined;
 			const isReconnect = this.hasConnectedOnce || this.reconnectAttempts > 0;
+			// Epochs belong to this socket's server process. Never replay queued
+			// frames from the previous connection after adopting a new epoch.
+			this.pendingDispatchQueue = [];
+			this._clearStatusVersionState();
 			this.hasConnectedOnce = true;
 			this.reconnectAttempts = 0;
 			this._resetPingTimeout();
@@ -1487,7 +1606,7 @@ export class NarratorWSManager {
 		};
 
 		ws.onmessage = (event) => {
-			if (this.cancelled || this.ws !== ws) return;
+			if (this.cancelled || this.ws !== ws || !isCurrentAuth()) return;
 			// Any inbound frame proves the socket still delivers, including a
 			// heartbeat `ping` on an otherwise idle narrator.
 			this._clearSyncProbe();
@@ -1600,6 +1719,7 @@ export class NarratorWSManager {
 
 		ws.onclose = (ev) => {
 			if (this.cancelled || this.ws !== ws) return;
+			this._clearConnectTimeout();
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
@@ -1683,6 +1803,12 @@ export class NarratorWSManager {
 				this._scheduleReconnect();
 			}
 		}, CLIENT_PING_TIMEOUT_MS);
+	}
+
+	private _clearConnectTimeout(): void {
+		clearTimeout(this.connectTimer);
+		this.connectTimer = undefined;
+		this.connectingAt = 0;
 	}
 
 	private _setConnected(
@@ -1800,6 +1926,7 @@ export class NarratorWSManager {
 
 	private _handleNetworkOffline(): void {
 		if (this.cancelled) return;
+		this._clearConnectTimeout();
 		this.networkOffline = true;
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
@@ -1873,6 +2000,7 @@ export class NarratorWSManager {
 		// the recovery decision sees a clean "missing" state and no sync_check or
 		// permission decision is ever written into a dead socket.
 		this._socketDiscarded = true;
+		this._clearConnectTimeout();
 		this._clearSyncProbe();
 		clearTimeout(this.pingTimeoutTimer);
 		this.pingTimeoutTimer = undefined;
@@ -1908,6 +2036,10 @@ export class NarratorWSManager {
 	}
 
 	private _recoverForeground(): void {
+		if (this.ws?.readyState === 0 && Date.now() - this.connectingAt >= CONNECT_TIMEOUT_MS) {
+			this.reconnect();
+			return;
+		}
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
 		const socketDiscarded = this._socketDiscarded;
@@ -1933,7 +2065,18 @@ export class NarratorWSManager {
 		// Only arm the liveness probe when a check was actually sent. With no
 		// messages subscription there is nothing to answer, and an unanswered
 		// probe would tear down a perfectly healthy socket.
-		if (action === "sync" && this.checkAllSubscribedSync() > 0) this._armSyncProbe();
+		if (action === "sync") {
+			if (this.checkAllSubscribedSync() > 0) this._armSyncProbe();
+			if (this._connected) {
+				for (const callback of this.controlPlaneRecoveryCallbacks) {
+					try {
+						callback();
+					} catch (error) {
+						console.error("[NarratorWS] Control-plane recovery callback failed", error);
+					}
+				}
+			}
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -2046,6 +2189,12 @@ export class NarratorWSManager {
 
 	private _dispatch(data: Record<string, unknown>): void {
 		const msgType = data.type as string | undefined;
+		// Authorized topology frames are bounded and ordered; in particular an access
+		// invalidation must clear sensitive cache synchronously, not wait behind queued data.
+		if (msgType?.startsWith("communication_")) {
+			this._dispatchImmediate(data);
+			return;
+		}
 
 		// Latency-sensitive messages (streaming) are dispatched immediately —
 		// their consumers already have RAF-based batching.
@@ -2085,6 +2234,38 @@ export class NarratorWSManager {
 		const targetSubscriptionId = subscriptionRequestId
 			? this.requestToSubscription.get(subscriptionRequestId)
 			: undefined;
+		const statusVersion =
+			(msgType === "status_change" || msgType === "substatus_change") &&
+			typeof data.status === "string"
+				? readStatusVersion(data)
+				: undefined;
+		if (narratorId && statusVersion) {
+			if (subscriptionRequestId && targetSubscriptionId === undefined) return;
+			if (this.isStatusVersionStale(narratorId, data)) {
+				// State and completion intent are separate: a done broadcast may
+				// finish its occupancy probe after a newer label-only commit. Never
+				// replay its old state; let the notification consumer revalidate the
+				// current turn before using the original suppression flag.
+				if (
+					!subscriptionRequestId &&
+					statusVersion.statusEpoch === this.statusEpoch &&
+					msgType === "status_change" &&
+					data.status === "idle" &&
+					typeof data.turnStartedAt === "string" &&
+					Array.isArray(data.substatus) &&
+					data.substatus.includes("unread")
+				) {
+					this._dispatchImmediate({ ...data, type: "status_notification" });
+				}
+				return;
+			}
+			this.statusEpoch ??= statusVersion.statusEpoch;
+			// A request-scoped snapshot was not seen by sibling listeners. It may
+			// advance only its recipient's watermark, never the shared live one.
+			if (!subscriptionRequestId) {
+				this.liveStatusRevisions.set(narratorId, statusVersion.statusRevision);
+			}
+		}
 		if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
 			// Advance before fan-out so listeners observe this frame in the live-event epoch.
 			this.noteRealtimeEvent(narratorId);
@@ -2116,6 +2297,10 @@ export class NarratorWSManager {
 				)
 			)
 				continue;
+			if (narratorId && statusVersion) {
+				if (statusVersion.statusRevision < (entry.statusRevisions.get(narratorId) ?? -1)) continue;
+				entry.statusRevisions.set(narratorId, statusVersion.statusRevision);
+			}
 			try {
 				entry.cb(data);
 			} catch (err) {

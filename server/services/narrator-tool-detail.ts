@@ -1,8 +1,9 @@
 import { getTableColumns } from "drizzle-orm";
 import { sqlite } from "../db";
 import { narratorToolCalls } from "../db/schema";
-import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
-import { isCurrentToolDetail, type ToolDetailSnapshot } from "../lib/db-worker/tool-detail-query";
+import { readDomainTaskText } from "../db/worker-read";
+import { WorkersUnavailableError } from "../lib/db-worker/pool";
+import { isCurrentToolDetail } from "../lib/db-worker/tool-detail-query";
 import type { ToolDetailReference } from "../lib/db-worker/tool-detail-selection";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 
@@ -46,9 +47,10 @@ export async function readCommittedToolDetail(
 	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
 		throw new WorkersUnavailableError("requires_committed_file");
 	}
-	const result = await runReadTask<ToolDetailSnapshot>(
-		sqlite.filename,
-		{ kind: "toolDetailSnapshot", narratorId, toolUseId, reference, columns },
+	const { metadata: result, text } = await readDomainTaskText(
+		sqlite,
+		"toolDetailSnapshot",
+		{ narratorId, toolUseId, reference, columns },
 		{ diagnosticSource: "narrator.tool-detail", timeoutMs: 15_000, signal },
 	);
 	signal.throwIfAborted();
@@ -69,6 +71,6 @@ export async function readCommittedToolDetail(
 			if (!isCurrentToolDetail(sqlite, narratorId, toolUseId, result.identity)) {
 				throw new NotFoundError("ToolCall", toolUseId);
 			}
-			return result.json;
+			return text();
 	}
 }

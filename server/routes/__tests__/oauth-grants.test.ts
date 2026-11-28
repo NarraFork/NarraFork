@@ -24,6 +24,10 @@ import {
 	validateAccessToken,
 } from "../../lib/oauth-provider";
 import { requireSessionAuth } from "../../middleware/auth";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+} from "../../services/__tests__/narrator-worker-fixture";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { getUserOAuthGrant } from "../../services/oauth-grant-service";
 import { oauthGrantRoutes } from "../oauth-grants";
@@ -351,13 +355,15 @@ describe("oauth grants Connected Apps routes", () => {
 				new workerPool.DbReadTaskTimeoutError("worker timed out"),
 			]) {
 				read.mockRejectedValueOnce(error);
-				await expect(getUserOAuthGrant(userId, own.id, {})).rejects.toBe(error);
+				expect(await captureWorkerRejection(getUserOAuthGrant(userId, own.id, {}))).toBe(error);
 			}
 			const controller = new AbortController();
 			controller.abort();
-			await expect(getUserOAuthGrant(userId, own.id, { signal: controller.signal })).rejects.toBe(
-				controller.signal.reason,
-			);
+			expect(
+				await captureWorkerRejection(
+					getUserOAuthGrant(userId, own.id, { signal: controller.signal }),
+				),
+			).toBe(controller.signal.reason);
 			expect(read).toHaveBeenCalledTimes(4);
 			expect(inline).not.toHaveBeenCalled();
 		} finally {
@@ -371,7 +377,9 @@ describe("oauth grants Connected Apps routes", () => {
 		const read = spyOn(workerPool, "runReadTask");
 		try {
 			const pending = sqlite.transaction(() => getUserOAuthGrant(userId, own.id, {}))();
-			await expect(pending).rejects.toBeInstanceOf(workerPool.WorkersUnavailableError);
+			expect(await captureWorkerRejection(pending)).toBeInstanceOf(
+				workerPool.WorkersUnavailableError,
+			);
 			expect(read).not.toHaveBeenCalled();
 		} finally {
 			read.mockRestore();
@@ -389,7 +397,7 @@ describe("oauth grants Connected Apps routes", () => {
 			SELECT ${own.id} || ':' || n, ${own.id}, 'device.provision', 'project', 'p' || n,
 				'project:p' || n, 'system', ${now}, ${now}
 			FROM numbers`);
-		await expect(getUserOAuthGrant(userId, own.id, {})).rejects.toMatchObject({
+		expect(await captureWorkerRejection(getUserOAuthGrant(userId, own.id, {}))).toMatchObject({
 			code: "INTEGRATION_GRANT_LIMIT_EXCEEDED",
 		});
 	});
@@ -435,6 +443,15 @@ describe("oauth grants Connected Apps routes", () => {
 	test("revoke-all requires confirmation and processes at most 100 active grants per call", async () => {
 		await insertGrants(userId, 101);
 		const [other] = await insertGrants(otherUserId, 1);
+
+		const pageResponse = await app.request("/api/oauth/grants?limit=100", {
+			headers: await sessionHeaders(userId),
+		});
+		expect(pageResponse.status).toBe(200);
+		const page = (await pageResponse.json()) as { items: GrantResponse[]; nextCursor: string };
+		expect(page.items).toHaveLength(100);
+		expect(new Set(page.items.map((item) => item.id)).size).toBe(100);
+		expect(page.nextCursor).toBeTruthy();
 
 		const unconfirmed = await app.request("/api/oauth/grants/revoke-all", {
 			method: "POST",
@@ -507,16 +524,20 @@ describe("oauth grants Connected Apps routes", () => {
 		});
 		expect(revokeResponse.status).toBe(200);
 		expect(await validateAccessToken(tokenPair.accessToken)).toBeNull();
-		await expect(
-			refreshAccessToken({ refreshToken: tokenPair.refreshToken, clientId: grant.clientId }),
-		).rejects.toThrow(/invalid or revoked/i);
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: grant.clientId,
-				redirectUri: "http://127.0.0.1:9876/oauth/callback",
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(/invalid or revoked/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: tokenPair.refreshToken, clientId: grant.clientId }),
+			),
+		).toThrow(/invalid or revoked/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: grant.clientId,
+					redirectUri: "http://127.0.0.1:9876/oauth/callback",
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(/invalid or revoked/i);
 	});
 });

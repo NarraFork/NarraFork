@@ -11,11 +11,7 @@ import type {
 	KnowledgeEntryRow,
 	KnowledgeEntryTitleCursor,
 } from "./knowledge/read-store";
-import {
-	knowledgeReadStore,
-	knowledgeWriteStore,
-	synchronousKnowledgeInjectionReads,
-} from "./knowledge/store";
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
 import { type KnowledgeCollectionRow, WriteConflictError } from "./knowledge/write-store";
 import {
 	type AclCollection,
@@ -1302,8 +1298,10 @@ function parseStringArrayJson(raw: unknown): string[] {
  */
 const KEYWORD_INJECTION_CANDIDATE_LIMIT = 5000;
 
-function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
-	const rows = synchronousKnowledgeInjectionReads().listKeywordInjectionCandidates({
+async function listKeywordInjectionCandidates(
+	opts: { collectionId?: string; projectId?: string } = {},
+) {
+	const rows = await knowledgeReadStore.listKeywordInjectionCandidates({
 		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
 		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
 		limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
@@ -1331,10 +1329,10 @@ function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId
  * built Aho-Corasick matcher until this signature changes — keeping the hot passive
  * injection path off the 5000-row read + trie rebuild on every tool output.
  */
-function keywordInjectionCandidatesSignature(
+async function keywordInjectionCandidatesSignature(
 	opts: { collectionId?: string; projectId?: string } = {},
-): string {
-	return synchronousKnowledgeInjectionReads().keywordInjectionCandidatesSignature({
+): Promise<string> {
+	return knowledgeReadStore.keywordInjectionCandidatesSignature({
 		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
 		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
 	});
@@ -1352,19 +1350,19 @@ const SNIPPETS_LOOKUP_MAX = 100;
  * a small, indexed, bounded read — at most `maxInjectedEntries` (3) rows per turn.
  */
 const SNIPPET_SOURCE_CHARS = 1536;
-function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
+async function snippetsByEntryIds(entryIds: string[]): Promise<Map<string, string>> {
 	const out = new Map<string, string>();
 	const ids = entryIds.slice(0, SNIPPETS_LOOKUP_MAX);
 	if (ids.length === 0) return out;
-	const rows = synchronousKnowledgeInjectionReads().snippetsByEntryIds(ids, SNIPPET_SOURCE_CHARS);
+	const rows = await knowledgeReadStore.snippetsByEntryIds(ids, SNIPPET_SOURCE_CHARS);
 	for (const row of rows) out.set(row.id, row.snippet ?? "");
 	return out;
 }
 
 type KnowledgeInjectionSource = "user_message" | "tool_output" | "system_continuation";
 
-function listInjectedEntryIds(narratorId: string, compactSeq: number): Set<string> {
-	const ids = synchronousKnowledgeInjectionReads().listInjectedEntryIds(narratorId, compactSeq);
+async function listInjectedEntryIds(narratorId: string, compactSeq: number): Promise<Set<string>> {
+	const ids = await knowledgeReadStore.listInjectedEntryIds(narratorId, compactSeq);
 	return new Set(ids);
 }
 

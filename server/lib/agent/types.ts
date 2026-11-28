@@ -575,6 +575,7 @@ export type AgentEvent =
 	| {
 			type: "block_complete";
 			block: ContentBlock;
+			sealedReasoningLength?: number;
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
@@ -704,6 +705,8 @@ export type AgentEvent =
 	| {
 			type: "payment_required";
 			message: string;
+			/** 专用于该失败请求的钱包证明；不含公开 CID/私有 identity。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;
@@ -793,6 +796,8 @@ export type AgentEvent =
 			detailedQuotaBalance?: string | null;
 			credentialId?: string;
 			customApiQuotaTarget?: import("../provider-quota-async").FrozenCustomApiQuotaTarget | null;
+			/** Request-start credential identity; stale events cannot update a replacement key/network. */
+			providerIdentity?: string;
 	  }
 	| {
 			type: "invalid_state";
@@ -1315,8 +1320,8 @@ export interface AgentConfig {
 	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
 	/** Whether the initial history ends with tool results the model has not answered. */
 	historyEndsWithToolResults?: boolean;
-	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
-	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
+	/** Pending input or external work will wake this session; empty/reasoning-only replies may idle. */
+	hasPendingWake?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
@@ -1420,7 +1425,7 @@ export interface AgentConfig {
 	 * the response produced still runs, and the loop ends the turn once the step's tools
 	 * have settled instead of sending the next provider request. One-shot like shouldStop.
 	 */
-	shouldYieldToInput?: () => boolean;
+	shouldYieldToInput?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cut the provider response at the next tool-call
 	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
 	 * Supply a fresh signal for each loop invocation. */

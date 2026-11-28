@@ -16,6 +16,7 @@ import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-co
  * registers those facts; any two sessions can be related the same way.
  */
 
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq, inArray } from "drizzle-orm";
@@ -52,6 +53,7 @@ import {
 } from "../narrator-session-state";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
 import { freezeCheckpointStopAdmission, matchesCheckpointRun } from "./checkpoint-stop";
+import { notifyAgentInboxChanged } from "./inbox";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -98,6 +100,9 @@ export interface StartNarratorRunRequest {
 	registeredStart?: RegisteredAgentStart;
 	/** Recovery of a run that already executed: its attribution window is kept. */
 	recovered?: boolean;
+	recoveryObservation?: import("../recovery-observation").RestartNarrator;
+	parentRecoveryTurn?: import("../recovery-observation").ParentRecoveryTurn;
+	onRegistered?: () => void;
 	/** A recovery explanation may settle active projections, never overwrite terminal ones. */
 	convergeOnlyActiveProjections?: boolean;
 	/** Recovery that must not deliver into a call that already has its result. */
@@ -187,19 +192,24 @@ type Session = typeof import("../narrator-session");
 const session = (): Promise<Session> => import("../narrator-session");
 
 /** The session row a run start reads once: its registration and its runtime source. */
-async function readRunSource(narratorId: string) {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			title: true,
-			model: true,
-			reasoningEffort: true,
-			variant: true,
-			subagentType: true,
-			ownerUserId: true,
-		},
-	});
+async function readRunSource(narratorId: string, signal?: AbortSignal) {
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				title: true,
+				model: true,
+				reasoningEffort: true,
+				variant: true,
+				subagentType: true,
+				ownerUserId: true,
+				type: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, signal },
+	);
 	if (!row) throw new AppError("Narrator not found", 404, "NOT_FOUND");
 	return row;
 }
@@ -237,7 +247,11 @@ async function prepareLogicalRun(
 			narratorId,
 			resumeRunId: req.resumeRunId,
 			binding,
+			expectedSource: row,
+			recoveryObservation: req.recoveryObservation,
+			parentRecoveryTurn: req.parentRecoveryTurn,
 		});
+	req.onRegistered?.();
 	if (!deliverTo || !publicationRun) return { binding: registered };
 	// A caller waiting in the foreground receives the result itself, never via a task.
 	// A new run that only inherits a destination which already holds an earlier
@@ -250,10 +264,14 @@ async function prepareLogicalRun(
 
 async function settled(deliverTo: RunDeliverTo): Promise<boolean> {
 	if (!deliverTo.toolCallId) return false;
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, deliverTo.toolCallId),
-		columns: { status: true },
-	});
+	const call = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, deliverTo.toolCallId),
+			columns: { status: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return call?.status === "success" || call?.status === "fail";
 }
 
@@ -578,7 +596,7 @@ async function executeRun(
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
 		syncActiveReplyContext(id, replyContext);
 		const session = active;
-		let source = await readRunSource(id);
+		let source = await readRunSource(id, req.cancelSignal);
 		delegated = readRuntimeRegistrationColumn(source.runtimeRegistrationJson)?.delegatedTask;
 		// Only human input or this session's own registration establishes identity.
 		// An explicitly anonymous binding must not fall through to an old session user.
@@ -609,7 +627,7 @@ async function executeRun(
 				isNewSubagentModelSelectionRun(req) &&
 				(await reselectSubagentModelForNewRun(id, principal))
 			)
-				source = await readRunSource(id);
+				source = await readRunSource(id, req.cancelSignal);
 		}
 		const prepared = await prepareLogicalRun(id, source, req, principal);
 		const binding = prepared.binding;
@@ -704,16 +722,20 @@ async function executeRun(
 					})
 				: null;
 			const checkpoint = !settled
-				? await db.query.narrators.findFirst({
-						where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
-						columns: {
-							backgroundResult: true,
-							backgroundCompletedAt: true,
-							backgroundStatus: true,
-							substatus: true,
-							errorMessage: true,
-						},
-					})
+				? await readQueryFirst(
+						db.query.narrators.findMany({
+							limit: 1,
+							where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
+							columns: {
+								backgroundResult: true,
+								backgroundCompletedAt: true,
+								backgroundStatus: true,
+								substatus: true,
+								errorMessage: true,
+							},
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					)
 				: undefined;
 			const pending =
 				checkpoint?.backgroundCompletedAt &&
@@ -804,6 +826,22 @@ async function executeRun(
 					hasInboxKind(id, ["user_input", "agent_message"]),
 				);
 				if (woke === "input") outcome.freshInput = true;
+			}
+			// A delivering run whose turn ended while work it started is still pending has not
+			// produced its result yet: it waits for that work to wake it and continues.
+			if (
+				!outcome.freshInput &&
+				deliverTo &&
+				req.deliver !== false &&
+				outcome.allowInboxWake === true &&
+				!run.cancel.signal.aborted &&
+				!activeHold(id)
+			) {
+				const woke = await awaitPendingWake(owner, run);
+				if (woke === "input") outcome.freshInput = true;
+				else if (woke === "hold") continue;
+				// The answer so far was provisional: a cancelled wait ends the run cancelled.
+				else if (woke === "cancel") outcome = { ...outcome, aborted: true };
 			}
 			if (!outcome.freshInput || run.cancel.signal.aborted) break;
 			// The old session finalizer has restored its temporary model. Rotate the epoch
@@ -927,7 +965,12 @@ async function executeRun(
 			const { backgroundTaskService } = await import("../background-task-service");
 			backgroundTaskService.unregisterAbortController(id, run.cancel);
 		} finally {
-			if (owner.release() && !run.checkpointStop) afterRunRelease(id, active, allowInboxWake);
+			if (owner.release() && !run.checkpointStop) {
+				// The loop has cleared _loopRunning and committed its late lastStopReason.
+				// Notify even when error/user interruption forbids an automatic inbox wake.
+				notifyAgentInboxChanged(id);
+				afterRunRelease(id, active, allowInboxWake);
+			}
 		}
 	}
 }
@@ -1231,18 +1274,32 @@ async function renderResult(
 			import("../subagent-label"),
 			import("../subagent-execution-boundary"),
 		]);
-	const turn = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { turnStartedAt: true, title: true },
-	});
+	const turn = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, id),
+			columns: { turnStartedAt: true, title: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
+	let executionBoundary: Awaited<ReturnType<typeof boundary.readSubagentExecutionBoundary>>;
+	try {
+		executionBoundary = await boundary.readSubagentExecutionBoundary(
+			id,
+			publicationRun.logicalRunId,
+		);
+	} catch (error) {
+		logger.warn("Agent result delivered without its file-change summary", {
+			id,
+			error: String(error),
+		});
+		return `${finalText}\n\n<subagent_file_changes>\nFile-change summary unavailable: execution boundary could not be read.\n</subagent_file_changes>`;
+	}
 	return appendSubagentFileChanges(
 		{
 			parentNarratorId: deliverTo.narratorId,
 			childNarratorId: id,
-			executionBoundary: await boundary.readSubagentExecutionBoundary(
-				id,
-				publicationRun.logicalRunId,
-			),
+			executionBoundary,
 			scope: {
 				sourceToolUseId: deliverTo.toolUseId,
 				startedAt: turn?.turnStartedAt ?? null,
@@ -1626,10 +1683,14 @@ async function registerDetachedTask(
 	run: RunControl,
 	deliverTo: RunDeliverTo,
 ): Promise<string> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { title: true, subagentType: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { title: true, subagentType: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	const [{ backgroundTaskService }, { registerAndPersistSubagentAlias }] = await Promise.all([
 		import("../background-task-service"),
 		import("../subagent-alias"),
@@ -1638,6 +1699,10 @@ async function registerDetachedTask(
 		deliverTo.narratorId,
 		narratorId,
 		row?.title ?? undefined,
+		{
+			signal: run.cancel.signal,
+			deadlineAt: run.deadlineAt ? Date.parse(run.deadlineAt) : undefined,
+		},
 	);
 	// Re-registering the same run keeps its destination and absolute deadline.
 	await backgroundTaskService.createAgentTask({
@@ -1770,24 +1835,107 @@ export async function awaitRunHold(
 	// Timing metadata is not a hold label; parking replaces the visible substatus.
 	await narratorService.updateSubstatus(id, ["taken_over"], { preserveTiming: false });
 	const { promise, resolve } = Promise.withResolvers<"input" | "release" | "cancel">();
-	run.wake = resolve;
-	const onCancel = () => resolve("cancel");
+	let wakeReason: "input" | "release" | "cancel" | undefined;
+	const wake = (reason: "input" | "release" | "cancel") => {
+		if (wakeReason !== undefined) return;
+		wakeReason = reason;
+		resolve(reason);
+	};
+	run.wake = wake;
+	const onCancel = () => wake("cancel");
 	run.cancel.signal.addEventListener("abort", onCancel, { once: true });
 	setExecutionSuspended(owner, true);
 	try {
-		if (run.cancel.signal.aborted) resolve("cancel");
-		else if (!getRunHold(id) || getRunHold(id)?.released) resolve("release");
-		else if (await hasInput()) resolve("input");
-		// hasInput is async: release/cancel may have won while it was checking.
+		if (run.cancel.signal.aborted) wake("cancel");
+		else if (!getRunHold(id) || getRunHold(id)?.released) wake("release");
+		else if (await hasInput()) wake("input");
+		// A queued input wake can win while the Worker probe is pending. Reconcile
+		// release state only if no wake has already been observed; cancellation always wins.
 		if (run.cancel.signal.aborted) return "cancel";
-		if (!getRunHold(id) || getRunHold(id)?.released) return "release";
+		if (wakeReason === undefined && (!getRunHold(id) || getRunHold(id)?.released)) wake("release");
 		return await promise;
 	} finally {
+		run.cancel.signal.removeEventListener("abort", onCancel);
+		if (run.wake === wake) {
+			run.wake = undefined;
+			setExecutionSuspended(owner, false);
+		}
+	}
+}
+
+/** How often a run waiting on pending work re-checks it, as a backstop to its wake. */
+export const PENDING_WAKE_RECHECK_MS = 2_000;
+
+/**
+ * Keep a delivering run open while work its session started will still wake it
+ * (background tasks, Watch observations, subagents, open questions, queued notices):
+ * the result snapshot is the answer after that work, not the turn that started it.
+ * The owner is kept, so queued input wakes this same run (`wakeHeldRun`). Returns
+ * "settled" once nothing is pending, "hold" when the user took the run over.
+ */
+async function awaitPendingWake(
+	owner: ExecutionOwner,
+	run: RunControl,
+): Promise<"input" | "settled" | "hold" | "cancel"> {
+	const id = owner.narratorId;
+	const { hasPendingWork, hasQueuedWake } = await import("./pending-wake");
+	const { flushInboxPublicationBarrier } = await import("./inbox");
+	// Work is read before the outbox flush: a task that settled before the read has its
+	// notice in the outbox, so the flush moves it into the inbox before the inbox read.
+	// Unreadable pending state before waiting keeps the previous behavior: the run settles
+	// with this answer. Once waiting (e.g. the store stopped for a restart), it keeps waiting.
+	const pending = async (waiting: boolean): Promise<"input" | "settled" | undefined> => {
+		try {
+			const working = await hasPendingWork(id);
+			await flushInboxPublicationBarrier(id);
+			if (await hasQueuedWake(id)) return "input";
+			return working ? undefined : "settled";
+		} catch (error) {
+			logger.warn("Pending wake state unavailable", { id, waiting, error: String(error) });
+			return waiting ? undefined : "settled";
+		}
+	};
+	const first = await pending(false);
+	if (first) return first;
+	const { narratorService } = await import("../narrator-service");
+	await narratorService.updateStatus(id, "idle");
+	const { promise, resolve } = Promise.withResolvers<"input" | "settled" | "hold" | "cancel">();
+	let done = false;
+	const finish = (reason: "input" | "settled" | "hold" | "cancel") => {
+		if (done) return;
+		done = true;
+		resolve(reason);
+	};
+	run.wake = (reason) => finish(reason === "release" ? "hold" : reason);
+	const onCancel = () => finish("cancel");
+	run.cancel.signal.addEventListener("abort", onCancel, { once: true });
+	// A takeover may claim the run while it waits: it is not finalizing yet.
+	run.finalizing = false;
+	setExecutionSuspended(owner, true);
+	const check = async () => {
+		if (done) return;
+		if (run.cancel.signal.aborted) return finish("cancel");
+		if (activeHold(id)) return finish("hold");
+		const woke = await pending(true);
+		if (woke) finish(woke);
+	};
+	const timer = setInterval(() => void check(), PENDING_WAKE_RECHECK_MS);
+	try {
+		await check();
+		return await promise;
+	} finally {
+		clearInterval(timer);
 		run.wake = undefined;
 		run.cancel.signal.removeEventListener("abort", onCancel);
 		setExecutionSuspended(owner, false);
+		if (!activeHold(id)) run.finalizing = true;
 	}
 }
+
+const activeHold = (id: string) => {
+	const hold = getRunHold(id);
+	return hold && !hold.released ? hold : undefined;
+};
 
 /** Wake a held run for queued input. Returns whether a held run was woken. */
 export function wakeHeldRun(narratorId: string): boolean {
@@ -1807,16 +1955,20 @@ async function deliverHeldResult(
 	run: RunControl,
 ): Promise<void> {
 	const row = await readRunSource(narratorId);
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			substatus: true,
-			logicalRunId: true,
-			backgroundResult: true,
-			backgroundStatus: true,
-			backgroundCompletedAt: true,
-		},
-	});
+	const current = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				substatus: true,
+				logicalRunId: true,
+				backgroundResult: true,
+				backgroundStatus: true,
+				backgroundCompletedAt: true,
+			},
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	const registered = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
 	const prepared = registered
 		? {
@@ -1915,7 +2067,9 @@ async function deliverHeldResult(
 }
 
 /** Restore holds after a restart from their durable `taken_over` mirror; returns the ids. */
-export async function hydrateRunHolds(): Promise<Set<string>> {
+export async function hydrateRunHolds(
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<Set<string>> {
 	const { asc, gt } = await import("drizzle-orm");
 	const PAGE = 500;
 	const startedAt = Date.now();
@@ -1924,12 +2078,15 @@ export async function hydrateRunHolds(): Promise<Set<string>> {
 	// Bound rows scanned, not matches: a sparse hold must never cause a full-table
 	// synchronous scan in one request. Parse labels exactly (SQL LIKE treats _ as wildcard).
 	for (let after = ""; ; ) {
-		const rows = await db
-			.select({ id: narrators.id, substatus: narrators.substatus })
-			.from(narrators)
-			.where(gt(narrators.id, after))
-			.orderBy(asc(narrators.id))
-			.limit(PAGE);
+		const rows = await readQuery(
+			db
+				.select({ id: narrators.id, substatus: narrators.substatus })
+				.from(narrators)
+				.where(gt(narrators.id, after))
+				.orderBy(asc(narrators.id))
+				.limit(PAGE),
+			{ ...options, executionPolicy: "worker-required", maxRows: PAGE },
+		);
 		scanned += rows.length;
 		for (const row of rows) {
 			if (!parseSubstatus(row.substatus).includes("taken_over")) continue;

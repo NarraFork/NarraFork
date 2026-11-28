@@ -1,6 +1,7 @@
 /**
- * Owns only the children it starts. Source development keeps hot reload; production
- * launches a frozen local runtime, optionally beside the source Vite frontend.
+ * Owns only the children it starts. Plain production uses a frozen local runtime;
+ * hybrid mode keeps the source backend beside Vite so filesystem frontend builds
+ * remain visible without a backend restart.
  */
 
 import { realpath, stat } from "node:fs/promises";
@@ -95,16 +96,17 @@ export async function runDevAll(
 	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		let runtime = options.runtime;
-		if (options.production) {
+		// Hybrid mode stays on the source backend so each frontend build is visible
+		// through its filesystem static handler without a backend restart. An
+		// explicit runtime remains an opt-in frozen override.
+		const useFrozenRuntime = options.production && (!options.frontendDev || !!runtime);
+		if (useFrozenRuntime) {
 			if (runtime) {
 				runtime = await realpath(runtime);
 				if (!(await stat(runtime)).isFile())
 					throw new Error("--runtime must name an executable file");
 			} else {
-				({ executable: runtime } = await deps.build({
-					frontend: !options.frontendDev,
-					signal,
-				}));
+				({ executable: runtime } = await deps.build({ frontend: true, signal }));
 				signal?.throwIfAborted();
 				console.log(`Runtime ready: ${runtime}\nReuse with: --runtime=${JSON.stringify(runtime)}`);
 			}
@@ -120,7 +122,7 @@ export async function runDevAll(
 			: devAllBackendEnv(env);
 		if (options.production && options.frontendDev)
 			backendEnv.NF_SQL_TRACE = env.NF_SQL_TRACE || "summary";
-		const backendCommand = options.production
+		const backendCommand = useFrozenRuntime
 			? [runtime as string, "--serve", ...options.serverArgs]
 			: [
 					process.execPath,

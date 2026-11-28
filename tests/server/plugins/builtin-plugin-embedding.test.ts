@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { z } from "zod";
+import quotaManifest from "../../../plugins/provider-quota/manifest.json";
 import {
 	collectPluginBuildModules,
 	renderBuiltinPluginModule,
@@ -20,7 +21,7 @@ import { providerQuotaSourceSchema } from "../../../shared/provider-quota";
 
 const ROOT = resolve(import.meta.dir, "../../..");
 const ID = "io.narrafork.provider-quota";
-const VERSION = "1.0.3";
+const VERSION = quotaManifest.version;
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -44,6 +45,7 @@ async function isolatedSource() {
 		"server/lib/logger.ts",
 		"server/lib/narrafork-home.ts",
 		"server/lib/win-handle-guard.ts",
+		"tests/fixtures/provider-quota-1.0.3.nfplugin",
 	]) {
 		const target = join(source, path);
 		await mkdir(dirname(target), { recursive: true });

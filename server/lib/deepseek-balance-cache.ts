@@ -1,6 +1,9 @@
 import { type ProviderQuotaSnapshot, providerQuotaDataSchema } from "@shared/provider-quota";
-import { providerQuotaService } from "../services/provider-quota-service";
-import { settings } from "./settings";
+import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { providerQuotaService, toQuotaSnapshot } from "../services/provider-quota-service";
+import { usageSubjects } from "./provider-key-subjects";
+import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 
 export interface DeepSeekBalanceCache {
 	generation: string;
@@ -17,7 +20,7 @@ export interface DeepSeekBalanceCache {
 
 export const DEEPSEEK_BALANCES_STALE_MS = 60_000;
 
-/** Legacy route selection only; the source catalog owns discovery and transport. */
+/** Legacy view selection only; the source catalog owns discovery and transport. */
 export function isDeepSeekCustomApiProvider(config: {
 	baseUrl?: string;
 	disabled?: boolean;
@@ -40,6 +43,15 @@ export function isDeepSeekCustomApiProvider(config: {
 	}
 }
 
+export function deepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.protocol,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+}
+
 export function toDeepSeekBalanceCache(snapshot: ProviderQuotaSnapshot): DeepSeekBalanceCache {
 	const parsed = providerQuotaDataSchema.safeParse(snapshot.data);
 	const data =
@@ -60,7 +72,6 @@ export function toDeepSeekBalanceCache(snapshot: ProviderQuotaSnapshot): DeepSee
 			.map((amount) => ({
 				currency: amount.unit,
 				totalBalance: amount.remainingText ?? String(amount.remaining),
-				// Exact decimal text is a validated generic amount field, not a raw provider payload.
 				grantedBalance: (() => {
 					const detail = amounts.find(
 						(item) => item.id === `granted:${amount.unit}` && item.unit === amount.unit,
@@ -85,11 +96,8 @@ export function toDeepSeekBalanceCache(snapshot: ProviderQuotaSnapshot): DeepSee
 	};
 }
 
-function providerIds(): string[] {
-	return (settings.customApiProviders ?? [])
-		.filter((provider) => provider.apiKey && isDeepSeekCustomApiProvider(provider))
-		.map(({ id }) => id);
-}
+const deepSeekSubjects = () => usageSubjects(isDeepSeekCustomApiProvider);
+const providerIds = () => [...new Set(deepSeekSubjects().map((subject) => subject.providerId))];
 
 export function syncDeepSeekBalanceCache(): void {
 	providerQuotaService.sync();
@@ -111,19 +119,46 @@ export function getDeepSeekBalanceGenerations(): Record<string, string> {
 	);
 }
 
+export const peekDeepSeekBalanceGeneration = (providerId: string): string | undefined =>
+	providerQuotaService.peekGeneration(providerId);
+
+export function getDeepSeekQuotaSnapshot(
+	providerId: string,
+	credentialId?: string,
+): QuotaSnapshot | undefined {
+	const snapshot = credentialId
+		? providerQuotaService.peekKey(credentialId)
+		: providerQuotaService.peek(providerId);
+	return snapshot?.providerId === providerId ? toQuotaSnapshot(snapshot) : undefined;
+}
+
+export function isDeepSeekQuotaRefreshing(providerId: string, credentialId?: string): boolean {
+	const snapshot = credentialId
+		? providerQuotaService.peekKey(credentialId)
+		: providerQuotaService.peek(providerId);
+	return snapshot?.providerId === providerId && snapshot.status === "probing";
+}
+
 export async function refreshDeepSeekBalance(
 	providerId: string,
+	credentialId?: string,
 ): Promise<DeepSeekBalanceCache | null> {
 	if (!providerIds().includes(providerId)) return null;
-	const snapshot = await providerQuotaService.refresh(providerId);
+	if (
+		credentialId &&
+		!deepSeekSubjects().some((s) => s.id === credentialId && s.providerId === providerId)
+	)
+		return null;
+	const snapshot = credentialId
+		? await providerQuotaService.refreshKey(credentialId)
+		: await providerQuotaService.refresh(providerId);
 	return snapshot ? toDeepSeekBalanceCache(snapshot) : null;
 }
 
 export async function refreshAllDeepSeekBalances(options?: { manual?: boolean }): Promise<void> {
-	// A sweep submits one job at a time rather than overflowing the shared bounded queue.
-	for (const id of providerIds()) {
-		const snapshot = await providerQuotaService.refresh(id, options);
-		if (!snapshot && providerQuotaService.peek(id))
+	for (const subject of deepSeekSubjects()) {
+		const snapshot = await providerQuotaService.refreshKey(subject.id, options);
+		if (!snapshot && providerQuotaService.peekKey(subject.id))
 			throw new Error("Quota refresh did not complete");
 	}
 }

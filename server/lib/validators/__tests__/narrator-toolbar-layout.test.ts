@@ -33,6 +33,19 @@ describe("narratorToolbarLayout id whitelist", () => {
 		);
 	});
 
+	it("persists communication in any toolbar zone", () => {
+		for (const items of [
+			[{ id: "communication" }, { id: NARRATOR_TOOLBAR_DIVIDER_ID }],
+			[{ id: NARRATOR_TOOLBAR_DIVIDER_ID }, { id: "communication" }],
+			[{ id: NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID }, { id: "communication" }],
+		]) {
+			const parsed = updateUserPreferencesSchema.parse({ narratorToolbarLayout: { items } });
+			expect(parsed.narratorToolbarLayout?.items.map((item) => item.id as string)).toEqual(
+				items.map((item) => item.id),
+			);
+		}
+	});
+
 	it("filters the retired filemod id from old clients without dropping other preferences", () => {
 		const parsed = updateUserPreferencesSchema.parse({
 			fastModeDefault: true,

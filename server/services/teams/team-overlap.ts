@@ -97,10 +97,12 @@ import { AppError, NotFoundError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import type { Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
-import { getTeamOverlapLabels } from "../../lib/prompts/team-coordinator-notes";
+import { getTeamOverlapLabels, oneLine } from "../../lib/prompts/team-coordinator-notes";
 import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../narrator-acl";
 import { canReadProject } from "../project-acl";
 import { type ChangedPaths, teamGit } from "./team-git";
+import { isMerging } from "./team-merge-guard";
+import { compareRefFor, remoteTrackingRef } from "./team-work-start";
 import { markMergedByAncestry, recordWorkEvent, type WorkActor } from "./work-items";
 
 const FINISHED = [...TEAM_WORK_ITEM_FINISHED_STATES];
@@ -531,7 +533,8 @@ export interface ChangedPathsGit {
 	head(): Promise<string | null>;
 	resolve(ref: string): Promise<string | null>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
-	changed(baseRef: string): Promise<ChangedPaths | null>;
+	/** At `at` (a full commit SHA) when given, else at HEAD as it is now. */
+	changed(baseRef: string, at?: string): Promise<ChangedPaths | null>;
 }
 
 /** Where changed paths come from: the hardened git of `team-git.ts` (tests replace it). */
@@ -543,7 +546,7 @@ const hardenedSource: ChangedPathsSource = (worktree) => {
 		head: () => git.resolveCommit("HEAD"),
 		resolve: (ref) => git.resolveCommit(ref),
 		isAncestor: (ancestor, descendant) => git.isAncestor(ancestor, descendant),
-		changed: (baseRef) => git.changedPaths(baseRef),
+		changed: (baseRef, at) => git.changedPaths(baseRef, at),
 	};
 };
 
@@ -556,12 +559,16 @@ export function setChangedPathsSourceForTests(next: ChangedPathsSource | null): 
 
 const source = () => sourceOverride ?? hardenedSource;
 
-/** Read an item's changed paths now (hardened git). Null when they cannot be read. */
+/**
+ * Read an item's changed paths now (hardened git), at the commit `at` when given (`work.ready`
+ * pins one), else at HEAD. Null when they cannot be read.
+ */
 export async function readChangedPaths(
 	worktree: string,
 	baseRef: string,
+	at?: string,
 ): Promise<ChangedPaths | null> {
-	return source()(worktree).changed(baseRef);
+	return source()(worktree).changed(baseRef, at);
 }
 
 /**
@@ -633,12 +640,14 @@ export type RefreshOutcome = "updated" | "unchanged" | "merged" | "failed";
  *  2. the evidence recorded at `work.ready`: its head there is the item's recorded head, and the
  *     changed paths computed there were not empty (never derived again later);
  *  3. its worker is not running;
- *  4. that head is an ancestor of the base, and the item's BRANCH (`refs/heads/<branch>`, never
+ *  4. that head is an ancestor of the base (the local one, or `refs/remotes/origin/<base>`), and the item's BRANCH (`refs/heads/<branch>`, never
  *     the worktree's HEAD) is that head or also inside the base — commits made after ready are
  *     never dropped.
  * Then it is merged, if it is still exactly what was read (checked in the transaction).
  */
 async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promise<boolean> {
+	// M: a member's merge job holds the item; it records the merge itself.
+	if (isMerging(target.id)) return false;
 	const item = db
 		.select({
 			state: teamWorkItems.state,
@@ -681,9 +690,16 @@ async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promi
 			.get();
 		if (worker && worker.status !== "idle" && worker.status !== "archived") return false;
 	}
-	const base = await git.resolve(target.baseRef);
-	if (!base || !(await git.isAncestor(item.headSha, base))) return false;
-	if (tip !== item.headSha && !(await git.isAncestor(tip, base))) return false;
+	// Landed in the local base, or in origin's (merged elsewhere and fetched): either counts.
+	let base: string | null = null;
+	for (const ref of [target.baseRef, remoteTrackingRef(target.baseRef)]) {
+		const candidate = await git.resolve(ref).catch(() => null);
+		if (!candidate || !(await git.isAncestor(item.headSha, candidate))) continue;
+		if (tip !== item.headSha && !(await git.isAncestor(tip, candidate))) continue;
+		base = candidate;
+		break;
+	}
+	if (!base) return false;
 	return markMergedByAncestry({
 		itemId: target.id,
 		head: item.headSha,
@@ -700,7 +716,9 @@ async function refreshTarget(target: RefreshTarget): Promise<RefreshOutcome> {
 		if (!head) return "failed";
 		let outcome: RefreshOutcome = "unchanged";
 		if (head !== target.atSha) {
-			const changed = await git.changed(target.baseRef);
+			// W: an item started from origin/<base> is compared with it, not a local base behind it.
+			const compare = await compareRefFor(target.id, target.baseRef, (ref) => git.resolve(ref));
+			const changed = await git.changed(compare);
 			if (!changed) return "failed";
 			if (storeChangedPaths(db, target.id, changed)) outcome = "updated";
 		}
@@ -998,6 +1016,18 @@ async function passOnce(sweep: boolean): Promise<BatchResult> {
 		}
 	}
 	await flushNotices();
+	// D: a sweep also re-checks queued items whose dependencies merged but had not reached their
+	// start ref yet (bounded; recorded and told once). Within what is left of the deadline.
+	if (sweep && activeDatabaseBackend === "sqlite") {
+		const remaining = deadlineAt - job.clock.now();
+		if (remaining > 0)
+			await withinDeadline(
+				import("./work-item-dependencies").then(({ reconcileUnblocks }) => reconcileUnblocks()),
+				remaining,
+			).catch((error) =>
+				logger.warn("Team unblocks could not be reconciled", { error: String(error) }),
+			);
+	}
 	return result;
 }
 
@@ -1403,11 +1433,6 @@ async function coordinatorLocale(teamId: string): Promise<Locale> {
 		return "en";
 	}
 }
-
-const oneLine = (value: string, max = 80) => {
-	const flat = value.replace(/\s+/g, " ").trim();
-	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
-};
 
 /** The notice text for one coordinator, at most {@link NOTICE_MAX_BYTES}. */
 export async function renderOverlapNotice(

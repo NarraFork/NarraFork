@@ -71,10 +71,12 @@ function run(worker: Worker, outputs: ModelTraceOutput[], signal: AbortSignal): 
 		}
 		function onMessage(reply: Partial<WorkerReply> | null) {
 			if (reply?.type !== "ranked" || !isRanking(reply.ranking)) return onFailure();
+			const { decision, results, acceptedSampleIndexes } = reply.ranking;
+			if (acceptedSampleIndexes?.some((index) => index >= outputs.length)) return onFailure();
 			clean();
-			const { decision, results } = reply.ranking;
 			resolve({
 				decision,
+				...(acceptedSampleIndexes && { acceptedSampleIndexes: [...acceptedSampleIndexes] }),
 				results: results.map(({ model, displayName, probability }) => ({
 					model,
 					displayName,

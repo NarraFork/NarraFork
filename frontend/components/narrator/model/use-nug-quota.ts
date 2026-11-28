@@ -1,104 +1,50 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo } from "react";
-import { api } from "../../../lib/api";
+import type { QuotaSnapshotEntry } from "@shared/quota-snapshot";
+import { useMemo, useSyncExternalStore } from "react";
+import { selectQuotaEntries, useQuotaSnapshots } from "../../../hooks/useQuotaSnapshots";
+import { getAuthSnapshot, subscribeAuth } from "../../../lib/api/client";
 
-/**
- * NUG provider config as stored in settings. Only the fields this hook reads
- * are declared; the settings object carries more that is irrelevant here.
- */
 export interface NugProviderSetting {
 	id: string;
 	name?: string;
 	prefix?: string;
 	disabled?: boolean;
+	generation?: number | string;
 }
 
-/** Resolved NUG provider quota info surfaced to the panel (feeds the WS state). */
 export interface NugProviderInfo {
 	providerId: string;
 	providerPrefix: string | undefined;
 	name: string;
-	quotaBalance: string | null;
-	totalGranted: number | null;
-	detailedQuotaBalance: string | null;
+	entries: QuotaSnapshotEntry[];
 }
 
-/**
- * Owns the NUG quota data layer for the active narrator's model:
- * - resolves the NUG provider config from the model prefix,
- * - fetches the aggregate quotas (and a targeted single-provider quota when the
- *   aggregate is missing the current provider),
- * - writes the single-provider result back into the aggregate cache, and
- * - derives {@link NugProviderInfo} for the current provider.
- *
- * The derived info still flows back into NarratorPanel (it feeds the shared
- * `useNarratorPanelWS` and the payment-required recharge derivation), so the
- * call stays in the panel rather than being pushed into a single child.
- */
+/** One cached-only group projection, isolated by the model-runtime and auth generations. */
 export function useNugQuota(
 	resolvedModel: string | undefined,
 	nugProviders: NugProviderSetting[] | undefined,
 	enabled = true,
 ): NugProviderInfo | null {
-	const qc = useQueryClient();
-
-	const nugProviderConfig = useMemo(() => {
+	const { hasToken } = useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
+	const provider = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const providers: NugProviderSetting[] = nugProviders ?? [];
-		return providers.find((p) => !p.disabled && (p.prefix === prefix || p.id === prefix)) ?? null;
+		return prefix
+			? nugProviders?.find(
+					(entry) => !entry.disabled && (entry.prefix === prefix || entry.id === prefix),
+				)
+			: undefined;
 	}, [resolvedModel, nugProviders]);
-	const hasNugProviders = (nugProviders?.length ?? 0) > 0;
-	const { data: nugQuotasData } = useQuery({
-		queryKey: ["nug", "quotas"],
-		queryFn: api.nugGetQuotas,
-		enabled: !REMOTE_BUILD && enabled && hasNugProviders,
-		staleTime: 30_000,
-	});
-	const missingCurrentNugQuota = Boolean(
-		nugProviderConfig?.id && nugQuotasData && !nugQuotasData[nugProviderConfig.id],
+	const query = useQuotaSnapshots(
+		!REMOTE_BUILD && enabled && hasToken && !!provider && provider.generation !== undefined,
+		{ groupId: provider?.id, cachedOnly: true, expectedGeneration: provider?.generation },
 	);
-	const { data: currentNugQuotaData } = useQuery({
-		queryKey: ["nug", "quota", nugProviderConfig?.id],
-		queryFn: () => api.nugGetQuota(nugProviderConfig?.id ?? ""),
-		enabled: !REMOTE_BUILD && enabled && missingCurrentNugQuota,
-		staleTime: 30_000,
-	});
-
-	useEffect(() => {
-		if (!nugProviderConfig?.id || !currentNugQuotaData) return;
-		qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-			const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-			const existing =
-				quotas[nugProviderConfig.id] && typeof quotas[nugProviderConfig.id] === "object"
-					? (quotas[nugProviderConfig.id] as Record<string, unknown>)
-					: {};
-			return {
-				...quotas,
-				[nugProviderConfig.id]: {
-					...existing,
-					balance: currentNugQuotaData.balance,
-					totalGranted: currentNugQuotaData.totalGranted,
-					detailedQuotaBalance: currentNugQuotaData.detailedQuotaBalance ?? null,
-					...(currentNugQuotaData.extra !== undefined ? { extra: currentNugQuotaData.extra } : {}),
-				},
-			};
-		});
-	}, [currentNugQuotaData, nugProviderConfig?.id, qc]);
-
-	return useMemo(() => {
-		if (REMOTE_BUILD || !nugProviderConfig) return null;
-		const quota = nugQuotasData?.[nugProviderConfig.id] ?? currentNugQuotaData;
-		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
-		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
-		return {
-			providerId: nugProviderConfig.id,
-			providerPrefix: nugProviderConfig.prefix,
-			name: nugProviderConfig.name ?? nugProviderConfig.prefix ?? nugProviderConfig.id,
-			quotaBalance: quota?.balance == null ? null : String(quota.balance),
-			totalGranted: quota?.totalGranted ?? null,
-			detailedQuotaBalance,
-		};
-	}, [nugProviderConfig, nugQuotasData, currentNugQuotaData]);
+	if (REMOTE_BUILD || !enabled || !hasToken || !provider) return null;
+	return {
+		providerId: provider.id,
+		providerPrefix: provider.prefix,
+		name: provider.name ?? provider.prefix ?? provider.id,
+		entries: selectQuotaEntries(query.data?.entries ?? []).filter(
+			(entry) => entry.groupId === provider.id && entry.supported !== false,
+		),
+	};
 }

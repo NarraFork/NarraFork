@@ -16,6 +16,7 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { TimeOfUsePriceGroup } from "@shared/model-catalog/card";
 import {
 	isEmptyOverride,
 	MODALITIES,
@@ -74,6 +75,45 @@ export function formatFieldValue(
 			.map((f) => `${t(`catalog.price.${f}`)} $${(value as Record<string, string>)[f]}`)
 			.join(" · ");
 	return String(value);
+}
+
+/** Catalog time-of-use quotes are informational, never effective override values. */
+export function TimeOfUsePrices({ groups }: { groups?: TimeOfUsePriceGroup[] }) {
+	const { t } = useTranslation("settings");
+	if (!groups?.length) return null;
+	return (
+		<Stack gap={4}>
+			{groups.map(({ tier, rows }) => (
+				<div key={tier}>
+					<Text size="xs" fw={500}>
+						{t(`card.tiers.${tier}`)}
+					</Text>
+					{rows.map((row) => {
+						const parts = [t(`card.components.${row.component}`)];
+						if (row.modality !== "text") parts.push(t(`card.modalities.${row.modality}`));
+						if (row.cacheDuration === "1h") parts.push(t("card.cache.1h"));
+						if (row.thresholdTokens !== null)
+							parts.push(t("catalog.aboveTokens", { count: row.thresholdTokens }));
+						const unit =
+							row.unit === "token"
+								? t("card.perTokens", { count: row.displayQuantity / 1_000_000 })
+								: t(`card.units.${row.unit}`);
+						return (
+							<Text key={row.key} size="xs">
+								{parts.join(" · ")}:{" "}
+								{row.displayRate === null
+									? t("catalog.unknown")
+									: `${row.displayRate} ${row.currency} / ${unit}`}
+							</Text>
+						);
+					})}
+				</div>
+			))}
+			<Text size="xs" c="dimmed">
+				{t("catalog.timeOfUseNote")}
+			</Text>
+		</Stack>
+	);
 }
 
 function FieldRow({
@@ -409,6 +449,7 @@ export function ModelOverrideEditor({
 							))}
 						</SimpleGrid>,
 					)}
+					<TimeOfUsePrices groups={info.timeOfUsePrices} />
 					{!readOnly && (
 						<Group justify="space-between">
 							<Button

@@ -98,10 +98,7 @@ describe("sub2api shape validation", () => {
 			scope: "subscription",
 			planName: "Premium",
 			unlimited: false,
-			amounts: [
-				{ unit: "USD", total: 10, used: 12, remaining: -2, window: "daily" },
-				{ unit: "USD", total: 0, used: 0, remaining: 0, window: "monthly" },
-			],
+			amounts: [{ unit: "USD", total: 10, used: 12, remaining: -2, window: "daily" }],
 		});
 		expect(parseSub2ApiBalance({ ...body, subscription: undefined })).toBeNull();
 		const { subscription: _subscription, ...withoutSubscription } = body;
@@ -111,6 +108,25 @@ describe("sub2api shape validation", () => {
 			unlimited: false,
 			amounts: [],
 		});
+	});
+
+	test("unconfigured zero caps are omitted, but positive exhausted caps keep remaining zero", () => {
+		const result = parseSub2ApiBalance({
+			mode: "unrestricted",
+			isValid: true,
+			unit: "USD",
+			planName: "Metered",
+			subscription: {
+				daily_limit_usd: 0,
+				weekly_limit_usd: 10,
+				weekly_usage_usd: 10,
+				monthly_limit_usd: 0,
+				monthly_usage_usd: 17,
+			},
+		});
+		expect(result?.amounts).toEqual([
+			{ unit: "USD", total: 10, used: 10, remaining: 0, window: "weekly" },
+		]);
 	});
 
 	test("the gateway's explicit -1 remaining distinguishes unlimited from unknown subscription", () => {

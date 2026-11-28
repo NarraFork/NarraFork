@@ -236,6 +236,7 @@ interface Frame {
 function socket(userId: string, userRole: "user" | "admin" = "user") {
 	const sent: Frame[] = [];
 	const ws = {
+		readyState: 1,
 		data: {
 			channel: "terminal",
 			connectedAt: Date.now(),

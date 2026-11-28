@@ -255,3 +255,24 @@ for (const renderer of ["flowing", "prepared"] as const)
 			expect(narratorWSManager.subscribe).toHaveBeenCalledTimes(1);
 		});
 	});
+
+describe("prepared chip lines", () => {
+	test("mark exactly the lines holding a chip, so their CSS needs no :has()", async () => {
+		await render(
+			"prepared",
+			"普通的一行文字\n\n交给 [任务](nf-agent://open?id=Child_A) 处理\n\n| a | b |\n|---|---|\n| [表格](nf-agent://open?id=Child_A) | 纯文本 |\n\n[外链](https://example.com)",
+			true,
+			400,
+		);
+		const lines = [...host.querySelectorAll("[data-vlist-line-frags]")];
+		const marked = lines.filter((el) => el.hasAttribute("data-vlist-line-chip"));
+		expect(marked).toHaveLength(2);
+		for (const el of lines)
+			expect(el.hasAttribute("data-vlist-line-chip")).toBe(
+				el.querySelector(":scope > [data-agent-reference]") !== null,
+			);
+		const css = await Bun.file(new URL("./AgentReferenceLink.module.css", import.meta.url)).text();
+		expect(css).not.toMatch(/\[data-vlist-line-frags\][^{]*:has\(/);
+		expect(css).toMatch(/\[data-vlist-line-frags\]\[data-vlist-line-chip\] > \* \{/);
+	});
+});

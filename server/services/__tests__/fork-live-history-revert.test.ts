@@ -14,6 +14,11 @@ import {
 import type { ToolExecutionTarget } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
+import { getDefaultLocalFileChangeRuntime } from "../file-change-runtime";
+import {
+	allowRetainedFileHistoryForTests,
+	retainFileHistoryForTests,
+} from "./retained-file-history";
 
 // Import the service first: persistence and the service have a pre-existing cycle.
 // Dynamic imports preserve this order when Biome sorts the static imports.
@@ -34,8 +39,12 @@ let userId: string;
 let parentId: string;
 let releaseSource: (() => void) | undefined;
 const now = () => new Date().toISOString();
+let restorePolicy: () => void;
+let restoreHistory: () => void;
 
 beforeEach(async () => {
+	restorePolicy = allowRetainedFileHistoryForTests();
+	restoreHistory = retainFileHistoryForTests(await getDefaultLocalFileChangeRuntime());
 	workspace = await mkdtemp(join(testEnvironment.isolatedHome, "live-fork-revert-"));
 	userId = generateId();
 	parentId = generateId();
@@ -57,6 +66,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	restoreHistory();
+	restorePolicy();
 	releaseSource?.();
 	releaseSource = undefined;
 	await rm(workspace, { recursive: true, force: true });

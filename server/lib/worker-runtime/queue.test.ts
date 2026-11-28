@@ -748,6 +748,242 @@ describe("TaskQueue run and close", () => {
 	});
 });
 
+describe("TaskQueue reserved waiting admission", () => {
+	test("normal waiters leave the remaining global count available to short tasks", async () => {
+		const q = queue({
+			maxQueued: 64,
+			maxQueuedBytes: 8 * 1024 * 1024,
+			normalQueue: { maxQueued: 48, maxQueuedBytes: 6 * 1024 * 1024 },
+		});
+		const first = await acquire(q);
+		const controller = new AbortController();
+		const waiting = Array.from({ length: 48 }, () => acquire(q, { signal: controller.signal }));
+		await expect(acquire(q)).rejects.toMatchObject({
+			code: "TASK_QUEUE_FULL",
+			reason: "normal-count",
+		});
+		waiting.push(
+			...Array.from({ length: 16 }, () =>
+				acquire(q, { taskClass: "short", signal: controller.signal }),
+			),
+		);
+		await expect(acquire(q, { taskClass: "short" })).rejects.toMatchObject({
+			code: "TASK_QUEUE_FULL",
+			reason: "total-count",
+		});
+		expect(q.stats.queuedByClass).toEqual({ normal: 48, short: 16 });
+		controller.abort(new Error("cancel waiting"));
+		await Promise.allSettled(waiting);
+		expect(q.stats.queuedByClass).toEqual({ normal: 0, short: 0 });
+		expect(q.stats.queuedBytesByClass).toEqual({ normal: 0, short: 0 });
+		first.release();
+	});
+
+	test("normal and global waiting byte limits are independent of immediate admission", async () => {
+		const mib = 1024 * 1024;
+		const q = queue({
+			maxQueued: 64,
+			maxQueuedBytes: 8 * mib,
+			normalQueue: { maxQueued: 48, maxQueuedBytes: 6 * mib },
+		});
+		const first = await acquire(q, { bytes: 9 * mib });
+		const controller = new AbortController();
+		const normal = acquire(q, { bytes: 6 * mib, signal: controller.signal });
+		await expect(acquire(q, { bytes: 1 })).rejects.toMatchObject({ reason: "normal-bytes" });
+		const short = acquire(q, { taskClass: "short", bytes: 2 * mib, signal: controller.signal });
+		await expect(acquire(q, { taskClass: "short", bytes: 1 })).rejects.toMatchObject({
+			reason: "total-bytes",
+		});
+		expect(q.stats.queuedBytesByClass).toEqual({ normal: 6 * mib, short: 2 * mib });
+		controller.abort();
+		await Promise.allSettled([normal, short]);
+		expect(q.stats.queuedBytes).toBe(0);
+		first.release();
+	});
+
+	test.each([
+		0, 1,
+	])("Q=%i permits immediate normal work with zero normal waiting capacity", async (qSize) => {
+		const q = queue({
+			maxQueued: qSize,
+			normalQueue: { maxQueued: 0, maxQueuedBytes: 0 },
+		});
+		const first = await acquire(q, { bytes: 100 });
+		await expect(acquire(q)).rejects.toMatchObject({
+			reason: qSize === 0 ? "total-count" : "normal-count",
+		});
+		if (qSize === 0) {
+			await expect(acquire(q, { taskClass: "short" })).rejects.toMatchObject({
+				reason: "total-count",
+			});
+			first.release();
+		} else {
+			const short = acquire(q, { taskClass: "short" });
+			first.release();
+			(await short).release();
+		}
+		expect(q.stats.queuedByClass).toEqual({ normal: 0, short: 0 });
+	});
+
+	test("eligible classes alternate while preserving FIFO within each class", async () => {
+		const q = queue({ normalQueue: { maxQueued: 10, maxQueuedBytes: 100 } });
+		const first = await acquire(q);
+		const order: string[] = [];
+		const waiting = ["n1", "n2", "s1", "s2"].map((name) =>
+			acquire(q, {
+				taskClass: name.startsWith("s") ? "short" : "normal",
+				onAdmission: (event) => {
+					if (event.phase === "granted") order.push(name);
+				},
+			}),
+		);
+		first.release();
+		for (const index of [2, 0, 3, 1]) (await waiting[index]).release();
+		expect(order).toEqual(["s1", "n1", "s2", "n2"]);
+	});
+
+	test("per-class key rotation retains key quotas and does not block another class", async () => {
+		const q = queue({
+			concurrency: 2,
+			maxActivePerKey: 1,
+			normalQueue: { maxQueued: 10, maxQueuedBytes: 100 },
+		});
+		const a = await acquire(q, { key: "a" });
+		const b = await acquire(q, { key: "b" });
+		const order: string[] = [];
+		const schedule = (key: string, taskClass: "normal" | "short" = "normal") =>
+			acquire(q, {
+				key,
+				taskClass,
+				onAdmission: (event) => {
+					if (event.phase === "granted") order.push(`${taskClass}:${key}`);
+				},
+			});
+		const a1 = schedule("a");
+		const b1 = schedule("b");
+		const short = schedule("a", "short");
+		b.release();
+		(await b1).release();
+		expect(order).toEqual(["normal:b"]);
+		a.release();
+		(await short).release();
+		(await a1).release();
+		expect(order).toEqual(["normal:b", "short:a", "normal:a"]);
+	});
+
+	test("an internal resource gate skips blocked normal waiters and wake resumes them", async () => {
+		let shared = false;
+		let claims = 0;
+		let releases = 0;
+		const q = new TaskQueue(
+			{ concurrency: 2 },
+			{
+				canGrant: (taskClass) => taskClass === "short" || shared,
+				claim: () => {
+					claims++;
+					return { release: () => releases++ };
+				},
+			},
+		);
+		queues.add(q);
+		const normal = acquire(q);
+		const short = await acquire(q, { taskClass: "short" });
+		expect(q.stats).toMatchObject({ active: 1, queued: 1 });
+		expect(claims).toBe(1);
+		short.release();
+		expect(releases).toBe(1);
+		shared = true;
+		q.wake();
+		expect(q.stats.queued).toBe(0);
+		(await normal).release();
+		expect(claims).toBe(2);
+		expect(releases).toBe(2);
+	});
+
+	test("committed admission notifications are isolated and pre-work abort releases its claim", async () => {
+		let releases = 0;
+		const q = new TaskQueue(
+			{ concurrency: 1 },
+			{ canGrant: () => true, claim: () => ({ release: () => releases++ }) },
+		);
+		queues.add(q);
+		const controller = new AbortController();
+		const reason = new Error("cancel before work");
+		let dispatched = false;
+		const task = q.run(
+			() => {
+				dispatched = true;
+			},
+			{
+				signal: controller.signal,
+				onAdmission: (event) => {
+					expect(event.phase).toBe("granted");
+					expect(q.stats.active).toBe(1);
+					controller.abort(reason);
+					throw new Error("observer");
+				},
+			},
+		);
+		await expect(task).rejects.toBe(reason);
+		expect(dispatched).toBe(false);
+		expect(releases).toBe(1);
+		expect(q.stats.active).toBe(0);
+	});
+
+	test("reentrant observers cannot let arrivals bypass eligible existing waiters", async () => {
+		const q = queue({ concurrency: 3 });
+		const a = await acquire(q);
+		const b = await acquire(q);
+		const c = await acquire(q);
+		const order: number[] = [];
+		let arrival: Promise<TaskQueuePermit> | undefined;
+		const first = acquire(q, {
+			onAdmission: (event) => {
+				if (event.phase !== "granted") return;
+				order.push(1);
+				b.release();
+				arrival = acquire(q, {
+					onAdmission: (next) => {
+						if (next.phase === "granted") order.push(3);
+					},
+				});
+			},
+		});
+		const older = acquire(q, {
+			onAdmission: (event) => {
+				if (event.phase === "granted") order.push(2);
+			},
+		});
+		a.release();
+		expect(order).toEqual([1, 2]);
+		(await first).release();
+		expect(order).toEqual([1, 2, 3]);
+		(await older).release();
+		(await arrival)?.release();
+		c.release();
+	});
+
+	test("queued cancellation, timeout and close restore all classified waiting counters", async () => {
+		const q = queue({ normalQueue: { maxQueued: 10, maxQueuedBytes: 100 } });
+		const first = await acquire(q);
+		const controller = new AbortController();
+		const cancelled = acquire(q, { signal: controller.signal, bytes: 7 });
+		const timed = acquire(q, { taskClass: "short", bytes: 9, waitTimeoutMs: 5 });
+		controller.abort();
+		await expect(cancelled).rejects.toBeInstanceOf(Error);
+		await expect(timed).rejects.toMatchObject({ code: "TASK_QUEUE_TIMEOUT" });
+		const final = acquire(q, { taskClass: "short", bytes: 11 });
+		const closed = q.close();
+		await expect(final).rejects.toMatchObject({ code: "TASK_QUEUE_CLOSED" });
+		expect(q.stats.queuedByClass).toEqual({ normal: 0, short: 0 });
+		expect(q.stats.queuedBytesByClass).toEqual({ normal: 0, short: 0 });
+		first.release();
+		await closed;
+		q.wake();
+		expect(q.stats.active).toBe(0);
+	});
+});
+
 describe("TaskQueue configuration", () => {
 	for (const options of [
 		{ concurrency: 0 },

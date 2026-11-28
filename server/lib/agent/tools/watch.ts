@@ -84,6 +84,12 @@ export const watchTool: ToolDefinition = {
 			return {
 				output: `Watch could not be registered: ${error instanceof Error ? error.message : String(error)}`,
 				isError: true,
+				metadata: {
+					kind: "watch",
+					type: input.type,
+					targetId: input.id,
+					status: "failed",
+				},
 			};
 		}
 	},

@@ -14,6 +14,7 @@ import {
 	type QuotaQueryResult,
 	quotaQueryResultSchema,
 } from "@shared/provider-quota";
+import { epochOf, type QuotaSnapshot, type QuotaWindow } from "@shared/quota-snapshot";
 import {
 	createProviderQuotaPersistence,
 	type PersistedProviderQuota,
@@ -25,6 +26,103 @@ import {
 	type CustomApiQuotaTargetDirectory,
 	customApiQuotaTargets,
 } from "./provider-quota-targets";
+
+/** Read-only bridge into the shared snapshot UI; scheduling and identity stay with this service. */
+export function toQuotaSnapshot(
+	snapshot: ProviderQuotaSnapshot | null | undefined,
+): QuotaSnapshot | undefined {
+	if (
+		!snapshot ||
+		snapshot.status === "unsupported" ||
+		(!snapshot.data && !snapshot.error && snapshot.fetchedAt === 0)
+	)
+		return undefined;
+	const data = snapshot.status === "unavailable" ? null : snapshot.data;
+	const kind = (name: string | undefined, durationMs?: number): QuotaWindow["kind"] =>
+		name === "fiveHour" || name === "rolling" || name === "5h" || durationMs === 5 * 3_600_000
+			? "5h"
+			: name === "weekly" || name === "7d" || durationMs === 7 * 86_400_000
+				? "weekly"
+				: name === "monthly"
+					? "monthly"
+					: "other";
+	const ratio = (
+		used: number | null | undefined,
+		total: number | null | undefined,
+		remaining: number | null,
+	): number | null => {
+		if (total == null || total <= 0) return null;
+		const value = used != null ? used / total : remaining != null ? 1 - remaining / total : null;
+		return value !== null && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : null;
+	};
+	const windows: QuotaWindow[] = (data?.windows ?? []).map((window) => ({
+		kind: kind(window.id, window.durationMs),
+		...(window.label || kind(window.id, window.durationMs) === "other"
+			? { label: window.label ?? window.id }
+			: {}),
+		usedRatio:
+			window.status === "rate-limited" || window.remaining === 0
+				? 1
+				: window.usedPercent != null
+					? Math.max(0, Math.min(1, window.usedPercent / 100))
+					: ratio(window.used, window.limit, window.remaining),
+		resetsAt: epochOf(window.resetAt),
+		...(window.status ? { status: window.status } : {}),
+		...(window.used != null ? { used: window.used } : {}),
+		...(window.limit != null ? { total: window.limit } : {}),
+		...(window.remaining != null ? { remaining: window.remaining } : {}),
+		...(window.unit ? { unit: window.unit } : {}),
+	}));
+	for (const amount of data?.amounts ?? []) {
+		if (!amount.window || amount.quota === "none" || amount.quota === "alternative") continue;
+		if (data?.unlimited && amount.total === 0) continue;
+		windows.push({
+			kind: kind(amount.window),
+			label: amount.label ?? amount.window,
+			usedRatio: ratio(amount.used, amount.total, amount.remaining),
+			// A window start or plan expiry is not a promised refill time.
+			resetsAt: null,
+			...(amount.used != null ? { used: amount.used } : {}),
+			...(amount.total != null ? { total: amount.total } : {}),
+			...(amount.remaining != null ? { remaining: amount.remaining } : {}),
+			unit: amount.unit,
+		});
+	}
+	const balances: QuotaSnapshot["balances"] = (data?.amounts ?? []).map((amount) => ({
+		id: amount.id,
+		...(amount.label ? { label: amount.label } : {}),
+		...(amount.display ? { display: amount.display } : {}),
+		unit: amount.unit,
+		remaining: amount.remaining,
+		quota: amount.quota ?? "required",
+		...(amount.remainingText !== undefined ? { remainingText: amount.remainingText } : {}),
+		...(amount.used != null ? { used: amount.used } : {}),
+		...(amount.total != null ? { total: amount.total } : {}),
+		...(amount.window ? { window: amount.window } : {}),
+		...(epochOf(amount.windowStart) !== null ? { windowStart: epochOf(amount.windowStart)! } : {}),
+		...(amount.unlimited !== undefined || data?.unlimited
+			? { unlimited: amount.unlimited ?? data?.unlimited }
+			: {}),
+	}));
+	if (data?.unlimited && !balances.length && !windows.length)
+		balances.push({ unit: "", remaining: null, unlimited: true });
+	const expiresAt = epochOf(data?.expiresAt);
+	const error = snapshot.status === "unavailable" ? "plugin_not_enabled" : snapshot.error;
+	return {
+		fetchedAt: snapshot.fetchedAt,
+		scope:
+			data?.scope === "account" || data?.scope === "wallet" || data?.scope === "subscription"
+				? data.scope
+				: "key",
+		windows,
+		balances,
+		...(error ? { error } : {}),
+		...(typeof data?.available === "boolean" ? { available: data.available } : {}),
+		...(data?.details ? { details: data.details } : {}),
+		...(data?.planName ? { plan: data.planName } : {}),
+		...(expiresAt !== null ? { expiresAt } : {}),
+	};
+}
 
 export interface ProviderQuotaSource {
 	id: string;
@@ -487,6 +585,14 @@ export class ProviderQuotaService {
 		return this.discoveryReady && this.sources().length > 0;
 	}
 
+	/** Hot model-runtime reads must not reconcile, restore persistence or schedule probes. */
+	peekGeneration(providerId: string): string | undefined {
+		const entry = this.providerEntry(providerId);
+		return entry && this.directory.isProviderIdentityCurrent(entry.connection)
+			? entry.snapshot.generation
+			: undefined;
+	}
+
 	peek(providerId: string): ProviderQuotaSnapshot | null {
 		this.sync();
 		const entry = this.providerEntry(providerId);
@@ -545,9 +651,14 @@ export class ProviderQuotaService {
 		return { snapshots, nextCursor };
 	}
 
-	manualRetryAfterMs(providerId: string): number {
+	manualRetryAfterMs(providerId: string, keyId?: string): number {
 		this.sync();
-		const entry = this.providerEntry(providerId);
+		const connection = keyId ? this.directory.getKey(keyId) : undefined;
+		const entry = keyId
+			? connection?.target.providerId === providerId
+				? this.entries.get(connectionId(connection))
+				: undefined
+			: this.providerEntry(providerId);
 		return !entry || entry.task || !entry.connection.valid
 			? 0
 			: Math.max(0, entry.nextManualAt - this.now());
@@ -610,6 +721,21 @@ export class ProviderQuotaService {
 				]),
 		);
 	}
+	/** Stream values have their own cache but must still belong to the current plugin identity. */
+	isStreamSnapshotCurrent(keyId: string, generation: unknown): boolean {
+		const entry = this.entries.get(`key/${keyId}`) ?? this.entries.get(keyId);
+		return (
+			!!entry?.connection.valid &&
+			this.discoveryReady &&
+			this.sources().length > 0 &&
+			entry.snapshot.status !== "unavailable" &&
+			entry.snapshot.error !== "unavailable" &&
+			entry.snapshot.pushCompatible !== false &&
+			entry.snapshot.generation === generation &&
+			this.directory.isKeyIdentityCurrent(keyId, entry.connection)
+		);
+	}
+
 	/** Pure selection read: no reconcile, scheduling, key selection, or database audit. */
 	peekKeyForSelection(keyId: string): ProviderQuotaSnapshot | null {
 		const entry = this.entries.get(`key/${keyId}`) ?? this.entries.get(keyId);
@@ -1060,11 +1186,12 @@ quotaOwner.removeProbe = registerKeyQuotaProbe((keyId, now) => {
 		const usedUp =
 			window.remaining === 0 ||
 			window.status === "rate-limited" ||
-			(window.usedPercent ?? 0) >= 100 ||
-			(window.limit != null &&
-				window.used != null &&
-				window.limit > 0 &&
-				window.used >= window.limit);
+			(!(window.remaining != null && window.remaining > 0) &&
+				((window.usedPercent ?? 0) >= 100 ||
+					(window.limit != null &&
+						window.used != null &&
+						window.limit > 0 &&
+						window.used >= window.limit)));
 		const reset = window.resetAt ? Date.parse(window.resetAt) : Number.NaN;
 		return usedUp && Number.isFinite(reset) && reset > now ? [reset] : [];
 	});

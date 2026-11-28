@@ -25,6 +25,9 @@ export const SNAPSHOT_TABLES = {
 	sessions: [
 		// 顺序即建表顺序：消息指向会话，块指向消息。
 		"narrators",
+		// Explicit NULL roots are durable; peers are restored only after target-side ACL checks.
+		"narrator_communication_nodes",
+		"narrator_communication_peers",
 		"narrator_messages",
 		"narrator_message_refs",
 		"narrator_tool_calls",

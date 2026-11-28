@@ -46,8 +46,9 @@ export function customApiQuotaPushPrefix(
 	target: CustomApiQuotaPushTarget,
 	directory: CustomApiQuotaTargetDirectory = customApiQuotaTargets,
 ): string | null {
-	const current = directory.get(target.providerId);
+	const current = target.keyId ? directory.getKey(target.keyId) : directory.get(target.providerId);
 	return current?.valid &&
+		current.target.providerId === target.providerId &&
 		!current.target.siteQuota &&
 		current.target.generation === target.generation
 		? (current.target.prefix ?? null)

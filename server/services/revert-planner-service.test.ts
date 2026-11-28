@@ -4,11 +4,11 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { assertDbReadersReady } from "@server/lib/db-worker/pool";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
-import { openSchemaCopyInMemory } from "../../tests/sqlite-schema-image";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -18,9 +18,11 @@ import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
+import { makeRetainedHistoryRuntimeForTests } from "./__tests__/retained-file-history";
 import { fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
-import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
+import { type LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
 import { type RevertPlanFileCursor, RevertPlanService } from "./revert-plan-service";
 import {
@@ -74,8 +76,8 @@ beforeEach(async () => {
 	// Schema ONLY from the test-preload-isolated DB. No production connection/data,
 	// migration edits, fake receipts or mocked selection/reversal/planner services.
 	// A byte image built once per process replaces replaying ~550 DDL statements per case.
-	sqlite = openSchemaCopyInMemory(isolatedTemplate);
-	sqlite.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;");
+	sqlite = openFileWorkerDatabase(isolatedTemplate);
+	await assertDbReadersReady(sqlite.filename);
 	db = database(sqlite);
 	clock = Date.parse("2026-09-07T12:00:00.000Z");
 	serial = 0;
@@ -112,7 +114,7 @@ beforeEach(async () => {
 				updatedAt: now(),
 			})
 			.run();
-	runtime = new LocalFileChangeRuntime({
+	runtime = makeRetainedHistoryRuntimeForTests({
 		db,
 		privateRoot: join(root, "private"),
 		blobStoreOptions: { minimumFreeBytes: 0 },
@@ -201,7 +203,10 @@ beforeEach(async () => {
 		blobStore: namespace.store,
 		blobCatalog: namespace.catalog,
 		generation: namespace.generation,
-		planOptions: { namespaceKey: namespace.catalog.getBudget()?.namespaceKey ?? "missing", now },
+		planOptions: {
+			namespaceKey: (await namespace.catalog.readBudget())?.namespaceKey ?? "missing",
+			now,
+		},
 		onSlow: () => {},
 	};
 	service = new RevertPlannerService(db, options);
@@ -209,7 +214,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	await closeRevertManifestWorkers();
-	sqlite.close();
+	await closeFileWorkerDatabase(sqlite);
 	await rm(root, { recursive: true, force: true });
 });
 function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
@@ -437,6 +442,37 @@ describe("manifest warmup is preview-only and non-blocking", () => {
 });
 
 describe("real tool evidence -> complete prepared preview", () => {
+	test("optional archive metadata read failure retains the prepared preview and live bytes", async () => {
+		const { path } = await fixture();
+		const current = await readFile(path);
+		const currentDigest = hash(current);
+		const getMetadata = namespace.catalog.readMetadata.bind(namespace.catalog);
+		let failedReads = 0;
+		const metadataRead = spyOn(namespace.catalog, "readMetadata").mockImplementation(
+			async (input) => {
+				if (input.ref.digest === currentDigest) {
+					failedReads++;
+					throw new DOMException("Archive read deadline", "AbortError");
+				}
+				return getMetadata(input);
+			},
+		);
+		try {
+			const result = await prepare();
+			expect(result.plan.status).toBe("prepared");
+			expect(result.plan.coverageComplete).toBe(true);
+			expect(failedReads).toBe(1);
+			const file = db
+				.select()
+				.from(schema.revertOperationFiles)
+				.where(eq(schema.revertOperationFiles.revertOperationId, result.plan.id))
+				.get();
+			expect(file?.beforeBlobDigest).toBeNull();
+			expect(await readFile(path)).toEqual(current);
+		} finally {
+			metadataRead.mockRestore();
+		}
+	});
 	test("Write A -> human -> Edit B -> late human preserves human raw bytes without workspace/history mutation", async () => {
 		const { path, original } = await fixture();
 		const disk = await readFile(path);
@@ -446,14 +482,14 @@ describe("real tool evidence -> complete prepared preview", () => {
 		expect(result.plan.status).toBe("prepared");
 		expect(result.plan.coverageComplete).toBe(true);
 		expect(result.plan.expectedFileCount).toBe(1);
-		const file = plans.listFiles(owner, result.plan.id).items[0];
+		const file = (await plans.listFiles(owner, result.plan.id)).items[0];
 		expect(file.expectedStateJson).toMatchObject({
 			kind: "regular",
 			blob: { digest: hash(disk), sizeBytes: disk.byteLength },
 		});
 		// The merge overwrites late human bytes, so they are archived for a later undo.
 		expect(
-			namespace.catalog.getMetadata({
+			await namespace.catalog.getMetadata({
 				expectedGeneration: namespace.generation,
 				ref: { algorithm: "sha256", digest: hash(disk), sizeBytes: disk.byteLength },
 			}),
@@ -504,7 +540,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		const disk = await readFile(path);
 		const before = historySnapshot();
 		const result = await prepare();
-		const file = plans.listFiles(owner, result.plan.id).items[0];
+		const file = (await plans.listFiles(owner, result.plan.id)).items[0];
 		expect((await bytes(file.desiredStateJson)).equals(original)).toBe(true);
 		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(before);
@@ -580,7 +616,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		let cursor: RevertPlanFileCursor | undefined;
 		const sequences: number[] = [];
 		for (;;) {
-			const page = plans.listFiles(owner, result.plan.id, { limit: 7, cursor });
+			const page = await plans.listFiles(owner, result.plan.id, { limit: 7, cursor });
 			for (const file of page.items) {
 				sequences.push(file.sequence);
 				expect((await bytes(file.desiredStateJson)).toString()).toStartWith("original");
@@ -642,7 +678,7 @@ describe("complete selection and per-file unavailable preview states", () => {
 			.run();
 		const before = historySnapshot();
 		const result = await prepare();
-		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson).toEqual({
+		expect((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson).toEqual({
 			kind: "unknown",
 			reason: "history_unavailable",
 		});
@@ -719,7 +755,9 @@ describe("complete selection and per-file unavailable preview states", () => {
 				reason: "history_unavailable",
 			},
 		]);
-		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson.kind).toBe("regular");
+		expect((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson.kind).toBe(
+			"regular",
+		);
 		expect(reads).toBe(2);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
@@ -745,7 +783,7 @@ describe("complete selection and per-file unavailable preview states", () => {
 			operationId: effect.operationId,
 			reason: "history_unavailable",
 		});
-		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson).toEqual({
+		expect((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson).toEqual({
 			kind: "unknown",
 			reason: "history_unavailable",
 		});
@@ -769,7 +807,7 @@ describe("complete selection and per-file unavailable preview states", () => {
 		const before = historySnapshot();
 		const result = await prepare();
 		expect(result.plan.expectedFileCount).toBe(2);
-		const files = plans.listFiles(owner, result.plan.id).items;
+		const files = (await plans.listFiles(owner, result.plan.id)).items;
 		const safe = files.find((file) => file.identityJson.canonicalPath === first);
 		const conflict = files.find((file) => file.identityJson.canonicalPath === second);
 		if (!safe || !conflict) throw new Error("Complete preview must contain both files");
@@ -800,7 +838,7 @@ describe("complete selection and per-file unavailable preview states", () => {
 		const before = historySnapshot();
 		const disk = await readFile(path);
 		const result = await prepare();
-		const files = plans.listFiles(owner, result.plan.id).items;
+		const files = (await plans.listFiles(owner, result.plan.id)).items;
 		expect(files).toHaveLength(2);
 		expect(
 			files.find((file) => file.identityJson.canonicalPath === path)?.desiredStateJson,
@@ -1101,7 +1139,9 @@ describe("mandatory authorization, freshness and idempotency", () => {
 		};
 		const result = await prepare();
 		expect(result.plan.status).toBe("prepared");
-		expect(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson.kind).toBe("regular");
+		expect((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson.kind).toBe(
+			"regular",
+		);
 		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(before);
 		await write(path, "independent new contents\n");
@@ -1263,7 +1303,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		await writeFile(path, "a".repeat(1024 * 1024));
 		await write(path, "b".repeat(1024 * 1024));
 		const disk = await readFile(path);
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.readBudget();
 		if (!budget) throw new Error("Missing catalog budget");
 		db.update(schema.fileChangeStorageBudgets)
 			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
@@ -1281,7 +1321,9 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			.get();
 		expect(row?.beforeBlobDigest).toBe(hash(disk));
 		expect(
-			(await bytes(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson)).toString(),
+			(
+				await bytes((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson)
+			).toString(),
 		).toBe("a".repeat(1024 * 1024));
 		expect(await readFile(path)).toEqual(disk);
 	});
@@ -1291,7 +1333,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		await write(path, "b".repeat(1024 * 1024));
 		const external = Buffer.from("c".repeat(1024 * 1024));
 		await writeFile(path, external);
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.readBudget();
 		if (!budget) throw new Error("Missing catalog budget");
 		db.update(schema.fileChangeStorageBudgets)
 			.set({ quotaBytes: budget.usedBytes + 32 * 1024 })
@@ -1311,13 +1353,13 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const disk = await readFile(path);
 		const ref = { algorithm: "sha256" as const, digest: hash(disk), sizeBytes: disk.byteLength };
 		expect(
-			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+			await namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
 		).toBeNull();
 		const putting = spyOn(namespace.store, "putBytes");
 		try {
 			const result = await prepare();
 			expect(result.plan.coverageComplete).toBe(true);
-			const [file] = plans.listFiles(owner, result.plan.id).items;
+			const [file] = (await plans.listFiles(owner, result.plan.id)).items;
 			const row = db
 				.select()
 				.from(schema.revertOperationFiles)
@@ -1394,7 +1436,9 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 		const result = await prepare();
 		expect(result.plan.coverageComplete).toBe(true);
 		expect(
-			(await bytes(plans.listFiles(owner, result.plan.id).items[0].desiredStateJson)).toString(),
+			(
+				await bytes((await plans.listFiles(owner, result.plan.id)).items[0].desiredStateJson)
+			).toString(),
 		).toBe(original.replace("H0", "H2"));
 		expect(await readFile(path)).toEqual(disk);
 	});
@@ -1410,7 +1454,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			sizeBytes: external.byteLength,
 		};
 		const result = await prepare({ uiAction: "revert_files" });
-		const [file] = plans.listFiles(owner, result.plan.id).items;
+		const [file] = (await plans.listFiles(owner, result.plan.id)).items;
 		expect(result.plan.coverageComplete).toBe(true);
 		expect(file.expectedStateJson).toEqual(file.desiredStateJson);
 		expect(file.desiredStateJson).toMatchObject({ kind: "regular", blob: ref });
@@ -1421,7 +1465,7 @@ describe("aggregate budgets, cancellation and storage failures", () => {
 			.get();
 		expect(row?.desiredBlobDigest).toBeNull();
 		expect(
-			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
+			await namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref }),
 		).toBeNull();
 		expect(await readFile(path)).toEqual(external);
 	});

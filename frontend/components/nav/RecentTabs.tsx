@@ -2,7 +2,11 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
 import {
 	hasDirectorySubtitle,
+	isCoordinatorSessionTab,
 	isTeamOnlookerTab,
+	recentTabHref,
+	recentTabLiveNarratorId,
+	selectProjectRuntimeTabs,
 	statusAttention,
 } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
@@ -22,19 +26,17 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
 	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
+	RECENT_TABS_LIVE_LIMIT,
 	type RecentTabsDelta as RecentTabsDeltaFrame,
 } from "@shared/recent-tabs";
-import { IconBrain, IconClock, IconFolder, IconPencil, IconRobot } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { installTeamOnlookerRefresh } from "../../hooks/team-onlooker-refresh";
 import { useFolderDisplay } from "../../hooks/useFolderDisplay";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
-import { useNarratorIsOptimizingPrompt } from "../../hooks/usePromptOptimizeTask";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
@@ -49,8 +51,10 @@ import {
 	type RecentTab,
 	type RecentTabRuntimeVersions,
 	type RecentTabsInfiniteData,
+	recentTabsFlatQueryKey,
 	recentTabsSectionQueryKey,
 	reconcileRecentTabsRuntimePatches,
+	refreshRecentTabsAfterReconnect,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
 	snapshotRecentTabRuntimeVersions,
@@ -63,17 +67,16 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	clearNotifiedAttention,
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { isRecentTabsScopeCurrent, type RecentTabsScope } from "../../lib/recent-tabs-owner";
 import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import { CreateNarratorLazyModal } from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
-import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 import {
 	type RecentTabCardActions,
@@ -89,6 +92,7 @@ import {
 	RecentTabFolderStrip,
 	recentTabFolderCardStyle,
 } from "./RecentTabFolderRows";
+import { RecentTabIcon as TabIcon } from "./RecentTabIcon";
 import { RecentTabPinDivider, TabContextMenu } from "./RecentTabMenu";
 import {
 	createRecentTabDragModel,
@@ -108,20 +112,19 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { recentTabMenuKey, useRecentTabMenuTarget } from "./recent-tab-menu-target";
 import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
 import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
 
-const QUERY_KEY = ["user-preferences", "recent-tabs"];
-
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
+const TEAM_RUNTIME_REFRESH_DELAY_MS = 2_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	// group tabs have no single narrator (multi-party)
-	return null;
+	// Team rows may reference their coordinator, but only session rows receive session attention.
+	return tab.type === "team" ? null : recentTabLiveNarratorId(tab);
 }
 
 // Each list owns its click guard and pending submission state.
@@ -145,9 +148,29 @@ interface RecentTabsWSProviderProps {
 	onNavigate?: () => void;
 }
 
+/** The part of a coordinator's socket patch a team tab shows. */
+function teamTabPatch(patch: Partial<RecentTab>): Partial<RecentTab> {
+	const picked: Partial<RecentTab> = {};
+	if (patch.title !== undefined) picked.title = patch.title;
+	if (patch.status !== undefined) picked.status = patch.status;
+	if (patch.substatus !== undefined) picked.substatus = patch.substatus;
+	return picked;
+}
+
 /** Invisible root component that maintains the bounded RecentTabs live window. */
 export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
-	const { tabs } = useRecentTabs();
+	const { scope, tabs } = useRecentTabs();
+	if (!scope) return null;
+	return (
+		<RecentTabsLiveWindow
+			key={`${scope.authGeneration}:${scope.accessGeneration}`}
+			scope={scope}
+			tabs={tabs}
+		/>
+	);
+}
+
+function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: RecentTab[] }) {
 	const qc = useQueryClient();
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
@@ -161,18 +184,35 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	userPrefsRef.current = userPrefs;
 	const deltaBatchesRef = useRef<Parameters<typeof collectRecentTabsDeltaFrame>[0]>(new Map());
 
-	const liveTabs = useMemo(() => selectRecentTabsLiveWindow(tabs, pathname), [tabs, pathname]);
+	// Project tabs have no narrator socket; their hover-card details still come with the
+	// runtime patches, within the same per-request key budget.
+	const projectRuntimeTabs = useMemo(
+		() => selectProjectRuntimeTabs(tabs, pathname),
+		[tabs, pathname],
+	);
+	const liveTabs = useMemo(
+		() =>
+			selectRecentTabsLiveWindow(
+				tabs,
+				pathname,
+				RECENT_TABS_LIVE_LIMIT - projectRuntimeTabs.length,
+			),
+		[tabs, pathname, projectRuntimeTabs.length],
+	);
+	// A team tab follows its coordinator, so the socket subscribes to it as well.
 	const narratorIds = useMemo(
-		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
+		() => [...new Set(liveTabs.map(recentTabLiveNarratorId).filter((id): id is string => !!id))],
 		[liveTabs],
 	);
 	// Snapshot membership is independent of display and subscription order.
 	const runtimeTargetsKey = useMemo(
 		() =>
 			JSON.stringify(
-				liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const).sort(),
+				[...liveTabs, ...projectRuntimeTabs]
+					.map((tab) => [tabSortId(tab), recentTabLiveNarratorId(tab)] as const)
+					.sort(),
 			),
-		[liveTabs],
+		[liveTabs, projectRuntimeTabs],
 	);
 	const runtimeTargets = useMemo(
 		() => JSON.parse(runtimeTargetsKey) as Array<[string, string | null]>,
@@ -201,7 +241,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	} | null>(null);
 
 	const refreshRuntime = useCallback((): Promise<void> => {
-		if (runtimeKeys.length === 0) return Promise.resolve();
+		if (!isRecentTabsScopeCurrent(scope) || runtimeKeys.length === 0) return Promise.resolve();
 		const active = runtimeRequestRef.current;
 		if (active) {
 			active.refreshAgain = true;
@@ -214,7 +254,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			refreshAgain: false,
 			promise: Promise.resolve().then(async () => {
 				try {
-					while (!signal.aborted) {
+					while (!signal.aborted && isRecentTabsScopeCurrent(scope)) {
 						request.refreshAgain = false;
 						const versions = snapshotRecentTabRuntimeVersions(
 							runtimeVersionsRef.current,
@@ -231,6 +271,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 										versions,
 										runtimeVersionsRef.current,
 									),
+									scope,
 								);
 							}
 						} catch (error) {
@@ -245,28 +286,29 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		};
 		runtimeRequestRef.current = request;
 		return request.promise;
-	}, [qc, runtimeKeys, runtimeNarratorIds, runtimeNarratorIdsByKey]);
+	}, [qc, runtimeKeys, runtimeNarratorIds, runtimeNarratorIdsByKey, scope]);
 
+	const teamRuntimeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	useEffect(() => {
 		pruneRecentTabsRuntimeVersions(runtimeVersionsRef.current, runtimeNarratorIds);
 		void refreshRuntime().catch(() => {});
 		return () => {
 			runtimeRequestRef.current?.controller.abort();
 			runtimeRequestRef.current = null;
+			if (teamRuntimeTimerRef.current) clearTimeout(teamRuntimeTimerRef.current);
+			teamRuntimeTimerRef.current = null;
 		};
 	}, [refreshRuntime, runtimeNarratorIds]);
 
-	// A sharing change can turn a team onlooker into a member (or back): read the runtime patches
-	// again so `teamOnlooker` (which silences "waiting" alerts) follows it without a reload. M1.
-	useEffect(
-		() =>
-			installTeamOnlookerRefresh(
-				narratorWSManager,
-				() => tabsRef.current,
-				() => void refreshRuntime().catch(() => {}),
-			),
-		[refreshRuntime],
-	);
+	// Access changes remount this window. Coordinator status frames also coalesce a one-shot
+	// refresh: the team's pending-approval count has no socket frame of its own.
+	const scheduleTeamRuntimeRefresh = useCallback(() => {
+		if (teamRuntimeTimerRef.current) return;
+		teamRuntimeTimerRef.current = setTimeout(() => {
+			teamRuntimeTimerRef.current = null;
+			void refreshRuntime().catch(() => {});
+		}, TEAM_RUNTIME_REFRESH_DELAY_MS);
+	}, [refreshRuntime]);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
@@ -285,12 +327,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		if (pending.size === 0) return;
 		pendingTabPatchesRef.current = new Map();
 		const patches = tabsRef.current.flatMap((tab) => {
-			const narratorId = getRecentTabNarratorId(tab);
+			const narratorId = recentTabLiveNarratorId(tab);
 			const patch = narratorId ? pending.get(narratorId) : undefined;
-			return patch ? [{ key: tabSortId(tab), patch }] : [];
+			if (!patch) return [];
+			// A team tab shows its coordinator's name and state, not the session's own terminals,
+			// viewers or draft.
+			return [{ key: tabSortId(tab), patch: tab.type === "team" ? teamTabPatch(patch) : patch }];
 		});
-		applyRecentTabsRuntimePatches(qc, patches);
-	}, [qc]);
+		applyRecentTabsRuntimePatches(qc, patches, scope);
+	}, [qc, scope]);
 
 	const scheduleTabPatchFlush = useCallback(() => {
 		if (!tabPatchTimerRef.current) tabPatchTimerRef.current = setTimeout(flushTabPatches, 0);
@@ -308,6 +353,26 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
+			// A late done carries notification intent only: never touch cache, favicon or runtime fences.
+			if (event.type === "status" && event.notificationOnly) {
+				if (
+					event.status === "idle" &&
+					event.substatus?.includes("unread") &&
+					!isBackgroundWorkSilencedStatus(event) &&
+					userPrefsRef.current
+				) {
+					const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+					if (tab)
+						triggerNotification(
+							narratorId,
+							tab.title,
+							"unread",
+							userPrefsRef.current,
+							event.turnStartedAt,
+						);
+				}
+				return;
+			}
 			const patch: Partial<RecentTab> = {};
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
@@ -332,6 +397,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				// The subscription reconciles caches for ALL changes before this callback.
 				// Attention is separate: no synthetic status patch or urgency-gated refetch.
 				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+				// Only a session tab alerts; a pinned team's coordinator does not (see below).
+				if (!tab) return;
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
@@ -347,7 +414,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			// response must not roll them back (icon colour / filled state lag).
 			bumpRecentTabRuntimeVersions(runtimeVersionsRef.current, narratorId, Object.keys(patch));
 
-			if (event.type === "status") {
+			// The socket also follows the coordinators of pinned teams. Their status reaches the
+			// team tab below, but alerts belong to session tabs: pinning a team is not a request
+			// to be told each time its coordinator waits.
+			const hasSessionTab = tabsRef.current.some(
+				(tab) => getRecentTabNarratorId(tab) === narratorId,
+			);
+			if (
+				event.type === "status" &&
+				tabsRef.current.some((tab) => tab.type === "team" && tab.id === narratorId)
+			) {
+				// The tree's pending approvals may have moved with it; read them again.
+				scheduleTeamRuntimeRefresh();
+			}
+
+			if (event.type === "status" && hasSessionTab) {
 				const isReflecting = event.substatus?.includes("reflecting");
 				/*
 				 * A narrator parked until an unavailable model recovers is also
@@ -379,7 +460,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					// in-app unread + favicon state, but stay silent (no sound, no PWA
 					// browser notification). The wake-up turn after the last background
 					// task completes emits a fresh, unflagged done which notifies normally.
-					if (!isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
+					if (!event.stateOnly && !isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
 						const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 						if (tab) {
 							triggerNotification(
@@ -400,14 +481,14 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			const existing = pendingTabPatchesRef.current.get(narratorId);
 			if (event.type === "status" && event.status === "working") {
 				// The pending patch wins before the flush; the cache wins before React commits.
-				const tabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? tabsRef.current;
+				const tabs = qc.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope)) ?? tabsRef.current;
 				const tab = tabs.find((item) => getRecentTabNarratorId(item) === narratorId);
 				if (tab && (existing?.status ?? tab.status) !== "working") {
 					// A folder member is promoted inside its folder and the folder moves with it;
 					// the server resolves that from the member key.
 					api
 						.moveRecentTab(tabSortId(tab), { position: "above_idle" })
-						.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result))
+						.then((result) => applyRecentTabsDeltaAndFollowUp(qc, result, scope))
 						.catch(() => {});
 				}
 			}
@@ -415,7 +496,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
-		[qc, scheduleTabPatchFlush],
+		[qc, scheduleTabPatchFlush, scheduleTeamRuntimeRefresh, scope],
 	);
 
 	const handleGlobalEvent = useCallback(
@@ -437,14 +518,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				const collected = collectRecentTabsDeltaFrame(deltaBatchesRef.current, frame);
 				if (collected.status === "pending") return;
 				if (collected.status === "gap") {
-					void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+					void refreshRecentTabsLoadedWindow(qc, { reset: true }, scope).catch(() => {});
 					return;
 				}
 				const { delta } = collected;
 				flushTabPatches();
 				const previousTabs = tabsRef.current;
-				void applyRecentTabsDeltaAndFollowUp(qc, delta).catch(() => {});
-				const nextTabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? previousTabs;
+				void applyRecentTabsDeltaAndFollowUp(qc, delta, scope).catch(() => {});
+				const nextTabs =
+					qc.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope)) ?? previousTabs;
 				const currentPath = pathnameRef.current;
 				if (
 					previousTabs.some((tab) => isTabActive(tab, currentPath)) &&
@@ -463,10 +545,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			}
 			// Legacy compatibility during rolling upgrades: rebuild loaded windows from revision zero.
 			if (event.type === "user:recent_tabs_snapshot") {
-				void refreshRecentTabsLoadedWindow(qc, { reset: true }).catch(() => {});
+				void refreshRecentTabsLoadedWindow(qc, { reset: true }, scope).catch(() => {});
 			}
 		},
-		[flushTabPatches, navigate, qc],
+		[flushTabPatches, navigate, qc, scope],
 	);
 
 	const lastReconnectRefreshRef = useRef(0);
@@ -474,12 +556,13 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		const now = Date.now();
 		if (now - lastReconnectRefreshRef.current < 5000) return;
 		lastReconnectRefreshRef.current = now;
-		void Promise.all([refreshRecentTabsLoadedWindow(qc), refreshRuntime()]).catch(() => {
-			notifications.show({ color: "red", message: t("recentTabsSyncError") });
+		void Promise.all([refreshRecentTabsAfterReconnect(qc, scope), refreshRuntime()]).catch(() => {
+			if (isRecentTabsScopeCurrent(scope))
+				notifications.show({ color: "red", message: t("recentTabsSyncError") });
 		});
-	}, [qc, refreshRuntime, t]);
+	}, [qc, refreshRuntime, scope, t]);
 
-	useRecentTabsWS(narratorIds, handleWSUpdate, handleGlobalEvent, handleReconnect);
+	useRecentTabsWS(scope, narratorIds, handleWSUpdate, handleGlobalEvent, handleReconnect);
 	return null;
 }
 
@@ -499,8 +582,30 @@ interface RecentTabListProps {
  * The narrator section also renders folders: a folder header, its visible members
  * (collapsed = none, preview = first N, expanded = all) and a strip under an open folder.
  */
-export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: RecentTabListProps) {
+export function RecentTabList(props: RecentTabListProps) {
 	const recentTabs = useRecentTabs();
+	const { scope } = recentTabs;
+	if (!scope) return null;
+	return (
+		<ScopedRecentTabList
+			key={`${scope.authGeneration}:${scope.accessGeneration}`}
+			{...props}
+			recentTabs={recentTabs}
+			scope={scope}
+		/>
+	);
+}
+
+function ScopedRecentTabList({
+	filter,
+	onNavigate,
+	excludeActiveNarratorId,
+	recentTabs,
+	scope,
+}: RecentTabListProps & {
+	recentTabs: ReturnType<typeof useRecentTabs>;
+	scope: RecentTabsScope;
+}) {
 	const { removeTab, moveTab, pinTab, updateFolder, dissolveFolder, clearTabs } = recentTabs;
 	const isTouch = useMatchMedia(TOUCH_POINTER_MEDIA_QUERY);
 	const [hoverStore] = useState(createRecentTabHoverStore);
@@ -547,11 +652,9 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[qc],
 	);
 
-	const [ctxMenu, setCtxMenu] = useState<{
-		x: number;
-		y: number;
-		tab: RecentTab;
-	} | null>(null);
+	// The menu holds the row's key; the tab is read from the live list on each render, so its
+	// details follow runtime patches and a row that leaves the list closes it.
+	const [ctxMenu, ctxTab, setCtxMenu] = useRecentTabMenuTarget(tabs);
 
 	// Rename / archive-from-context-menu modal state
 	const [renameTab, setRenameTab] = useState<{ id: string; title: string } | null>(null);
@@ -610,6 +713,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	);
 	const newFolderTitle = t("newFolderName");
 	const drag = useRecentTabsDrag({
+		scope,
 		tabs,
 		folderOptions: effectiveFolderOptions,
 		containerRef: listBoxRef,
@@ -630,6 +734,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const hasClearableTabs = tabs.some(
 		(tab) =>
 			tab.type !== "project" &&
+			tab.type !== "team" &&
 			tab.type !== "folder" &&
 			!tab.folderId &&
 			!tab.pinned &&
@@ -668,36 +773,42 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[removeTab, navigate],
 	);
 
-	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
-		e.preventDefault();
-		e.stopPropagation();
-		setCtxMenu({ x: e.clientX, y: e.clientY, tab });
-	}, []);
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent, tab: RecentTab) => {
+			e.preventDefault();
+			e.stopPropagation();
+			setCtxMenu({ x: e.clientX, y: e.clientY, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	/** Touch: a left swipe opens the same menu at the release point. */
-	const handleSwipeMenu = useCallback((tab: RecentTab, x: number, y: number) => {
-		setCtxMenu({ x, y, tab });
-	}, []);
+	const handleSwipeMenu = useCallback(
+		(tab: RecentTab, x: number, y: number) => {
+			setCtxMenu({ x, y, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	const handleMoveToTop = useCallback(() => {
-		if (!ctxMenu) return;
-		moveTab(tabSortId(ctxMenu.tab), { position: "top" });
+		if (!ctxMenu || !ctxTab) return;
+		moveTab(tabSortId(ctxTab), { position: "top" });
 		setCtxMenu(null);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const pinTabToggle = useCallback(
 		(tab: RecentTab) => pinTab(tabSortId(tab), !tab.pinned),
 		[pinTab],
 	);
 	const handlePin = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		pinTabToggle(ctxMenu.tab);
-	}, [ctxMenu, pinTabToggle]);
+		pinTabToggle(ctxTab);
+	}, [ctxMenu, ctxTab, pinTabToggle, setCtxMenu]);
 
 	const handleLeaveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!tab.folderId) return;
 		const folder = tabsRef.current.find(
@@ -710,21 +821,21 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			tabSortId(tab),
 			folder?.pinned ? { folderId: null } : { afterKey: `folder:${tab.folderId}`, folderId: null },
 		);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const handleEditFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		setEditFolder(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		setEditFolder(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu]);
+	}, [ctxMenu, ctxTab, setCtxMenu]);
 
 	const handleDissolveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		setFolderDisplay(tab.id, null);
 		void dissolveFolder(tab.id).catch(() => {});
-	}, [ctxMenu, dissolveFolder, setFolderDisplay]);
+	}, [ctxMenu, ctxTab, dissolveFolder, setFolderDisplay, setCtxMenu]);
 
 	const toggleFolderCollapsed = useCallback(
 		(folder: RecentTab) => {
@@ -735,20 +846,20 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	);
 
 	const handleCtxFolderToggle = useCallback(() => {
-		if (!ctxMenu) return;
-		toggleFolderCollapsed(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		toggleFolderCollapsed(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu, toggleFolderCollapsed]);
+	}, [ctxMenu, ctxTab, toggleFolderCollapsed, setCtxMenu]);
 
 	const closeTabRow = useCallback(
 		(tab: RecentTab) => handleRemove(tab.type, tab.id),
 		[handleRemove],
 	);
 	const handleCtxClose = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		closeTabRow(ctxMenu.tab);
-	}, [ctxMenu, closeTabRow]);
+		closeTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, closeTabRow, setCtxMenu]);
 
 	/**
 	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
@@ -819,24 +930,28 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[requireSetup, resolveTabDirectory, closeNewNarratorHere, t],
 	);
 	const handleNewNarratorHere = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void newNarratorHereFor(ctxMenu.tab);
-	}, [ctxMenu, newNarratorHereFor]);
+		void newNarratorHereFor(ctxTab);
+	}, [ctxMenu, ctxTab, newNarratorHereFor, setCtxMenu]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
 		// folder comes from the call site's closure rather than from state.
 		(data: CreateNarratorResult, folderId?: string) => {
+			if (!isRecentTabsScopeCurrent(scope)) return;
 			closeNewNarratorHere();
-			void addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-			}).then(() => {
-				if (!folderId) return;
+			void addRecentTab(
+				{
+					type: "narrator",
+					id: data.id,
+					title: data.title,
+					subtitle: data.cwd,
+					status: data.status,
+				},
+				scope,
+			).then(() => {
+				if (!folderId || !isRecentTabsScopeCurrent(scope)) return;
 				// The upsert strips `folderId`, so membership is a separate move. Going through the
 				// tab mutation keeps the row from flashing at top level until the WS delta lands.
 				moveTab(
@@ -853,7 +968,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate, closeNewNarratorHere, moveTab, t],
+		[navigate, onNavigate, closeNewNarratorHere, moveTab, scope, t],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -863,8 +978,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
@@ -878,7 +993,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		} catch {
 			// ignore
 		}
-	}, [ctxMenu, revealAvailable]);
+	}, [ctxMenu, ctxTab, revealAvailable, setCtxMenu]);
 
 	/** 复制工作目录到剪贴板（narrator/subagent） */
 	const copyTabCwd = useCallback(
@@ -900,10 +1015,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		[resolveTabDirectory, t],
 	);
 	const handleCopyCwd = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void copyTabCwd(ctxMenu.tab);
-	}, [ctxMenu, copyTabCwd]);
+		void copyTabCwd(ctxTab);
+	}, [ctxMenu, ctxTab, copyTabCwd, setCtxMenu]);
 
 	/** 在外部窗口打开该标签（叙述者 → chat 面板窗口；project → 主应用窗口） */
 	const openTabInWindow = useCallback((tab: RecentTab) => {
@@ -911,10 +1026,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
 	}, []);
 	const handleOpenInWindow = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		openTabInWindow(ctxMenu.tab);
-	}, [ctxMenu, openTabInWindow]);
+		openTabInWindow(ctxTab);
+	}, [ctxMenu, ctxTab, openTabInWindow, setCtxMenu]);
 
 	/** 打开重命名对话框 */
 	const renameTabRow = useCallback((tab: RecentTab) => {
@@ -923,14 +1038,14 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setRenameTab({ id: tab.id, title: tab.title || "" });
 	}, []);
 	const handleRename = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		renameTabRow(ctxMenu.tab);
-	}, [ctxMenu, renameTabRow]);
+		renameTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, renameTabRow, setCtxMenu]);
 
 	/** 提交重命名 */
 	const handleRenameSubmit = useCallback(async () => {
-		if (!renameTab) return;
+		if (!renameTab || !isRecentTabsScopeCurrent(scope)) return;
 		const trimmed = renameValue.trim();
 		if (!trimmed || trimmed === renameTab.title) {
 			setRenameTab(null);
@@ -939,10 +1054,12 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setRenaming(true);
 		try {
 			await api.updateNarratorTitle(renameTab.id, trimmed);
-			updateRecentTabLocal("narrator", renameTab.id, { title: trimmed });
+			if (!isRecentTabsScopeCurrent(scope)) return;
+			updateRecentTabLocal("narrator", renameTab.id, { title: trimmed }, scope);
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			setRenameTab(null);
 		} catch {
+			if (!isRecentTabsScopeCurrent(scope)) return;
 			// Keep the dialog open. Closing it on failure was indistinguishable from
 			// success, so a rename that never happened looked like one the server had
 			// accepted and then ignored.
@@ -950,7 +1067,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		} finally {
 			setRenaming(false);
 		}
-	}, [renameTab, renameValue, qc, tn]);
+	}, [renameTab, renameValue, qc, scope, tn]);
 
 	/** 打开归档确认 */
 	const archiveTabRow = useCallback((tab: RecentTab) => {
@@ -958,10 +1075,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		setArchiveConfirmTab({ id: tab.id });
 	}, []);
 	const handleArchive = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		archiveTabRow(ctxMenu.tab);
-	}, [ctxMenu, archiveTabRow]);
+		archiveTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, archiveTabRow, setCtxMenu]);
 
 	/** 执行归档 */
 	const handleArchiveConfirm = useCallback(() => {
@@ -1138,6 +1255,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 			title: string;
 			target: RecentTabDropTarget;
 		}) => {
+			if (!isRecentTabsScopeCurrent(scope)) return;
 			const key = `narrator:${narratorId}`;
 			const cached = findCachedNarratorSummary(qc, narratorId);
 			const tab = {
@@ -1149,8 +1267,10 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 				...(cached?.cwd ? { subtitle: cached.cwd } : {}),
 				...(cached?.status ? { status: cached.status } : {}),
 			};
-			const fail = () =>
-				notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+			const fail = () => {
+				if (isRecentTabsScopeCurrent(scope))
+					notifications.show({ color: "red", message: t("recentTabsReorderFailed") });
+			};
 			const existing = drag.model.tabs.some((candidate) => tabSortId(candidate) === key);
 			const anchor =
 				target.kind === "before" || target.kind === "member-before"
@@ -1161,23 +1281,25 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 
 			// Plain top-level placement of a narrator: one anchored upsert (creates or moves).
 			if (target.kind === "empty" || target.kind === "before" || target.kind === "after") {
-				void addRecentTabOrThrow(tab, anchor).catch(fail);
+				void addRecentTabOrThrow(tab, anchor, scope).catch(fail);
 				return;
 			}
 			// Everything else needs the tab to exist first, then the drag plan does the rest.
 			// The plan is computed from the cache, which the upsert's delta has already updated
 			// (the rendered `tabs` may not have caught up yet).
 			void (async () => {
-				if (!existing) await addRecentTabOrThrow(tab);
+				if (!existing) await addRecentTabOrThrow(tab, undefined, scope);
+				if (!isRecentTabsScopeCurrent(scope)) return;
 				const latest = (
-					qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))?.pages ?? []
+					qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, "work"))
+						?.pages ?? []
 				).flatMap((page) => page.items as RecentTab[]);
 				const model = createRecentTabDragModel(latest, effectiveFolderOptions);
 				const plan = planRecentTabDrop(model, key, target, newFolderTitle);
 				if (plan) await drag.submitPlan(plan);
 			})().catch(fail);
 		},
-		[qc, t, drag.model, drag.submitPlan, effectiveFolderOptions, newFolderTitle],
+		[qc, t, scope, drag.model, drag.submitPlan, effectiveFolderOptions, newFolderTitle],
 	);
 
 	const externalDrop = useRecentTabExternalDrop({
@@ -1236,7 +1358,6 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 		],
 	);
 
-	const ctxTab = ctxMenu?.tab;
 	const ctxIsFolder = ctxTab?.type === "folder";
 	const ctxInFolder = !!ctxTab?.folderId;
 	const ctxUnitKey = ctxTab ? (ctxInFolder ? `folder:${ctxTab.folderId}` : tabSortId(ctxTab)) : "";
@@ -1331,7 +1452,12 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								pinScope={ctxInFolder ? "folder" : "list"}
 								onRemove={handleCtxClose}
 								onReveal={handleReveal}
-								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
+								canReveal={
+									revealAvailable &&
+									ctxTab.type !== "project" &&
+									ctxTab.type !== "team" &&
+									!ctxIsFolder
+								}
 								onNewNarratorHere={handleNewNarratorHere}
 								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
 								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
@@ -1439,119 +1565,6 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	);
 }
 
-/** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
-function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconColor?: string }) {
-	// Read from the optimize registry, not from tab props: the request outlives the
-	// composer that started it, so the sidebar has to learn about it from the same
-	// place the request lives. `TabIcon` is a component (not a render helper) so a
-	// hook is legal here even though it is called per row.
-	const narratorId = tab.type === "narrator" ? getRecentTabNarratorId(tab) : null;
-	const isOptimizingPrompt = useNarratorIsOptimizingPrompt(narratorId);
-
-	// The narrator bubble is shared verbatim with the narrator list page — see
-	// `NarratorStatusIcon`. It owns its corner markers and the centre shape overlay.
-	if (tab.type === "narrator") {
-		return (
-			<NarratorStatusIcon
-				size={size}
-				status={tab.status}
-				substatus={tab.substatus}
-				activeBackgroundWorkCount={tab.activeBackgroundWorkCount}
-				activeBackgroundTaskCount={tab.activeBackgroundTaskCount}
-				hasDraft={tab.hasDraft}
-				isScheduled={tab.isScheduled}
-				isOptimizingPrompt={isOptimizingPrompt}
-			/>
-		);
-	}
-
-	let icon: React.ReactNode;
-	if (tab.type === "project") icon = <IconFolder size={size} />;
-	else icon = <IconRobot size={size} color={iconColor} />;
-
-	// Corner markers remain for subagent rows. The centre state SHAPE (tick / shield /
-	// alert) does not: it is knocked out in white and needs the narrator bubble's solid
-	// body behind it — the robot glyph is a Tabler OUTLINE icon (stroke only, no closed
-	// shape), so a white glyph there would land on the page background and disappear.
-	const canShowMarker = tab.type === "subagent";
-	const showDraft = !!tab.hasDraft && canShowMarker;
-	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
-	const showScheduled = !!tab.isScheduled && canShowMarker;
-	if (!showDraft && !showReasoning && !showScheduled) return icon;
-
-	return (
-		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
-			{icon}
-			{showScheduled && (
-				<Box
-					component="span"
-					style={{
-						position: "absolute",
-						right: -4,
-						bottom: -4,
-						width: 11,
-						height: 11,
-						borderRadius: "50%",
-						background: "var(--mantine-color-indigo-6)",
-						border: "1px solid var(--mantine-color-body)",
-						display: "inline-flex",
-						alignItems: "center",
-						justifyContent: "center",
-						color: "var(--mantine-color-white)",
-						pointerEvents: "none",
-					}}
-				>
-					<IconClock size={7} stroke={2.5} />
-				</Box>
-			)}
-			{showReasoning && (
-				<Box
-					component="span"
-					style={{
-						position: "absolute",
-						left: -4,
-						top: -4,
-						width: 11,
-						height: 11,
-						borderRadius: "50%",
-						background: "var(--mantine-color-grape-light)",
-						border: "1px solid var(--mantine-color-body)",
-						display: "inline-flex",
-						alignItems: "center",
-						justifyContent: "center",
-						color: "var(--mantine-color-grape-light-color)",
-						pointerEvents: "none",
-					}}
-				>
-					<IconBrain size={7} stroke={2.5} />
-				</Box>
-			)}
-			{showDraft && (
-				<Box
-					component="span"
-					style={{
-						position: "absolute",
-						right: -4,
-						top: -4,
-						width: 11,
-						height: 11,
-						borderRadius: "50%",
-						background: "var(--mantine-color-yellow-6)",
-						border: "1px solid var(--mantine-color-body)",
-						display: "inline-flex",
-						alignItems: "center",
-						justifyContent: "center",
-						color: "var(--mantine-color-dark-9)",
-						pointerEvents: "none",
-					}}
-				>
-					<IconPencil size={7} stroke={2.5} />
-				</Box>
-			)}
-		</Box>
-	);
-}
-
 /** Rendered in DragOverlay while a tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const iconColor = getNarratorStatusIconColor(tab);
@@ -1572,14 +1585,77 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 }
 
 /** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
-function RecentTabTitle({ tab }: { tab: RecentTab }) {
+/**
+ * A team tab's amber count at the row's end (R2): what waits for this member in the team — the
+ * tree's pending calls and the items ready to accept, as the team page's 「等你处理」 lists them.
+ */
+function TeamWaitingBadge({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type !== "team" || waiting <= 0) return null;
+	return (
+		<Box
+			component="span"
+			role="img"
+			aria-label={t("teamTabWaiting", { count: waiting })}
+			data-testid="team-tab-pending"
+			style={{
+				flexShrink: 0,
+				minWidth: 18,
+				height: 18,
+				padding: "0 5px",
+				borderRadius: 9,
+				background: "var(--mantine-color-yellow-6)",
+				color: "var(--mantine-color-dark-9)",
+				fontSize: 11,
+				fontWeight: 700,
+				lineHeight: "18px",
+				textAlign: "center",
+				fontVariantNumeric: "tabular-nums",
+			}}
+		>
+			{waiting > 99 ? "99+" : waiting}
+		</Box>
+	);
+}
+
+export function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
 	const { data: userPrefs } = useUserPreferences();
 	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
+	// A coordinator's session sits next to its team's tab with the same title: label it.
+	const coordinator = isCoordinatorSessionTab(tab);
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type === "team" && waiting > 0)
+		return (
+			<Group gap={6} wrap="nowrap" justify="space-between" style={{ minWidth: 0 }}>
+				<Text size="sm" truncate style={{ minWidth: 0 }}>
+					{tab.title}
+				</Text>
+				<TeamWaitingBadge tab={tab} />
+			</Group>
+		);
 	return (
 		<Stack gap={0} style={{ minWidth: 0 }}>
-			<Text size="sm" truncate>
-				{tab.title}
-			</Text>
+			{coordinator ? (
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+					<Text size="sm" truncate style={{ minWidth: 0 }}>
+						{tab.title}
+					</Text>
+					<Text
+						size="xs"
+						c="dimmed"
+						style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+						data-testid="recent-tab-coordinator-label"
+					>
+						{t("recentTabCoordinatorLabel")}
+					</Text>
+				</Group>
+			) : (
+				<Text size="sm" truncate>
+					{tab.title}
+				</Text>
+			)}
 			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
 				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
 			)}
@@ -1643,7 +1719,8 @@ function TabItemBody({
 	const drag = useContext(RecentTabsDragContext);
 	const hover = useContext(RecentTabHoverContext);
 	const { t } = useTranslation("common");
-	const to = tab.type === "project" ? `/projects/${tab.id}` : `/narrators/${tab.id}`;
+	// A team tab without a project yet (never the case for a stored one) stays put.
+	const href = recentTabHref(tab);
 	const iconColor = getNarratorStatusIconColor(tab);
 	const rowKey = tabSortId(tab);
 
@@ -1653,10 +1730,11 @@ function TabItemBody({
 	const handleClick = useCallback(() => {
 		if (drag.consumeClick()) return;
 		hover?.hide();
+		if (!href) return;
 		handlePrefetch();
-		navigate({ to });
+		navigate({ to: href });
 		onNavigate?.();
-	}, [drag.consumeClick, hover, handlePrefetch, navigate, to, onNavigate]);
+	}, [drag.consumeClick, hover, handlePrefetch, navigate, href, onNavigate]);
 
 	// Mouse only: touch has no hover, its details live at the top of the row menu.
 	const handlePointerEnter = useCallback(
@@ -1720,7 +1798,7 @@ function TabItemBody({
 	);
 
 	// Icon and body use the same sensors and cross-surface drag bridge.
-	const dragNarratorId = getRecentTabNarratorId(tab);
+	const dragNarratorId = recentTabLiveNarratorId(tab);
 	return (
 		<div
 			ref={outerRef}
@@ -1733,6 +1811,8 @@ function TabItemBody({
 				position: "relative",
 			}}
 			data-tab-sort-id={tabSortId(tab)}
+			// Where Enter leads from the keyboard: a team page's path needs its project.
+			data-tab-href={href ?? undefined}
 		>
 			<SwipeMenuHint swipeX={swipe.swipeX} label={t("swipeMenu")} />
 			<div style={swipe.style}>

@@ -1,11 +1,15 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 const { eventBus } = await import("../../lib/event-bus");
@@ -75,6 +79,16 @@ afterAll(() => {
 });
 const ctx = () => ({ narratorId: parent, signal: new AbortController().signal }) as ToolContext;
 
+function waitForSubscription(eventType: Parameters<typeof eventBus.on>[0]): Promise<void> {
+	const subscribed = Promise.withResolvers<void>();
+	const subscribe = eventBus.on.bind(eventBus);
+	spyOn(eventBus, "on").mockImplementation((type, handler) => {
+		subscribe(type, handler);
+		if (type === eventType) subscribed.resolve();
+	});
+	return subscribed.promise;
+}
+
 function commitAgentResult(source = agentRun, output = "current final") {
 	db.transaction((tx) => {
 		runtimePublication.reserve(source, tx);
@@ -125,11 +139,17 @@ for (const method of ["completion", "text"] as const) {
 			.update(backgroundTasks)
 			.set({ status: "running", output: null })
 			.where(eq(backgroundTasks.id, taskId));
+		const row = await backgroundTaskService.getById(taskId);
+		const initialRead = Promise.withResolvers<typeof row>();
+		spyOn(backgroundTaskService, "getById").mockReturnValueOnce(initialRead.promise);
+		const subscribed = waitForSubscription("background_task:completed");
 		const waiting =
 			method === "text"
 				? backgroundTaskService.waitForText(taskId, "needle", 1000)
 				: backgroundTaskService.waitForCompletion(taskId, 1000);
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		// Worker reads may outlast a fixed sleep; publish only after the actual subscription.
+		initialRead.resolve(row);
+		await subscribed;
 		await db
 			.update(backgroundTasks)
 			.set({ logicalRunId: "bash-run-2" })
@@ -247,12 +267,13 @@ for (const event of ["completion", "status"] as const) {
 			.update(narrators)
 			.set({ status: "working", logicalRunId: "agent-run-2" })
 			.where(eq(narrators.id, child));
+		const subscribed = waitForSubscription("narrator:status_changed");
 		const waiting = waitForSubagentResult({
 			subagentId: child,
 			recipientId: parent,
 			timeoutMs: 1000,
 		});
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await subscribed;
 		commitAgentResult({ ...agentRun, logicalRunId: "agent-run-2" });
 		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, child));
 		if (event === "completion")
@@ -277,8 +298,9 @@ for (const outcome of ["failed", "timeout", "cancelled"] as const) {
 			.update(backgroundTasks)
 			.set({ status: "running", output: null })
 			.where(eq(backgroundTasks.id, taskId));
+		const subscribed = waitForSubscription("background_task:completed");
 		const waiting = backgroundTaskService.waitForCompletion(taskId, 1000);
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await subscribed;
 		if (outcome === "failed") await backgroundTaskService.markFailed(taskId, "failure");
 		else if (outcome === "timeout")
 			await backgroundTaskService.markTimedOut(taskId, "execution limit");
@@ -337,20 +359,24 @@ test("foreground subscribe recheck binds the terminal continuation", async () =>
 test("interrupt during foreground result read wins without consumption", async () => {
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, child));
 	const controller = new AbortController();
+	const read = spyOn(getRuntimePublicationService(), "readAgentTerminalResult").mockImplementation(
+		async () => {
+			controller.abort();
+			return { output: "finished text", source: "terminal" as const };
+		},
+	);
+	const subscribed = waitForSubscription("narrator:status_changed");
 	const waiting = waitForSubagentResult({
 		subagentId: child,
 		recipientId: parent,
 		signal: controller.signal,
 		timeoutMs: 1000,
 	});
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	spyOn(getRuntimePublicationService(), "readAgentTerminalResult").mockImplementation(async () => {
-		controller.abort();
-		return { output: "finished text", source: "terminal" as const };
-	});
+	await subscribed;
 	await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, child));
 	eventBus.emit({ type: "narrator:status_changed", narratorId: child, status: "idle" });
 	const result = await waiting;
+	expect(read).toHaveBeenCalledTimes(1);
 	expect(result.status).toBe("aborted");
 	expect(result.publicationRun).toBeUndefined();
 });

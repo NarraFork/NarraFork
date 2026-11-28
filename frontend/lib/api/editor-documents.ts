@@ -20,7 +20,7 @@ import {
 	type EditorRecoveryScopeInput,
 	type EditorUploadDescriptor,
 } from "@shared/editor-document";
-import { ApiError, authorizedFetch, readFetchError } from "./client";
+import { ApiError, authorizedFetch, getAuthSnapshot, readFetchError } from "./client";
 
 function base(narratorId: string) {
 	return `/api/narrators/${encodeURIComponent(narratorId)}/editor-documents`;
@@ -109,11 +109,12 @@ function timedSignal(signal?: AbortSignal) {
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 async function checkedFetch(path: string, options: RequestInit, signal: AbortSignal) {
+	const { generation } = getAuthSnapshot();
 	const response = await authorizedFetch(path, { ...options, signal });
 	if (!response.ok) {
 		const body = await readEditorBody(response, EDITOR_METADATA_MAX_BYTES, signal);
 		const bounded = new Response(body, { status: response.status, headers: response.headers });
-		const failure = await readFetchError(bounded, "Editor request failed");
+		const failure = await readFetchError(bounded, "Editor request failed", generation);
 		throw new ApiError(failure.message, response.status, failure.data);
 	}
 	return response;

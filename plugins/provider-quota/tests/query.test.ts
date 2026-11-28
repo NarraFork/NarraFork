@@ -444,6 +444,7 @@ describe("independent quota contributions", () => {
 		);
 		expect(calls).toEqual(["/user/balance"]);
 		expect(result.data).toEqual({
+			scope: "wallet",
 			amounts: [
 				{
 					id: "balance:USD",
@@ -486,7 +487,7 @@ describe("independent quota contributions", () => {
 		const result = await queryQuota(params("deepseek", "https://api.deepseek.com"), async () =>
 			json({ is_available: false, balance_infos: [] }),
 		);
-		expect(result.data).toEqual({ amounts: [], windows: [], available: false });
+		expect(result.data).toEqual({ scope: "wallet", amounts: [], windows: [], available: false });
 	});
 	test("unsafe or oversized DeepSeek decimal amounts cannot become a snapshot", () => {
 		expect(
@@ -599,7 +600,10 @@ describe("independent quota contributions", () => {
 			remaining: -2,
 			usedPercent: 100,
 		});
-		expect(result.data?.amounts).toEqual([{ id: "balance:USD", unit: "USD", remaining: 1.5 }]);
+		expect(result.data?.scope).toBe("subscription");
+		expect(result.data?.amounts).toEqual([
+			{ id: "balance:USD", unit: "USD", remaining: 1.5, quota: "none" },
+		]);
 	});
 	test.each([
 		"deepseek",

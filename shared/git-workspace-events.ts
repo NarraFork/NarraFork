@@ -1,4 +1,5 @@
 import type { GitLineStatsFile } from "./git-line-stats";
+import type { GitStatusPageCacheState } from "./git-status-page";
 
 /** Published SQLite observation plus database/WAL identities, sampled in the Worker. */
 export interface GitStagingWatchState {
@@ -33,6 +34,8 @@ export interface GitStatusPagesWatchState {
 
 /** A projection of shared Git facts, never permissions or modification attribution. */
 export interface GitWorkspaceSnapshot {
+	/** Published paging cache state, independent from summary/detail measurement completion. */
+	statusPages?: GitStatusPageCacheState;
 	revision: number;
 	updating: boolean;
 	status?: {
@@ -92,6 +95,23 @@ export interface GitWorkspaceEventIdentity {
 	repositoryKey: string;
 	narratorId?: string;
 }
+/** Errors revoke authorization continuity until a newer subscribed acknowledgement. */
+export type GitWorkspaceErrorKind = "retryable" | "denied" | "workspace_changed" | "unavailable";
+
+export interface GitWorkspaceError {
+	type: "git_workspace_error";
+	subscriptionId: string;
+	/** GIT_WORKSPACE_SUBSCRIPTION_LIMIT rejects registration; retry with a new subscription id. */
+	code: string;
+	message: string;
+	/** Optional only for compatibility with older servers; new servers always include it. */
+	kind?: GitWorkspaceErrorKind;
+	/** Shares the subscription's increasing sequence with acknowledgements and facts. */
+	version?: number;
+	/** True only while automatic reauthorization is scheduled or in flight. */
+	retrying?: boolean;
+}
+
 export type GitWorkspaceServerMessage =
 	| ({ type: "git_workspace_subscribed" } & GitWorkspaceEventIdentity)
 	| ({
@@ -111,4 +131,4 @@ export type GitWorkspaceServerMessage =
 			view: GitWorkspaceView;
 			snapshot: GitWorkspaceSnapshot;
 	  } & GitWorkspaceEventIdentity)
-	| { type: "git_workspace_error"; subscriptionId: string; code: string; message: string };
+	| GitWorkspaceError;

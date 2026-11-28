@@ -5,11 +5,12 @@
  * them, a subagent attaches to its call, compaction limits what the model sees, and
  * the imported history builds a provider request without dangling tool calls.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { InterchangeSession } from "@shared/session-interchange/model";
 import { and, asc, eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -18,13 +19,23 @@ import {
 } from "../../db/schema";
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
+import { eventBus } from "../../lib/event-bus";
+import { generateId } from "../../lib/id";
 import { parseRuntimePolicyTraits } from "../../lib/runtime-policy-trait";
+import { sendSubagentMessageDetailed } from "../agent-communication";
+import * as inbox from "../agent-runtime/inbox";
 import { compileDelegationPolicy, withDelegationDepth } from "../agent-runtime/policy";
+import { getCommunicationTopology } from "../narrator-communication/reader";
+import { mutateCommunication } from "../narrator-communication/service";
 import { narratorService } from "../narrator-service";
+import { readSpecFile, writeSpecFile } from "../spec-vfs-service";
 import { importInterchangeSession } from "./import";
 
 const TAG = Date.now();
 const USER = `import-user-${TAG}`;
+const owner = { userId: USER, isAdmin: false };
+const topologyOf = (narratorId: string) =>
+	getCommunicationTopology({ kind: "narrator", narratorId }, owner);
 // 1×1 transparent PNG.
 const PNG =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -110,6 +121,77 @@ async function refsOf(narratorId: string) {
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId))
 		.orderBy(asc(narratorMessageRefs.seq));
+}
+
+async function expectSendByTitleSlug(callerNarratorId: string, slug: string, recipientId: string) {
+	const messageId = generateId();
+	const toolCallId = generateId();
+	const toolUseId = `send-${toolCallId}`;
+	const message = `Message to ${slug}`;
+	const now = new Date().toISOString();
+	db.transaction((tx) => {
+		tx.insert(narratorMessages)
+			.values({
+				id: messageId,
+				narratorId: callerNarratorId,
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			})
+			.run();
+		tx.insert(narratorToolCalls)
+			.values({
+				id: toolCallId,
+				narratorId: callerNarratorId,
+				messageId,
+				toolUseId,
+				toolName: "Send",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				status: "running",
+				createdAt: now,
+			})
+			.run();
+	});
+	// Only suppress model wake-up. Name lookup, ACL, receipt validation and enqueue are real.
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			callerNarratorId,
+			id: slug,
+			message,
+			toolUseId,
+			toolCallBinding: { toolCallId, attempt: 1 },
+			signal: new AbortController().signal,
+			locale: "en",
+		});
+		expect(result.targets).toEqual([
+			expect.objectContaining({
+				id: recipientId,
+				status: "queued",
+				deliveryMessageId: expect.any(String),
+			}),
+		]);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.sourceToolCallId, toolCallId))
+				.all(),
+		).toEqual([
+			expect.objectContaining({
+				narratorId: recipientId,
+				sourceNarratorId: callerNarratorId,
+				recipientMessageId: result.targets[0]?.deliveryMessageId,
+				kind: "agent_message",
+				state: "queued",
+				text: message,
+				createdBy: USER,
+			}),
+		]);
+	} finally {
+		wake.mockRestore();
+	}
 }
 
 describe("importInterchangeSession", () => {
@@ -260,6 +342,11 @@ describe("importInterchangeSession", () => {
 
 	test("attaches a subagent narrator to its Agent call", async () => {
 		const callId = `agent-call-${TAG}`;
+		const changes: string[][] = [];
+		const onDirty = ({ narratorIds }: { narratorIds: string[] }) => {
+			changes.push(narratorIds);
+		};
+		eventBus.on("narrator:communication_changed", onDirty);
 		const result = await importInterchangeSession(
 			session({
 				externalId: `sub-${TAG}`,
@@ -300,7 +387,7 @@ describe("importInterchangeSession", () => {
 						ref: "ext-sub",
 						parentToolUseId: callId,
 						subagentType: "Explore",
-						title: "Look around",
+						title: "Review API",
 						messages: [
 							{
 								role: "user",
@@ -317,9 +404,10 @@ describe("importInterchangeSession", () => {
 				],
 			}),
 			{ ownerUserId: USER, source: { format: "claude-code" } },
-		);
+		).finally(() => eventBus.off("narrator:communication_changed", onDirty));
 		expect(result.subagentIds).toHaveLength(1);
 		const subId = result.subagentIds[0] ?? "";
+		expect(changes.filter((ids) => ids.includes(subId))).toEqual([[result.narratorId, subId]]);
 		const [sub] = await db.select().from(narrators).where(eq(narrators.id, subId));
 		const [call] = await db
 			.select()
@@ -360,6 +448,142 @@ describe("importInterchangeSession", () => {
 		// import the UI cannot see would look like a lost subagent.
 		const page = await narratorService.getPretextDocumentPage(result.narratorId);
 		expect(JSON.stringify(page)).toContain(subId);
+
+		const graph = await topologyOf(subId);
+		expect(graph.nodes).toEqual([
+			expect.objectContaining({
+				id: subId,
+				parentNarratorId: result.narratorId,
+				restoreParentId: result.narratorId,
+				groupId: result.narratorId,
+				canManage: true,
+			}),
+			expect.objectContaining({ id: result.narratorId, parentNarratorId: null }),
+		]);
+		expect(graph.peers).toEqual([]);
+		await expectSendByTitleSlug(result.narratorId, "review-api", subId);
+		expect(sub).toMatchObject({ title: "Review API", titleSlug: "review-api" });
+		const peer = await narratorService.create({ ownerUserId: USER });
+		expect(
+			await mutateCommunication(subId, owner, { kind: "connect", targetNarratorId: peer.id }),
+		).toEqual({ changed: true });
+	});
+
+	test("does not grant communication inheritance to a historical non-Agent tool reference", async () => {
+		const result = await importInterchangeSession(
+			session({
+				subagents: [{ ref: "not-an-agent", parentToolUseId: `t1-${TAG}`, messages: [] }],
+			}),
+			{ ownerUserId: USER, source: { format: "claude-code" } },
+		);
+		expect(result.subagentIds).toHaveLength(1);
+		const subId = result.subagentIds[0] ?? "";
+		expect(await narratorService.getById(subId)).toMatchObject({
+			type: "subagent",
+			parentNarratorId: result.narratorId,
+			aclRootNarratorId: result.narratorId,
+		});
+		const graph = await topologyOf(subId);
+		expect(graph.nodes).toEqual([
+			expect.objectContaining({
+				id: subId,
+				groupId: subId,
+				parentNarratorId: null,
+				restoreParentId: null,
+			}),
+		]);
+		expect(graph.peers).toEqual([]);
+	});
+
+	test("a primary extracted from a connected subagent immediately has its own communication root", async () => {
+		const parent = await narratorService.create({
+			ownerUserId: USER,
+			cwd: "/tmp",
+			model: "openai:parent-model",
+			taskBackend: "spec",
+		});
+		const source = await narratorService.createSubagent({
+			parentNarratorId: parent.id,
+			subagentType: "general",
+			title: "Original Research",
+			subagentOriginKind: "standalone",
+			cwd: "/tmp",
+			runtimePolicy: { version: 1 },
+		});
+		const peer = await narratorService.create({ ownerUserId: USER });
+		expect(
+			await mutateCommunication(source.id, owner, { kind: "connect", targetNarratorId: peer.id }),
+		).toEqual({ changed: true });
+		const taskUri = "spec://tasks.json";
+		const originalTasks = await writeSpecFile(
+			source.id,
+			taskUri,
+			JSON.stringify({ tasks: [{ text: "Preserve this task", status: "todo" }] }),
+		);
+		const historyId = generateId();
+		db.transaction((tx) => {
+			tx.insert(narratorMessages)
+				.values({
+					id: historyId,
+					narratorId: source.id,
+					role: "assistant",
+					contentJson: [{ type: "text", text: "Keep the original research history" }],
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			tx.insert(narratorMessageRefs)
+				.values({ id: generateId(), narratorId: source.id, messageId: historyId, seq: 0 })
+				.run();
+		});
+		const originalRefs = await refsOf(source.id);
+		expect(originalRefs).toHaveLength(1);
+		const originalGraph = await topologyOf(source.id);
+		const extracted = await narratorService.extractSubagentToPrimary(source.id, {
+			title: "Release Review Notes",
+		});
+
+		const graph = await topologyOf(extracted.id);
+		expect(graph.nodes).toEqual([
+			expect.objectContaining({
+				id: extracted.id,
+				parentNarratorId: null,
+				restoreParentId: null,
+				groupId: extracted.id,
+				canManage: true,
+			}),
+		]);
+		expect(graph.peers).toEqual([]);
+		expect(
+			await mutateCommunication(extracted.id, owner, {
+				kind: "connect",
+				targetNarratorId: peer.id,
+			}),
+		).toEqual({ changed: true });
+		await expectSendByTitleSlug(peer.id, "release-review-notes", extracted.id);
+		expect(db.select().from(narrators).where(eq(narrators.id, extracted.id)).get()).toMatchObject({
+			title: "Release Review Notes",
+			titleSlug: "release-review-notes",
+		});
+		expect(await topologyOf(source.id)).toEqual(originalGraph);
+		expect(await refsOf(source.id)).toEqual(originalRefs);
+		expect(await narratorService.getById(source.id)).toMatchObject({
+			title: "Original Research",
+			titleSlug: "original-research",
+			type: "subagent",
+			parentNarratorId: parent.id,
+			aclRootNarratorId: parent.id,
+			taskBackend: "spec",
+		});
+		expect(extracted).toMatchObject({
+			type: "primary",
+			parentNarratorId: null,
+			taskBackend: "spec",
+		});
+		expect(await readSpecFile(source.id, taskUri)).toMatchObject({
+			revisionId: originalTasks.revisionId,
+			content: originalTasks.content,
+		});
+		expect((await readSpecFile(extracted.id, taskUri)).content).toBe(originalTasks.content);
 	});
 
 	test("importing the same session twice shares no tool ids, so neither sees the other's subagent", async () => {

@@ -31,7 +31,9 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { type PlanTreeView, planTreeViewSignature } from "@shared/outline-plan-tree";
+import { prepareModelTraceResult } from "./measure/measure-modeltrace-result";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +265,13 @@ export function buildCacheKey(
 export function extractDataRevision(data: unknown): string | undefined {
 	if (data == null || typeof data !== "object") return undefined;
 	const d = data as Record<string, unknown>;
+	if (d.type === "modeltrace_result") {
+		// A streamed slot update may change the card without changing its key or height.
+		const { sampleProgress, ...result } = prepareModelTraceResult(data as ModelTraceResultBlock);
+		return `mt:${textSignature(JSON.stringify(result))}:${
+			sampleProgress?.map((slot) => textSignature(JSON.stringify(slot))).join(":") ?? ""
+		}`;
+	}
 	// Collect height-affecting primitives that can change for the same spec.key.
 	let rev = "";
 	if ("status" in d && d.status != null) rev += `s:${d.status}`;
@@ -613,6 +622,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// An expandable body is measured as markdown when its row is expanded.
 		const body = typeof r.bodyText === "string" ? r.bodyText : r.body;
 		if (typeof body === "string") rev += `|tb:${textSignature(body)}`;
+		if (r.sourceRanges === true) rev += "|tsr:1";
 		if (r.shimmer === true) rev += "|tw:1";
 		// A DRILLED-IN row nests a whole tool card, so the trace's height now depends
 		// on that card's own height-bearing fields. `opts.expandedIndices` only tells
@@ -1025,9 +1035,22 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				if (!row) return "-";
 				const text = typeof row.text === "string" ? textSignature(row.text) : "";
 				const identity = typeof row.identity === "string" ? textSignature(row.identity) : "";
+				// A live bar row is height-fixed but PAINTED from the cached payload: a
+				// progress patch on a committed card moves only these figures.
+				const progress = row.progress as
+					| { ratio?: unknown; percent?: unknown; figures?: unknown }
+					| null
+					| undefined;
+				const bar = progress
+					? `:p${String(progress.ratio)}/${String(progress.percent)}/${
+							Array.isArray(progress.figures)
+								? textSignature(progress.figures.map(String).join("|"))
+								: ""
+						}`
+					: "";
 				return `${text}:${identity}:${Array.isArray(row.badges) ? row.badges.length : 0}:${
 					Array.isArray(row.actions) ? row.actions.length : 0
-				}`;
+				}${bar}`;
 			})
 			.join(";")}`;
 	}

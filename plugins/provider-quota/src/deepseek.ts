@@ -92,5 +92,5 @@ export function deepSeekQuotaData(payload: DeepSeekBalancePayload): QuotaData | 
 			});
 		}
 	}
-	return { amounts, windows: [], available: payload.isAvailable };
+	return { scope: "wallet", amounts, windows: [], available: payload.isAvailable };
 }

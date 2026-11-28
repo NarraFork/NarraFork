@@ -314,10 +314,21 @@ describe("PostgreSQL modeltrace exclusion SQL", () => {
 	for (const strategy of ["index", "substring"] as const) {
 		test(`${strategy} excludes traces in every search path before LIMIT`, async () => {
 			const statements: string[] = [];
+			const lineageQueries: { sql: string; params: unknown[] }[] = [];
 			let targetVisible = true;
 			const store = createPostgresSearchStore({
-				async unsafe(sql) {
+				async unsafe(sql, params) {
+					if (
+						sql.startsWith(
+							"WITH RECURSIVE lineage(id, refs_inherited_from, refs_backfill_cursor, depth)",
+						)
+					) {
+						lineageQueries.push({ sql, params: [...(params ?? [])] });
+						return [{ id: "source", refs_inherited_from: null, refs_backfill_cursor: null }];
+					}
 					statements.push(sql);
+					if (sql.includes("recall_marked_results"))
+						return [{ recall_lineage_valid: true, recall_row_present: null }];
 					return sql.startsWith("SELECT n.id FROM narrators n") && targetVisible
 						? [{ id: "source" }]
 						: [];
@@ -336,6 +347,21 @@ describe("PostgreSQL modeltrace exclusion SQL", () => {
 			await store.searchSessionHits({ ...q, narratorIds: ["source"], perSession: 2 });
 			for (const narratorId of [null, "source"]) {
 				await store.searchRecallMessages({ ...q, narratorId, previewChars: 200 });
+			}
+			expect(lineageQueries).toHaveLength(1);
+			for (const { sql, params } of lineageQueries) {
+				expect(params).toEqual(["source"]);
+				expect(sql).toContain(
+					"SELECT id, refs_inherited_from, refs_backfill_cursor, 0 FROM narrators WHERE id = $1",
+				);
+				expect(sql).toContain(
+					"SELECT n.id, n.refs_inherited_from, n.refs_backfill_cursor, l.depth + 1",
+				);
+				expect(sql).toContain("WHERE l.depth < 32");
+				expect(sql).toContain("ORDER BY depth LIMIT 33");
+				expect(sql).not.toMatch(
+					/narrator_messages|content_text|content_json|INSERT|UPDATE|DELETE/i,
+				);
 			}
 			for (const sql of statements) {
 				expect(sql).toContain(exclusion);

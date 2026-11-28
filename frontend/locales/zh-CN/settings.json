@@ -1,6 +1,7 @@
 {
 	"title": "设置",
-
+	"dataImportCommunication": "通讯关系：恢复 {{restored}} 条联系，跳过 {{skipped}} 条，保留 {{preserved}} 个现有通讯节点。",
+	"dataImportCommunicationDetached": "因缺少端点或权限，{{count}} 条通讯父关系已安全拆分。",
 	"remoteAccessSection": "WebRTC 远程访问",
 	"remoteAccess": {
 		"description": "使用匹配版本的托管远程前端，让已配对浏览器直连此实例。配对不能替代管理员登录，业务流量不经信令服务器中继。",
@@ -113,6 +114,11 @@
 		"enabled": "启用",
 		"refresh": "刷新模型",
 		"reauthorize": "重新授权",
+		"loginChoice": "授权后替换哪个已有 Key？",
+		"loginChoiceDescription": "这些 Key 没有可信登录来源记录。请选择旧登录 Key，系统仅在授权成功后替换；也可明确保留全部 Key 及其优先级并新增登录。",
+		"loginChoicePlaceholder": "请明确选择后再授权",
+		"loginKeepKeys": "保留已有 Key 和优先级，新增登录",
+		"loginReplaceKey": "替换旧登录 Key：{{key}}",
 		"delete": "移除 TokenDance",
 		"deleteDescription": "仅移除此安装实例的 TokenDance 连接？此操作不会撤销上游 API Key，也不会删除会话历史。",
 		"top_up_balance": "为 TokenDance 余额充值",
@@ -148,7 +154,7 @@
 			"context": "上下文",
 			"output": "最大输出",
 			"reasoning": "推理档位",
-			"price": "价格 输入 / 输出（$/M）"
+			"price": "参考价格"
 		},
 		"edit": "编辑模型参数",
 		"editParameters": "编辑模型参数",
@@ -207,6 +213,8 @@
 		"details": "模型资料与价格",
 		"actualPricing": "NUG 实际渠道报价",
 		"reference": "参考 $/M 输入 / 输出",
+		"timeOfUseNote": "仅供目录参考，适用时段与实际收费以供应商为准。",
+		"aboveTokens": "超过 {{count}} token",
 		"free": "0（免费）",
 		"unknown": "明确未知",
 		"unreported": "未报告 / 跟随继承",
@@ -265,7 +273,9 @@
 			"standard": "标准",
 			"batch": "批处理",
 			"flex": "Flex",
-			"priority": "Priority"
+			"priority": "Priority",
+			"peak": "高峰参考价",
+			"off_peak": "非高峰参考价"
 		},
 		"basis": {
 			"full": "超阈值后整次请求按该档计价",
@@ -284,6 +294,7 @@
 			"audio": "音频",
 			"video": "视频",
 			"media": "媒体",
+			"reasoning": "思考",
 			"search_context_size_low": "低搜索上下文",
 			"search_context_size_medium": "中搜索上下文",
 			"search_context_size_high": "高搜索上下文"
@@ -1378,6 +1389,10 @@
 	"pwaUpdating": "更新中...",
 	"unsavedSave": "保存更改",
 	"unsavedDiscard": "放弃更改",
+	"credentialMigrationConflict": {
+		"title": "凭据尚未迁移到新存储",
+		"description": "以下凭据的 id 重复。每组删除或重新添加其中一个后重启 NarraFork，即可完成迁移；在此之前一切照常可用。"
+	},
 	"providersTitle": "AI 供应商",
 	"providersTabPlatforms": "平台集成",
 	"providersTabCustom": "自定义供应商",
@@ -1484,6 +1499,7 @@
 	"addProviderSearch": "搜索",
 	"addProviderSearchPlaceholder": "搜索供应商",
 	"addProviderCustom": "自定义",
+	"addProviderCatalogLoadFailed": "供应商预设加载失败",
 	"addProviderNoResults": "无匹配结果",
 	"addProviderAttribution": "预设来自 Cherry Studio（MIT），详见开源协议。",
 	"addProviderConfigure": "配置",
@@ -3052,6 +3068,7 @@
 		"none": "没有可导出的凭据。",
 		"archived": "已归档",
 		"kinds": {
+			"credential": "凭据",
 			"codex": "Codex",
 			"api-key": "API Key"
 		},

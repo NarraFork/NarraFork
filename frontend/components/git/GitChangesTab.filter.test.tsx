@@ -40,6 +40,7 @@ import { GIT_CHANGES_ROW_HEIGHT, type GitChangesListWindow } from "./git-changes
 import {
 	createGitChangesTestQueryClient,
 	flushGitChangesTestRender,
+	gitChangesFixtureCache,
 	gitChangesFixturePage,
 	installGitChangesTestTransport,
 	TestGitChangesWorker,
@@ -602,6 +603,8 @@ describe("GitChangesTab status filter", () => {
 		api.getGitStatusPageStats = async (_target, query) => {
 			await statsGate.promise;
 			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
 				snapshotId: query.snapshotId,
 				rows: query.rows.map((row) => ({ ...row, complete: false })),
 			};
@@ -738,6 +741,8 @@ describe("GitChangesTab status filter", () => {
 			measuredPaths.push(query.rows.map((row) => row.path));
 			await statsGate.promise;
 			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
 				snapshotId: query.snapshotId,
 				rows: query.rows.map((row) => ({ ...row, added: 77, removed: 3, complete: true })),
 			};
@@ -833,9 +838,21 @@ describe("GitChangesTab status filter", () => {
 		api.getGitStatusPage = async (_target, query) => {
 			if (query?.cursor) {
 				await appendGate.promise;
-				return { ...nextPage, files: nextPage.files.slice(1), hasMore: false, nextCursor: null };
+				return {
+					...nextPage,
+					cache: gitChangesFixtureCache(),
+					files: nextPage.files.slice(1),
+					hasMore: false,
+					nextCursor: null,
+				};
 			}
-			return { ...nextPage, files: nextPage.files.slice(0, 1), hasMore: true, nextCursor: "next" };
+			return {
+				...nextPage,
+				cache: gitChangesFixtureCache(),
+				files: nextPage.files.slice(0, 1),
+				hasMore: true,
+				nextCursor: "next",
+			};
 		};
 		const firstStats = deferred<never>();
 		const secondStatsGate = deferred<void>();
@@ -845,6 +862,8 @@ describe("GitChangesTab status filter", () => {
 			if (requestedRows.length === 1) return firstStats.promise;
 			await secondStatsGate.promise;
 			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
 				snapshotId: query.snapshotId,
 				rows: query.rows.map((row) => ({ ...row, added: 23, removed: 2, complete: true })),
 			};
@@ -946,7 +965,7 @@ describe("GitChangesTab status filter", () => {
 		await click(refreshButton(container));
 		assertRefreshState(container, true);
 		expect(callbacks).toBe(2);
-		expect(pageCalls).toBe(2);
+		expect(pageCalls).toBe(1);
 		expect(fileRowPaths(container)).toEqual(paths);
 		gate.resolve();
 		await waitFor(
@@ -977,6 +996,8 @@ describe("GitChangesTab status filter", () => {
 		api.getGitStatusPageStats = async (_target, query) => {
 			await gate.promise;
 			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
 				snapshotId: query.snapshotId,
 				rows: query.rows.map((row) => ({ ...row, complete: false })),
 			};
@@ -1032,6 +1053,8 @@ describe("GitChangesTab status filter", () => {
 		api.getGitStatusPageStats = async (_target, query) => {
 			if (failureKind === "statistics" && fail) throw new Error("statistics refresh unavailable");
 			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
 				snapshotId: query.snapshotId,
 				rows: query.rows.map((row) => ({ ...row, added: 8, removed: 2, complete: true })),
 			};
@@ -1101,7 +1124,12 @@ describe("GitChangesTab status filter", () => {
 		let statsCalls = 0;
 		api.getGitStatusPageStats = async (_target, query) => {
 			statsCalls++;
-			return { snapshotId: query.snapshotId, rows: [] };
+			return {
+				status: "ready",
+				cache: gitChangesFixtureCache(),
+				snapshotId: query.snapshotId,
+				rows: [],
+			};
 		};
 		await click(buttonByLabel(container, "Refresh"));
 		expect(fileRowPaths(container)).toHaveLength(5);

@@ -1,11 +1,13 @@
 import { afterAll, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { ProviderQuotaSnapshot } from "@shared/provider-quota";
+import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { providerQuotaKey } from "../../hooks/useProviderQuota";
+import { quotaSnapshotsReadKey } from "../../hooks/useQuotaSnapshots";
 import en from "../../locales/en/narrator.json";
 import zh from "../../locales/zh-CN/narrator.json";
 import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
@@ -36,6 +38,7 @@ function render(
 	overrides: Partial<ProviderQuotaSnapshot> | boolean = {},
 	locale: keyof typeof instances = "en",
 	capabilityEnabled?: boolean,
+	entries?: QuotaSnapshotEntry[],
 ) {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["auth", "me"], { role });
@@ -47,7 +50,7 @@ function render(
 				? {}
 				: { providerBalanceCapability: { enabled: capabilityEnabled } }),
 	});
-	client.setQueryData(providerQuotaKey("p", "A"), {
+	const diagnostic: ProviderQuotaSnapshot = {
 		providerId: "p",
 		targetId: "custom-api/p",
 		generation: "A",
@@ -60,13 +63,50 @@ function render(
 		stale: false,
 		version: 1,
 		...(typeof overrides === "object" ? overrides : {}),
-	} satisfies ProviderQuotaSnapshot);
-	if (queryState === "loading") client.removeQueries({ queryKey: providerQuotaKey("p", "A") });
-	if (queryState === "error")
-		client
-			.getQueryCache()
-			.find({ queryKey: providerQuotaKey("p", "A") })
-			?.setState({ status: "error", error: new Error("private transport exception") });
+	};
+	client.setQueryData(providerQuotaKey("p", "A"), diagnostic);
+	client.setQueryData(quotaSnapshotsReadKey(), {
+		entries: entries ?? [
+			{
+				groupId: "p",
+				prefix: "p",
+				templateId: "custom-api",
+				credentialId: "key",
+				generation: "A",
+				primary: true,
+				supported: status !== "unsupported",
+				refreshing: status === "pending" || status === "probing",
+				snapshot: diagnostic.data
+					? {
+							scope:
+								diagnostic.data.scope === "wallet" ||
+								diagnostic.data.scope === "key" ||
+								diagnostic.data.scope === "subscription"
+									? diagnostic.data.scope
+									: "account",
+							fetchedAt: diagnostic.fetchedAt,
+							windows: [],
+							balances: diagnostic.data.amounts.map((amount) => ({
+								unit: amount.unit,
+								remaining: amount.remaining ?? null,
+								total: amount.total ?? undefined,
+								unlimited: amount.unlimited,
+							})),
+							plan: diagnostic.data.planName ?? undefined,
+							available: diagnostic.data.available ?? undefined,
+						}
+					: null,
+			},
+		],
+	} satisfies QuotaSnapshotsResponse);
+	for (const queryKey of [providerQuotaKey("p", "A"), quotaSnapshotsReadKey()]) {
+		if (queryState === "loading") client.removeQueries({ queryKey });
+		if (queryState === "error")
+			client
+				.getQueryCache()
+				.find({ queryKey })
+				?.setState({ status: "error", error: new Error("private transport exception") });
+	}
 	try {
 		return renderToStaticMarkup(
 			<QueryClientProvider client={client}>
@@ -161,7 +201,7 @@ test.each([
 	).toBe("");
 	const html = render(role, false, "A", "supported", "cached", { data, version: 3 }, locale);
 	const translate = instances[locale].t;
-	expect(html).toContain("USD 0");
+	expect(html).toContain("0 USD");
 	expect(html).toContain(translate("providerQuota.supported"));
 	expect(html).toContain(translate("providerQuota.accountUnavailable"));
 	if (role === "admin") {
@@ -177,7 +217,7 @@ test("third-party amount values stay visible and marked stale after transport fa
 		data: { amounts: [{ id: "wallet", unit: "credits", remaining: 19.5 }], windows: [] },
 		fetchedAt: 1,
 	});
-	expect(html).toContain("credits 19.5");
+	expect(html).toContain("19.5 credits");
 	expect(html).toContain(en.quotaPanel.staleHint);
 });
 test("replacing the same provider account does not render the previous balance", () => {
@@ -185,7 +225,7 @@ test("replacing the same provider account does not render the previous balance",
 		data: { amounts: [{ id: "wallet", unit: "credits", remaining: 19.5 }], windows: [] },
 		fetchedAt: 1,
 	});
-	expect(html).not.toContain("credits 19.5");
+	expect(html).not.toContain("19.5 credits");
 });
 test.each([
 	["admin", "en"],
@@ -203,7 +243,7 @@ test.each([
 	};
 	expect(render(role, true, "A", "supported", "cached", cached, locale, false)).toBe("");
 	const restored = render(role, false, "A", "supported", "cached", cached, locale, true);
-	expect(restored).toContain("USD 19.5");
+	expect(restored).toContain("19.5 USD");
 	expect(restored).toContain("Saved group");
 	expect(restored).toContain(instances[locale].t("providerQuota.scopes.wallet"));
 });
@@ -212,4 +252,33 @@ test("a disabled capability hides the whole quota row; enabled and older setting
 	expect(render("admin", false, "A", "error", "cached", false)).toBe("");
 	expect(render("admin", false, "A", "supported", "cached", true)).toContain("Refresh quota");
 	expect(render("admin", false, "A", "supported")).toContain("Refresh quota");
+});
+test("the group summary follows the selected key, not the disabled first key or its stale balance", () => {
+	const selected: QuotaSnapshotEntry = {
+		groupId: "p",
+		prefix: "p",
+		templateId: "openai-compatible",
+		credentialId: "B",
+		generation: "A",
+		primary: true,
+		supported: true,
+		snapshot: {
+			scope: "key",
+			fetchedAt: 1,
+			windows: [],
+			balances: [{ unit: "USD", remaining: 20 }],
+		},
+	};
+	for (const snapshot of [
+		null,
+		{ scope: "key" as const, fetchedAt: 1, windows: [], balances: [{ unit: "USD", remaining: 7 }] },
+	]) {
+		const html = render("admin", false, "A", "supported", "cached", true, "en", true, [
+			{ ...selected, credentialId: "A", primary: false, snapshot },
+			selected,
+		]);
+		expect(html).toContain("20 USD");
+		expect(html).not.toContain("7 USD");
+		expect(html).not.toContain("Quota unknown");
+	}
 });

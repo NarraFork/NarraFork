@@ -38,4 +38,11 @@ export type VListElementKind =
 	| "ask-user-question"
 	| "inline-permission"
 	| "subagent-card"
-	| "turn-usage";
+	| "turn-usage"
+	/**
+	 * Team page only (opt-in): consecutive coordinator `Team` calls of one action folded into a
+	 * one-line chip (「创建工作项 ×7」); toggles open onto the ordinary tool cards below it.
+	 */
+	| "team-chip"
+	/** Team page only (opt-in): a team event as a thin divider at its time. */
+	| "team-event";

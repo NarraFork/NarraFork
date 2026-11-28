@@ -13,16 +13,18 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import quotaManifest from "../../plugins/provider-quota/manifest.json";
 import { buildBundledPlugins } from "../../scripts/build-bundled-plugins";
 import { collectPluginBuildModules } from "../../scripts/generate-builtin-plugins";
 import { collectBuildModules } from "../../scripts/lib/build-materials";
 import { safeSpawn } from "../../server/lib/spawn";
+import { computePackageHash, PluginPackageStore } from "../../server/services/plugin-package-store";
 import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const project = resolve(import.meta.dir, "../..");
 const roots: string[] = [];
 const pluginId = "io.narrafork.provider-quota";
-const version = "1.0.3";
+const version = quotaManifest.version;
 const fixtureBytes = Buffer.from("bounded independent archive fixture");
 const fixtureIdentity = {
 	schemaVersion: 1,
@@ -47,6 +49,7 @@ async function fixture(): Promise<{ root: string; source: string }> {
 		"server/lib/logger.ts",
 		"server/lib/narrafork-home.ts",
 		"server/lib/win-handle-guard.ts",
+		"tests/fixtures/provider-quota-1.0.3.nfplugin",
 	]) {
 		const target = join(source, path);
 		await mkdir(dirname(target), { recursive: true });
@@ -246,13 +249,17 @@ test("concurrent publishers fail closed on the output lock and identical cache w
 }, 60_000);
 
 test("standalone rebuilds publish matching host sidecars while preserving frozen build inputs", async () => {
-	const { source, plugin, dist } = await pluginFixture();
+	const { root, source, plugin, dist } = await pluginFixture();
 	const built = await buildBundledPlugins({ root: source });
 	const frozenBytes = await readFile(built.assets[0].archivePath);
 	const generated = await readFile(built.generatedModulePath, "utf8");
 	await writeFile(join(plugin, "LICENSE"), "standalone replacement publication\n");
 	const { buildProviderQuotaPlugin } = await import(pathToFileURL(join(plugin, "build.ts")).href);
-	await buildProviderQuotaPlugin({ outDir: dist });
+	const standalone = await buildProviderQuotaPlugin({ outDir: dist });
+	const expectedHash = await computePackageHash(
+		standalone.packageRoot,
+		new PluginPackageStore({ root: join(root, "hash-store") }).limits,
+	);
 	const archive = await readFile(join(dist, "provider-quota.nfplugin"));
 	const digest = createHash("sha256").update(archive).digest("hex");
 	expect(digest).not.toBe(built.assets[0].sha256);
@@ -262,6 +269,7 @@ test("standalone rebuilds publish matching host sidecars while preserving frozen
 		version,
 		size: archive.byteLength,
 		sha256: digest,
+		packageHash: expectedHash,
 	});
 	expect(await readFile(built.assets[0].archivePath)).toEqual(frozenBytes);
 	expect(await readFile(built.generatedModulePath, "utf8")).toBe(generated);
@@ -687,10 +695,13 @@ test("real generated archive is embedded and loads after every copied source/out
 		version,
 		size: asset.size,
 		sha256: asset.sha256,
+		packageHash: asset.packageHash,
 	});
+	expect(asset.packageHash).toMatch(/^[a-f0-9]{64}$/);
 	const generated = await readFile(built.generatedModulePath, "utf8");
 	expect(generated).toContain('with { type: "file" }');
 	expect(generated).toContain(`sha256: "${asset.sha256}"`);
+	expect(generated).toContain(`packageHash: "${asset.packageHash}"`);
 	expect(generated).toContain(`size: ${asset.size}`);
 	expect(generated).not.toMatch(/^import.*(?:server\/index\.js|src\/index\.ts)/m);
 	const entry = await probe(
@@ -701,6 +712,7 @@ const descriptors = getBundledPluginDescriptors();
 const loaded = await descriptors[0].load();
 console.log("RESULT " + JSON.stringify({ compiled: isCompiledRuntime(), pluginId: descriptors[0].pluginId,
 	version: descriptors[0].version, size: loaded.bytes.length, sha256: loaded.sha256,
+	packageHash: loaded.packageHash,
 	digest: Buffer.from(await crypto.subtle.digest("SHA-256", loaded.bytes)).toString("hex") }));`,
 	);
 	// Replace the public archive after generating this module, but before the compiler consumes it.
@@ -726,6 +738,7 @@ console.log("RESULT " + JSON.stringify({ compiled: isCompiledRuntime(), pluginId
 		version,
 		size: asset.size,
 		sha256: asset.sha256,
+		packageHash: asset.packageHash,
 		digest: asset.sha256,
 	});
 }, 90_000);

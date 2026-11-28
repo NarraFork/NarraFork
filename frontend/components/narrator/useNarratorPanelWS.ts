@@ -4,15 +4,27 @@ import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quo
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
+import type { QuotaSnapshotReadScope } from "@shared/quota-snapshot";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useMemo,
+	useReducer,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import { api, type BufferMessageSummary } from "../../lib/api";
+import { invalidateQuotaSnapshotRead } from "../../hooks/useQuotaSnapshots";
+import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
+import { getAuthSnapshot, subscribeAuth } from "../../lib/api/client";
+import { createNarratorPanelReadScope, type NarratorPanelReadScope } from "../../lib/api/narrators";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
 	createPanelReconcileRestartScheduler,
@@ -22,6 +34,7 @@ import {
 	reconcilePanelStatePages,
 	shouldFallbackPanelState,
 } from "../../lib/narrator-panel-state";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { statusRegistry } from "../../lib/status-registry";
 import {
 	contextSnapshotFields,
@@ -119,6 +132,8 @@ export interface QuotaWaitInfo {
 }
 
 export interface PaymentRequiredInfo {
+	/** 失败请求专用的服务器 opaque 充值上下文；缺失时不能回退首 Key。 */
+	paymentContext?: string;
 	providerId?: string;
 	providerPrefix?: string;
 	balance?: number;
@@ -179,22 +194,10 @@ export interface UseNarratorPanelWSOptions {
 	isAtBottomRef: React.RefObject<boolean>;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
-	/** Initial generic gateway/API quota balance from settings cache. */
-	initialQuotaBalance?: string | null;
-	/** Initial generic gateway/API quota details from settings cache. */
-	initialDetailedQuotaBalance?: string | null;
-	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
-	customApiProviderId?: string | null;
-	/** Identity of the saved Custom API account; pushed text cannot survive its replacement. */
-	customApiProviderGeneration?: string;
-	/** Known Key identities cannot accept quota text from an unidentified legacy request. */
-	customApiProviderKeyId?: string;
-	/** Explicit site-account queries must not fall back to inference-key push text. */
-	customApiQuotaPushCompatible?: boolean;
-	/** NUG provider ID for the current narrator model (used to sync quota back to NUG cache). */
-	nugProviderId?: string | null;
 	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
 	quotaProviderKey?: string | null;
+	/** The same unified read identity as the active quota surface. */
+	quotaReadScope?: QuotaSnapshotReadScope;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
 	 *  substatus survives page navigation (the WS-only path starts from []). */
 	narratorSubstatus?: string[];
@@ -212,6 +215,7 @@ export interface UseNarratorPanelWSOptions {
 }
 
 export interface UseNarratorPanelWSReturn {
+	readScope: NarratorPanelReadScope;
 	// WS connection
 	connected: boolean;
 	disconnected: boolean;
@@ -264,8 +268,6 @@ export interface UseNarratorPanelWSReturn {
 	 * besides the inline timeline marker.
 	 */
 	compactFailure: { error: string } | null;
-	quotaBalance: string | null;
-	detailedQuotaBalance: string | null;
 	// Browser sessions
 	browserSessionCount: number;
 	browserVisualChange: { sessionId: string; seq: number } | null;
@@ -358,14 +360,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorErrorMessage,
 		initialMessageStatus,
 		isSubagent,
-		initialQuotaBalance,
-		initialDetailedQuotaBalance,
-		customApiProviderId,
-		customApiProviderGeneration,
-		customApiProviderKeyId,
-		customApiQuotaPushCompatible,
-		nugProviderId,
 		quotaProviderKey,
+		quotaReadScope,
 		narratorSubstatus,
 		onDraftChanged,
 		onDraftMeta,
@@ -374,8 +370,25 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const { data: currentUser } = useCurrentUser();
-	const panelScope = JSON.stringify([currentUser?.id ?? null, narratorId]);
+	const { generation: authGeneration } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
+	const panelScope = JSON.stringify([authGeneration, currentUser?.id ?? null, narratorId]);
+	const quotaScope = JSON.stringify([
+		panelScope,
+		quotaProviderKey ?? null,
+		quotaReadScope?.groupId ?? null,
+		quotaReadScope?.expectedGeneration ?? null,
+	]);
+	// Each mount owns its own pool, even when another panel reads the same narrator.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
+	const readScope = useMemo(() => createNarratorPanelReadScope(), [panelScope]);
 	const connectionReconcileRef = useRef<PanelConnectionState | null>(null);
+	const lastStatusRef = useRef({ scope: panelScope, status: narratorStatus });
+	if (lastStatusRef.current.scope !== panelScope)
+		lastStatusRef.current = { scope: panelScope, status: narratorStatus };
 	const activeReconcileRef = useRef<{
 		controller: AbortController;
 		promise: Promise<void>;
@@ -647,20 +660,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sessionId: string;
 		seq: number;
 	} | null>(null);
-	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
-	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
-		initialDetailedQuotaBalance ?? null,
-	);
-	// Sync initial generic quota when switching narrators or custom API providers.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/providerId must reset same-balance stale runtime state.
-	useEffect(() => {
-		setQuotaBalance(initialQuotaBalance ?? null);
-		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
-		setPaymentRequired(null);
-	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [quotaWaitInfo, setQuotaWaitInfo] = useState<QuotaWaitInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
+	// Only identity changes retire payment state; ordinary quota updates must preserve it.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: quotaScope is the identity reset trigger.
+	useEffect(() => {
+		setPaymentRequired(null);
+	}, [quotaScope]);
 	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
 	const retryInfoRef = useRef<RetryInfo | null>(null);
 	const clearRetryIfActive = useCallback(() => {
@@ -877,6 +884,45 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t],
 	);
 
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval.
+	 *
+	 * The permission itself is never removed optimistically: it is only settled once the review
+	 * decides — a review that cannot decide leaves the card (and this permission) where it was.
+	 * Only the 计划反思 entry is hidden while the review runs.
+	 */
+	const handlePlanReflect = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			// Hide the entry while the review runs: the server refuses a second start (409), and a
+			// card that still offers the button reads as if the first click did nothing. A review
+			// that hands the plan back sends `plan_reflection_stopped`, whose reconcile restores it.
+			const setAvailable = (available: boolean) => {
+				const current = pendingPermsByRequestIdRef.current.get(requestId);
+				if (current && current.planReflectionAvailable !== available) {
+					upsertPendingPermission({ ...current, planReflectionAvailable: available });
+				}
+			};
+			setAvailable(false);
+			try {
+				await api.reflectPlan(requestId);
+			} catch (err) {
+				if (err instanceof ApiError && err.status === 409) {
+					// Already running, or no longer reflectable: the server's state is the answer.
+					requestPanelReconcileRef.current();
+					return;
+				}
+				setAvailable(true);
+				notifications.show({
+					message: t("planReflectFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+			}
+		},
+		[permissionDecisionsSupported, t, upsertPendingPermission],
+	);
+
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -887,6 +933,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onQuestionReflect: handleQuestionReflect,
 		onQuestionDeny: handleQuestionDeny,
 		onQuestionDefer: handleQuestionDefer,
+		onPlanReflect: handlePlanReflect,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -897,6 +944,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
+			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect?.(...args),
 		}),
 		[],
 	);
@@ -999,7 +1047,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) => {
 				removePendingPermission(requestId);
 				if (subagentNarratorId) {
-					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId], exact: true });
 				}
 			},
 			// Live gate progress feeds the render-only store both renderers read from.
@@ -1143,7 +1191,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onAsyncQuestionChanged: ({ change, question }) => {
 				applyAsyncQuestionChange(change, question);
 			},
-			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
+			onStatusChange: (status, turnStartedAt, eventSubstatus, statusPatch) => {
 				clearRetryIfActive();
 				// A self-recovering wait is only meaningful while the narrator is still
 				// parked on it. Leaving `waiting` is the single signal that it ended —
@@ -1177,12 +1225,43 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (eventSubstatus !== undefined) {
 					narratorPatch.substatus = eventSubstatus;
 				}
+				if (statusPatch && Object.hasOwn(statusPatch, "messageCount")) {
+					narratorPatch.messageCount = statusPatch.messageCount;
+				}
+				const persistedFields = [
+					"substatus",
+					"turnStartedAt",
+					"updatedAt",
+					"errorMessage",
+					"errorRetryable",
+					"archivedWithNarratorId",
+					"backgroundWorkActive",
+				] as const;
+				for (const field of persistedFields) {
+					if (statusPatch && Object.hasOwn(statusPatch, field))
+						narratorPatch[field] = statusPatch[field];
+				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
 					if (!old) return old;
 					if (typeof old.id === "string" && old.id !== narratorId) return old;
 					return { ...old, ...narratorPatch };
 				});
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+				const previous = lastStatusRef.current.status;
+				lastStatusRef.current.status = status;
+				const wasRunning = previous === "working" || previous === "waiting";
+				const running = !isNotWorking;
+				const lifecycleChanged = previous !== status && (!wasRunning || !running);
+				const complete =
+					statusPatch &&
+					persistedFields.every(
+						(field) => field === "backgroundWorkActive" || Object.hasOwn(statusPatch, field),
+					);
+				// Legacy sparse producers need a bounded lifecycle recovery, not a read per status label.
+				if (!complete && lifecycleChanged)
+					void qc.invalidateQueries(
+						{ queryKey: ["narrators", narratorId], exact: true },
+						{ cancelRefetch: false },
+					);
 			},
 			onSubstatusChange: (newSubstatus) => {
 				const hasCompact = hasActiveCompactSubstatus(newSubstatus);
@@ -1212,7 +1291,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setQueuedMessages(remaining);
 			},
 			onQueuedNewNarratorCreated: (_messageId, newNarratorId) => {
-				qc.invalidateQueries({ queryKey: ["narrators"] });
+				qc.invalidateQueries({
+					queryKey: ["narrators"],
+					// List filters and paginated lists only; never invalidate another
+					// narrator's detail children (tasks/current, file trees, etc.).
+					predicate: ({ queryKey }) =>
+						queryKey.length === 1 || typeof queryKey[1] === "object" || queryKey[1] === "paginated",
+				});
 				qc.invalidateQueries({ queryKey: ["narrators", newNarratorId], exact: true });
 				onQueuedNewNarratorCreated?.(newNarratorId);
 			},
@@ -1286,102 +1371,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onQuotaBalance: (balance, detailedBalance, target, credentialId) => {
-				if (customApiProviderId) {
-					if (
-						customApiQuotaPushCompatible === false ||
-						(target === undefined && customApiProviderKeyId) ||
-						credentialId === null ||
-						(credentialId !== undefined &&
-							customApiProviderKeyId &&
-							credentialId !== customApiProviderKeyId)
-					)
-						return;
-					// Compare the immutable request identity BEFORE touching local state or caches.
-					// A late event is delivered through the latest callback after account switches.
-					if (
-						target !== undefined &&
-						(!target ||
-							target.providerId !== customApiProviderId ||
-							target.generation !== customApiProviderGeneration)
-					)
-						return;
-					const saved = qc.getQueryData<{ providerQuotaGenerations?: Record<string, string> }>([
-						"settings",
-					]);
-					if (
-						customApiProviderGeneration &&
-						saved?.providerQuotaGenerations?.[customApiProviderId] !== customApiProviderGeneration
-					)
-						return;
-				} else if (target) {
-					// A late Custom API pass must not be relabelled as the current NUG/platform balance.
+			onQuotaBalance: () => {
+				if (getAuthSnapshot().generation !== authGeneration) return;
+				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
+				if (
+					connectionIdentity !== undefined &&
+					connectionIdentity !== narratorWSManager.getCredentialIdentity()
+				)
 					return;
-				}
-				setQuotaBalance(balance);
-				setDetailedQuotaBalance(detailedBalance ?? null);
-				if (customApiProviderId) {
-					const updateSettingsQuota = (old: unknown) => {
-						if (!old || typeof old !== "object") return old;
-						const settings = old as Record<string, unknown>;
-						const generations = settings.providerQuotaGenerations as
-							| Record<string, unknown>
-							| undefined;
-						if (
-							customApiProviderGeneration &&
-							generations?.[customApiProviderId] !== customApiProviderGeneration
-						)
-							return old;
-						const customApiQuotas =
-							settings.customApiQuotas && typeof settings.customApiQuotas === "object"
-								? (settings.customApiQuotas as Record<string, unknown>)
-								: {};
-						const existing =
-							customApiQuotas[customApiProviderId] &&
-							typeof customApiQuotas[customApiProviderId] === "object"
-								? (customApiQuotas[customApiProviderId] as Record<string, unknown>)
-								: {};
-						return {
-							...settings,
-							customApiQuotas: {
-								...customApiQuotas,
-								[customApiProviderId]: {
-									...existing,
-									...(customApiProviderGeneration
-										? { generation: customApiProviderGeneration }
-										: {}),
-									quotaBalance: balance,
-									detailedQuotaBalance: detailedBalance ?? null,
-								},
-							},
-						};
-					};
-					qc.setQueryData(["settings"], updateSettingsQuota);
-					qc.setQueryData(["admin", "settings"], updateSettingsQuota);
-				}
-				if (nugProviderId && balance != null) {
-					const numericBalance = Number(balance);
-					if (Number.isFinite(numericBalance)) {
-						qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-							const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-							const existing =
-								quotas[nugProviderId] && typeof quotas[nugProviderId] === "object"
-									? (quotas[nugProviderId] as Record<string, unknown>)
-									: {};
-							return {
-								...quotas,
-								[nugProviderId]: {
-									...existing,
-									balance: numericBalance,
-									totalGranted: existing.totalGranted ?? null,
-									detailedQuotaBalance: detailedBalance ?? existing.detailedQuotaBalance ?? null,
-								},
-							};
-						});
-					}
-				}
+				// Re-read the server projection; stream payloads cannot replace another
+				// credential's balance or overwrite an authoritative quota probe.
+				void invalidateQuotaSnapshotRead(qc, quotaReadScope, authGeneration);
 			},
 			onPaymentRequired: (info) => {
+				if (getAuthSnapshot().generation !== authGeneration) return;
+				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
+				if (
+					connectionIdentity !== undefined &&
+					connectionIdentity !== narratorWSManager.getCredentialIdentity()
+				)
+					return;
 				setPaymentRequired(info);
 			},
 			onModelUnavailableWaiting: (info) => {
@@ -1399,7 +1408,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider, waitKind }
 						: null,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
 					title: t(
@@ -1447,7 +1456,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, status: "working", substatus: [] } : old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				notifications.show({
 					title: t(
 						transientPrefix
@@ -1557,7 +1566,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				if (contextPercentAfter != null) {
 					notifications.show({
 						title: t(isSegment ? "segmentCompactSuccess" : "compactSuccess"),
@@ -1612,15 +1621,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 			},
 			onSubagentSuspended: (subagentNarratorId: string) => {
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId], exact: true });
 			},
 			onSubagentStatusChanged: (
 				subagentNarratorId: string,
 				status: string,
 				substatus?: string[],
 			) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
+				const queryKey = ["narrators", subagentNarratorId];
+				const previous = qc.getQueryData<{ status?: string }>(queryKey)?.status;
+				qc.setQueryData(queryKey, (old: Record<string, unknown> | undefined) =>
 					old
 						? {
 								...old,
@@ -1630,7 +1640,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							}
 						: old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				const wasRunning = previous === "working" || previous === "waiting";
+				const running = status === "working" || status === "waiting";
+				if (previous !== undefined && previous !== status && (!wasRunning || !running))
+					void qc.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
 			},
 			onSubagentWarning: (subagentNarratorId: string, info: NarratorWarningInfo) => {
 				const fallbackNotice = nativeMediaFallbackNotice(info, t);
@@ -1679,6 +1692,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		{
 			kind: "panel",
 			excludeTypes: PANEL_EXCLUDED_EVENT_TYPES,
+			callbackScope: quotaScope,
 		},
 	);
 
@@ -1693,19 +1707,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Initial REST is shared with the composer; every WS connection edge closes its event gap. ---
 	const reconcilePanelState = useCallback(
 		(fresh = false) => {
+			// Principal hydration owns this boundary; do not read once anonymously and
+			// repeat the entire snapshot when auth/me supplies the actual owner.
+			if (!currentUser?.id || getAuthSnapshot().generation !== authGeneration)
+				return Promise.resolve();
 			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
 			reconcileRestartSchedulerRef.current?.cancel();
 			if (fresh) activeReconcileRef.current?.controller.abort();
 			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), 15_000);
+			const timer = setTimeout(() => {
+				controller.abort(new DOMException("Panel reconciliation timed out", "TimeoutError"));
+				if (isCurrent()) reconcileRestartSchedulerRef.current?.schedule();
+			}, 15_000);
 			const generation = permissionGenerationRef.current;
 			const lifecycle = permissionLifecycleRef.current;
 			const bufferEpoch = bufferEpochRef.current;
-			const alive = () =>
-				!controller.signal.aborted &&
+			const isCurrent = () =>
+				getAuthSnapshot().generation === authGeneration &&
 				permissionLifecycleRef.current === lifecycle &&
 				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
 					(currentUser?.id ?? null);
+			const alive = () => !controller.signal.aborted && isCurrent();
 			const onDiscard = () => {
 				if (alive()) requestPanelReconcileRef.current();
 			};
@@ -1740,16 +1762,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						onDiscard,
 					);
 					applyBuffer(snapshot.buffer, !snapshot.hasMore.buffer);
-					// Draft metadata rides every page; the composer no-ops it unless it
-					// proves a live draft_changed was missed while disconnected.
-					onDraftMetaRef.current?.(snapshot.draft);
+					// Initial metadata belongs solely to Composer hydration. Only recovery
+					// reads can announce a missed update, avoiding a second initial body GET.
+					if (fresh) onDraftMetaRef.current?.(snapshot.draft);
 				},
-				{ signal: controller.signal, fresh },
+				{ signal: controller.signal, fresh, readScope },
 			)
 				.catch(async (error) => {
 					if (!alive() || !shouldFallbackPanelState(error)) return;
 					// Independent fallbacks: a draft/network failure must never hide safety permissions.
-					await Promise.allSettled([
+					const fallbacks = await Promise.allSettled([
 						api.getPendingPermissions(narratorId, controller.signal).then((permissions) => {
 							if (alive())
 								replacePendingPermissions(permissions, generation, lifecycle, true, onDiscard);
@@ -1758,6 +1780,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							.getBufferedMessages(narratorId, controller.signal)
 							.then((messages) => applyBuffer(messages ?? [])),
 					]);
+					if (
+						alive() &&
+						fallbacks.some(
+							(result) => result.status === "rejected" && shouldFallbackPanelState(result.reason),
+						)
+					)
+						reconcileRestartSchedulerRef.current?.schedule();
 				})
 				.finally(() => {
 					clearTimeout(timer);
@@ -1767,7 +1796,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
 			return promise;
 		},
-		[narratorId, replacePendingPermissions, qc, currentUser?.id],
+		[narratorId, replacePendingPermissions, qc, currentUser?.id, authGeneration, readScope],
 	);
 	reconcilePanelStateRef.current = reconcilePanelState;
 	requestPanelReconcileRef.current = () => {
@@ -1784,26 +1813,44 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	};
 
 	useEffect(() => {
-		const transition = panelConnectionRead(connectionReconcileRef.current, panelScope, connected);
-		connectionReconcileRef.current = transition.state;
-		if (!transition.read) return;
-		if (transition.read === "fresh") {
-			bumpPermissionGeneration();
-			bumpBufferEpoch();
-		}
-		void reconcilePanelState(transition.read === "fresh");
-	}, [panelScope, connected, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
-
-	// --- Fallback polling for permissions ---
-	useEffect(() => {
-		if (narratorStatus !== "waiting" || pendingPermissions.length > 0) return;
-		const poll = () => {
-			void reconcilePanelState();
+		const observe = (isConnected: boolean) => {
+			const transition = panelConnectionRead(
+				connectionReconcileRef.current,
+				panelScope,
+				isConnected,
+			);
+			connectionReconcileRef.current = transition.state;
+			if (!transition.read) return;
+			if (transition.read === "fresh") {
+				bumpPermissionGeneration();
+				bumpBufferEpoch();
+			}
+			void reconcilePanelState(transition.read === "fresh");
 		};
-		poll();
-		const timer = setInterval(poll, 5000);
+		// Observe raw edges: React may batch false→true back to the same boolean.
+		const unsubscribe = narratorWSManager.onConnectionChange(observe);
+		observe(narratorWSManager.connected);
+		return unsubscribe;
+	}, [panelScope, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
+
+	useEffect(
+		() =>
+			narratorWSManager.onControlPlaneRecovery(() => {
+				bumpPermissionGeneration();
+				bumpBufferEpoch();
+				void reconcilePanelState(true);
+			}),
+		[reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch],
+	);
+
+	// Only a visible, disconnected waiting page needs the rate-limited safety fallback.
+	// The initial/connection-edge reads above already cover entry; do not add an immediate poll.
+	useEffect(() => {
+		if (connected || !pageVisible || narratorStatus !== "waiting" || pendingPermissions.length > 0)
+			return;
+		const timer = setInterval(() => void reconcilePanelState(), 5000);
 		return () => clearInterval(timer);
-	}, [narratorStatus, pendingPermissions.length, reconcilePanelState]);
+	}, [connected, pageVisible, narratorStatus, pendingPermissions.length, reconcilePanelState]);
 
 	// --- Mark "done" narrator as read ---
 	const hasUnreadSubstatus = substatus.includes("unread");
@@ -1850,6 +1897,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	return useMemo(
 		() => ({
+			readScope,
 			connected,
 			disconnected,
 			reconnect,
@@ -1873,8 +1921,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			compactProgress,
 			compactFailure,
-			quotaBalance,
-			detailedQuotaBalance,
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,
@@ -1888,6 +1934,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			viewers,
 		}),
 		[
+			readScope,
 			connected,
 			disconnected,
 			reconnect,
@@ -1910,8 +1957,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			compactProgress,
 			compactFailure,
-			quotaBalance,
-			detailedQuotaBalance,
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,

@@ -9,6 +9,7 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { projects } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { getGlobalPromptCandidates, isWritableGlobalPromptPath } from "../lib/global-prompt-paths";
 import { requireProjectAccess } from "../lib/project-access";
@@ -72,10 +73,14 @@ routineRoutes.post("/:id/mode", async (c) => {
 routineRoutes.get("/project/:projectId", async (c) => {
 	await requireProjectAccess(c, c.req.param("projectId"), "read");
 	const projectId = c.req.param("projectId");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQueryFirst(
+		db.query.projects.findMany({
+			where: eq(projects.id, projectId),
+			columns: { chapterSettings: true },
+			limit: 1,
+		}),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal, maxRows: 1 },
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	let routinesConf: RoutineModeConfig | undefined;

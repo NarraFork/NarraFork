@@ -38,22 +38,28 @@ export async function trackFileChange(
 		if (ctx.parentNarratorId) {
 			const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
 			const remoteCwd = ctx.executionTarget?.cwd ?? backend.defaultCwd;
-			recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
-				deviceId: backend.deviceId,
-				workspacePath:
-					backend.kind === "local"
-						? ctx.cwd
-						: remoteCwd
-							? backend.paths.identityKey(remoteCwd)
-							: null,
-			});
+			await recordTeamFileChange(
+				ctx.parentNarratorId,
+				ctx.narratorId,
+				filePath,
+				{
+					deviceId: backend.deviceId,
+					workspacePath:
+						backend.kind === "local"
+							? ctx.cwd
+							: remoteCwd
+								? backend.paths.identityKey(remoteCwd)
+								: null,
+				},
+				{ signal: ctx.signal },
+			);
 		}
 	} catch {
 		// Rebuildable team display, not mutation evidence.
 	}
 	const hint = await outlineOverlap(ctx, filePath, options?.hint === true, backend);
-	// The local v2 runtime already persisted exactly one effect projection. Never
-	// add a legacy row for it or write a decoded first-touch baseline again.
+	// A recorded effect already owns its attribution projection, including metadata-only
+	// local effects. This flag does not claim complete historical content evidence.
 	if (options?.evidenceRecorded) return hint;
 
 	// File attribution (all narrators, including standalone)

@@ -37,7 +37,7 @@ async function finish(run: () => Promise<boolean>): Promise<void> {
 test("default production block readers convert, verify, reindex, index, clear and restore on real workers", async () => {
 	cleanDb(sqlite);
 	delete process.env.NARRAFORK_DB_WORKER;
-	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
+	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
 	await resetDbWorkerPoolForTest();
 	blockIndex.setBlockIndexAutoRunForTests(false);
 	Object.assign(settings.narratorBlocks, { write: true, read: true, compactJson: false });

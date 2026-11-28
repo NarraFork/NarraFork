@@ -18,7 +18,7 @@ import {
 	test,
 } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorktreeDependent } from "@shared/narrator-worktrees";
@@ -28,7 +28,10 @@ import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { LocalBackend } from "../../../lib/agent/execution/local-backend";
 import { eventBus } from "../../../lib/event-bus";
-import { setGitHardeningProbeForTests } from "../../../lib/git-exec-hardening";
+import {
+	setGitHardeningProbeForTests,
+	setNoLazyFetchSupportForTests,
+} from "../../../lib/git-exec-hardening";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import {
@@ -317,6 +320,51 @@ afterEach(async () => {
 });
 
 describe("work item lifecycle", () => {
+	test("communication dirty observes committed worker/role state and never a rolled-back binding", async () => {
+		const item = await create("Communication projection binding");
+		seedWorker("p3-projection-worker");
+		const observed: Array<{ inTransaction: boolean; worker: string | null; state: string }> = [];
+		const handler = (event: { teamId: string }) => {
+			if (event.teamId !== LEAD) return;
+			const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+			if (!row) throw new Error("Missing committed work item");
+			observed.push({
+				inTransaction: sqlite.inTransaction,
+				worker: row.workerNarratorId,
+				state: row.state,
+			});
+		};
+		eventBus.on("team:communication_changed", handler);
+		try {
+			sqlite.run(
+				"CREATE TEMP TRIGGER reject_communication_work_event BEFORE INSERT ON team_work_events BEGIN SELECT RAISE(ABORT, 'test rollback'); END",
+			);
+			try {
+				expect(() => attachWorker(LEAD, item.id, "p3-projection-worker", agent)).toThrow(
+					"test rollback",
+				);
+			} finally {
+				sqlite.run("DROP TRIGGER reject_communication_work_event");
+			}
+			expect(observed).toEqual([]);
+			expect(
+				db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()
+					?.workerNarratorId,
+			).toBeNull();
+			attachWorker(LEAD, item.id, "p3-projection-worker", agent);
+			expect(observed).toEqual([
+				{ inTransaction: false, worker: "p3-projection-worker", state: "in_progress" },
+			]);
+			cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+			expect(observed.at(-1)).toEqual({
+				inTransaction: false,
+				worker: "p3-projection-worker",
+				state: "cancelled",
+			});
+		} finally {
+			eventBus.off("team:communication_changed", handler);
+		}
+	});
 	test("create → the worker commits → blocker round → clear round → ready", async () => {
 		const item = await create("Add the export button");
 		expect(item.state).toBe("queued");
@@ -700,6 +748,8 @@ describe("base sync", () => {
 
 	test("commits a worker's base merge brings in do not count as commits since the review", async () => {
 		const item = await create("Reviewed then synced");
+		seedWorker("p3-synced");
+		attachWorker(LEAD, item.id, "p3-synced", agent);
 		const path = worktreePathOf(item) ?? "";
 		await commitFile(path, "mine.txt", "mine\n", "item work");
 		await recordReview({
@@ -777,6 +827,72 @@ describe("cleanup", () => {
 			actorKind: "agent",
 			detail: { reason: "superseded", from: "queued" },
 		});
+	});
+});
+
+describe("cleanup on a partial clone", () => {
+	test("without lazy-fetch protection the refusal is recorded as a work.cleanup event", async () => {
+		const item = await create("Partial");
+		const path = worktreePathOf(item) ?? "";
+		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		await git(["config", "remote.evil.url", join(temporary, "nowhere.git")]);
+		await git(["config", "remote.evil.promisor", "true"]);
+		setNoLazyFetchSupportForTests(false);
+		try {
+			const refused = await cleanupWorkItem({
+				coordinatorId: LEAD,
+				itemId: item.id,
+				principal,
+				actor: agent,
+				signal: signal(),
+			});
+			expect(refused).toMatchObject({
+				outcome: "refused",
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+			expect(existsSync(path)).toBe(true);
+			expect(events(item.id).find((event) => event.kind === "work.cleanup")?.detail).toMatchObject({
+				outcome: "refused",
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+	});
+});
+
+describe("cleanup when the partial-clone check cannot read the configuration", () => {
+	test("the unmeasurable plan is recorded as a work.cleanup refusal", async () => {
+		const item = await create("Unreadable");
+		const path = worktreePathOf(item) ?? "";
+		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		// Over the 64 KB cap of the gate's configuration read.
+		const filters = Array.from(
+			{ length: 3000 },
+			(_, i) => `[filter "f${i}"]\n\tclean = cat\n`,
+		).join("");
+		await appendFile(join(source, ".git", "config"), filters);
+		setNoLazyFetchSupportForTests(false);
+		try {
+			const refused = await cleanupWorkItem({
+				coordinatorId: LEAD,
+				itemId: item.id,
+				principal,
+				actor: agent,
+				signal: signal(),
+			});
+			expect(refused).toMatchObject({
+				outcome: "refused",
+				code: "WORKTREE_REMOVAL_STATUS_UNAVAILABLE",
+			});
+			expect(existsSync(path)).toBe(true);
+			expect(events(item.id).find((event) => event.kind === "work.cleanup")?.detail).toMatchObject({
+				outcome: "refused",
+				code: "WORKTREE_REMOVAL_STATUS_UNAVAILABLE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
 	});
 });
 
@@ -909,6 +1025,8 @@ describe("no repository code runs on the server", () => {
 
 	test("a git that ignores environment overrides is refused before any git runs", async () => {
 		const live = await create("Old git, live");
+		seedWorker("p3-old-git");
+		attachWorker(LEAD, live.id, "p3-old-git", agent);
 		const done = await create("Old git, cancelled");
 		cancelWorkItem({ coordinatorId: LEAD, itemId: done.id, actor: agent });
 		setGitHardeningProbeForTests(async () => false);

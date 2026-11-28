@@ -1,3 +1,5 @@
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
+import { confirmAuthUser, getAuthSnapshot } from "../../lib/api/client";
 /**
  * Rows are one line and their details are a hover card, which touch cannot reach. These
  * tests hold the touch fallbacks: the row menu (left swipe) starts with the details, and
@@ -20,6 +22,7 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { appearanceStore } from "../../lib/appearance-preference-store";
 import commonEn from "../../locales/en/common.json";
 import navEn from "../../locales/en/nav.json";
 import {
@@ -30,6 +33,9 @@ import {
 import { RecentTabPinDivider, TabContextMenu, type TabContextMenuProps } from "./RecentTabMenu";
 import { createRecentTabHoverStore, RECENT_TAB_HOVER_SHOW_DELAY_MS } from "./recent-tab-hover";
 
+const fixtureUser = "recent-tab-menu-fixture-user";
+const fixtureToken = "recent-tab-menu-fixture-token";
+const preferencesKey = () => userPreferencesQueryKey("ui");
 const i18n = createInstance();
 await i18n.init({
 	lng: "en",
@@ -51,6 +57,7 @@ const DOM_KEYS = [
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
 	"IS_REACT_ACT_ENVIRONMENT",
+	"localStorage",
 ] as const;
 
 let restoreDom: (() => void) | null = null;
@@ -102,7 +109,13 @@ beforeEach(() => {
 			};
 		},
 	});
+	const storage = new Map([["narrafork_token", fixtureToken]]);
 	const values: Record<string, unknown> = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -122,7 +135,9 @@ beforeEach(() => {
 			value: values[key],
 		});
 	}
+	appearanceStore.activate(null, true);
 	restoreDom = () => {
+		appearanceStore.activate(null, true);
 		for (const [key, descriptor] of previous) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
@@ -137,7 +152,9 @@ beforeEach(() => {
 		notificationTimers.set(timer, callback);
 	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	client.setQueryData(["user-preferences"], {});
+	confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
+	client.setQueryData(["auth", "me"], { id: fixtureUser });
+	client.setQueryData(preferencesKey(), {});
 	container = window.document.createElement("div");
 	window.document.body.append(container);
 	root = createRoot(container);

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import quotaManifest from "../../../plugins/provider-quota/manifest.json";
 import {
 	buildBalanceRoots,
 	parseNewApiBalance,
@@ -28,7 +29,10 @@ let f: Awaited<ReturnType<typeof archivedQuotaFixture>>;
 let responder: (url: string, init?: RequestInit) => Response = () =>
 	Response.json({ isValid: true, mode: "unrestricted", unit: "USD", balance: 7 });
 beforeAll(async () => {
-	f = await archivedQuotaFixture({ fetch: async (url, init) => responder(String(url), init) });
+	f = await archivedQuotaFixture({
+		approveSettings: true,
+		fetch: async (url, init) => responder(String(url), init),
+	});
 }, 60000);
 afterAll(async () => {
 	await f?.close();
@@ -52,12 +56,14 @@ describe("archived quota manifest and credential-free contract", () => {
 		const root = (await quotaTestPackage()).packageRoot;
 		const manifest = parseManifest(JSON.parse(await readFile(join(root, "manifest.json"), "utf8")));
 		expect(manifest.pluginId).toBe("io.narrafork.provider-quota");
-		expect(manifest.version).toBe("1.0.3");
+		expect(manifest.version).toBe(quotaManifest.version);
 		expect(manifest.server?.entry).toBe("server/index.js");
 		expect(manifest.engine.hostApi).toBe(">=1.0 <2");
 		expect(manifest.contributes.tools).toEqual([]);
 		expect(manifest.contributes.commands).toEqual([]);
 		expect(manifest.contributes.providers).toEqual([]);
+		expect(manifest.contributes.providerSettings).toHaveLength(1);
+		expect(manifest.contributes.providerSettings[0]?.id).toBe("site-account");
 		expect(manifest.contributes.quotaSources).toHaveLength(4);
 		expect(manifest.contributes.quotaSources.map(({ id }) => id).sort()).toEqual([
 			"deepseek",
@@ -65,11 +71,15 @@ describe("archived quota manifest and credential-free contract", () => {
 			"opencode",
 			"relay",
 		]);
-		for (const source of manifest.contributes.quotaSources)
+		for (const source of manifest.contributes.quotaSources) {
 			expect(providerQuotaSourceSchema.safeParse(source).success).toBe(true);
+			expect(source.settingsContribution).toBe("site-account");
+		}
 		expect(manifest.activationEvents).toEqual(["onStartup"]);
 		expect(manifest.permissions.host.sort()).toEqual([
 			"provider.connection.request",
+			"provider.settings.connection.use",
+			"provider.settings.read_self",
 			"quota.provide",
 		]);
 	});
@@ -95,6 +105,8 @@ describe("archived quota manifest and credential-free contract", () => {
 		const manifest = parseManifest(JSON.parse(await readFile(join(root, "manifest.json"), "utf8")));
 		const mapping = {
 			"provider.connection.request": "provider.connection.request",
+			"provider.settings.get": "provider.settings.read_self",
+			"provider.settings.connection.request": "provider.settings.connection.use",
 			"secrets.get": "secret.use_self",
 			"storage.get": "storage.read_self",
 			"config.get": "config.read_self",

@@ -1,6 +1,6 @@
 import type { ProviderBalanceData, ProviderBalanceSnapshot } from "@shared/provider-balance";
 import { type ProviderQuotaSnapshot, providerQuotaDataSchema } from "@shared/provider-quota";
-import { providerQuotaService } from "../services/provider-quota-service";
+import { providerQuotaService, toQuotaSnapshot } from "../services/provider-quota-service";
 import { hasSiteQuotaConfig } from "../services/provider-quota-sites";
 import { isDeepSeekCustomApiProvider } from "./deepseek-balance-cache";
 import { isKimiCustomApiProvider } from "./kimi-usage-cache";
@@ -25,6 +25,27 @@ export function isProviderBalanceCandidate(config: CustomApiProviderConfig): boo
 		!isKimiCustomApiProvider(config) &&
 		!isOpencodeCustomApiProvider(config)
 	);
+}
+
+/** Legacy identity readers remain source-compatible; plugin snapshots validate their own identity. */
+export function providerBalanceQuotaIdentity(
+	config: CustomApiProviderConfig,
+	globalProxy: unknown,
+): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		config.protocol,
+		config.proxy,
+		config.tlsRejectUnauthorized,
+		config.userAgentMode,
+		config.customUserAgent,
+		Object.entries(config.extraHeaders ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+		config.quotaSiteUrl,
+		config.quotaAccessToken,
+		config.quotaUserId,
+		globalProxy,
+	]);
 }
 
 export function toProviderBalanceSnapshot(
@@ -98,7 +119,7 @@ function isLegacyProvider(id: string): boolean {
 	return !!config && isProviderBalanceCandidate(config);
 }
 
-/** Kept for older callers only. All state, jobs and throttles belong to the one quota service. */
+/** Compatibility facade. The plugin quota service is the sole owner of state and refresh jobs. */
 export const providerBalanceCache = {
 	sync(): void {
 		providerQuotaService.sync();
@@ -108,10 +129,27 @@ export const providerBalanceCache = {
 			Object.entries(providerQuotaService.generations()).filter(([id]) => isLegacyProvider(id)),
 		);
 	},
+	peekGeneration(id: string): string | undefined {
+		return providerQuotaService.peekGeneration(id);
+	},
 	peek(id: string): ProviderBalanceSnapshot | null {
 		if (!isLegacyProvider(id)) return null;
 		const snapshot = providerQuotaService.peek(id);
 		return snapshot ? toProviderBalanceSnapshot(snapshot) : null;
+	},
+	quotaSnapshot(id: string) {
+		if (!isLegacyProvider(id)) return undefined;
+		const current = providerQuotaService.peek(id);
+		const snapshot = toQuotaSnapshot(current);
+		return current && snapshot
+			? { credentialId: current.pushCompatible === false ? null : (current.keyId ?? id), snapshot }
+			: undefined;
+	},
+	isRefreshing(id: string, credentialId?: string): boolean {
+		const snapshot = credentialId
+			? providerQuotaService.peekKey(credentialId)
+			: providerQuotaService.peek(id);
+		return snapshot?.providerId === id && snapshot.status === "probing";
 	},
 	read(providerId?: string): Record<string, ProviderBalanceSnapshot> {
 		return Object.fromEntries(

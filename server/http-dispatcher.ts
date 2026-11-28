@@ -9,22 +9,23 @@ import { isStreamingAttachmentUpload } from "../shared/text-file-types";
 import type { AppEnv } from "./app";
 import { db } from "./db";
 import { users } from "./db/schema";
+import { readQuery } from "./db/worker-read";
 import type { ServerRequestLifecycle } from "./http-request-lifecycle";
+import { toDatabaseReadUnavailablePayload, toErrorPayload } from "./lib/app-error-response";
 import { verifyToken } from "./lib/auth";
 import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import {
 	type DatabaseReaderReadiness,
 	databaseReadersAvailable,
 	databaseReaderUnavailableResponse,
-	isDatabaseReadUnavailable,
 	requiresDatabaseReaders,
 } from "./lib/db-reader-readiness";
+import { AppError, catalogError } from "./lib/errors";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { trustedRemoteRequestContext } from "./lib/remote-request-context";
 import { settings } from "./lib/settings";
 import { buildHealthPayload, type createStartupReadinessGate } from "./lib/startup-readiness";
 import type { VNetRelayAuth } from "./lib/vnet/types";
-import { authRead } from "./services/auth/sqlite-auth-read";
 import {
 	consumeOAuthWsTicket,
 	EXTERNAL_NARRATORS_WS_CHANNEL,
@@ -44,6 +45,13 @@ import {
 	type WSData,
 } from "./websocket/ws-handler";
 
+function isCredentialFailure(error: unknown): boolean {
+	return (
+		(error instanceof AppError && error.statusCode === 401) ||
+		(error instanceof Error && ["SessionTokenRevoked", "SessionTokenExpired"].includes(error.name))
+	);
+}
+
 async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
 	if (!settings.vnet?.enabled) return null;
 	const bearer = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
@@ -56,10 +64,11 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	}
 	if (token) {
 		try {
-			const payload = await verifyToken(token);
+			const payload = await verifyToken(token, { signal: req.signal });
 			return { kind: "session", userId: payload.sub };
-		} catch {
-			// Fall through to anonymous only when explicitly enabled.
+		} catch (error) {
+			if (!isCredentialFailure(error)) throw error;
+			// Fall through to anonymous only for an invalid credential.
 		}
 	}
 	if (settings.vnet.allowAnonymousRelay) {
@@ -112,10 +121,15 @@ export function createServerRequestDispatcher(options: {
 	startupReadiness: ReturnType<typeof createStartupReadinessGate>;
 	activeDatabaseBackend: "sqlite" | "postgres";
 	databaseReaders?: DatabaseReaderReadiness;
+	databaseReaderReadiness?: Pick<DatabaseReaderReadiness, "state" | "wait">;
 }) {
 	const { app, lifecycle, startupReadiness, activeDatabaseBackend } = options;
-	const databaseReaders = options.databaseReaders;
-	return (req: Request, server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">) => {
+	const databaseReaders = options.databaseReaderReadiness ?? options.databaseReaders;
+	return (
+		req: Request,
+		server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade"> &
+			Partial<Pick<Bun.Server<WSData>, "timeout">>,
+	) => {
 		if (!lifecycle.accepting) {
 			return new Response("Server is shutting down", {
 				status: 503,
@@ -123,8 +137,11 @@ export function createServerRequestDispatcher(options: {
 			});
 		}
 		const requestId = lifecycle.nextRequestId();
+		const url = new URL(req.url);
 		const execute = async () => {
-			const url = new URL(req.url);
+			if (req.method === "POST" && url.pathname === "/api/diagnostics/cpu-profile") {
+				server.timeout?.(req, 0);
+			}
 
 			// Keep liveness available while exposing whether continuation recovery is still
 			// running or has failed. Recovery is considered admitted once every continuation
@@ -146,6 +163,9 @@ export function createServerRequestDispatcher(options: {
 				return new Response(
 					JSON.stringify({
 						...buildHealthPayload(healthPayload, startupReadiness.state),
+						...(!readerState || databaseReadersAvailable(readerState)
+							? {}
+							: { status: "not_ready" }),
 						...(readerState ? { databaseReaders: readerState } : {}),
 						// Which database backend this process wired at startup. A monitor that
 						// watches a PostgreSQL deployment must be able to tell it actually came
@@ -153,7 +173,8 @@ export function createServerRequestDispatcher(options: {
 						database: { backend: activeDatabaseBackend },
 					}),
 					{
-						status: readerState?.status === "failed" ? 503 : healthResponse.status,
+						status:
+							readerState && !databaseReadersAvailable(readerState) ? 503 : healthResponse.status,
 						headers,
 					},
 				);
@@ -165,17 +186,20 @@ export function createServerRequestDispatcher(options: {
 			);
 			if (narratorWsRefusal) return narratorWsRefusal;
 
-			if (databaseReaders && requiresDatabaseReaders(url.pathname)) {
-				const readerState = await databaseReaders.wait();
+			if (databaseReaders && requiresDatabaseReaders(url.pathname, req.method)) {
+				const readerState = databaseReaders.state;
 				if (!databaseReadersAvailable(readerState)) {
+					void databaseReaders.wait();
 					return databaseReaderUnavailableResponse(readerState);
 				}
+				// Recovery failures keep repair routes reachable; missing readers fail closed.
+				await startupReadiness.barrier;
+				const currentReaders = databaseReaders.state;
+				if (!databaseReadersAvailable(currentReaders))
+					return databaseReaderUnavailableResponse(currentReaders);
+			} else if (requiresDatabaseReaders(url.pathname, req.method)) {
+				await startupReadiness.barrier;
 			}
-
-			// Wait for recovery to reach a terminal outcome so restored narrators observe a
-			// consistent state. A recovery failure is scoped to its narrator and never
-			// closes the HTTP surface: the UI is what repairs that narrator's state.
-			await startupReadiness.barrier;
 			if (!lifecycle.accepting) return new Response("Server is shutting down", { status: 503 });
 
 			if (url.pathname === "/ws/external/v1/narrators") {
@@ -191,7 +215,7 @@ export function createServerRequestDispatcher(options: {
 				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
 				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
 				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
-				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
+				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId);
 				if (
 					!live ||
 					live.userId !== consumed.auth.user.sub ||
@@ -251,7 +275,8 @@ export function createServerRequestDispatcher(options: {
 					let share: VerifiedPublicShare;
 					try {
 						share = verifyPublicShare(shareId, `Share ${shareToken}`);
-					} catch {
+					} catch (error) {
+						if (!isCredentialFailure(error)) throw error;
 						return new Response("Share link unavailable", { status: 401 });
 					}
 					const wsData = resolveWSData(url, undefined, undefined, undefined, share);
@@ -290,44 +315,25 @@ export function createServerRequestDispatcher(options: {
 				try {
 					payload = await verifyToken(token, { signal: req.signal });
 				} catch (error) {
-					if (isDatabaseReadUnavailable(error)) {
-						return databaseReaderUnavailableResponse({
-							status: "failed",
-							code: "DB_READERS_UNAVAILABLE",
-							reason: (error as Error).message,
-						});
-					}
+					if (!isCredentialFailure(error)) throw error;
 					return new Response("Invalid or expired token", { status: 401 });
 				}
 
 				// Look up user info for presence tracking
-				const userQuery = db
-					.select({
-						id: users.id,
-						username: users.username,
-						avatarColor: users.avatarColor,
-						avatarImageId: users.avatarImageId,
-						// Read live, so a demotion applies to the next socket. The narrator
-						// subscribe path uses it for the admin short-circuit.
-						role: users.role,
-					})
-					.from(users)
-					.where(eq(users.id, payload.sub))
-					.limit(1);
-				let user: Awaited<typeof userQuery>[number] | undefined;
-				try {
-					[user] =
-						activeDatabaseBackend === "sqlite"
-							? await authRead(userQuery, { signal: req.signal })
-							: await userQuery;
-				} catch (error) {
-					if (!isDatabaseReadUnavailable(error)) throw error;
-					return databaseReaderUnavailableResponse({
-						status: "failed",
-						code: "DB_READERS_UNAVAILABLE",
-						reason: (error as Error).message,
-					});
-				}
+				const user = await readQuery(
+					db.query.users.findFirst({
+						where: eq(users.id, payload.sub),
+						columns: {
+							id: true,
+							username: true,
+							avatarColor: true,
+							avatarImageId: true,
+							// Read live so demotions apply to the next socket.
+							role: true,
+						},
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1, signal: req.signal },
+				);
 				// `verifyToken` already rejected revoked and expired sessions; a user row that
 				// vanished since still fails the upgrade.
 				if (!user) {
@@ -379,6 +385,33 @@ export function createServerRequestDispatcher(options: {
 				trustedProxy: !remote && isTrustedProxyAddress(peerIp, trustedProxyCidrs),
 			});
 		};
-		return lifecycle.run(requestId, req, execute, !!trustedRemoteRequestContext(req));
+		const execution = lifecycle.run(requestId, req, execute, !!trustedRemoteRequestContext(req));
+		// WS admission runs outside Hono. Resolve known reader failures here so Bun does
+		// not report an unhandled fetch rejection with the token-bearing request URL.
+		return url.pathname.startsWith("/ws")
+			? execution.catch((error: unknown) => {
+					if (error instanceof AppError)
+						return Response.json(toErrorPayload(error), { status: error.statusCode });
+					if (req.signal.aborted) return new Response(null, { status: 499 });
+					if (
+						error instanceof Error &&
+						(error.name === "AbortError" || ("code" in error && error.code === "DB_READ_ABORTED"))
+					) {
+						return Response.json(
+							{
+								...toErrorPayload(catalogError("DATABASE_READ_UNAVAILABLE")),
+								code: "DB_READ_ABORTED",
+							},
+							{ status: 503, headers: { "Retry-After": "5" } },
+						);
+					}
+					const payload = toDatabaseReadUnavailablePayload(error);
+					if (!payload) throw error;
+					return Response.json(payload, {
+						status: 503,
+						headers: { "Retry-After": String(5) },
+					});
+				})
+			: execution;
 	};
 }

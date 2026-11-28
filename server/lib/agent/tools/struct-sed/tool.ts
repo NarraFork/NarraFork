@@ -833,15 +833,11 @@ export const structSedTool: ToolDefinition = {
 						};
 					},
 				});
-				// `undefined` means the pipeline declined: no tool-call binding, so the change
-				// would carry no snapshot, attribution or tree boundary. Edit has a legacy
-				// fallback that writes anyway; StructSed deliberately refuses instead. A
-				// structural rewrite with no recorded evidence is not revertable, and this tool
-				// exists to make large edits, which is exactly when revert matters.
+				// Structural writes require the persisted tool identity and guarded write runtime.
 				if (!recorded) {
 					return {
 						output:
-							"StructSed requires a recorded tool call to write (for snapshot and revert evidence) and this call has none. Use Edit if you need to write without it.",
+							"StructSed requires a recorded tool call and guarded file-write runtime to write.",
 						isError: true,
 						title: filePath,
 					};
@@ -852,7 +848,22 @@ export const structSedTool: ToolDefinition = {
 				if (args.keep !== true) {
 					for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
 				}
-				return recorded;
+				const { linesAdded, linesRemoved } = recorded.metadata ?? {};
+				const hint = await trackFileChange(
+					ctx,
+					ioPath,
+					"edit",
+					backend,
+					typeof linesAdded === "number" && typeof linesRemoved === "number"
+						? { added: linesAdded, removed: linesRemoved }
+						: null,
+					{
+						evidenceRecorded: Boolean(recorded.metadata?.fileChangeEvidence),
+						toolName: "StructSed",
+						hint: true,
+					},
+				);
+				return withOverlapHint(recorded, hint);
 			} catch (err) {
 				if (err instanceof FileNoDispatchEvidenceError) throw err;
 				rethrowConfirmedToolDiskError(err, ctx, true);
@@ -862,7 +873,7 @@ export const structSedTool: ToolDefinition = {
 					title: filePath,
 					metadata: {
 						diskOutcome: remoteDispatched ? "unknown" : "not_applied",
-						historyStatus: "unavailable",
+						historyStatus: backend.kind === "local" ? "disabled" : "unavailable",
 						...fileChangeDiagnosticMetadata(err),
 						...fileWriteOutcomeMetadata(err),
 					},

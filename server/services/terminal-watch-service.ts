@@ -21,14 +21,22 @@
  * terminal without watches pays nothing.
  */
 
+import { formatWatchTarget, TERMINAL_WATCH_DEADLINE_OUTPUT_PREFIX } from "@shared/watch-command";
 import type { IMarker } from "@xterm/headless";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import type { BufferManager, BufferReadCursor, BufferReadFrame } from "../terminal/buffer-manager";
+import type {
+	BufferManager,
+	BufferReadCursor,
+	BufferReadFrame,
+	RestoredBufferAnchor,
+} from "../terminal/buffer-manager";
 import {
+	type AdoptedWatchRow,
 	cancelWatchRegistration,
 	createWatchObservation,
+	registerWatchObservation,
 	resumeWatchObservationsForTests,
 	suspendWatchObservationsForShutdown,
 	type WatchObservation,
@@ -60,6 +68,7 @@ export type WatchStart =
 interface WatchResult {
 	status: "completed" | "timeout" | "failed";
 	output: string;
+	coalesceKey?: string;
 }
 
 interface Watch {
@@ -79,13 +88,14 @@ interface Watch {
 	disposeMarkers?: () => void;
 	prefixUnknown?: boolean;
 	cursor?: BufferReadCursor;
-	matchFrame?: ReturnType<typeof createWatchFrameMatcher>;
-	timer: ReturnType<typeof setTimeout>;
+	matchFrame?: WatchFrameMatcher;
 	checkTimer?: ReturnType<typeof setTimeout>;
 	/** Frozen once observation ends; delivery ownership then lives in the shared observation. */
 	result?: WatchResult;
 	dirty: boolean;
 	checking: boolean;
+	/** The check currently reading the buffer, so a caller can wait for its verdict. */
+	inflight?: Promise<void>;
 	lastCheck: number;
 	lastText?: string;
 	settled: boolean;
@@ -225,16 +235,21 @@ function scanRenderedMatches(
  * Appended rows are a separate region: erasing an old match cannot cancel a
  * genuinely new match there. KMP keeps overlapping literals linear and bounded.
  */
-export function createRenderedPatternMatcher(pattern: string, observedPrefix: string) {
-	if (!pattern.length) return (_text: string, _scope: RenderedMatchScope = {}) => -1;
+export function createRenderedPatternMatcher(
+	pattern: string,
+	observedPrefix: string,
+	/** Restores {@link RenderedPatternMatcher.excluded} from a checkpoint instead. */
+	initialExcluded?: number,
+): RenderedPatternMatcher {
+	if (!pattern.length)
+		return Object.assign((_text: string, _scope: RenderedMatchScope = {}) => -1, {
+			excluded: () => 0,
+		});
 	const table = literalPrefixTable(pattern);
-	let excluded = scanRenderedMatches(
-		observedPrefix,
-		pattern,
-		table,
-		Number.POSITIVE_INFINITY,
-	).prefixMatches;
-	return (text: string, scope: RenderedMatchScope = {}): number => {
+	let excluded =
+		initialExcluded ??
+		scanRenderedMatches(observedPrefix, pattern, table, Number.POSITIVE_INFINITY).prefixMatches;
+	const match = (text: string, scope: RenderedMatchScope = {}): number => {
 		if (scope.resetHistory) excluded = 0;
 		const result = scanRenderedMatches(
 			text,
@@ -249,21 +264,45 @@ export function createRenderedPatternMatcher(pattern: string, observedPrefix: st
 			excluded = Math.min(excluded, result.prefixMatches);
 		return result.at;
 	};
+	return Object.assign(match, { excluded: () => excluded });
 }
 
-export function createWatchFrameMatcher(pattern: string, start: WatchStart) {
-	let skip = start.kind === "offset" ? start.offset : -1;
+export type RenderedPatternMatcher = ((text: string, scope?: RenderedMatchScope) => number) & {
+	/** Earlier occurrences still treated as old output. */
+	excluded(): number;
+};
+
+/**
+ * A frame matcher's progress, enough to continue it in another process: where its
+ * matching starts in the text read from the start row, and how many occurrences
+ * before that it still treats as old (absent when it compares plain text).
+ */
+export interface WatchMatchCheckpoint {
+	skip: number;
+	excluded?: number;
+}
+
+export function createWatchFrameMatcher(
+	pattern: string,
+	start: WatchStart,
+	/** Continue a matcher saved with {@link WatchFrameMatcher.checkpoint}. */
+	resume?: WatchMatchCheckpoint,
+): WatchFrameMatcher {
+	let skip = resume ? resume.skip : start.kind === "offset" ? start.offset : -1;
 	let clippedEcho = false;
 	let partialEcho = false;
 	let echoBaseline: string | undefined;
 	let allowedEchoTail = "";
 	const echoLine = start.kind === "echo" ? lastEchoLine(start.input) : undefined;
 	const echoTable = echoLine ? literalPrefixTable(echoLine) : undefined;
-	let matcher =
-		start.kind === "offset" && start.textBefore !== undefined
+	let matcher: RenderedPatternMatcher | undefined = resume
+		? resume.excluded === undefined
+			? undefined
+			: createRenderedPatternMatcher(pattern, "", resume.excluded)
+		: start.kind === "offset" && start.textBefore !== undefined
 			? createRenderedPatternMatcher(pattern, start.textBefore.slice(0, Math.max(0, skip)))
 			: undefined;
-	return (frame: Exclude<BufferReadFrame, { kind: "error" }>): number => {
+	const matchFrame = (frame: Exclude<BufferReadFrame, { kind: "error" }>): number => {
 		if (frame.kind === "baseline") {
 			// The parser produces no output between the old snapshot and this baseline.
 			matcher = createRenderedPatternMatcher(pattern, frame.text);
@@ -352,7 +391,17 @@ export function createWatchFrameMatcher(pattern: string, start: WatchStart) {
 				})
 			: text.indexOf(pattern, Math.max(0, skip));
 	};
+	return Object.assign(matchFrame, {
+		// An echo start has no checkpoint until its echo is found: before that only the
+		// typed input could locate it, and that is never saved.
+		checkpoint: (): WatchMatchCheckpoint | undefined =>
+			skip < 0 ? undefined : { skip, ...(matcher ? { excluded: matcher.excluded() } : {}) },
+	});
 }
+
+export type WatchFrameMatcher = ((frame: Exclude<BufferReadFrame, { kind: "error" }>) => number) & {
+	checkpoint(): WatchMatchCheckpoint | undefined;
+};
 
 export interface StartWatchInput {
 	narratorId: string;
@@ -366,7 +415,7 @@ export interface StartWatchInput {
 	/** Owns the relocatable markers and queued layout checkpoints. */
 	cursor?: BufferReadCursor;
 	/** A write may already have consumed frames while waiting for its immediate result. */
-	matchFrame?: ReturnType<typeof createWatchFrameMatcher>;
+	matchFrame?: WatchFrameMatcher;
 	/** Revision captured with the cursor; legacy callers freeze it before task creation. */
 	layoutRevision?: number;
 	/** Both markers transfer to the watch, including failure/cancellation cleanup. */
@@ -378,10 +427,54 @@ export interface StartWatchInput {
 	toolUseId?: string;
 	/** Only cancels asynchronous registration; an accepted watch outlives its tool call. */
 	registrationSignal?: AbortSignal;
+	/**
+	 * Re-attach a watch row left by the previous server process. A text watch also
+	 * needs the cursor its terminal's snapshot restored ({@link claimRestoredWatchAnchor}).
+	 */
+	adopt?: AdoptedWatchRow;
+	/** Who registers the watch; restart re-attachment re-authorizes as this identity. */
+	principal?: { userId: string | null };
+}
+
+type TerminalLifecycleService = Pick<
+	typeof import("./terminal-service")["terminalService"],
+	"isAttached" | "getActiveBuffer"
+>;
+
+/**
+ * Lifecycle probe shared by the Terminal tool and restart re-attachment: exited is read
+ * from the terminal row; a missing row, a detached PTY or a replaced buffer is reported
+ * as disconnected, never as an exit.
+ */
+export function terminalLifecycleReader(
+	terminalId: string,
+	buffer: BufferManager | undefined,
+	service: TerminalLifecycleService,
+	readStatus: () => Promise<string | null | undefined>,
+): () => Promise<"running" | "exited" | "disconnected"> {
+	return async () => {
+		const status = await readStatus();
+		if (status === "exited") return "exited";
+		if (
+			status === undefined ||
+			!service.isAttached(terminalId) ||
+			(buffer && service.getActiveBuffer(terminalId) !== buffer)
+		)
+			return "disconnected";
+		return "running";
+	};
 }
 
 export type StartWatchResult =
-	| { status: "started"; taskId: string; alias: string; observation: WatchObservation }
+	| {
+			status: "started";
+			taskId: string;
+			alias: string;
+			observation: WatchObservation;
+			/** This watcher already had the same lifecycle watch; its deadline was extended. */
+			reused?: boolean;
+			remainingMs: number;
+	  }
 	| { status: "error"; message: string };
 
 function disposeWatchMarkers(
@@ -425,17 +518,53 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 				message: "Watch registration was interrupted; no terminal input was sent.",
 			};
 		}
-		observation = await createWatchObservation({
+		const observationInput = {
 			narratorId: input.narratorId,
 			title: `watch ${input.terminalName}${pattern ? `: ${pattern.slice(0, 40)}` : ""}`,
-			command: `terminal ${JSON.stringify(input.terminalId)}${pattern ? ` for ${JSON.stringify(pattern)}` : ""}`,
+			command: formatWatchTarget({
+				type: "terminal",
+				id: input.terminalId,
+				pattern: pattern || undefined,
+				timeoutMs: input.timeoutMs,
+			}),
 			toolUseId: input.toolUseId,
+			timeoutMs: input.timeoutMs,
+			principal: input.principal,
+			onDeadline: () => {
+				if (observation) void timeOut(observation.taskId);
+			},
 			onObservationEnd: () => {
 				if (observation) release(observation.taskId);
 			},
-		});
+		};
+		if (pattern) {
+			// Text watches keep their own read cursors, so only their ending notices merge.
+			observation = await createWatchObservation({
+				...observationInput,
+				...(input.adopt ? { adopt: input.adopt } : {}),
+			});
+		} else {
+			const registered = await registerWatchObservation({
+				...observationInput,
+				...(input.adopt ? { adopt: input.adopt } : {}),
+				dedupKey: `terminal ${JSON.stringify(input.terminalId)} lifecycle`,
+			});
+			if (registered.reused) {
+				disposeWatchMarkers(input);
+				const { taskId, alias } = registered.observation;
+				return {
+					status: "started",
+					taskId,
+					alias,
+					observation: registered.observation,
+					reused: true,
+					remainingMs: registered.remainingMs,
+				};
+			}
+			observation = registered.observation;
+		}
 		if (input.registrationSignal?.aborted) {
-			// No source subscription or timer exists yet. Cancel only this new task,
+			// No source subscription exists yet. Cancel only this new task (and its deadline),
 			// before a buffered exit or pattern can publish after registration aborts.
 			await cancelWatchRegistration(observation);
 			disposeWatchMarkers(input);
@@ -475,13 +604,11 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 			pattern && input.start
 				? (input.matchFrame ?? createWatchFrameMatcher(pattern, input.start))
 				: undefined,
-		timer: setTimeout(() => void timeOut(taskId), input.timeoutMs),
 		dirty: true,
 		checking: false,
 		lastCheck: 0,
 		settled: false,
 	};
-	watch.timer.unref?.();
 	watches.set(taskId, watch);
 	let set = byTerminal.get(input.terminalId);
 	if (!set) {
@@ -489,8 +616,10 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		byTerminal.set(input.terminalId, set);
 	}
 	set.add(taskId);
-	if (pattern) scheduleCheck(watch);
-	else {
+	if (pattern) {
+		saveDurableAnchor(watch, input.start);
+		scheduleCheck(watch);
+	} else {
 		const ended = input.buffer && endedBuffers.get(input.buffer);
 		if (ended) await settleLifecycle(watch, ended);
 		else {
@@ -514,7 +643,26 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 			}
 		}
 	}
-	return { status: "started", taskId, alias, observation };
+	const remainingMs = input.adopt
+		? Math.max(0, input.adopt.deadlineAt - Date.now())
+		: input.timeoutMs;
+	return { status: "started", taskId, alias, observation, remainingMs };
+}
+
+const bufferIds = hotSafe("narrafork:terminal-watch-buffer-ids", () => ({
+	ids: new WeakMap<BufferManager, number>(),
+	next: 0,
+}));
+
+/** A watcher's ending notices for one terminal buffer describe one event: publish it once. */
+function endedKey(watch: Watch): string | undefined {
+	if (!watch.buffer) return undefined;
+	let id = bufferIds.ids.get(watch.buffer);
+	if (id === undefined) {
+		id = ++bufferIds.next;
+		bufferIds.ids.set(watch.buffer, id);
+	}
+	return `terminal ${JSON.stringify(watch.terminalId)} buffer ${id} ended`;
 }
 
 /** Called by the terminal service for every output chunk of `terminalId`. */
@@ -558,6 +706,7 @@ export async function endWatchesForBuffer(
 			watch,
 			"failed",
 			`Terminal watch ended: ${reason} before ${JSON.stringify(watch.pattern)} appeared in terminal "${watch.terminalName}". Check the terminal before continuing.\nLast output:\n${tailLines(text)}`,
+			endedKey(watch),
 		);
 	}
 }
@@ -568,6 +717,7 @@ function settleLifecycle(watch: Watch, reason: string): Promise<void> {
 		watch,
 		completed ? "completed" : "failed",
 		`Terminal watch ended: ${reason} in terminal "${watch.terminalName}". ${completed ? "This observes the terminal lifecycle, not an individual command's success." : "The command may still be running; check the terminal connection before continuing."}`,
+		endedKey(watch),
 	);
 }
 
@@ -588,7 +738,14 @@ async function readText(watch: Watch): Promise<string> {
 	return (await watch.buffer.readFromMarker(watch.cursor?.marker ?? watch.marker)).text;
 }
 
-async function check(watch: Watch): Promise<void> {
+function check(watch: Watch): Promise<void> {
+	if (watch.checking) return watch.inflight ?? Promise.resolve();
+	const run = runCheck(watch);
+	if (watch.checking) watch.inflight = run;
+	return run;
+}
+
+async function runCheck(watch: Watch): Promise<void> {
 	if (!watch.pattern || !watch.buffer || !watch.marker || !watch.matchFrame) return;
 	if (watch.settled || watch.result || watch.checking || !watch.dirty) return;
 	watch.checking = true;
@@ -639,7 +796,85 @@ async function check(watch: Watch): Promise<void> {
 		}
 	} finally {
 		watch.checking = false;
+		watch.inflight = undefined;
 		if (watch.dirty && !watch.settled) scheduleCheck(watch);
+	}
+}
+
+/**
+ * Output of `terminalId` between two stream positions was lost (an executor
+ * session evicted it while the device was away). Text watches first get one
+ * last match on what was observed before the hole; one that still has not
+ * matched ends saying the text may have appeared unseen, instead of later
+ * reporting that it never appeared. The caller holds back later output (and
+ * the visible gap notice) until this resolves, so neither can be matched here.
+ */
+export async function interruptTextWatchesForGap(
+	terminalId: string,
+	buffer: BufferManager,
+	missingBytes: number,
+): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			`${missingBytes} bytes of output from terminal "${watch.terminalName}" were lost while its device was disconnected`,
+	);
+}
+
+/**
+ * The device's executor restarted under a terminal: its recorded output has been
+ * replayed, but what follows (a notice, then the end) is not the shell's. Each text
+ * watch gets a last check against the real output; one that has not matched ends
+ * saying its text may have been printed without being recorded.
+ */
+export async function interruptTextWatchesForRestart(
+	terminalId: string,
+	buffer: BufferManager,
+	outcome: "lost" | "incomplete",
+): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			outcome === "lost"
+				? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
+				: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
+		// One notice per watcher for the restart, but not the terminal's ending key: a
+		// watch for the terminal's exit still reports that on its own.
+		"interrupted by an executor restart",
+	);
+}
+
+/**
+ * Output before an interruption still matches; an unmatched text watch then ends
+ * with `cause`, never on a notice or output that follows the interruption.
+ */
+async function interruptTextWatches(
+	terminalId: string,
+	buffer: BufferManager,
+	cause: (watch: Watch) => string,
+	/** Watches ended by one interruption share one notice per watcher under this key. */
+	sharedKey?: string,
+): Promise<void> {
+	const current = [...(byTerminal.get(terminalId) ?? [])]
+		.map((id) => watches.get(id))
+		.filter(
+			(watch): watch is Watch =>
+				!!watch && !!watch.pattern && (!watch.buffer || watch.buffer === buffer),
+		);
+	for (const watch of current) {
+		if (watch.settled || watch.result) continue;
+		watch.dirty = true;
+		await check(watch);
+		if (watch.settled || watch.result) continue;
+		// The result freezes synchronously; publication continues in the background.
+		void settle(
+			watch,
+			"failed",
+			`Terminal watch ended: ${cause(watch)}, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
+			sharedKey && watch.buffer ? `${endedKey(watch)} ${sharedKey}` : undefined,
+		);
 	}
 }
 
@@ -651,17 +886,21 @@ async function timeOut(taskId: string): Promise<void> {
 	await settle(
 		watch,
 		"timeout",
-		`Terminal watch timed out: ${watch.pattern ? `${JSON.stringify(watch.pattern)} did not appear in` : "observation reached its deadline for"} terminal "${watch.terminalName}". The command may still be running.${watch.pattern ? `\nLast observed output:\n${watch.lastText ?? "(no completed output snapshot)"}` : ""}`,
+		`${TERMINAL_WATCH_DEADLINE_OUTPUT_PREFIX}: ${watch.pattern ? `${JSON.stringify(watch.pattern)} did not appear in` : "observation reached its deadline for"} terminal "${watch.terminalName}". The command may still be running.${watch.pattern ? `\nLast observed output:\n${watch.lastText ?? "(no completed output snapshot)"}` : ""}`,
 	);
 }
 
-async function settle(watch: Watch, status: WatchResult["status"], output: string): Promise<void> {
+async function settle(
+	watch: Watch,
+	status: WatchResult["status"],
+	output: string,
+	coalesceKey?: string,
+): Promise<void> {
 	if (watch.settled || watch.result) return;
 	// Stop observing, but keep cancellation/shutdown ownership until the result
 	// and its notification have been committed. A failed transaction is retried
 	// with this same result, never by reading or executing the command again.
-	watch.result = { status, output };
-	clearTimeout(watch.timer);
+	watch.result = { status, output, ...(coalesceKey ? { coalesceKey } : {}) };
 	if (watch.checkTimer) clearTimeout(watch.checkTimer);
 	watch.checkTimer = undefined;
 	await publishResult(watch);
@@ -677,16 +916,245 @@ function release(taskId: string): void {
 	const watch = watches.get(taskId);
 	if (!watch) return;
 	watch.settled = true;
-	clearTimeout(watch.timer);
 	if (watch.checkTimer) clearTimeout(watch.checkTimer);
-	disposeWatchMarkers(watch);
+	// At shutdown the start point stays saved (markers included) for the next process.
+	if (!shutdownState.suspended) {
+		watch.buffer?.deleteDurableAnchor(taskId);
+		disposeWatchMarkers(watch);
+	}
 	watches.delete(taskId);
 	const set = byTerminal.get(watch.terminalId);
 	set?.delete(taskId);
 	if (set?.size === 0) byTerminal.delete(watch.terminalId);
 }
 
+function liveTextWatches(terminalId: string, buffer: BufferManager): Watch[] {
+	return [...(byTerminal.get(terminalId) ?? [])]
+		.map((id) => watches.get(id))
+		.filter(
+			(watch): watch is Watch =>
+				!!watch && !!watch.pattern && watch.buffer === buffer && !watch.settled && !watch.result,
+		);
+}
+
+/** Whether `buffer` has text watches still matching. */
+export function hasTextWatches(terminalId: string, buffer: BufferManager): boolean {
+	return liveTextWatches(terminalId, buffer).length > 0;
+}
+
+/**
+ * Check every text watch on `buffer` now, without the usual throttle. Used while
+ * held output is written back in batches: a burst larger than the scrollback must
+ * not push a match out before any check has seen it.
+ */
+export async function checkTextWatchesNow(
+	terminalId: string,
+	buffer: BufferManager,
+): Promise<void> {
+	for (const watch of liveTextWatches(terminalId, buffer)) {
+		watch.dirty = true;
+		await check(watch);
+	}
+}
+
 /** Active watch task ids on a terminal. */
 export function activeWatchIds(terminalId: string): string[] {
 	return [...(byTerminal.get(terminalId) ?? [])];
+}
+
+/**
+ * What a text watch saves with its terminal's snapshot to continue after a restart:
+ * its pattern, the kind of start, and its matcher's latest checkpoint. Never the
+ * input typed with it, which may not have been echoed (a password).
+ */
+interface DurableWatchAnchor {
+	version: 2;
+	pattern: string;
+	kind: WatchStart["kind"];
+	checkpoint: WatchMatchCheckpoint;
+}
+
+function isCount(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function parseDurableAnchor(data: unknown): DurableWatchAnchor | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const anchor = data as Record<string, unknown>;
+	const checkpoint = anchor.checkpoint as Record<string, unknown> | null | undefined;
+	if (
+		anchor.version !== 2 ||
+		typeof anchor.pattern !== "string" ||
+		(anchor.kind !== "echo" && anchor.kind !== "offset") ||
+		!checkpoint ||
+		typeof checkpoint !== "object" ||
+		!isCount(checkpoint.skip) ||
+		(checkpoint.excluded !== undefined && !isCount(checkpoint.excluded))
+	)
+		return undefined;
+	return {
+		version: 2,
+		pattern: anchor.pattern,
+		kind: anchor.kind,
+		checkpoint: {
+			skip: checkpoint.skip,
+			...(checkpoint.excluded === undefined ? {} : { excluded: checkpoint.excluded }),
+		},
+	};
+}
+
+/**
+ * Save a text watch with its terminal's snapshot when the terminal can be resumed
+ * after a restart (an executor session), and write the snapshot now so the window
+ * in which a restart still loses the watch stays small. Each save records the
+ * matcher's state at that moment; a watch whose echo has not been found yet has
+ * none and is not saved.
+ */
+function saveDurableAnchor(watch: Watch, start: WatchStart | undefined): void {
+	const { buffer, cursor, matchFrame } = watch;
+	if (!buffer || !cursor || !start || !matchFrame || buffer.streamSeq === undefined) return;
+	const data = (): DurableWatchAnchor | undefined => {
+		const checkpoint = matchFrame.checkpoint();
+		return checkpoint && { version: 2, pattern: watch.pattern, kind: start.kind, checkpoint };
+	};
+	if (buffer.setDurableAnchor(watch.taskId, cursor, data)) void buffer.saveToDisk();
+}
+
+/** A text watch's start recreated from the snapshot, waiting for its row to resume it. */
+export interface RestoredWatchAnchor {
+	terminalId: string;
+	buffer: BufferManager;
+	cursor: BufferReadCursor;
+	pattern: string;
+	/** Start for registration; matching continues from `checkpoint`. */
+	start: WatchStart;
+	checkpoint: WatchMatchCheckpoint;
+}
+
+/** How long a terminal's output waits for its restored watches to be resumed. */
+export const RESTORED_WATCH_CLAIM_TIMEOUT_MS = 60_000;
+
+interface RestoredTerminal {
+	/** Anchors not yet claimed, by watch task id. */
+	unclaimed: Map<string, RestoredWatchAnchor>;
+	/** Claimed anchors whose watch is still being registered. */
+	claimed: Set<string>;
+	resolve: () => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+const restored = hotSafe("narrafork:terminal-watch-restored", () => ({
+	terminals: new Map<string, RestoredTerminal>(),
+	/** Set once restart recovery has resumed every watch it is going to. */
+	closed: false,
+}));
+
+function settleRestoredTerminal(terminalId: string, entry: RestoredTerminal): void {
+	if (entry.unclaimed.size > 0 || entry.claimed.size > 0) return;
+	clearTimeout(entry.timer);
+	if (restored.terminals.get(terminalId) === entry) restored.terminals.delete(terminalId);
+	entry.resolve();
+}
+
+function discardUnclaimed(terminalId: string, entry: RestoredTerminal): void {
+	for (const anchor of entry.unclaimed.values()) anchor.cursor.dispose();
+	entry.unclaimed.clear();
+	entry.claimed.clear();
+	settleRestoredTerminal(terminalId, entry);
+}
+
+/**
+ * Hand the watch starts saved with a resumed terminal's snapshot to restart
+ * recovery. Returns a promise that settles once each has been resumed or given
+ * up; the terminal holds back its output until then, so the replayed stream (and
+ * any gap or exit in it) reaches a resumed watch exactly as it would a live one.
+ * Returns undefined when there is nothing to wait for.
+ */
+export function registerRestoredWatchAnchors(
+	terminalId: string,
+	buffer: BufferManager,
+	anchors: readonly RestoredBufferAnchor[],
+): Promise<void> | undefined {
+	const unclaimed = new Map<string, RestoredWatchAnchor>();
+	for (const anchor of anchors) {
+		const data = restored.closed ? undefined : parseDurableAnchor(anchor.data);
+		if (!data || unclaimed.has(anchor.id)) {
+			anchor.cursor.dispose();
+			continue;
+		}
+		unclaimed.set(anchor.id, {
+			terminalId,
+			buffer,
+			cursor: anchor.cursor,
+			pattern: data.pattern,
+			start:
+				data.kind === "echo"
+					? { kind: "echo", input: "" }
+					: { kind: "offset", offset: data.checkpoint.skip },
+			checkpoint: data.checkpoint,
+		});
+	}
+	if (unclaimed.size === 0) return undefined;
+	const previous = restored.terminals.get(terminalId);
+	if (previous) discardUnclaimed(terminalId, previous);
+	return new Promise<void>((resolve) => {
+		const entry: RestoredTerminal = {
+			unclaimed,
+			claimed: new Set(),
+			resolve,
+			timer: setTimeout(() => discardUnclaimed(terminalId, entry), RESTORED_WATCH_CLAIM_TIMEOUT_MS),
+		};
+		entry.timer.unref?.();
+		restored.terminals.set(terminalId, entry);
+	});
+}
+
+/**
+ * Take the restored start of watch `taskId` on `buffer`, if one was saved for the
+ * same pattern. The caller registers the watch with it and then calls
+ * {@link finishRestoredWatchAnchor}, whatever the outcome.
+ */
+export function claimRestoredWatchAnchor(
+	taskId: string,
+	terminalId: string,
+	buffer: BufferManager | undefined,
+	pattern: string,
+): RestoredWatchAnchor | undefined {
+	const entry = restored.terminals.get(terminalId);
+	const anchor = entry?.unclaimed.get(taskId);
+	if (!entry || !anchor) return undefined;
+	entry.unclaimed.delete(taskId);
+	if (anchor.buffer !== buffer || anchor.pattern !== normalizeWatchPattern(pattern)) {
+		anchor.cursor.dispose();
+		settleRestoredTerminal(terminalId, entry);
+		return undefined;
+	}
+	entry.claimed.add(taskId);
+	return anchor;
+}
+
+/** The watch claimed with {@link claimRestoredWatchAnchor} is registered (or was not). */
+export function finishRestoredWatchAnchor(taskId: string, terminalId: string): void {
+	const entry = restored.terminals.get(terminalId);
+	if (!entry?.claimed.delete(taskId)) return;
+	settleRestoredTerminal(terminalId, entry);
+}
+
+/**
+ * Restart recovery has resumed every watch it will: drop the starts nobody claimed
+ * (their rows ended, expired or were not resumable) and release the output held for
+ * them. Terminals resumed after this keep nothing for watches.
+ */
+export function closeRestoredWatchAnchors(): void {
+	restored.closed = true;
+	for (const [terminalId, entry] of [...restored.terminals]) {
+		for (const anchor of entry.unclaimed.values()) anchor.cursor.dispose();
+		entry.unclaimed.clear();
+		settleRestoredTerminal(terminalId, entry);
+	}
+}
+
+export function resetRestoredWatchAnchorsForTests(): void {
+	for (const [terminalId, entry] of [...restored.terminals]) discardUnclaimed(terminalId, entry);
+	restored.closed = false;
 }

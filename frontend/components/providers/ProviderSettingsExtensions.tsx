@@ -25,6 +25,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { usePluginProviderConfig } from "../../hooks/usePlugins";
+import { invalidateQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { ApiError } from "../../lib/api/client";
 import {
 	type ProviderSettingsExtensionView,
@@ -207,6 +208,13 @@ function ProviderSettingsExtension({
 	queryClient: ReturnType<typeof useQueryClient>;
 }) {
 	const { t } = useTranslation("plugins");
+	const invalidateSavedViews = () => {
+		void queryClient.invalidateQueries({ queryKey });
+		void queryClient.invalidateQueries({ queryKey: ["settings"] });
+		void queryClient.invalidateQueries({ queryKey: ["admin", "settings"] });
+		void queryClient.invalidateQueries({ queryKey: ["provider-quotas"] });
+		void invalidateQuotaSnapshots(queryClient);
+	};
 	const [actionText, setActionText] = useState<string>();
 	const [draftDirty, setDraftDirty] = useState(false);
 	const adminConfig =
@@ -284,7 +292,7 @@ function ProviderSettingsExtension({
 		onSuccess: () => {
 			setShowRetained(false);
 			setRetainedId(null);
-			void queryClient.invalidateQueries({ queryKey });
+			invalidateSavedViews();
 		},
 		onError: (caught) => onError(errorMessage(caught, t("providerSettings.rebindError"))),
 	});
@@ -318,7 +326,7 @@ function ProviderSettingsExtension({
 		},
 		onSuccess: () => {
 			onError(undefined);
-			void queryClient.invalidateQueries({ queryKey });
+			invalidateSavedViews();
 		},
 		onError: (caught) => onError(errorMessage(caught, t("providerSettings.saveError"))),
 	});
@@ -332,13 +340,16 @@ function ProviderSettingsExtension({
 				adminConfig?.revision ?? 0,
 			);
 		},
-		onSuccess: () => void queryClient.invalidateQueries({ queryKey }),
+		onSuccess: invalidateSavedViews,
 		onError: (caught) => onError(errorMessage(caught, t("providerSettings.deleteError"))),
 	});
 	const actionMutation = useMutation({
 		mutationFn: () =>
 			providerSettingsApi.action(target, extension.pluginId, extension.contributionId),
-		onSuccess: (result) => setActionText(result.text),
+		onSuccess: (result) => {
+			setActionText(result.text);
+			invalidateSavedViews();
+		},
 		onError: (caught) => onError(errorMessage(caught, t("providerSettings.actionError"))),
 	});
 	const rebindMutation = useMutation({
@@ -351,7 +362,7 @@ function ProviderSettingsExtension({
 				expectedBindingRevision: adminConfig.bindingRevision,
 			});
 		},
-		onSuccess: () => void queryClient.invalidateQueries({ queryKey }),
+		onSuccess: invalidateSavedViews,
 		onError: (caught) => onError(errorMessage(caught, t("providerSettings.rebindError"))),
 	});
 

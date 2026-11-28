@@ -15,7 +15,7 @@ const stats = { queued: 8, queuedBytes: 1234, workers: 1, active: 1, starting: 0
 test("empty snapshots contain no fabricated task identity", () => {
 	mockWarn = spyOn(logger, "warn").mockImplementation(() => {});
 	expect(readPoolTaskSnapshot(undefined, 100, undefined)).toEqual({
-		kind: undefined,
+		kind: "unattributed",
 		source: "unattributed",
 		ageMs: null,
 	});

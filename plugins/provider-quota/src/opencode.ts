@@ -154,6 +154,8 @@ export function opencodeQuotaData(payload: OpencodeUsagePayload): QuotaData | nu
 		});
 	}
 	const amounts: QuotaData["amounts"] =
-		payload.balance == null ? [] : [{ id: "balance:USD", unit: "USD", remaining: payload.balance }];
-	return windows.length || amounts.length ? { amounts, windows } : null;
+		payload.balance == null
+			? []
+			: [{ id: "balance:USD", unit: "USD", remaining: payload.balance, quota: "none" }];
+	return windows.length || amounts.length ? { scope: "subscription", amounts, windows } : null;
 }

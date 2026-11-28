@@ -166,7 +166,7 @@ export async function buildProviderQuotaPlugin(
 		// Bundled builds derive their cache and generated module from the same private bytes.
 		const sidecars = options.preparePublication
 			? await options.preparePublication(staged)
-			: await standaloneMetadata(staged.archivePath, outDir);
+			: await standaloneMetadata(staged, outDir);
 		await publishBuild(staging, outDir, sidecars);
 		return {
 			archivePath: join(outDir, "provider-quota.nfplugin"),
@@ -184,11 +184,47 @@ export async function buildProviderQuotaPlugin(
 	}
 }
 
+/** Match the host store's sorted, depth-first content identity without importing host code. */
+async function packageContentHash(root: string): Promise<string> {
+	const hash = createHash("sha256");
+	let entries = 0;
+	let bytes = 0;
+	const deadline = Date.now() + 10000;
+	const walk = async (directory: string): Promise<void> => {
+		if (Date.now() > deadline) throw new Error("Package identity deadline exceeded");
+		const info = await lstat(directory);
+		if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Unsafe build directory");
+		const children = await readdir(directory, { withFileTypes: true });
+		entries += children.length;
+		if (entries > 128) throw new Error("Package identity entry budget exceeded");
+		children.sort((a, b) => a.name.localeCompare(b.name));
+		for (const child of children) {
+			const path = join(directory, child.name);
+			if (child.isDirectory()) await walk(path);
+			else {
+				const stat = await lstat(path);
+				if (!child.isFile() || !stat.isFile() || stat.isSymbolicLink())
+					throw new Error("Unsafe build file");
+				const data = await cappedRead(path);
+				bytes += data.byteLength;
+				if (bytes > MAX_PACKAGE_BYTES || Date.now() > deadline)
+					throw new Error("Package identity budget exceeded");
+				hash.update(relative(root, path).replaceAll("\\", "/"));
+				hash.update("\0");
+				hash.update(data);
+			}
+		}
+	};
+	await walk(root);
+	return hash.digest("hex");
+}
+
 async function standaloneMetadata(
-	archivePath: string,
+	staged: BuildProviderQuotaResult,
 	outDir: string,
 ): Promise<readonly { path: string; content: string }[]> {
-	const bytes = await cappedRead(archivePath, MAX_ARCHIVE_BYTES);
+	const bytes = await cappedRead(staged.archivePath, MAX_ARCHIVE_BYTES);
+	const packageHash = await packageContentHash(staged.packageRoot);
 	return [
 		{
 			path: join(outDir, "provider-quota.asset.json"),
@@ -199,6 +235,7 @@ async function standaloneMetadata(
 					version: manifest.version,
 					size: bytes.byteLength,
 					sha256: sha256(bytes),
+					packageHash,
 				},
 				null,
 				2,

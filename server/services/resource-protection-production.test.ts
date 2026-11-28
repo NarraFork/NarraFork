@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narrators, worktreeTreeSnapshots } from "../db/schema";
@@ -14,7 +15,7 @@ import * as protectionIndex from "./resource-protection-index";
 import { snapshotPathIdentity, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
-test("production cold snapshot survives history beyond the former global inventory budget", async () => {
+test("local hot snapshot stays disabled without inspecting the global inventory", async () => {
 	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Isolated database required");
 	const root = await realpath(await mkdtemp(join(tmpdir(), "nf-protection-scale-")));
 	const ids: string[] = [];
@@ -97,7 +98,7 @@ test("production cold snapshot survives history beyond the former global invento
 			},
 		);
 		try {
-			expect(await worktreeTreeSnapshot.tryCaptureHot(root)).toMatch(/^[a-f0-9]{40,64}$/);
+			expect(await worktreeTreeSnapshot.tryCaptureHot(root)).toBeNull();
 			expect(readClaims).not.toHaveBeenCalled();
 			expect(heads()).toEqual(before);
 			expect(
@@ -105,7 +106,7 @@ test("production cold snapshot survives history beyond the former global invento
 					.select()
 					.from(worktreeTreeSnapshots)
 					.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(root))),
-			).toHaveLength(1);
+			).toHaveLength(0);
 		} finally {
 			readClaims.mockRestore();
 		}
@@ -186,11 +187,13 @@ test("production journal handles idempotency and results without writing resourc
 				throw new Error("Journal retry metadata must not become a snapshot inventory barrier");
 			},
 		);
+		const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
 		try {
 			expect(await worktreeTreeSnapshot.capture(snapshotRoot)).toMatch(/^[a-f0-9]{40,64}$/);
 			expect(readClaims).not.toHaveBeenCalled();
 			expect(await journal.read(narratorId, requestId)).toEqual(finished);
 		} finally {
+			policy.mockRestore();
 			readClaims.mockRestore();
 		}
 		expect(

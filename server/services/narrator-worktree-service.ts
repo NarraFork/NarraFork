@@ -20,11 +20,16 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
+	ensureNoUnguardedLazyFetch,
 	GIT_NO_EXEC_CONFIG,
+	type GitConfiguredPrograms,
 	gitConfigEnv,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../lib/git-exec-hardening";
 import { logger } from "../lib/logger";
@@ -59,6 +64,39 @@ import { confirmLifecyclePathRemoved, withProtectionReservation } from "./worktr
 
 export type { WorktreeCreateResult, WorktreeEntry } from "./narrator-worktree-journal";
 
+/**
+ * The only commands the service runs without the partial-clone gate, because they read no
+ * object: repository and checkout discovery (`rev-parse` of paths), branch-name syntax, and the
+ * worktree listing (refs and administrative files; the commit metadata a listing shows is a
+ * separate, gated `show`). Audited; keep it this short — anything that resolves a revision,
+ * checks a ref's object, lists a tree or walks history goes through the gate.
+ */
+const METADATA_ONLY_WORKTREE_COMMANDS: ReadonlyArray<readonly string[]> = [
+	["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+	["rev-parse", "--path-format=absolute", "--git-common-dir"],
+	["worktree", "list", "--porcelain", "-z"],
+	["worktree", "list", "--porcelain"],
+];
+
+function isMetadataOnlyWorktreeCommand(args: readonly string[]): boolean {
+	if (args[0] === "check-ref-format" && args.length === 2) return true;
+	return METADATA_ONLY_WORKTREE_COMMANDS.some(
+		(command) => command.length === args.length && command.every((arg, i) => arg === args[i]),
+	);
+}
+
+/**
+ * Failures of a command before git was spawned (its hardening or partial-clone gate refused):
+ * nothing ran, so a creation that fails this way was never dispatched.
+ */
+const failedBeforeSpawn = new WeakSet<object>();
+const markFailedBeforeSpawn = (cause: unknown): never => {
+	if (typeof cause === "object" && cause !== null) failedBeforeSpawn.add(cause);
+	throw cause;
+};
+const isPartialCloneRefusal = (cause: unknown): cause is AppError =>
+	cause instanceof AppError && cause.code === "GIT_TOO_OLD_FOR_PARTIAL_CLONE";
+
 /** ASCII filesystem leaf with an exact-ref hash; Git branch names remain unchanged. */
 export function worktreeDirectoryName(branchName: string): string {
 	const slug =
@@ -74,7 +112,7 @@ export const WORKTREE_MAX_ENTRIES = 128;
 export const WORKTREE_READ_TIMEOUT_MS = 10_000;
 export const WORKTREE_CREATE_TIMEOUT_MS = 120_000;
 export const WORKTREE_NAME_TIMEOUT_MS = 5000;
-/** Listing is not the fail-closed inventory used to authorize mutations. */
+/** Shared bound for read-only listings and the fail-closed inventory used by mutations. */
 export const WORKTREE_LIST_MAX_ENTRIES = 4096;
 export const WORKTREE_LIST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const WORKTREE_LIST_CACHE_TTL_MS = 60_000;
@@ -184,6 +222,7 @@ export interface WorktreeServicePorts<Principal> {
 		signal: AbortSignal,
 		writing: boolean,
 		scope?: WorktreeGitScope,
+		env?: Readonly<Record<string, string | undefined>>,
 	) => Promise<SafeSpawnResult>;
 	/**
 	 * Removal side effects: the sessions, runtime objects and durable rows a worktree
@@ -792,6 +831,8 @@ export class NarratorWorktreeService<Principal> {
 		writing = false,
 		maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
 		scope: WorktreeGitScope = { kind: "workspace" },
+		/** Extra environment (`measureLoss` reads history without replacements or grafts). */
+		env?: Readonly<Record<string, string | undefined>>,
 	) {
 		if (!target.backend || target.backend.kind !== "local")
 			error(
@@ -801,26 +842,32 @@ export class NarratorWorktreeService<Principal> {
 			);
 		signal.throwIfAborted();
 		const operation = this.ports.runGit
-			? this.ports.runGit(target, args, signal, writing, scope)
-			: this.hardenedConfig(target, args, scope, writing, signal).then((config) =>
-					safeSpawn({
-						cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
-						timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
-						maxOutputBytes: maxBytes,
-						killProcessTree: true,
-						env: {
-							...process.env,
-							// Keep the unsupported-option diagnostic stable across server locales.
-							LC_ALL: "C",
-							GIT_DIR: undefined,
-							GIT_COMMON_DIR: undefined,
-							GIT_WORK_TREE: undefined,
-							GIT_INDEX_FILE: undefined,
-							GIT_EXTERNAL_DIFF: undefined,
-							...(config ? gitConfigEnv(config) : {}),
-						},
-						signal,
-					}),
+			? this.ports.runGit(target, args, signal, writing, scope, env)
+			: this.hardenedConfig(target, args, scope, writing, signal, markFailedBeforeSpawn).then(
+					(config) =>
+						safeSpawn({
+							cmd: [
+								"git",
+								"--no-optional-locks",
+								...this.scopeArgv(target, scope, writing),
+								...args,
+							],
+							timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
+							maxOutputBytes: maxBytes,
+							killProcessTree: true,
+							env: {
+								...cleanGitEnv(),
+								// Keep the unsupported-option diagnostic stable across server locales.
+								LC_ALL: "C",
+								...(config ? gitConfigEnv(config) : {}),
+								// While lazy fetching is not prevented, a hardened command (never
+								// `worktree add`) can use no transport at all: a promisor remote added
+								// after the gate read the configuration still cannot be fetched from.
+								...(config ? noTransportEnv() : {}),
+								...env,
+							},
+							signal,
+						}),
 				);
 		const result = writing ? await operation : await abortableRead(operation, signal);
 		signal.throwIfAborted();
@@ -837,6 +884,13 @@ export class NarratorWorktreeService<Principal> {
 	 * configured filter and disable every configuration-defined hook by name. A git that ignores
 	 * environment overrides (older than 2.31) is refused. Creation keeps the repository's own
 	 * behavior (its checkout hooks and filters are what a person creating it expects).
+	 *
+	 * Every command that may read an object — creation included — first passes the partial-clone
+	 * gate (`ensureNoUnguardedLazyFetch`): where this git is not known to honour
+	 * `GIT_NO_LAZY_FETCH`, a partial clone or promisor repository is refused
+	 * (`GIT_TOO_OLD_FOR_PARTIAL_CLONE`) before a missing object could be fetched lazily through
+	 * the repository-configured remote. Only {@link METADATA_ONLY_WORKTREE_COMMANDS} skip it; on a
+	 * git that honours the variable the gate reads nothing.
 	 */
 	private async hardenedConfig(
 		target: WorktreeTarget,
@@ -844,12 +898,56 @@ export class NarratorWorktreeService<Principal> {
 		scope: WorktreeGitScope,
 		writing: boolean,
 		signal: AbortSignal,
+		/** Every refusal goes through it (`run` marks it as "nothing was spawned"). */
+		refuse: (cause: unknown) => never = (cause) => {
+			throw cause;
+		},
 	): Promise<Array<readonly [string, string]> | null> {
-		if (args[0] === "worktree" && args[1] === "add") return null;
-		// Fail closed: a git that ignores the overrides would run everything they disable.
-		await ensureConfigOverridesHonored();
-		const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
-		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) return config;
+		try {
+			if (args[0] === "worktree" && args[1] === "add") {
+				await this.lazyFetchGate(target, scope, writing, signal);
+				return null;
+			}
+			// Fail closed: a git that ignores the overrides would run everything they disable.
+			await ensureConfigOverridesHonored();
+			const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
+			if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) {
+				if (!isMetadataOnlyWorktreeCommand(args))
+					await this.lazyFetchGate(target, scope, writing, signal);
+				return config;
+			}
+			// Refuses a partial clone itself where lazy fetching is not prevented.
+			const programs = await this.configuredPrograms(target, scope, writing, config, signal);
+			return [...config, ...untrustedProgramOverrides(programs)];
+		} catch (cause) {
+			return refuse(cause);
+		}
+	}
+
+	/**
+	 * The partial-clone gate alone (`ensureNoUnguardedLazyFetch`), where a command of `scope`
+	 * would run. A `runGit` fixture has no hardening, so it has no gate either.
+	 */
+	private async lazyFetchGate(
+		target: WorktreeTarget,
+		scope: WorktreeGitScope,
+		writing: boolean,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (this.ports.runGit) return;
+		await ensureNoUnguardedLazyFetch(() =>
+			this.configuredPrograms(target, scope, writing, [...GIT_NO_EXEC_CONFIG], signal),
+		);
+	}
+
+	/** {@link PROGRAM_CONFIG_QUERY} where the command runs: configuration only, never an object. */
+	private async configuredPrograms(
+		target: WorktreeTarget,
+		scope: WorktreeGitScope,
+		writing: boolean,
+		config: ReadonlyArray<readonly [string, string]>,
+		signal: AbortSignal,
+	): Promise<GitConfiguredPrograms> {
 		const programs = await safeSpawn({
 			cmd: [
 				"git",
@@ -861,24 +959,21 @@ export class NarratorWorktreeService<Principal> {
 			maxOutputBytes: 64 * 1024,
 			killProcessTree: true,
 			env: {
-				...process.env,
+				...cleanGitEnv(),
 				LC_ALL: "C",
-				GIT_DIR: undefined,
-				GIT_COMMON_DIR: undefined,
-				GIT_WORK_TREE: undefined,
-				GIT_INDEX_FILE: undefined,
 				...gitConfigEnv(config),
+				...noTransportEnv(),
 			},
 			signal,
 		});
-		if (programs.exitCode === 1 && !programs.stdout) return config;
+		if (programs.exitCode === 1 && !programs.stdout) return { filters: [], hooks: [] };
 		if (programs.exitCode !== 0 || programs.stdoutTruncated)
 			error(
 				"WORKTREE_GIT_CONFIG_UNREADABLE",
 				"Cannot read the checkout's filter and hook configuration",
 				409,
 			);
-		return [...config, ...untrustedProgramOverrides(parseProgramConfig(programs.stdout))];
+		return parseProgramConfig(programs.stdout);
 	}
 
 	/**
@@ -902,7 +997,6 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		result: SafeSpawnResult,
 		signal: AbortSignal,
-		listing = false,
 	): Promise<ReturnType<typeof parseWorktreePorcelain>> {
 		const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
 		if (result.stdoutTruncated || result.stderrTruncated) return incomplete;
@@ -922,8 +1016,8 @@ export class NarratorWorktreeService<Principal> {
 				readLegacyRegisteredPaths(
 					target,
 					limited,
-					listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
-					listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES,
+					WORKTREE_LIST_MAX_ENTRIES,
+					WORKTREE_LIST_MAX_OUTPUT_BYTES,
 				),
 				cancelled,
 			]);
@@ -933,7 +1027,7 @@ export class NarratorWorktreeService<Principal> {
 				false,
 				registered,
 				target.backend?.paths.identityKey,
-				listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+				WORKTREE_LIST_MAX_ENTRIES,
 			);
 		} catch (cause) {
 			signal.throwIfAborted();
@@ -948,8 +1042,8 @@ export class NarratorWorktreeService<Principal> {
 				logger.warn("Slow legacy Git registration verification", { elapsedMs });
 		}
 	}
-	private async entries(target: WorktreeTarget, signal: AbortSignal, listing = false) {
-		const maxBytes = listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES;
+	private async entries(target: WorktreeTarget, signal: AbortSignal) {
+		const maxBytes = WORKTREE_LIST_MAX_OUTPUT_BYTES;
 		let result = await this.run(
 			target,
 			["worktree", "list", "--porcelain", "-z"],
@@ -969,11 +1063,11 @@ export class NarratorWorktreeService<Principal> {
 			result = await this.run(target, ["worktree", "list", "--porcelain"], signal, false, maxBytes);
 		}
 		if (result.exitCode !== 0) worktreeListError(result);
-		if (legacy) return this.legacyEntries(target, result, signal, listing);
+		if (legacy) return this.legacyEntries(target, result, signal);
 		return parseWorktreePorcelain(
 			result.stdout,
 			!!(result.stdoutTruncated || result.stderrTruncated),
-			listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+			WORKTREE_LIST_MAX_ENTRIES,
 		);
 	}
 
@@ -1076,69 +1170,93 @@ export class NarratorWorktreeService<Principal> {
 		input: unknown,
 		signal: AbortSignal,
 	): Promise<WorktreeListResult> {
-		const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
-		signal.throwIfAborted();
-		const target = await (this.ports.authorizeList ?? this.ports.authorize)(
-			principal,
-			narratorId,
-			"read",
-			signal,
-		);
-		if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
-			if (target.workspace.workspaceKey !== workspaceKey)
-				error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
-			if (
-				!target.repositoryPath ||
-				!target.workspace.repositoryKey ||
-				!target.backend ||
-				target.backend.kind !== "local"
-			)
-				error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
-		} else assertReady(target, "read", workspaceKey);
-		const binding = JSON.stringify([
-			this.actorKey(principal),
-			narratorId,
-			target.workspace.repositoryKey,
-			target.workspace.deviceId,
-			target.repositoryPath,
-			target.workspace.rootPath,
-			workspaceKey,
-			sort,
-			order,
-			search,
-		]);
-		this.pruneListSnapshots(Date.now());
-		let snapshot: ListSnapshot;
-		let id: string | undefined;
-		let offset = 0;
-		if (cursor) {
-			const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
-			if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
-			id = match[1] ?? "";
-			offset = Number(match[2]);
-			const cached = this.listSnapshots.get(id);
-			if (!cached)
-				error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
-			if (cursor !== this.listCursor(id, offset))
-				error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
-			if (cached.binding !== binding)
-				error(
-					"WORKTREE_CURSOR_MISMATCH",
-					"Cursor does not match actor, workspace or list query",
-					409,
-				);
-			if (offset >= cached.entries.length)
-				error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
-			snapshot = cached;
-		} else {
-			const started = performance.now();
-			const listSignal = AbortSignal.any([
+		const started = performance.now();
+		const timings = {
+			authorizationMs: 0,
+			enumerationMs: 0,
+			metadataMs: 0,
+			snapshotMs: 0,
+			pageMs: 0,
+		};
+		let stage: keyof typeof timings = "authorizationMs";
+		let stageStarted = started;
+		let cursorPage: boolean | null = null;
+		let completed = false;
+		const recordStage = (now: number) => {
+			timings[stage] += Math.round(now - stageStarted);
+			stageStarted = now;
+		};
+		const startStage = (next: keyof typeof timings) => {
+			recordStage(performance.now());
+			stage = next;
+		};
+		try {
+			const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
+			cursorPage = !!cursor;
+			signal.throwIfAborted();
+			const target = await (this.ports.authorizeList ?? this.ports.authorize)(
+				principal,
+				narratorId,
+				"read",
 				signal,
-				AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
+			);
+			if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
+				if (target.workspace.workspaceKey !== workspaceKey)
+					error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
+				if (
+					!target.repositoryPath ||
+					!target.workspace.repositoryKey ||
+					!target.backend ||
+					target.backend.kind !== "local"
+				)
+					error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
+			} else assertReady(target, "read", workspaceKey);
+			const binding = JSON.stringify([
+				this.actorKey(principal),
+				narratorId,
+				target.workspace.repositoryKey,
+				target.workspace.deviceId,
+				target.repositoryPath,
+				target.workspace.rootPath,
+				workspaceKey,
+				sort,
+				order,
+				search,
 			]);
-			try {
-				const result = await this.entries(target, listSignal, true);
+			startStage("snapshotMs");
+			this.pruneListSnapshots(Date.now());
+			let snapshot: ListSnapshot;
+			let id: string | undefined;
+			let offset = 0;
+			if (cursor) {
+				const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
+				if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
+				id = match[1] ?? "";
+				offset = Number(match[2]);
+				const cached = this.listSnapshots.get(id);
+				if (!cached)
+					error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
+				if (cursor !== this.listCursor(id, offset))
+					error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
+				if (cached.binding !== binding)
+					error(
+						"WORKTREE_CURSOR_MISMATCH",
+						"Cursor does not match actor, workspace or list query",
+						409,
+					);
+				if (offset >= cached.entries.length)
+					error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
+				snapshot = cached;
+			} else {
+				startStage("enumerationMs");
+				const listSignal = AbortSignal.any([
+					signal,
+					AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
+				]);
+				const result = await this.entries(target, listSignal);
+				startStage("metadataMs");
 				await this.enrichListEntries(target, result.entries, listSignal);
+				startStage("snapshotMs");
 				const needle = search.toLowerCase();
 				const name = (entry: WorktreeEntry) =>
 					entry.branch?.replace(/^refs\/heads\//, "") ??
@@ -1173,39 +1291,55 @@ export class NarratorWorktreeService<Principal> {
 					bytes: Buffer.byteLength(JSON.stringify(entries)) + Buffer.byteLength(binding) + 256,
 				};
 				if (entries.length > limit) id = this.rememberListSnapshot(snapshot);
-			} finally {
-				const elapsedMs = Math.round(performance.now() - started);
-				if (elapsedMs >= 1000) logger.warn("Slow worktree listing", { elapsedMs });
+			}
+			signal.throwIfAborted();
+			startStage("pageMs");
+			const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
+			const hasMore = offset + entries.length < snapshot.entries.length;
+			// Removal needs both a wired retirement adapter and a healthy local checkout to
+			// inspect; the write ACL itself is enforced on the removal call, not claimed here.
+			const canRemove =
+				!!this.ports.retirement &&
+				target.workspace.state === "ready" &&
+				target.workspace.deviceId === "local" &&
+				target.backend?.kind === "local";
+			const page: WorktreeListResult = {
+				repositoryKey: target.workspace.repositoryKey,
+				hasMore,
+				nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
+				truncated: snapshot.truncated,
+				entries,
+				capabilities: {
+					list: true,
+					create: target.workspace.capabilities.write,
+					switch: false,
+					delete: canRemove,
+					prune: false,
+					remote: false,
+					reason: canRemove
+						? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
+						: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
+				},
+			};
+			completed = true;
+			return page;
+		} finally {
+			const now = performance.now();
+			const elapsedMs = Math.round(now - started);
+			if (elapsedMs >= 1000) {
+				recordStage(now);
+				try {
+					logger.warn("Slow worktree listing", {
+						elapsedMs,
+						...timings,
+						cursorPage,
+						outcome: completed ? "complete" : signal.aborted ? "cancelled" : "error",
+					});
+				} catch {
+					// Diagnostics must not replace the result or original error.
+				}
 			}
 		}
-		signal.throwIfAborted();
-		const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
-		const hasMore = offset + entries.length < snapshot.entries.length;
-		// Removal needs both a wired retirement adapter and a healthy local checkout to
-		// inspect; the write ACL itself is enforced on the removal call, not claimed here.
-		const canRemove =
-			!!this.ports.retirement &&
-			target.workspace.state === "ready" &&
-			target.workspace.deviceId === "local" &&
-			target.backend?.kind === "local";
-		return {
-			repositoryKey: target.workspace.repositoryKey,
-			hasMore,
-			nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
-			truncated: snapshot.truncated,
-			entries,
-			capabilities: {
-				list: true,
-				create: target.workspace.capabilities.write,
-				switch: false,
-				delete: canRemove,
-				prune: false,
-				remote: false,
-				reason: canRemove
-					? "Create supports only existing, non-symlink parents inside the authorized repository root; removal is an explicit per-worktree retirement"
-					: "Create supports only existing, non-symlink parents inside the authorized repository root; removal needs a local checkout and a wired retirement adapter",
-			},
-		};
 	}
 
 	/**
@@ -1304,7 +1438,14 @@ export class NarratorWorktreeService<Principal> {
 			requestorId: narratorId,
 			signal,
 		});
-		const loss = await this.measureLoss(target, entry, worktreePath, present, signal);
+		// Remove and prune read objects (`status`, `rev-list`, `worktree remove`, which runs a
+		// status): a partial clone this git cannot keep from fetching lazily is a blocker, found
+		// here before any runtime is torn down — even when no measurement below reads an object.
+		const gate = entry ? await this.removalLazyFetchGate(target, signal) : "passed";
+		const loss =
+			gate === "passed"
+				? await this.measureLoss(target, entry, worktreePath, present, signal)
+				: null;
 		const dirtyFileCount = loss?.dirtyFileCount ?? 0;
 		// Every dependent has to go somewhere. A linked checkout's `repositoryPath` is the
 		// Git directory, never a usable working directory, so the target is derived from
@@ -1370,7 +1511,8 @@ export class NarratorWorktreeService<Principal> {
 				),
 			);
 		// An unanswered loss question is a refusal, never "nothing to lose".
-		if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
+		if (gate === "partialClone") blockers.push(removalBlocker("GIT_TOO_OLD_FOR_PARTIAL_CLONE"));
+		else if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
 		if (loss && (loss.dirtyFileCount > 0 || !loss.dirtyExact || loss.unreachableCommits > 0))
 			confirmations.push("force");
 		if (entry && !inspection.registration) confirmations.push("acknowledgeUnregistered");
@@ -1402,6 +1544,35 @@ export class NarratorWorktreeService<Principal> {
 			confirmations,
 			relocateTo,
 		};
+	}
+
+	/**
+	 * The partial-clone gate of a removal preflight, as a plan answer: `partialClone` when it
+	 * refuses the repository, `unmeasured` when it could not tell (the configuration read failed,
+	 * timed out or was over its cap; the plan is then blocked as unmeasurable, never thrown, like
+	 * a failed loss measurement). Cancellation still propagates.
+	 */
+	private async removalLazyFetchGate(
+		target: WorktreeTarget,
+		signal: AbortSignal,
+	): Promise<"passed" | "partialClone" | "unmeasured"> {
+		try {
+			// Addressed by `--git-dir` when known: the checkout being removed may be gone.
+			await this.lazyFetchGate(
+				target,
+				target.repositoryPath ? { kind: "repository" } : { kind: "workspace" },
+				false,
+				signal,
+			);
+			return "passed";
+		} catch (cause) {
+			signal.throwIfAborted();
+			if (isPartialCloneRefusal(cause)) return "partialClone";
+			logger.warn("Worktree removal could not check for a partial clone", {
+				reason: String(cause).slice(0, 256),
+			});
+			return "unmeasured";
+		}
 	}
 
 	private async removeLocked(
@@ -1672,7 +1843,10 @@ export class NarratorWorktreeService<Principal> {
 		signal: AbortSignal,
 	): Promise<{ dirtyFileCount: number; dirtyExact: boolean; unreachableCommits: number } | null> {
 		const runner =
-			(scope: WorktreeGitScope): GitQueryRunner =>
+			(
+				scope: WorktreeGitScope,
+				env?: Readonly<Record<string, string | undefined>>,
+			): GitQueryRunner =>
 			async (args, options) => {
 				const result = await this.run(
 					target,
@@ -1681,6 +1855,7 @@ export class NarratorWorktreeService<Principal> {
 					false,
 					options?.maxOutputBytes ?? WORKTREE_MAX_OUTPUT_BYTES,
 					scope,
+					env,
 				);
 				return {
 					stdout: result.stdout,
@@ -1701,8 +1876,13 @@ export class NarratorWorktreeService<Principal> {
 				entry?.detached && entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head)
 					? entry.head
 					: null;
+			// What would really be lost: a replacement ref or graft (repository content) claiming a
+			// branch reaches the detached commit must not skip the confirmation.
 			const unreachableCommits = head
-				? await countCommitsOnlyReachableFrom(runner({ kind: "repository" }), head)
+				? await countCommitsOnlyReachableFrom(
+						runner({ kind: "repository" }, TRUE_HISTORY_ENV),
+						head,
+					)
 				: 0;
 			return { dirtyFileCount: changes.count, dirtyExact: changes.exact, unreachableCommits };
 		} catch (cause) {
@@ -2043,6 +2223,7 @@ export class NarratorWorktreeService<Principal> {
 		const signal = AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS);
 		let destinationExists: boolean | null = null;
 		let branchExists: boolean | null = null;
+		let refusal: AppError | undefined;
 		try {
 			const branchName = record.branchName ?? record.request.branch.name;
 			if (!branchName) throw new Error("Pending receipt has no frozen branch name");
@@ -2132,18 +2313,20 @@ export class NarratorWorktreeService<Principal> {
 						message: "No matching registered worktree; residual files or branch are left untouched",
 					},
 				};
-		} catch {
+		} catch (cause) {
 			// An inaccessible repository, truncated evidence or lost runtime is not proof of failure.
+			// A partial clone this git cannot keep from fetching lazily is named, still unknown.
+			if (isPartialCloneRefusal(cause)) refusal = cause;
 		}
+		const unverified =
+			"Creation outcome could not be verified; reuse this requestId, do not blindly retry or clean up";
 		return {
 			outcome: "unknown",
 			worktree: null,
 			residuals: { destinationExists, branchExists },
-			error: {
-				code: "WORKTREE_OUTCOME_UNKNOWN",
-				message:
-					"Creation outcome could not be verified; reuse this requestId, do not blindly retry or clean up",
-			},
+			error: refusal
+				? { code: refusal.code, message: `${refusal.message}. ${unverified}`.slice(0, 1024) }
+				: { code: "WORKTREE_OUTCOME_UNKNOWN", message: unverified },
 		};
 	}
 
@@ -2379,6 +2562,9 @@ export class NarratorWorktreeService<Principal> {
 						error("GIT_WORKSPACE_CHANGED", "Repository or backend changed before write", 409);
 					await this.verifyIdentity(fresh, signal);
 					await this.requireDestination(principal, narratorId, fresh, record.destination, signal);
+					// Refused before any durable "started" boundary or resource registration; the
+					// add re-checks right before it spawns (`hardenedConfig`).
+					await this.lazyFetchGate(fresh, { kind: "workspace" }, true, signal);
 					// Durable protection is admitted under the same lock used by storage cleanup.
 					// A fresh receipt may reuse historical inventory after receipt loss. Only this
 					// register call's actual INSERT may be retracted before Git dispatch.
@@ -2404,7 +2590,13 @@ export class NarratorWorktreeService<Principal> {
 					await this.ports.journal.save(narratorId, request.requestId, record);
 					signal.throwIfAborted();
 					dispatched = true;
-					const execution = await this.run(fresh, args, signal, true);
+					const execution = await this.run(fresh, args, signal, true).catch((cause) => {
+						// Refused before git was spawned (say, a promisor remote added since the
+						// check above): nothing was dispatched after all.
+						if (typeof cause === "object" && cause !== null && failedBeforeSpawn.has(cause))
+							dispatched = false;
+						throw cause;
+					});
 					record.commandSucceeded = execution.exitCode === 0;
 					result = await this.reconcile(fresh, record);
 				} catch (cause) {

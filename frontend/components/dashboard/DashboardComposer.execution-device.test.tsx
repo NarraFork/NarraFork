@@ -82,8 +82,9 @@ mock.module("@mantine/core", () => ({
 	),
 }));
 mock.module("@mantine/notifications", () => ({ notifications: { show: mock(() => "notice") } }));
-mock.module("@tanstack/react-query", () => ({
-	useQuery: () => ({
+// Device selection does not exercise the settings query cache or its provider.
+mock.module("../../hooks/useRuntimeSettings", () => ({
+	useRuntimeSettings: () => ({
 		data: { agent: { defaultPermissionMode: "default", defaultStartInPlanMode: false } },
 	}),
 }));
@@ -101,6 +102,8 @@ mock.module("../../hooks/useProjectDirStatus", () => ({
 	useProjectDirStatus: () => ({ usablePath: "/workspace", needsChoice: false }),
 }));
 mock.module("../../hooks/useRecentTabs", () => ({ addRecentTab: async () => {} }));
+// This payload fixture does not mount the global RecentTabs/auth WebSocket owner.
+mock.module("../../lib/recent-tabs-owner", () => ({ getRecentTabsScope: () => null }));
 mock.module("../../hooks/useWorkspaceContext", () => ({
 	useWorkspaceDevices: () => ({ data: { devices }, isSuccess: true }),
 }));
@@ -135,6 +138,7 @@ mock.module("../narrator/CreateNarratorLazyModal", () => ({
 	CreateNarratorLazyModal: () => null,
 	preloadCreateNarratorModal: () => {},
 }));
+mock.module("../narrator/interaction/DropOverlay", () => ({ DropOverlay: () => null }));
 mock.module("../narrator/interaction/PermissionModePickerMenu", () => ({
 	PermissionModePickerMenu: () => null,
 }));

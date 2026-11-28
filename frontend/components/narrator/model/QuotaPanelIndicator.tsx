@@ -8,16 +8,16 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQuotaNow } from "../../../hooks/useQuotaNow";
 import { formatFullLocaleDateTime } from "../../../lib/format";
 import { QuotaWindowBars } from "./QuotaWindowBars";
 import {
-	formatQuotaAmount,
 	formatQuotaBadgeText,
 	formatQuotaCountdown,
 	formatQuotaSummaryLines,
+	formatQuotaWindowAmount,
 	QUOTA_LEVEL_COLORS,
 	type QuotaLevel,
 	type QuotaPanelView,
@@ -46,8 +46,8 @@ function WindowRow({
 	const amounts =
 		window.used != null && window.limit != null
 			? t("quotaPanel.usedOfLimit", {
-					used: formatQuotaAmount(window.used),
-					limit: formatQuotaAmount(window.limit),
+					used: formatQuotaWindowAmount(window.used, window.unit),
+					limit: formatQuotaWindowAmount(window.limit, window.unit),
 				})
 			: null;
 	return (
@@ -88,6 +88,13 @@ function WindowRow({
 					</Tooltip>
 				)}
 			</Group>
+			{window.remainingAmount != null && (
+				<Text size="xs" c="dimmed">
+					{t("quotaSnapshot.remainingAmount", {
+						amount: formatQuotaWindowAmount(window.remainingAmount, window.unit),
+					})}
+				</Text>
+			)}
 		</Stack>
 	);
 }
@@ -112,11 +119,15 @@ function QuotaDetails({
 					{waitingText}
 				</Text>
 			)}
-			{view.windows.length === 0 && (
+			{view.expired ? (
+				<Text size="xs" c="red">
+					{t("quotaSnapshot.expired")}
+				</Text>
+			) : view.windows.length === 0 ? (
 				<Text size="xs" c="dimmed">
 					{t("quotaPanel.noWindows")}
 				</Text>
-			)}
+			) : null}
 			{view.windows.map((window) => (
 				<WindowRow key={window.id} window={window} now={now} locale={i18n.language} />
 			))}
@@ -167,6 +178,8 @@ export interface QuotaPanelIndicatorProps {
 	isMobile?: boolean;
 	/** Popover open/close animation in ms; tests pass 0 so no transition is scheduled. */
 	transitionDuration?: number;
+	/** Provider actions stay separate from the public snapshot display. */
+	detailsFooter?: ReactNode;
 }
 
 /**
@@ -182,6 +195,7 @@ export function QuotaPanelIndicator({
 	waitingText = null,
 	isMobile = false,
 	transitionDuration,
+	detailsFooter,
 }: QuotaPanelIndicatorProps) {
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
@@ -278,6 +292,7 @@ export function QuotaPanelIndicator({
 				}}
 			>
 				<QuotaDetails view={view} now={now} waitingText={waitingForQuota ? waitingText : null} />
+				{detailsFooter}
 			</Popover.Dropdown>
 		</Popover>
 	);

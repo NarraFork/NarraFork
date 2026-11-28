@@ -26,6 +26,7 @@ import { knowledgeAcl, type Principal } from "../knowledge-acl";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeLinkService } from "../knowledge-link-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = `vc-${Date.now()}`;
 
@@ -247,24 +248,30 @@ describe("entry detail Worker", () => {
 		try {
 			const abort = new AbortController();
 			abort.abort(new Error("request gone"));
-			await expect(
-				sqliteKnowledgeReadStore.getEntryDetailById(entryId, abort.signal),
-			).rejects.toThrow("request gone");
+			expect(
+				await captureWorkerRejectionThrower(
+					sqliteKnowledgeReadStore.getEntryDetailById(entryId, abort.signal),
+				),
+			).toThrow("request gone");
 			process.env.NARRAFORK_DB_WORKER = "off";
-			await expect(sqliteKnowledgeReadStore.getEntryDetailById(entryId)).rejects.toBeInstanceOf(
-				pool.WorkersUnavailableError,
-			);
+			expect(
+				await captureWorkerRejection(sqliteKnowledgeReadStore.getEntryDetailById(entryId)),
+			).toBeInstanceOf(pool.WorkersUnavailableError);
 			const inTransaction = sqlite.transaction(() =>
 				sqliteKnowledgeReadStore.getEntryDetailById(entryId),
 			)();
-			await expect(inTransaction).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+			expect(await captureWorkerRejection(inTransaction)).toBeInstanceOf(
+				pool.WorkersUnavailableError,
+			);
 			for (const error of [
 				new pool.WorkersUnavailableError("worker_create_failed"),
 				new pool.DbReadTaskExecutionError("worker exited"),
 				new pool.DbReadTaskTimeoutError("timed out"),
 			]) {
 				dispatch.mockRejectedValueOnce(error);
-				await expect(sqliteKnowledgeReadStore.getEntryDetailById(entryId)).rejects.toBe(error);
+				expect(
+					await captureWorkerRejection(sqliteKnowledgeReadStore.getEntryDetailById(entryId)),
+				).toBe(error);
 			}
 			expect(inline).not.toHaveBeenCalled();
 		} finally {

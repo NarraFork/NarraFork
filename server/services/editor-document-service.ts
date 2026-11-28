@@ -785,7 +785,17 @@ export class EditorDocumentService {
 		};
 	}
 	/** Explicit consumer pulls are credit; no HTTP fetch read-ahead can drain the source. */
-	async rawOpen(actor: EditorActor, docId: string, versionHandle: string, signal?: AbortSignal) {
+	async rawOpen(...args: Parameters<EditorDocumentService["rawOpenActive"]>) {
+		// The session pin outlives stream.open while publication is reauthorized.
+		// Stream drain alone cannot join that pending authorization during dispose.
+		return this.track(() => this.rawOpenActive(...args));
+	}
+	private async rawOpenActive(
+		actor: EditorActor,
+		docId: string,
+		versionHandle: string,
+		signal?: AbortSignal,
+	) {
 		const { session, binding } = await this.bound(actor, docId, "read");
 		if (!session.raw || session.raw.handle !== versionHandle) throw invalid("Invalid raw version");
 		session.pins++;

@@ -13,6 +13,10 @@ import {
 	setDbWorkerSpecifiersForTest,
 	WorkersUnavailableError,
 } from "../../../lib/db-worker/pool";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+} from "../../__tests__/narrator-worker-fixture";
 import { sqliteKnowledgeInjectionReads, sqliteKnowledgeReadStore } from "../sqlite-read-store";
 
 const older = "2026-01-01T00:00:00.000Z";
@@ -90,12 +94,14 @@ beforeAll(async () => {
 afterAll(resetDbWorkerPoolForTest);
 
 describe("SQLite keyword matcher signatures", () => {
-	test("ordinary Worker matches the synchronous global read and respects project and collection", async () => {
+	test("ordinary Worker matches the compatibility read and respects project and collection", async () => {
 		const scoped = { projectId: "signature-project" };
 		const value = await sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature(scoped);
 		expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
 		expect(value).toBe(`2:${newer}`);
-		expect(value).toBe(sqliteKnowledgeInjectionReads.keywordInjectionCandidatesSignature(scoped));
+		expect(value).toBe(
+			await sqliteKnowledgeInjectionReads.keywordInjectionCandidatesSignature(scoped),
+		);
 		expect(
 			await sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({
 				...scoped,
@@ -132,9 +138,11 @@ describe("SQLite keyword matcher signatures", () => {
 	test("a cancelled request fails without starting a Worker", async () => {
 		await resetDbWorkerPoolForTest();
 		const signal = AbortSignal.abort(new DOMException("Stopped", "AbortError"));
-		await expect(
-			sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({ signal }),
-		).rejects.toThrow("database read task aborted");
+		expect(
+			await captureWorkerRejectionThrower(
+				sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({ signal }),
+			),
+		).toThrow("database read task aborted");
 		expect(getDbWorkerPoolStats().workers).toBe(0);
 	});
 
@@ -142,31 +150,39 @@ describe("SQLite keyword matcher signatures", () => {
 		await resetDbWorkerPoolForTest();
 		setDbWorkerSpecifiersForTest([new URL("./missing-signature-worker.ts", import.meta.url).href]);
 		try {
-			await expect(
-				sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({
-					projectId: "signature-project",
-				}),
-			).rejects.toBeInstanceOf(WorkersUnavailableError);
+			expect(
+				await captureWorkerRejection(
+					sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({
+						projectId: "signature-project",
+					}),
+				),
+			).toBeInstanceOf(WorkersUnavailableError);
 		} finally {
 			await resetDbWorkerPoolForTest();
 		}
 	});
 
-	test("disabled Workers reject async reads; only the explicit sync compatibility API stays inline", async () => {
+	test("disabled Workers reject both the read store and compatibility injection reads", async () => {
 		const previous = process.env.NARRAFORK_DB_WORKER;
 		process.env.NARRAFORK_DB_WORKER = "off";
 		try {
-			await expect(
-				sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({}),
-			).rejects.toBeInstanceOf(WorkersUnavailableError);
-			await expect(
-				sqliteKnowledgeReadStore.personalKeywordInjectionSignature({ userId: "sig-author" }),
-			).rejects.toBeInstanceOf(WorkersUnavailableError);
 			expect(
-				sqliteKnowledgeInjectionReads.keywordInjectionCandidatesSignature({
-					projectId: "signature-project",
-				}),
-			).toBe(`2:${newer}`);
+				await captureWorkerRejection(
+					sqliteKnowledgeReadStore.keywordInjectionCandidatesSignature({}),
+				),
+			).toBeInstanceOf(WorkersUnavailableError);
+			expect(
+				await captureWorkerRejection(
+					sqliteKnowledgeReadStore.personalKeywordInjectionSignature({ userId: "sig-author" }),
+				),
+			).toBeInstanceOf(WorkersUnavailableError);
+			expect(
+				await captureWorkerRejection(
+					sqliteKnowledgeInjectionReads.keywordInjectionCandidatesSignature({
+						projectId: "signature-project",
+					}),
+				),
+			).toBeInstanceOf(WorkersUnavailableError);
 		} finally {
 			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
 			else process.env.NARRAFORK_DB_WORKER = previous;

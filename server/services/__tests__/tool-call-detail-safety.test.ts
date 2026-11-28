@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { testEnvironment } from "../../../tests/preload";
 import { db, sqlite } from "../../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -19,6 +20,7 @@ import { delegationRegistration } from "../../lib/validators/runtime-registratio
 import { narratorRoutes } from "../../routes/narrators";
 import { getRunHold, setRunHold } from "../agent-runtime/ownership";
 import { runtimePublication } from "../agent-runtime/publication";
+import { publicationDedupeKey } from "../agent-runtime/publication-key";
 import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
 import { narratorService } from "../narrator-service";
@@ -503,6 +505,24 @@ describe("outbound aggregation positive scope and metadata budgets", () => {
 		).not.toContain(realChild.id);
 	});
 
+	test("activity evidence inherits the display cancellation signal and total deadline", async () => {
+		const own = narrator();
+		const parent = tool(own.id, "evidence-read-budget", { toolName: "Agent" });
+		const realChild = child(own, parent);
+		tool(realChild.id, "evidence-budget-child", { parentToolUseId: parent.toolUseId });
+		const current = spyOn(subagentFileChanges, "getCurrentSubagentFileChangeOptions");
+		const evidence = spyOn(subagentFileChanges, "getFileChangesBySubagent");
+		const signal = new AbortController().signal;
+		const before = Date.now();
+		await narratorService.getPretextDocumentPage(own.id, { limit: 20, signal });
+		expect(current).toHaveBeenCalled();
+		const options = current.mock.calls[0]?.[2];
+		expect(options?.signal).toBe(signal);
+		expect(options?.deadlineAt).toBeGreaterThanOrEqual(before);
+		expect(options?.deadlineAt).toBeLessThanOrEqual(Date.now() + 10_000);
+		expect(evidence.mock.calls[0]?.[1]).toMatchObject(options ?? {});
+	});
+
 	test("revoking a parent ref during async activity aggregation prevents the response", async () => {
 		const own = narrator();
 		const parent = tool(own.id, "revoke-during-aggregate", { toolName: "Agent" });
@@ -890,6 +910,19 @@ describe("tool detail unique selection and bounded payload reads", () => {
 });
 
 describe("committed tool detail reads", () => {
+	test("returns a multi-frame tool payload unchanged without selecting it on the caller connection", async () => {
+		const own = narrator();
+		const outputJson = { text: "🙂界".repeat(25_000) };
+		const stored = tool(own.id, "multi-frame-output", { outputJson });
+		const trace = traceToolReads();
+		const response = await appFor(own.ownerUserId).request(
+			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ id: stored.id, outputJson });
+		expect(trace.payloadReads()).toHaveLength(0);
+	});
+
 	test("preserves the response shape and never loads cleared input on the main thread", async () => {
 		const own = narrator();
 		const stored = tool(own.id, "redacted", { outputJson: clearedToolOutput(now) });
@@ -928,12 +961,19 @@ describe("committed tool detail reads", () => {
 		const own = narrator();
 		const other = user();
 		const stored = tool(own.id, "acl-changed-detail");
-		const read = readPool.runReadTask;
-		spyOn(readPool, "runReadTask").mockImplementation(async (...args) => {
-			const snapshot = await read(...args);
-			db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, own.id)).run();
-			return snapshot as never;
-		});
+		const read = readPool.runTrackedEphemeralReadTask;
+		spyOn(readPool, "runTrackedEphemeralReadTask").mockImplementation(
+			<T>(...args: Parameters<typeof read>) => {
+				const handle = read<T>(...args);
+				return {
+					...handle,
+					result: handle.result.then((snapshot) => {
+						db.update(narrators).set({ ownerUserId: other }).where(eq(narrators.id, own.id)).run();
+						return snapshot;
+					}),
+				};
+			},
+		);
 		const response = await appFor(own.ownerUserId).request(
 			`/api/narrators/${own.id}/tool-calls/${stored.toolUseId}`,
 		);
@@ -945,14 +985,14 @@ describe("committed tool detail reads", () => {
 		const own = narrator();
 		const stored = tool(own.id, "worker-failure");
 		const trace = traceToolReads();
-		const worker = spyOn(readPool, "runReadTask");
+		const worker = spyOn(readPool, "runTrackedEphemeralReadTask");
 		const authorize = mock(async () => {});
 		for (const error of [
 			new readPool.WorkersUnavailableError("creation_failed"),
 			new readPool.DbReadTaskExecutionError("execution failed"),
 			new readPool.DbReadTaskTimeoutError("timed out"),
 		]) {
-			worker.mockRejectedValueOnce(error);
+			worker.mockReturnValueOnce({ result: Promise.reject(error), released: Promise.resolve() });
 			const signal = new AbortController().signal;
 			await expect(
 				readCommittedToolDetail(own.id, stored.toolUseId, {}, signal, authorize),
@@ -1138,7 +1178,14 @@ describe("subagent conclusion routes retain exact parent bindings", () => {
 					),
 				)
 				.all();
-			expect(published).toEqual([{ eventKind: "completed" }]);
+			const delivered = db
+				.select({ id: narratorBufferedMessages.id })
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.dedupeKey, publicationDedupeKey(run, "completed")))
+				.all();
+			expect([...published, ...delivered.map(() => ({ eventKind: "completed" }))]).toEqual([
+				{ eventKind: "completed" },
+			]);
 			const reference = await narratorPersistence.resolveSubagentConclusionReference(
 				f.subagent.id,
 				f.own.id,

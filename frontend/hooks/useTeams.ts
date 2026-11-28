@@ -8,12 +8,25 @@
  * paused while the tab is hidden). The board refetches only when work items changed (new event
  * or column counts), the activity on a new event, the approvals when their count changed.
  */
-import type { CreateTeamPayload } from "@frontend/lib/api/teams";
-import type { TeamBoardColumn } from "@shared/project-teams";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/teams";
+import {
+	TEAM_WORK_STATS_IDS_MAX,
+	type TeamBoardColumn,
+	type TeamPrMergeMethod,
+	type TeamSettingsPatch,
+	type TeamWorkStatsResponse,
+} from "@shared/project-teams";
+import {
+	useInfiniteQuery,
+	useMutation,
+	useQueries,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import {
 	boardSignature,
+	chunkIds,
 	nextPollDelay,
 	nudgeDelay,
 	type PauseOutcome,
@@ -23,6 +36,7 @@ import {
 } from "../components/teams/team-page-model";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { projectOverviewKeys } from "./useProjectOverview";
 
 const TEAM_GC_TIME_MS = 60_000;
 
@@ -41,6 +55,16 @@ export const teamKeys = {
 	activity: (teamId: string) => ["teams", "page", teamId, "activity"] as const,
 	approvals: (teamId: string) => ["teams", "page", teamId, "approvals"] as const,
 	members: (teamId: string) => ["teams", "page", teamId, "members"] as const,
+	/** Work item sizes, the drawer and its diffs: refetched with the board. */
+	work: (teamId: string) => ["teams", "page", teamId, "work"] as const,
+	workStats: (teamId: string, ids: readonly string[]) =>
+		["teams", "page", teamId, "work", "stats", ids.join(",")] as const,
+	workItem: (teamId: string, itemId: string) =>
+		["teams", "page", teamId, "work", "item", itemId] as const,
+	workDiff: (teamId: string, itemId: string, path: string) =>
+		["teams", "page", teamId, "work", "diff", itemId, path] as const,
+	approvalDetail: (teamId: string, requestId: string) =>
+		["teams", "page", teamId, "approval-detail", requestId] as const,
 };
 
 /** A project's active teams, a page at a time. */
@@ -67,6 +91,36 @@ export function useCreateTeam(projectId: string) {
 		onSuccess: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
 			void queryClient.invalidateQueries({ queryKey: ["narrators", "project", projectId] });
+		},
+	});
+}
+
+/** Turn an existing session into a team's coordinator (the session overflow menu). */
+export function useUpgradeToTeam(projectId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (payload: UpgradeToTeamPayload) => api.upgradeSessionToTeam(projectId, payload),
+		// The dialog shows the failure.
+		meta: { suppressErrorToast: true },
+		onSuccess: (team) => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			void queryClient.invalidateQueries({ queryKey: ["narrators", team.id], exact: true });
+		},
+	});
+}
+
+/** Disband a team and keep its coordinator as an ordinary session (the team page's menu). */
+export function useDisbandTeam(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.disbandTeam(projectId, teamId),
+		// The dialog shows the failure.
+		meta: { suppressErrorToast: true },
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			queryClient.removeQueries({ queryKey: teamKeys.team(teamId) });
+			queryClient.removeQueries({ queryKey: teamKeys.page(teamId) });
+			void queryClient.invalidateQueries({ queryKey: ["narrators", teamId], exact: true });
 		},
 	});
 }
@@ -155,8 +209,10 @@ export function useTeamSummary(projectId: string, teamId: string) {
 	const seenBoard = useRef("");
 	useEffect(() => {
 		if (!board) return;
-		if (seenBoard.current && seenBoard.current !== board)
+		if (seenBoard.current && seenBoard.current !== board) {
 			void queryClient.invalidateQueries({ queryKey: [...teamKeys.page(teamId), "board"] });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
+		}
 		seenBoard.current = board;
 	}, [board, teamId, queryClient]);
 	const lastEvent = summary.data?.lastEventId ?? null;
@@ -232,18 +288,223 @@ export function useTeamMembers(projectId: string, teamId: string, enabled: boole
 	});
 }
 
-/** Approve or deny one pending tool call through the ordinary permission routes. */
+/**
+ * Approve or deny one pending call through the ordinary permission routes: a tool call, a plan,
+ * or a question with its answers (keyed by question header, as the session's own form sends).
+ */
 export function useDecideApproval(teamId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: ({ requestId, decision }: { requestId: string; decision: "allow" | "deny" }) =>
-			decision === "allow" ? api.approvePermission(requestId) : api.denyPermission(requestId),
-		// The row says it failed itself.
+		mutationFn: ({
+			requestId,
+			decision,
+			answers,
+		}: {
+			requestId: string;
+			decision: "allow" | "deny";
+			answers?: Record<string, string>;
+		}) =>
+			decision === "allow"
+				? api.approvePermission(requestId, answers ? { answers } : undefined)
+				: api.denyPermission(requestId),
+		// The card says it failed itself.
 		meta: { suppressErrorToast: true },
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.approvals(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
+		},
+	});
+}
+
+/**
+ * A pending call's full input (a question's options, a plan's text) through the attention
+ * inbox's detail read, which checks the caller's access to that session. Read per card shown.
+ */
+export function useApprovalDetail(teamId: string, requestId: string, enabled: boolean) {
+	return useQuery({
+		queryKey: teamKeys.approvalDetail(teamId, requestId),
+		queryFn: ({ signal }) => api.getHumanAttentionDetail(`permission:${requestId}`, signal),
+		enabled: enabled && !!requestId,
+		gcTime: TEAM_GC_TIME_MS,
+		staleTime: 60_000,
+		retry: false,
+	});
+}
+
+/**
+ * Lines added / removed and files of the listed work items: one request per 50 ids (the
+ * endpoint's limit), merged; none listed, no request.
+ */
+export function useTeamWorkStats(projectId: string, teamId: string, ids: readonly string[]) {
+	const chunks = chunkIds(ids, TEAM_WORK_STATS_IDS_MAX);
+	return useQueries({
+		queries: chunks.map((chunk) => ({
+			queryKey: teamKeys.workStats(teamId, chunk),
+			queryFn: () => api.getTeamWorkStats(projectId, teamId, chunk),
+			enabled: !!projectId && !!teamId,
+			gcTime: TEAM_GC_TIME_MS,
+			staleTime: 15_000,
+			placeholderData: (previous: TeamWorkStatsResponse | undefined) => previous,
+			refetchOnWindowFocus: false,
+		})),
+		combine: (results) => {
+			const stats: TeamWorkStatsResponse["stats"] = {};
+			for (const result of results) Object.assign(stats, result.data?.stats);
+			return { stats, isLoading: results.some((result) => result.isLoading) };
+		},
+	});
+}
+
+/** How often the drawer reads again while a merge job runs. */
+const MERGE_POLL_MS = 1_500;
+
+/**
+ * The work item drawer's detail; read only while the drawer shows that item. While a merge job
+ * runs it is read again every {@link MERGE_POLL_MS} until the job is done.
+ */
+export function useTeamWorkItem(projectId: string, teamId: string, itemId: string | null) {
+	return useQuery({
+		queryKey: teamKeys.workItem(teamId, itemId ?? ""),
+		queryFn: () => api.getTeamWorkItem(projectId, teamId, itemId ?? ""),
+		enabled: !!projectId && !!teamId && !!itemId,
+		gcTime: TEAM_GC_TIME_MS,
+		refetchOnWindowFocus: false,
+		// A merge job runs, or (G) the pull request is being read from GitHub.
+		refetchInterval: (query) =>
+			query.state.data?.merge?.phase || query.state.data?.merge?.pr?.refreshing
+				? MERGE_POLL_MS
+				: false,
+	});
+}
+
+/**
+ * Merge a ready item, or fast-forward its prepared merge (members). Both answer at once (202);
+ * the drawer and the board follow the job.
+ */
+export function useMergeWorkItem(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			itemId,
+			fastForward,
+			pullRequest,
+		}: {
+			itemId: string;
+			fastForward?: boolean;
+			/** G: 「合并 PR」 with this method (absent: the repository's default). */
+			pullRequest?: { method?: TeamPrMergeMethod };
+		}) =>
+			pullRequest
+				? api.mergeTeamPullRequest(projectId, teamId, itemId, pullRequest.method)
+				: fastForward
+					? api.fastForwardTeamWorkItem(projectId, teamId, itemId)
+					: api.mergeTeamWorkItem(projectId, teamId, itemId),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+			void queryClient.invalidateQueries({ queryKey: [...teamKeys.page(teamId), "board"] });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
+			// The project page's 等你处理 carries ready items of every team.
+			void queryClient.invalidateQueries({ queryKey: projectOverviewKeys.attention(projectId) });
+		},
+	});
+}
+
+/**
+ * G: confirm (or clear) where a project's pull requests go (project managers). Every team page
+ * of the project reads its merge state again.
+ */
+export function useSetTeamGithub(projectId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ target }: { target: string | null }) => api.setTeamGithub(projectId, target),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: ["projects", projectId, "team-github"] });
+			void queryClient.invalidateQueries({ queryKey: ["teams"] });
+			void queryClient.invalidateQueries({ queryKey: projectOverviewKeys.attention(projectId) });
+		},
+	});
+}
+
+/**
+ * G: read a ready item's pull request from GitHub when the drawer opens (members; at most once
+ * per 20 s on the server). The drawer polls while the read runs.
+ */
+export function useRefreshPullRequest(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ itemId }: { itemId: string }) =>
+			api.refreshTeamPullRequest(projectId, teamId, itemId),
+		meta: { suppressErrorToast: true },
+		onSuccess: (_result, { itemId }) => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.workItem(teamId, itemId) });
+		},
+	});
+}
+
+/** One changed file's diff; read only when that file is opened in the drawer. */
+export function useTeamWorkDiff(
+	projectId: string,
+	teamId: string,
+	itemId: string,
+	path: string | null,
+) {
+	return useQuery({
+		queryKey: teamKeys.workDiff(teamId, itemId, path ?? ""),
+		queryFn: () => api.getTeamWorkDiff(projectId, teamId, itemId, path ?? ""),
+		enabled: !!projectId && !!teamId && !!itemId && !!path,
+		gcTime: TEAM_GC_TIME_MS,
+		staleTime: 30_000,
+		refetchOnWindowFocus: false,
+	});
+}
+
+/** Send a work item back to work with a reason (members; the drawer shows the failure). */
+export function useReturnWorkItem(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ itemId, reason }: { itemId: string; reason: string }) =>
+			api.returnTeamWorkItem(projectId, teamId, itemId, reason),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+			void queryClient.invalidateQueries({ queryKey: [...teamKeys.page(teamId), "board"] });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
+		},
+	});
+}
+
+/** Archive the team (the wrap-up's suggestion): its records stay, read-only. */
+export function useArchiveTeam(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.archiveProjectTeam(projectId, teamId),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.team(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			// The drawer's 退回 depends on the team being active.
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
+		},
+	});
+}
+
+/** Change the team's base branch or brief (the settings dialog). */
+export function useUpdateTeam(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: (patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch }) =>
+			api.updateProjectTeam(projectId, teamId, patch),
+		meta: { suppressErrorToast: true },
+		onSuccess: (team) => {
+			queryClient.setQueryData(teamKeys.team(teamId), team);
+			// A new base branch changes every item's merge base, sizes and diffs.
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
 		},
 	});
 }

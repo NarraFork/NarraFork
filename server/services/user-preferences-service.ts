@@ -1,6 +1,7 @@
-import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
+import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projectTeams, terminals, users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
@@ -42,24 +43,27 @@ export async function enrichTabs(
 	if (narratorIds.length > 0) {
 		// Narrator status + current user's private draft markers
 		const [rows, draftNarratorIds] = await Promise.all([
-			db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					substatus: narrators.substatus,
-					// 系统内部叙述者（ModelTrace 舱）不留在最近标签里：按钮按 id 打开，
-					// 但侧栏不该因此多出一条。
-					hiddenFromLists: narrators.hiddenFromLists,
-					// The ACL columns, for marking team onlooker tabs below (M1).
-					ownerUserId: narrators.ownerUserId,
-					visibility: narrators.visibility,
-					writeAudience: narrators.writeAudience,
-					type: narrators.type,
-					aclRootNarratorId: narrators.aclRootNarratorId,
-					contextProjectId: narrators.contextProjectId,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds)),
+			readQuery(
+				db
+					.select({
+						id: narrators.id,
+						status: narrators.status,
+						substatus: narrators.substatus,
+						// 系统内部叙述者（ModelTrace 舱）不留在最近标签里：按钮按 id 打开，
+						// 但侧栏不该因此多出一条。
+						hiddenFromLists: narrators.hiddenFromLists,
+						// The ACL columns, for marking team onlooker tabs below (M1).
+						ownerUserId: narrators.ownerUserId,
+						visibility: narrators.visibility,
+						writeAudience: narrators.writeAudience,
+						type: narrators.type,
+						aclRootNarratorId: narrators.aclRootNarratorId,
+						contextProjectId: narrators.contextProjectId,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+				{ executionPolicy: "worker-required" },
+			),
 			getNarratorIdsWithDraft(userId, narratorIds),
 		]);
 		const hiddenIds = new Set(rows.filter((r) => r.hiddenFromLists).map((r) => r.id));
@@ -83,14 +87,17 @@ export async function enrichTabs(
 		}
 
 		// Active terminal counts
-		const termRows = await db
-			.select({
-				narratorId: terminals.narratorId,
-				count: countFn(),
-			})
-			.from(terminals)
-			.where(and(inArray(terminals.narratorId, narratorIds), eq(terminals.status, "running")))
-			.groupBy(terminals.narratorId);
+		const termRows = await readQuery(
+			db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(inArray(terminals.narratorId, narratorIds), eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId),
+			{ executionPolicy: "worker-required" },
+		);
 		const termCountMap = new Map(termRows.map((r) => [r.narratorId, r.count]));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
@@ -142,6 +149,15 @@ export async function enrichTabs(
 		}
 	}
 
+	// Team approval counts are members-only: compute them after the other async reads.
+	if (tabs.some((tab) => tab.type === "team")) {
+		try {
+			const { enrichTeamTabs } = await import("./recent-tab-teams");
+			await enrichTeamTabs(tabs, userId);
+		} catch (err) {
+			logger.warn("Failed to enrich team tabs", { error: String(err) });
+		}
+	}
 	return tabs;
 }
 
@@ -166,19 +182,20 @@ async function markTeamOnlookerTabs(
 	if (candidates.length === 0) return;
 	const teams = new Set(
 		(
-			await db
-				.select({ id: projectTeams.narratorId })
-				.from(projectTeams)
-				.where(inArray(projectTeams.narratorId, candidates))
+			await readQuery(
+				db
+					.select({ id: projectTeams.narratorId })
+					.from(projectTeams)
+					.where(inArray(projectTeams.narratorId, candidates)),
+				{ executionPolicy: "worker-required", maxRows: candidates.length },
+			)
 		).map((row) => row.id),
 	);
 	if (teams.size === 0) return;
-	const user = await db
-		.select({ role: users.role })
-		.from(users)
-		.where(eq(users.id, userId))
-		.limit(1)
-		.get();
+	const [user] = await readQuery(
+		db.select({ role: users.role }).from(users).where(eq(users.id, userId)).limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	const principal = { userId, isAdmin: user?.role === "admin" };
 	const writable = new Map<string, boolean>();
 	for (const row of rows) {

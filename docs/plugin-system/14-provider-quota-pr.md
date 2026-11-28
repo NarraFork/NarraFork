@@ -1,4 +1,8 @@
-# PR 标题
+# 历史阶段 PR 记录
+
+本文保留额度包 1.0.3、候选 `2a8042ea8` 阶段的实现与验收记录。当前分支已增加供应商设置扩展、额度包 1.0.4 和 SQLite/PG 增量迁移，并合并主线 `15eb583b4`；当前接入与验证限制见 [08-data-model-and-core-integration.md](08-data-model-and-core-integration.md)。下文成品、主线和检查结论仅指当时阶段，不代表当前合并结果。
+
+## 当时的 PR 标题
 
 feat(plugins): 额度查询插件化、可选来源更新与原版升级兼容
 

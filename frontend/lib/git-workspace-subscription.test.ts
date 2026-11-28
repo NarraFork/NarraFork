@@ -8,15 +8,26 @@ import type {
 import { GitWorkspaceSubscriptions } from "./git-workspace-subscription";
 import type { MessageCallback } from "./narrator-ws-manager";
 
-function setup() {
+function setup(onWorkspaceChanged?: () => void) {
 	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	const sent: Record<string, unknown>[] = [];
 	const listeners = new Map<number, MessageCallback>();
 	const listenerTypes = new Set<string>();
 	const connections = new Set<(connected: boolean, reconnect: boolean) => void>();
 	let id = 0;
+	let credential = 1;
+	let connectionCredential = credential;
+	const credentialListeners = new Set<() => void>();
 	const transport = {
 		connected: true,
+		getCredentialIdentity: () => credential,
+		getConnectionCredentialIdentity: () => connectionCredential,
+		onCredentialChange: (callback: () => void) => {
+			credentialListeners.add(callback);
+			return () => {
+				credentialListeners.delete(callback);
+			};
+		},
 		send(message: Record<string, unknown>) {
 			sent.push(message);
 			return true;
@@ -44,8 +55,15 @@ function setup() {
 			visibilityState: "visible" as DocumentVisibilityState,
 		}),
 	};
-	const subscriptions = new GitWorkspaceSubscriptions(qc, transport, lifecycle);
-	const connect = (connected: boolean) => {
+	const subscriptions = new GitWorkspaceSubscriptions(
+		qc,
+		transport,
+		lifecycle,
+		undefined,
+		onWorkspaceChanged,
+	);
+	const connect = (connected: boolean, socketCredential = credential) => {
+		if (connected) connectionCredential = socketCredential;
 		transport.connected = connected;
 		for (const callback of connections) callback(connected, connected);
 	};
@@ -60,12 +78,18 @@ function setup() {
 		])
 			qc.setQueryData([prefix, "w"], { value: 1 });
 	};
+	const versions = new Map<unknown, number>();
 	const emit = (type: string, extra: Record<string, unknown> = {}) => {
+		const subscriptionId =
+			extra.subscriptionId ??
+			sent.filter((message) => message.type === "git_workspace_subscribe").at(-1)?.subscriptionId;
+		const version = extra.version ?? (versions.get(subscriptionId) ?? -1) + 1;
+		if (typeof version === "number") versions.set(subscriptionId, version);
 		for (const callback of listeners.values())
 			callback({
 				type,
-				subscriptionId: sent.filter((message) => message.type === "git_workspace_subscribe").at(-1)
-					?.subscriptionId,
+				subscriptionId,
+				version,
 				narratorId: "n",
 				workspaceKey: "w",
 				repositoryKey: "r",
@@ -85,6 +109,10 @@ function setup() {
 		emit,
 		stale,
 		connect,
+		setCredential: (value: number) => {
+			credential = value;
+			for (const callback of credentialListeners) callback();
+		},
 		lifecycle,
 	};
 }
@@ -135,6 +163,435 @@ function stagingSummary(): GitStagingSummary {
 	};
 }
 
+test("cache publication is versioned independently and HTTP publishers cannot revive old Workers or grants", () => {
+	const s = setup();
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	const state = (workerEpoch = "a", memberVersion = 1, statsVersion = 3) => ({
+		status: "ready" as const,
+		workerEpoch,
+		memberVersion,
+		statsVersion,
+		updating: false,
+	});
+	s.emit("git_workspace_snapshot", {
+		version: 1,
+		view: "details",
+		snapshot: { ...snapshot(), statusPages: state() },
+	});
+	const lateA = s.subscriptions.statusPageReadPublisher(s.target);
+	const readB = s.subscriptions.statusPageReadPublisher(s.target);
+	expect(readB(state("b", 1, 1))).toBe(true);
+	expect(lateA(state())).toBe(false);
+	expect(s.subscriptions.getStatusPageState(s.target)?.workerEpoch).toBe("b");
+	s.emit("git_workspace_snapshot", {
+		version: 2,
+		view: "details",
+		snapshot: { ...snapshot(2), statusPages: state() },
+	});
+	expect(s.subscriptions.getStatusPageState(s.target)?.workerEpoch).toBe("b");
+	const beforeNewMember = s.subscriptions.statusPageReadPublisher(s.target);
+	s.emit("git_workspace_snapshot", {
+		version: 3,
+		view: "details",
+		snapshot: { ...snapshot(3), statusPages: state("b", 2, 0) },
+	});
+	expect(beforeNewMember(state("b", 1, 4))).toBe(false);
+	expect(s.subscriptions.getStatusPageState(s.target)?.memberVersion).toBe(2);
+	expect(s.subscriptions.getStatusPageState(s.target)?.statsVersion).toBe(0);
+	const oldGrant = s.subscriptions.statusPageReadPublisher(s.target);
+	s.connect(false);
+	s.connect(true);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(oldGrant(state("c"))).toBe(false);
+	const same = s.subscriptions.statusPageReadPublisher(s.target);
+	expect(same(state("c"))).toBe(true);
+	s.emit("git_workspace_changed", { version: 1, categories: ["worktree"] });
+	expect(same(state("c"))).toBe(true);
+	expect(s.subscriptions.getStatusPageState(s.target)?.updating).toBe(true);
+	s.emit("git_workspace_snapshot", {
+		version: 2,
+		view: "details",
+		snapshot: { ...snapshot(2), statusPages: state("c") },
+	});
+	expect(s.subscriptions.getStatusPageState(s.target)?.updating).toBe(false);
+	off();
+	s.qc.clear();
+});
+
+test("renewed authorization publishes status pages after its replayed snapshot", () => {
+	const s = setup();
+	const off = s.subscriptions.subscribe(s.target);
+	const state = {
+		status: "ready" as const,
+		workerEpoch: "worker",
+		memberVersion: 1,
+		statsVersion: 1,
+		updating: false,
+	};
+	s.emit("git_workspace_subscribed");
+	s.emit("git_workspace_snapshot", {
+		view: "details",
+		snapshot: { ...snapshot(), statusPages: state },
+	});
+	const oldPublish = s.subscriptions.statusPageReadPublisher(s.target);
+	s.subscriptions.unavailable(s.target);
+	s.subscriptions.refresh(s.target);
+	s.emit("git_workspace_subscribed");
+	expect(
+		s.qc.getQueryData<GitWorkspaceSnapshot>(["gitWorkspaceSnapshot", "w", "details"]),
+	).toMatchObject({ revision: -1, updating: true });
+	expect(oldPublish(state)).toBe(false);
+	s.emit("git_workspace_snapshot", {
+		view: "details",
+		snapshot: { ...snapshot(2), statusPages: state },
+	});
+	expect(s.subscriptions.getStatusPageState(s.target)).toEqual(state);
+	expect(s.subscriptions.isStatusPageUpdating(s.target)).toBe(false);
+	expect(
+		s.qc.getQueryData<GitWorkspaceSnapshot>(["gitWorkspaceSnapshot", "w", "details"]),
+	).toMatchObject({ revision: 2, updating: false });
+	expect(s.subscriptions.statusPageReadPublisher(s.target)({ ...state, statsVersion: 2 })).toBe(
+		true,
+	);
+	expect(s.subscriptions.getStatusPageState(s.target)?.statsVersion).toBe(2);
+	off();
+	s.qc.clear();
+});
+
+describe("Git authorization continuity", () => {
+	test.each([
+		true,
+		false,
+	])("a paused subscription retains its id and only a newer ack resumes it (retrying=%s)", (retrying) => {
+		const s = setup();
+		const off = s.subscriptions.subscribe(s.target);
+		expect(s.subscriptions.canRead(s.target)).toBe(false);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		s.seed();
+		const oldGuard = s.subscriptions.getWriteResultGuard(s.target);
+		const oldPublish = s.subscriptions.statusPageReadPublisher(s.target);
+		const id = s.sent[0]?.subscriptionId;
+		s.emit("git_workspace_error", {
+			kind: "retryable",
+			code: "DB_READ_WORKER_UNAVAILABLE",
+			version: 3,
+			retrying,
+		});
+		expect(s.subscriptions.isDenied(s.target)).toBe(false);
+		expect(s.subscriptions.isPush(s.target)).toBe(true);
+		expect(s.subscriptions.canRead(s.target)).toBe(false);
+		expect(s.subscriptions.getState(s.target)).toBe(retrying ? "paused" : "refresh_required");
+		expect(s.qc.getQueryData(["gitStatus", "w"])).toEqual({ value: 1 });
+		s.emit("git_workspace_staging_observation", { version: 4, observation: observationState() });
+		s.emit("git_workspace_snapshot", { version: 5, view: "details", snapshot: snapshot(99) });
+		s.emit("git_workspace_subscribed", { version: 2 });
+		expect(s.subscriptions.canRead(s.target)).toBe(false);
+		s.subscriptions.refresh(s.target);
+		expect(s.sent.at(-1)).toEqual({ type: "git_workspace_refresh", subscriptionId: id });
+		s.emit("git_workspace_subscribed", { version: 6 });
+		expect(s.subscriptions.canRead(s.target)).toBe(true);
+		expect(oldGuard()).toBe(false);
+		expect(
+			oldPublish({
+				status: "ready",
+				workerEpoch: "late",
+				memberVersion: 9,
+				statsVersion: 9,
+				updating: false,
+			}),
+		).toBe(false);
+		s.emit("git_workspace_error", {
+			kind: "denied",
+			code: "GIT_WORKSPACE_ACCESS_DENIED",
+			version: 3,
+		});
+		expect(s.subscriptions.isDenied(s.target)).toBe(false);
+		s.emit("git_workspace_staging_observation", { version: 5, observation: observationState() });
+		expect(s.subscriptions.isStagingWritable(s.target, stagingSummary())).toBe(false);
+		s.emit("git_workspace_staging_observation", { version: 7, observation: observationState() });
+		expect(s.subscriptions.isStagingWritable(s.target, stagingSummary())).toBe(true);
+		expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+		off();
+		s.qc.clear();
+	});
+	test.each([
+		"GIT_WORKSPACE_UNAVAILABLE",
+		"DB_READ_WORKER_UNAVAILABLE",
+		"UNKNOWN",
+	])("legacy %s safely pauses without reporting denial", (code) => {
+		const s = setup();
+		const off = s.subscriptions.subscribe(s.target);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		s.emit("git_workspace_error", { code, version: undefined });
+		expect(s.subscriptions.isDenied(s.target)).toBe(false);
+		expect(s.subscriptions.canRead(s.target)).toBe(false);
+		off();
+		s.qc.clear();
+	});
+	test("capacity retry registers a new id after space is available", () => {
+		const s = setup();
+		const off = s.subscriptions.subscribe(s.target);
+		const oldId = s.sent[0]?.subscriptionId;
+		s.emit("git_workspace_error", {
+			kind: "unavailable",
+			code: "GIT_WORKSPACE_SUBSCRIPTION_LIMIT",
+			version: 1,
+			retrying: false,
+		});
+		s.subscriptions.refresh(s.target);
+		expect(s.sent.at(-1)?.type).toBe("git_workspace_subscribe");
+		expect(s.sent.at(-1)?.subscriptionId).not.toBe(oldId);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		expect(s.subscriptions.canRead(s.target)).toBe(true);
+		off();
+		s.qc.clear();
+	});
+	test("a renewed ack retires old guards and staging observations without a preceding error", () => {
+		const s = setup();
+		const off = s.subscriptions.subscribe(s.target);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		s.emit("git_workspace_staging_observation", { version: 1, observation: observationState() });
+		const oldGuard = s.subscriptions.getWriteResultGuard(s.target);
+		s.emit("git_workspace_subscribed", { version: 2 });
+		expect(oldGuard()).toBe(false);
+		expect(s.subscriptions.getStagingObservation(s.target)).toBeUndefined();
+		expect(s.subscriptions.canRead(s.target)).toBe(true);
+		s.subscriptions.confirmWorkspace({ ...s.target, canWrite: false });
+		expect(s.subscriptions.canWrite(s.target)).toBe(false);
+		expect(oldGuard()).toBe(false);
+		off();
+		s.qc.clear();
+	});
+	test("identity probes are bounded per failure cycle and replace the repository before resubscribing", () => {
+		let probes = 0;
+		const s = setup(() => probes++);
+		const off = s.subscriptions.subscribe(s.target);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		const oldId = s.sent[0]?.subscriptionId;
+		for (const version of [1, 2])
+			s.emit("git_workspace_error", {
+				kind: "workspace_changed",
+				code: "WORKSPACE_KEY_MISMATCH",
+				version,
+			});
+		expect(probes).toBe(1);
+		const target = { ...s.target, repositoryKey: "new-repository" };
+		s.subscriptions.confirmWorkspace(target);
+		s.emit("git_workspace_subscribed", { subscriptionId: oldId, version: 10 });
+		expect(s.subscriptions.canRead(target)).toBe(false);
+		s.emit("git_workspace_subscribed", { repositoryKey: target.repositoryKey, version: 0 });
+		expect(s.subscriptions.canRead(target)).toBe(true);
+		s.emit("git_workspace_error", {
+			kind: "workspace_changed",
+			code: "GIT_WORKSPACE_CHANGED",
+			version: 1,
+		});
+		expect(probes).toBe(2);
+		off();
+		s.qc.clear();
+	});
+});
+
+test.each([
+	false,
+	true,
+])("HTTP revocation retires the old server id and rejects late acknowledgements (denied=%s)", (denied) => {
+	const s = setup();
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	s.seed();
+	const oldId = s.sent[0]?.subscriptionId;
+	const oldGuard = s.subscriptions.getWriteResultGuard(s.target);
+	if (denied) s.subscriptions.reject(s.target);
+	else s.subscriptions.unavailable(s.target, true);
+	expect(s.sent.at(-1)).toEqual({ type: "git_workspace_unsubscribe", subscriptionId: oldId });
+	s.emit("git_workspace_subscribed", { subscriptionId: oldId, version: 100 });
+	expect(s.subscriptions.canRead(s.target)).toBe(false);
+	expect(s.subscriptions.isDenied(s.target)).toBe(denied);
+	expect(s.qc.getQueryData(["gitStatus", "w"])).toBeUndefined();
+	s.subscriptions.refresh(s.target);
+	expect(s.sent.at(-1)?.subscriptionId).not.toBe(oldId);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	expect(oldGuard()).toBe(false);
+	off();
+	s.qc.clear();
+});
+
+test.each([
+	"ack",
+	"http",
+])("successful %s authorization clears a retained read refusal", (grant) => {
+	const s = setup();
+	if (grant === "http") s.connect(false);
+	const off = s.subscriptions.subscribe(s.target);
+	if (grant === "ack") s.emit("git_workspace_subscribed", { version: 0 });
+	else s.subscriptions.confirmWorkspace(s.target);
+	const refusal = new Error("Git read refused");
+	s.subscriptions.unavailable(s.target, false, refusal);
+	expect(s.subscriptions.getReadError(s.target)).toBe(refusal);
+	if (grant === "ack") {
+		s.emit("git_workspace_subscribed", { version: 0 });
+		expect(s.subscriptions.getReadError(s.target)).toBe(refusal);
+		s.emit("git_workspace_subscribed", { version: 1 });
+	} else s.subscriptions.confirmWorkspace(s.target);
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	expect(s.subscriptions.getReadError(s.target)).toBeUndefined();
+	off();
+	s.qc.clear();
+});
+
+test.each([
+	"probe-first",
+	"connection-first",
+])("principal replacement requires both a matching credential connection and a fresh workspace probe (%s)", (order) => {
+	const s = setup();
+	s.qc.setQueryData(["auth", "me"], { id: "A" });
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	const oldId = s.sent[0]?.subscriptionId;
+	const oldGuard = s.subscriptions.getWriteResultGuard(s.target);
+	s.seed();
+	s.qc.setQueryData(["gitWorkspace", "n"], { state: "ready", branch: "private-A" });
+	s.setCredential(2);
+	s.qc.setQueryData(["auth", "me"], { id: "B" });
+	expect(s.subscriptions.canRead(s.target)).toBe(false);
+	expect(s.qc.getQueryData(["gitWorkspace", "n"])).toBeUndefined();
+	expect(s.qc.getQueryData(["gitStatus", "w"])).toBeUndefined();
+	s.emit("git_workspace_subscribed", { subscriptionId: oldId, version: 100 });
+	s.subscriptions.refresh(s.target);
+	expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+	const target = { ...s.target, repositoryKey: "repository-B" };
+	if (order === "probe-first") {
+		s.subscriptions.confirmWorkspace(target);
+		expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+		s.connect(false);
+		s.connect(true, 1);
+		expect(s.subscriptions.canRead(target)).toBe(false);
+		expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+		s.connect(false);
+		s.connect(true, 2);
+	} else {
+		s.connect(false);
+		s.connect(true, 2);
+		expect(s.subscriptions.canRead(target)).toBe(false);
+		expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+		s.subscriptions.confirmWorkspace(target);
+	}
+	s.emit("git_workspace_subscribed", { repositoryKey: target.repositoryKey, version: 0 });
+	expect(s.subscriptions.canRead(target)).toBe(true);
+	expect(oldGuard()).toBe(false);
+	s.emit("git_workspace_snapshot", {
+		subscriptionId: oldId,
+		version: 101,
+		view: "details",
+		snapshot: snapshot(),
+	});
+	expect(s.qc.getQueryData(["gitStatus", "w"])).toBeUndefined();
+	off();
+	s.qc.clear();
+});
+
+test("an undefined principal gap cannot bless the preceding account's unchanged credential", () => {
+	const s = setup();
+	s.qc.setQueryData(["auth", "me"], { id: "A" });
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	s.qc.removeQueries({ queryKey: ["auth", "me"] });
+	s.qc.setQueryData(["auth", "me"], { id: "B" });
+	s.connect(false);
+	s.connect(true, 1);
+	expect(() => s.subscriptions.confirmWorkspace(s.target)).toThrow(
+		"principal confirmation pending",
+	);
+	s.emit("git_workspace_subscribed", { version: 99 });
+	expect(s.subscriptions.canRead(s.target)).toBe(false);
+	expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(1);
+	s.setCredential(2);
+	s.subscriptions.confirmWorkspace(s.target);
+	s.connect(false);
+	s.connect(true, 2);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	off();
+	s.qc.clear();
+});
+
+test("a token rollback to the trusted account cannot authorize the pending principal", () => {
+	const s = setup();
+	s.qc.setQueryData(["auth", "me"], { id: "A" });
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	s.setCredential(2);
+	s.qc.setQueryData(["auth", "me"], { id: "B" });
+	s.setCredential(1);
+	s.connect(false);
+	s.connect(true, 1);
+	expect(s.subscriptions.canRead(s.target)).toBe(false);
+	expect(() => s.subscriptions.confirmWorkspace(s.target)).toThrow(
+		"principal confirmation pending",
+	);
+	s.emit("git_workspace_subscribed", { version: 100 });
+	expect(s.subscriptions.canRead(s.target)).toBe(false);
+	s.setCredential(2);
+	s.connect(false);
+	s.connect(true, 2);
+	s.subscriptions.confirmWorkspace(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	off();
+	s.qc.clear();
+});
+
+test("credential changes synchronously retire old frames before the principal cache changes", () => {
+	const s = setup();
+	s.qc.setQueryData(["auth", "me"], { id: "A" });
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	const oldId = s.sent[0]?.subscriptionId;
+	const oldGuard = s.subscriptions.getWriteResultGuard(s.target);
+	s.setCredential(2);
+	expect(oldGuard()).toBe(false);
+	s.emit("git_workspace_snapshot", {
+		subscriptionId: oldId,
+		version: 10,
+		view: "details",
+		snapshot: snapshot(),
+	});
+	s.emit("git_workspace_subscribed", { subscriptionId: oldId, version: 11 });
+	expect(s.qc.getQueryData(["gitStatus", "w"])).toBeUndefined();
+	s.connect(false);
+	s.connect(true, 2);
+	expect(() => s.subscriptions.confirmWorkspace(s.target)).toThrow(
+		"principal confirmation pending",
+	);
+	s.qc.setQueryData(["auth", "me"], { id: "B" });
+	s.subscriptions.confirmWorkspace(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	off();
+	s.qc.clear();
+});
+
+test("a connection opened before a replacement consumer mounts is verified during listener setup", () => {
+	const s = setup();
+	s.qc.setQueryData(["auth", "me"], { id: "A" });
+	const off = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	off();
+	s.setCredential(2);
+	s.qc.setQueryData(["auth", "me"], { id: "B" });
+	s.subscriptions.confirmWorkspace(s.target);
+	s.connect(false);
+	s.connect(true, 2);
+	const release = s.subscriptions.subscribe(s.target);
+	s.emit("git_workspace_subscribed", { version: 0 });
+	expect(s.subscriptions.canRead(s.target)).toBe(true);
+	release();
+	s.qc.clear();
+});
+
 describe("Git shared staging observation", () => {
 	test("a new subscription requires an acknowledged matching settled epoch, not the old ready summary", () => {
 		const s = setup();
@@ -146,6 +603,8 @@ describe("Git shared staging observation", () => {
 		expect(s.subscriptions.isStagingWritable(s.target, summary)).toBe(false);
 		s.emit("git_workspace_subscribed", { version: 100 });
 		s.emit("git_workspace_staging_observation", { version: 0, observation: observationState() });
+		expect(s.subscriptions.isStagingWritable(s.target, summary)).toBe(false);
+		s.emit("git_workspace_staging_observation", { version: 101, observation: observationState() });
 		expect(s.subscriptions.isStagingWritable(s.target, summary)).toBe(true);
 		expect(s.subscriptions.isStagingWritable(s.target, { ...summary, observationId: "old" })).toBe(
 			false,
@@ -629,7 +1088,7 @@ describe("Git workspace WS subscriptions", () => {
 		s.qc.clear();
 	});
 
-	test("content changes invalidate independent row statistics without replacing them from WS snapshots", () => {
+	test("content changes mark updating while retaining independently versioned statistics", () => {
 		const s = setup();
 		const off = s.subscriptions.subscribe(s.target);
 		s.emit("git_workspace_subscribed", { version: 0 });
@@ -641,7 +1100,8 @@ describe("Git workspace WS subscriptions", () => {
 				statusPagesChanged: false,
 				categories: [category],
 			});
-			expect(s.stale("gitStatusPageStats")).toBe(true);
+			expect(s.stale("gitStatusPageStats")).toBe(false);
+			expect(s.subscriptions.isStatusPageUpdating(s.target)).toBe(true);
 		}
 		s.qc.setQueryData(["gitStatusPageStats", "w"], stats);
 		s.emit("git_workspace_snapshot", { version: 5, view: "details", snapshot: snapshot() });
@@ -719,9 +1179,9 @@ describe("Git workspace WS subscriptions", () => {
 		expect(s.qc.getQueryData(["gitLog", "w"])).toBeUndefined();
 		expect(s.qc.getQueryData(["gitLineStats", "w"])).toBeUndefined();
 		s.subscriptions.retry(s.target);
-		expect(s.sent[1]?.type).toBe("git_workspace_subscribe");
+		expect(s.sent.at(-1)?.type).toBe("git_workspace_subscribe");
 		s.subscriptions.retry(s.target);
-		expect(s.sent).toHaveLength(2);
+		expect(s.sent.filter((message) => message.type === "git_workspace_subscribe")).toHaveLength(2);
 		off();
 		s.qc.clear();
 	});
@@ -817,10 +1277,20 @@ describe("Git workspace WS subscriptions", () => {
 		const beforeAccess = s.subscriptions.getWriteResultGuard(s.target);
 		s.emit("narrator_access_changed", { subscriptionId: undefined });
 		expect(beforeAccess()).toBe(false);
+		s.emit("git_workspace_subscribed", { version: 0 });
 		const beforePrincipal = s.subscriptions.getWriteResultGuard(s.target);
 		expect(beforePrincipal()).toBe(true);
+		s.setCredential(2);
 		s.qc.setQueryData(["auth", "me"], { id: "other-user" });
 		expect(beforePrincipal()).toBe(false);
+		s.setCredential(3);
+		s.qc.setQueryData(["auth", "me"], { id: "owner" });
+		s.subscriptions.confirmWorkspace(s.target);
+		s.connect(false);
+		s.connect(true);
+		s.emit("git_workspace_subscribed", { version: 0 });
+		expect(beforePrincipal()).toBe(false);
+		expect(s.subscriptions.getWriteResultGuard(s.target)()).toBe(true);
 		off();
 		s.qc.clear();
 	});
@@ -932,6 +1402,7 @@ describe("Git workspace WS subscriptions", () => {
 	test("HTTP plus repeated WS observations merge into one read and one trailing refresh", async () => {
 		const s = setup();
 		const off = s.subscriptions.subscribe(s.target);
+		s.emit("git_workspace_subscribed", { version: 0 });
 		const key = ["gitStagingLists", "w", "n"];
 		const summary = { initialized: true, lists: [{ id: "A", snapshotVersion: "a1" }] };
 		s.qc.setQueryData(key, summary);

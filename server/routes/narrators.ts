@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import { FILE_CHANGE_LIMITS, isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import {
 	type FileReference,
 	type FileReferenceSnapshot,
@@ -62,14 +62,18 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
+import { localBackend } from "../lib/agent/execution/local-backend";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
+import { decodeFileBytes, looksBinary } from "../lib/agent/tools/encoding";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
+import { digestAttachment } from "../lib/attachment-digest";
 import {
+	discardStagedAttachment,
 	findStagedAttachment,
 	releaseStagedAttachment,
 	stagedAttachmentAsFile,
@@ -123,6 +127,7 @@ import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "../lib/file-reference-input";
+import { checkWriteBoundary } from "../lib/fs-write-boundary";
 import { getNarratorFolderIdForUser } from "../lib/git-identity";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -132,6 +137,7 @@ import {
 	validateUploadedMedia,
 } from "../lib/media-uploads";
 import { readMessageLanguagePreferences } from "../lib/message-language-read";
+import { buildRuntimeModelSummary } from "../lib/model-runtime";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -180,7 +186,7 @@ import {
 } from "../lib/prompt-i18n";
 import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
-import { policySourceIdOf } from "../lib/runtime-source";
+import { policySourceIdOf, runDeliverToOf } from "../lib/runtime-source";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
@@ -204,7 +210,9 @@ import {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -255,6 +263,7 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	deleteBlocksSchema,
+	modelTraceCalibrationSchema,
 	modelTraceOptionsSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
@@ -265,6 +274,12 @@ import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
+import {
+	assertUserSubmissionReplay,
+	type SubmissionAttachment,
+	submissionFingerprint,
+	USER_SUBMISSION_WINDOW_MS,
+} from "../services/agent-runtime/user-submission";
 import { coerceAskQuestions } from "../services/ask-user-question-coerce";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
@@ -273,6 +288,11 @@ import {
 	scanBrokenModelNarrators,
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
+import { bufferEditHolds } from "../services/buffer-edit-hold";
+import {
+	readBufferEditLeaseBody,
+	withBufferEditRequestDeadline,
+} from "../services/buffer-edit-request";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -303,7 +323,15 @@ import {
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
-import { captureFileReferences } from "../services/file-reference-service";
+import {
+	assertFileHistoryEnabledForDevice,
+	isNarratorFileHistoryEnabled,
+	resolveNarratorMessageOnlyRevert,
+} from "../services/file-history-policy";
+import {
+	authorizeEditorReferenceContext,
+	captureFileReferences,
+} from "../services/file-reference-service";
 import {
 	applyToolCall,
 	type DeviceFileIdentity,
@@ -323,9 +351,11 @@ import {
 	getHumanAttentionForPrincipal,
 	listHumanAttentionForPrincipal,
 } from "../services/human-attention-service";
+import { listNamedNarratorSuggestions } from "../services/named-narrator-suggestions";
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
+	loadNarratorForAccess,
 	NARRATOR_ACL_COLUMNS,
 	type NarratorPrincipal,
 	narratorReadableWhere,
@@ -342,8 +372,11 @@ import {
 import { bodyColumns, fillBody } from "../services/narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-writes";
 import {
+	beginBufferedMessageEdit,
+	canEditBufferedMessage,
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	readUserSubmission,
 	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
@@ -375,8 +408,11 @@ import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
+	isPendingPlanReflectionAvailable,
 	reflectPendingAskUserQuestion,
+	reflectPendingExitPlanMode,
 	resolveDecisionNarratorId,
+	startAutomaticPlanReflectionForNarrator,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
@@ -487,8 +523,13 @@ import {
 	resumeRecoverySubagents,
 	startRecoveryWatchBatch,
 } from "../services/narrator-subagent-recovery";
+import {
+	assertNarratorSurfaceObservation,
+	narratorSurfaceReadOptions,
+} from "../services/narrator-surface-reads";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { readCommittedToolDetail } from "../services/narrator-tool-detail";
+import { getNarratorUiSummary } from "../services/narrator-ui-summary";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
 import {
@@ -535,6 +576,7 @@ import {
 	getNarratorIdsWithPresence,
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
+import { registerNarratorCommunicationRoutes } from "./narrator-communication";
 import { fileReferenceRoutes } from "./narrator-file-references";
 import { narratorManualResourceRoutes } from "./narrator-manual-resources";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
@@ -644,6 +686,69 @@ export function attachmentBytesOf(files: readonly File[]): number {
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
+async function submissionAttachmentSnapshot(
+	narratorId: string,
+	groups: { images: File[]; media: File[]; textFiles: File[] },
+	staged: StagedAttachmentInput[],
+	previousMetadata: string | null | undefined,
+	signal?: AbortSignal,
+): Promise<SubmissionAttachment[]> {
+	const snapshots: SubmissionAttachment[] = [];
+	for (const channel of ["images", "media"] as const) {
+		for (const file of groups[channel]) {
+			if (!(file instanceof File)) throw new ValidationError(`${channel} must contain files`);
+			snapshots.push({
+				channel,
+				name: file.name,
+				size: file.size,
+				type: file.type,
+				digest: await digestAttachment(file, { signal }),
+			});
+		}
+	}
+	const textCount = groups.textFiles.length + staged.length;
+	if (textCount > MAX_EDIT_TEXT_FILES_PER_MESSAGE) throw new ValidationError("Too many text files");
+	const previous = JSON.parse(previousMetadata ?? "{}") as {
+		submissionAttachments?: SubmissionAttachment[];
+	};
+	let inlineIndex = 0;
+	for (let index = 0; index < textCount; index++) {
+		const descriptor = staged.find((item) => item.index === index);
+		if (descriptor) {
+			const current = findStagedAttachment(narratorId, descriptor.uploadId);
+			// A consumed immutable stage is resolved only from this exact original receipt.
+			const original = previous.submissionAttachments?.find(
+				(item) => item.channel === "textFiles" && item.uploadId === descriptor.uploadId,
+			);
+			if (!current && !original)
+				throw new ValidationError("Staged attachment is no longer available");
+			if (current)
+				snapshots.push({
+					channel: "textFiles",
+					uploadId: descriptor.uploadId,
+					name: current.filename,
+					size: current.size,
+					type: current.mediaType,
+					digest: current.contentDigest ?? (await digestAttachment(current.path, { signal })),
+				});
+			else if (original) snapshots.push({ ...original });
+		} else {
+			const file = groups.textFiles[inlineIndex++];
+			if (!(file instanceof File)) throw new ValidationError("Invalid staged attachment index");
+			snapshots.push({
+				channel: "textFiles",
+				name: file.name,
+				size: file.size,
+				type: file.type,
+				digest: await digestAttachment(file, { signal }),
+			});
+		}
+	}
+	if (inlineIndex !== groups.textFiles.length)
+		throw new ValidationError("Invalid staged attachment index");
+	return snapshots;
+}
+
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
 	c: {
@@ -651,10 +756,21 @@ export async function parseMessageRequest(
 			header: (name: string) => string | undefined;
 			formData: () => Promise<FormData>;
 			json: () => Promise<unknown>;
+			raw?: { signal: AbortSignal };
 		};
 	},
 	narratorId: string,
+	lookupSubmission?: (clientSubmissionId: string) => Promise<
+		| {
+				id: string;
+				bufferedAt: string;
+				metadataJson: string | null;
+				dedupeExpiresAt: string | null;
+		  }
+		| undefined
+	>,
 ): Promise<{
+	replayedSubmission?: { id: string; bufferedAt: string };
 	message: string;
 	images: ImageRef[];
 	media: MediaRef[];
@@ -664,6 +780,9 @@ export async function parseMessageRequest(
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	fileReferences?: FileReference[];
 	composerDocument?: ComposerDocument;
+	clientSubmissionId?: string;
+	submissionFingerprint?: string;
+	submissionAttachments?: SubmissionAttachment[];
 }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
@@ -671,6 +790,10 @@ export async function parseMessageRequest(
 		const rawMode = formData.get("queueMode");
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
+		const submissionResult = clientSubmissionIdSchema
+			.optional()
+			.safeParse(formData.get("clientSubmissionId") ?? undefined);
+		if (!submissionResult.success) throw new ValidationError(submissionResult.error.message);
 		const rawMessage = formData.get("message");
 		let fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		let composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
@@ -695,14 +818,54 @@ export async function parseMessageRequest(
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
+		const stagedInputs = parseStagedAttachmentInput(formData.get("stagedAttachments"));
+		const previous =
+			submissionResult.data && lookupSubmission
+				? await lookupSubmission(submissionResult.data)
+				: undefined;
+		const submissionAttachments = submissionResult.data
+			? await submissionAttachmentSnapshot(
+					narratorId,
+					{ images: imageFiles, media: mediaFiles, textFiles: textFileEntries },
+					stagedInputs,
+					previous?.metadataJson,
+					c.req.raw?.signal,
+				)
+			: undefined;
+		const fingerprint = submissionResult.data
+			? submissionFingerprint({
+					message,
+					composerDocument,
+					fileReferences,
+					queueMode: modeResult.data,
+					priority: formData.get("priority"),
+					interrupt: formData.get("interrupt"),
+					attachments: submissionAttachments?.map(
+						({ uploadId: _coordinate, ...content }) => content,
+					),
+				})
+			: undefined;
+		if (previous && fingerprint && submissionResult.data) {
+			assertUserSubmissionReplay(previous, {
+				clientSubmissionId: submissionResult.data,
+				fingerprint,
+			});
+			for (const descriptor of stagedInputs)
+				discardStagedAttachment(narratorId, descriptor.uploadId);
+			return {
+				replayedSubmission: { id: previous.id, bufferedAt: previous.bufferedAt },
+				message,
+				images: [],
+				media: [],
+				textFiles: [],
+				clientSubmissionId: submissionResult.data,
+				submissionFingerprint: fingerprint,
+			};
+		}
 		// Attachments over the buffered ceiling never appear here: the composer
 		// uploaded them through the streaming endpoint and sent only their ids, so
 		// the multipart body stays small no matter how large the file is.
-		const allTextFiles = resolveStagedAttachments(
-			narratorId,
-			parseStagedAttachmentInput(formData.get("stagedAttachments")),
-			textFileEntries,
-		);
+		const allTextFiles = resolveStagedAttachments(narratorId, stagedInputs, textFileEntries);
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
@@ -768,6 +931,9 @@ export async function parseMessageRequest(
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
+			clientSubmissionId: submissionResult.data,
+			submissionFingerprint: fingerprint,
+			submissionAttachments,
 			fileReferences,
 			composerDocument,
 		};
@@ -789,6 +955,17 @@ export async function parseMessageRequest(
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
 		queueMode: parsed.data.queueMode,
+		clientSubmissionId: parsed.data.clientSubmissionId,
+		submissionFingerprint: parsed.data.clientSubmissionId
+			? submissionFingerprint({
+					message: parsed.data.message,
+					composerDocument: parsed.data.composerDocument,
+					fileReferences: parsed.data.fileReferences,
+					queueMode: parsed.data.queueMode,
+					priority: parsed.data.priority,
+					interrupt: parsed.data.interrupt,
+				})
+			: undefined,
 		fileReferences: parsed.data.fileReferences,
 		composerDocument: parsed.data.composerDocument,
 	};
@@ -833,6 +1010,53 @@ function unarchiveAsCaller(c: Context, id: string) {
 		narratorService.updateStatus(id, "idle"),
 	);
 }
+
+narratorRoutes.use("/:id/buffer/:mid/edit", async (c, next) => {
+	await requireNarratorAccess(c, c.req.param("id"), "write");
+	if (c.req.method === "DELETE") return next();
+	return withBufferEditRequestDeadline(
+		c.req.raw,
+		async (request) => {
+			c.req.raw = await readBufferEditLeaseBody(request);
+			await next();
+		},
+		10_000,
+	);
+});
+
+// Pin before either body-limit middleware reads the streamed body: even a slow
+// multipart upload must not outlive its edit lease and get dispatched half-edited.
+narratorRoutes.use("/:id/buffer/:mid", async (c, next) => {
+	if (c.req.method !== "PATCH") return next();
+	const id = c.req.param("id");
+	const messageId = c.req.param("mid");
+	await requireNarratorAccess(c, id, "write");
+	const rawToken = c.req.header("X-Buffer-Edit-Token");
+	const parsed =
+		rawToken === undefined ? undefined : bufferEditLeaseSchema.safeParse({ token: rawToken });
+	if (parsed && !parsed.success) throw new ValidationError(parsed.error.message);
+	const identity = parsed?.success
+		? { messageId, userId: c.get("user").sub, token: parsed.data.token }
+		: undefined;
+	await bufferEditHolds.mutate(
+		id,
+		messageId,
+		() =>
+			withBufferEditRequestDeadline(
+				c.req.raw,
+				async (request) => {
+					c.req.raw = request;
+					if (!(await canEditBufferedMessage(id, messageId)))
+						throw new NotFoundError("Buffered message", messageId);
+					await next();
+				},
+				undefined,
+				bufferEditHolds.mutationSignal(),
+			),
+		identity,
+	);
+	if (identity && c.res.ok) await bufferEditHolds.release(id, identity);
+});
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
@@ -1008,6 +1232,14 @@ function narratorSubPath(requestPath: string, id: string): string {
 	return requestPath.slice(at + marker.length);
 }
 
+// This handler owns the same read ACL using only NARRATOR_ACL_COLUMNS. Register it
+// before the generic gate, whose full narrator snapshot is unnecessary for badges.
+narratorRoutes.get("/:id/ui-summary", async (c) => {
+	return c.json(
+		await getNarratorUiSummary(c.req.param("id"), narratorPrincipalOf(c), c.req.raw.signal),
+	);
+});
+
 narratorRoutes.use("/:id/*", async (c, next) => {
 	const id = c.req.param("id");
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
@@ -1027,6 +1259,15 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 		subPath === "revert-action-preview" ||
 		subPath === "revert-plans" ||
 		/^revert-plans\/[^/]+\/apply$/.test(subPath);
+	const fileHistoryRequest =
+		scopedRevert ||
+		subPath === "unrevert" ||
+		/^revert-plans\//.test(subPath) ||
+		subPath === "blocks/revert-action-preview" ||
+		subPath === "blocks/rollback-preview" ||
+		/^blocks\/[^/]+\/(?:edit|delete)-preview$/.test(subPath);
+	if (fileHistoryRequest && !(await isNarratorFileHistoryEnabled(id)))
+		assertFileHistoryEnabledForDevice("local");
 	if (
 		need === "write" &&
 		!scopedRevert &&
@@ -1047,6 +1288,21 @@ narratorRoutes.use("/:id", async (c, next) => {
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
 	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
 	return c.req.method === "GET" ? next() : withNarratorWorkAdmission(id, next);
+});
+
+registerNarratorCommunicationRoutes(narratorRoutes);
+
+// A mailbox admission exists before (and independently of) message materialization.
+narratorRoutes.get("/:id/submissions/:clientSubmissionId", async (c) => {
+	const receipt = await readUserSubmission(
+		c.req.param("id"),
+		c.get("user").sub,
+		clientSubmissionIdSchema.parse(c.req.param("clientSubmissionId")),
+	);
+	if (!receipt)
+		return c.json({ status: "not_found", dedupeWindowMs: USER_SUBMISSION_WINDOW_MS }, 404);
+	const { metadataJson: _metadata, ...accepted } = receipt;
+	return c.json(accepted, 200);
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
@@ -1070,7 +1326,11 @@ narratorRoutes.get("/:id/context-composition", async (c) => {
 narratorRoutes.use("/permissions/:requestId/*", async (c, next) => {
 	const requestId = c.req.param("requestId");
 	if (!requestId) return next();
-	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+	await requireOwningNarratorAccess(
+		c,
+		() => resolveDecisionNarratorId(requestId, { signal: c.req.raw.signal }),
+		"write",
+	);
 	return next();
 });
 
@@ -1088,7 +1348,11 @@ for (const segment of [
 	narratorRoutes.use(`/${segment}/:entryId`, async (c, next) => {
 		const entryId = c.req.param("entryId");
 		if (!entryId) return next();
-		await requireOwningNarratorAccess(c, () => resolveRuleNarratorId(segment, entryId), "write");
+		await requireOwningNarratorAccess(
+			c,
+			() => resolveRuleNarratorId(segment, entryId, c.req.raw.signal),
+			"write",
+		);
 		return next();
 	});
 }
@@ -1097,34 +1361,51 @@ for (const segment of [
 async function resolveRuleNarratorId(
 	segment: "whitelist-dirs" | "blacklist-dirs" | "cmd-whitelist" | "cmd-blacklist",
 	entryId: string,
+	signal?: AbortSignal,
 ): Promise<string | null> {
 	switch (segment) {
 		case "whitelist-dirs": {
-			const row = await db.query.narratorWhitelistDirs.findFirst({
-				where: eq(narratorWhitelistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorWhitelistDirs.findMany({
+					limit: 1,
+					where: eq(narratorWhitelistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "blacklist-dirs": {
-			const row = await db.query.narratorBlacklistDirs.findFirst({
-				where: eq(narratorBlacklistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorBlacklistDirs.findMany({
+					limit: 1,
+					where: eq(narratorBlacklistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-whitelist": {
-			const row = await db.query.narratorWhitelistCmds.findFirst({
-				where: eq(narratorWhitelistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorWhitelistCmds.findMany({
+					limit: 1,
+					where: eq(narratorWhitelistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-blacklist": {
-			const row = await db.query.narratorBlacklistCmds.findFirst({
-				where: eq(narratorBlacklistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQueryFirst(
+				db.query.narratorBlacklistCmds.findMany({
+					limit: 1,
+					where: eq(narratorBlacklistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+				narratorSurfaceReadOptions({ signal }),
+			);
 			return row?.narratorId ?? null;
 		}
 	}
@@ -1309,7 +1590,7 @@ async function askInPassingChildrenByParent(
 
 // List narrators (paginated)
 narratorRoutes.get("/", async (c) => {
-	const readOptions = { signal: c.req.raw.signal };
+	const readOptions = narratorSurfaceReadOptions({ signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const projectId = c.req.query("projectId")?.trim();
 	if (projectId !== undefined) {
@@ -1554,7 +1835,7 @@ narratorRoutes.get("/", async (c) => {
 					.map((row) => row.id),
 				principal,
 				status === "archived",
-				readOptions.signal,
+				c.req.raw.signal,
 			)
 		: undefined;
 
@@ -1809,13 +2090,19 @@ narratorRoutes.post("/", async (c) => {
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
 	let projectDir: string | undefined;
+	let expectedProject: { id: string; gitPath: string | null | undefined } | undefined;
 	if (input.contextProjectId) {
 		await requireProjectAccess(c, input.contextProjectId, "write");
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				limit: 1,
+				where: eq(projects.id, input.contextProjectId),
+				columns: { gitPath: true },
+			}),
+			narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+		);
 		projectDir = project?.gitPath ?? undefined;
+		expectedProject = { id: input.contextProjectId, gitPath: project?.gitPath };
 	}
 	// The device comes first: it decides what the directory even means.
 	const deviceId = await resolveCreationDevice(
@@ -1842,25 +2129,31 @@ narratorRoutes.post("/", async (c) => {
 	if (input.kind) {
 		const user = c.get("user");
 		const locale = await getUserLanguage(user.sub);
-		const narrator = await narratorService.create({
+		const narrator = await narratorService.create(
+			{
+				...input,
+				...audiences,
+				cwd: resolvedCwd,
+				defaultDeviceId: deviceId === "local" ? null : deviceId,
+				ownerUserId,
+				creatorIsAdmin: user.role === "admin",
+				locale,
+			},
+			{ expectedProject, signal: c.req.raw.signal },
+		);
+		return c.json(publicNarratorResponse(narrator), 201);
+	}
+
+	const narrator = await narratorService.create(
+		{
 			...input,
 			...audiences,
 			cwd: resolvedCwd,
 			defaultDeviceId: deviceId === "local" ? null : deviceId,
 			ownerUserId,
-			creatorIsAdmin: user.role === "admin",
-			locale,
-		});
-		return c.json(publicNarratorResponse(narrator), 201);
-	}
-
-	const narrator = await narratorService.create({
-		...input,
-		...audiences,
-		cwd: resolvedCwd,
-		defaultDeviceId: deviceId === "local" ? null : deviceId,
-		ownerUserId,
-	});
+		},
+		{ expectedProject, signal: c.req.raw.signal },
+	);
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
@@ -1954,7 +2247,7 @@ narratorRoutes.post("/setup-assistant", requireAdmin, async (c) => {
 // does not become a directory of other people's private sessions.
 narratorRoutes.get("/by-handle/:handle", async (c) => {
 	const handle = c.req.param("handle");
-	const narrator = await narratorService.getByHandle(handle);
+	const narrator = await narratorService.getByHandle(handle, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Named narrator", handle);
 	await requireAccessToNarratorRow(c, narrator, "read").catch(() => {
 		throw new NotFoundError("Named narrator", handle);
@@ -1965,10 +2258,20 @@ narratorRoutes.get("/by-handle/:handle", async (c) => {
 
 // List all named narrators (handle-based @mention targets).
 narratorRoutes.get("/named", async (c) => {
+	if (c.req.query("view") === "suggestions") {
+		return c.json(
+			await listNamedNarratorSuggestions(narratorPrincipalOf(c), {
+				q: c.req.query("q"),
+				limit: c.req.query("limit"),
+				cursor: c.req.query("cursor"),
+				signal: c.req.raw.signal,
+			}),
+		);
+	}
 	// Bounded set (named narrators are deliberately few), so filtering in memory is
 	// fine here; the paginated list endpoint pushes the same predicate into SQL.
 	const named = await filterReadableNarrators(
-		await narratorService.listNamed(),
+		await narratorService.listNamed({ signal: c.req.raw.signal }),
 		narratorPrincipalOf(c),
 	);
 	const draftNarratorIds = await getNarratorIdsWithDraft(
@@ -2068,10 +2371,11 @@ narratorRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	const narrator =
 		getAuthorizedNarrator(c, id, "read") ?? (await requireNarratorAccess(c, id, "read"));
+	const detailRead = { signal: c.req.raw.signal, deadlineAt: Date.now() + 30_000 };
 	const [hasDraft, navigationSummary, messageCount, fastMode] = await Promise.all([
 		narratorHasDraft(c.get("user").sub, id),
-		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c)),
-		countNarratorMessageRefs(id, narrator.messageVersion),
+		getNarratorNavigationSummary(narrator, narratorPrincipalOf(c), detailRead),
+		countNarratorMessageRefs(id, narrator.messageVersion, detailRead),
 		resolveNarratorFastMode(id, { signal: c.req.raw.signal }),
 	]);
 	const runtimeModel = getNarratorRuntimeModel(id, narrator.model?.trim() || FOLLOW_DEFAULT_MODEL);
@@ -2079,7 +2383,7 @@ narratorRoutes.get("/:id", async (c) => {
 	// A resolution failure just leaves the plain "follow parent" label.
 	const modelInheritance =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelInheritance(narrator, c.get("user").sub)
+			? await resolveSubagentModelInheritance(narrator, c.get("user").sub, 0, detailRead)
 					.then((result) => result.inheritance)
 					.catch(() => undefined)
 			: undefined;
@@ -2090,15 +2394,23 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json({
 		...publicNarratorResponse(narrator, hasDraft),
 		...fastMode,
+		// Takeover holds a delivered result; without a destination the UI offers Stop.
+		deliversResult: Boolean(runDeliverToOf(narrator)),
 		// Legacy clients remain compatible; Git facts are loaded by the opt-in endpoint.
 		gitSummary: null,
 		navigationSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
+		modelSummary: buildRuntimeModelSummary({
+			selection: narrator.model?.trim() || FOLLOW_DEFAULT_MODEL,
+			inheritance: modelInheritance,
+			observation: runtimeModel,
+		}),
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
 				model: runtimeModel.model,
+				concreteValue: runtimeModel.concreteValue,
 				resolvedAt: runtimeModel.resolvedAt,
 			},
 		}),
@@ -2149,10 +2461,15 @@ narratorRoutes.get("/:id/tasks/current", async (c) => {
 
 narratorRoutes.get("/:id/panel-state", async (c) => {
 	const id = c.req.param("id");
-	const result = await getNarratorPanelState(id, c.get("user").sub, {
-		permissionsCursor: c.req.query("permissionsCursor"),
-		bufferCursor: c.req.query("bufferCursor"),
-	});
+	const result = await getNarratorPanelState(
+		id,
+		c.get("user").sub,
+		{
+			permissionsCursor: c.req.query("permissionsCursor"),
+			bufferCursor: c.req.query("bufferCursor"),
+		},
+		{ signal: c.req.raw.signal },
+	);
 	await requireNarratorAccess(c, id, "read");
 	return c.json(result);
 });
@@ -2202,7 +2519,7 @@ narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
 
 narratorRoutes.get("/:id/draft", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(await getNarratorDraft(c.get("user").sub, id));
 });
 
@@ -2212,7 +2529,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = updateNarratorDraftSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const update = await updateNarratorDraft(
 		userId,
 		id,
@@ -2259,7 +2576,7 @@ narratorRoutes.post("/:id/draft/restore", async (c) => {
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = restoreNarratorDraftSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const update = await restoreNarratorDraftPrevious(userId, id, parsed.data.sourceId);
 	if (!update) throw new NotFoundError("Draft undo slot", id);
 	broadcastToUser(userId, {
@@ -2368,9 +2685,10 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const userId = c.get("user").sub;
 
 	// ACL: narrator must exist and user must have access
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, narratorId) }),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	await requireAccessToNarratorRow(c, narrator, "read");
 
@@ -2405,7 +2723,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 // Get usage stats for this narrator, optionally including direct subagents.
 narratorRoutes.get("/:id/usage-stats", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const includeSubagents = c.req.query("includeSubagents") !== "false";
 	const stats = await usageHistoryService.getUsageStats({ narratorId, includeSubagents });
 	return c.json(stats);
@@ -2422,7 +2740,7 @@ narratorRoutes.get("/:id/commands", async (c) => {
 // Get skills available to this narrator's current project/cwd context.
 narratorRoutes.get("/:id/skills", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const refresh = c.req.query("refresh") === "true";
 	const context = await skillService.resolveSkillContextForNarrator(id);
 	const result = await skillService.loadSkillSummariesForContext(context, {
@@ -2439,20 +2757,32 @@ function customTraitsResponse(traits: unknown) {
 	return buildCustomTraitsResponse(traits);
 }
 
-async function updateNarratorTraits(id: string, update: (traits: string[]) => string[]) {
+async function updateNarratorTraits(
+	id: string,
+	signal: AbortSignal,
+	update: (traits: string[]) => string[],
+) {
 	const traits = await narratorTraitsLock.acquire(id, async () => {
-		const narrator = await narratorService.getById(id);
+		const narrator = await narratorService.getById(id, undefined, { signal });
 		const nextTraits = update(parseTraits(narrator.traits));
-		await db
-			.update(narrators)
-			.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
-			.where(eq(narrators.id, id));
+		db.transaction((tx) => {
+			const current = tx
+				.select({ traits: narrators.traits })
+				.from(narrators)
+				.where(eq(narrators.id, id))
+				.get();
+			assertNarratorSurfaceObservation({ traits: narrator.traits }, current, ["traits"]);
+			tx.update(narrators)
+				.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+				.where(eq(narrators.id, id))
+				.run();
+		});
 		return nextTraits;
 	});
 	// The in-memory session state must reflect the *resolved* traits, otherwise an
 	// edit here would appear to relax a restriction that the project/user layer
 	// enforces. The narrator's own row keeps only what was written above.
-	const narratorRow = await narratorService.getById(id);
+	const narratorRow = await narratorService.getById(id, undefined, { signal });
 	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
 		"../services/trait-layer-service"
 	);
@@ -2476,7 +2806,7 @@ async function updateNarratorTraits(id: string, update: (traits: string[]) => st
 
 narratorRoutes.get("/:id/custom-traits", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(customTraitsResponse(narrator.traits));
 });
 
@@ -2485,7 +2815,7 @@ narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) =>
 	const body = await c.req.json().catch(() => ({}));
 	validateSubagentModelRestrictionInput(body);
 	const restriction = normalizeSubagentModelRestriction(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		Object.keys(restriction.pools).length === 0
 			? removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX)
 			: upsertEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction),
@@ -2505,7 +2835,7 @@ narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) =>
 
 narratorRoutes.patch("/:id/avatar", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Narrator", id);
 
 	const formData = await c.req.formData();
@@ -2525,7 +2855,7 @@ narratorRoutes.patch("/:id/avatar", async (c) => {
 
 narratorRoutes.delete("/:id/avatar", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (!narrator) throw new NotFoundError("Narrator", id);
 
 	deleteAvatarImage(id);
@@ -2538,7 +2868,7 @@ narratorRoutes.delete("/:id/avatar", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/subagent-model-restriction", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2552,7 +2882,7 @@ narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
 	const disabledTools = normalizeDisabledTools(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		upsertEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX, disabledTools),
 	);
 	return c.json({
@@ -2564,7 +2894,7 @@ narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2578,7 +2908,7 @@ narratorRoutes.put("/:id/custom-traits/blocked-skills", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
 	const blockedSkills = normalizeBlockedSkills(body);
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		!blockedSkills.all && blockedSkills.names.length === 0
 			? removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX)
 			: upsertEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX, blockedSkills),
@@ -2592,7 +2922,7 @@ narratorRoutes.put("/:id/custom-traits/blocked-skills", async (c) => {
 
 narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 	const id = c.req.param("id");
-	const traits = await updateNarratorTraits(id, (currentTraits) =>
+	const traits = await updateNarratorTraits(id, c.req.raw.signal, (currentTraits) =>
 		removeEncodedTrait(currentTraits, BLOCKED_SKILLS_TRAIT_PREFIX),
 	);
 	return c.json({
@@ -2605,12 +2935,7 @@ narratorRoutes.delete("/:id/custom-traits/blocked-skills", async (c) => {
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
-
-	// Auto-unarchive on interaction
-	if (narrator.status === "archived") {
-		await unarchiveAsCaller(c, id);
-	}
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // throws NotFoundError if missing
 
 	const {
 		message,
@@ -2622,7 +2947,18 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		queueMode,
 		fileReferences,
 		composerDocument: requestedComposerDocument,
-	} = await parseMessageRequest(c, id);
+		clientSubmissionId,
+		submissionFingerprint: fingerprint,
+		submissionAttachments,
+		replayedSubmission,
+	} = await parseMessageRequest(c, id, (submissionId) =>
+		readUserSubmission(id, c.get("user").sub, submissionId),
+	);
+	if (replayedSubmission) return c.json({ buffered: true, ...replayedSubmission }, 202);
+	const submission =
+		clientSubmissionId && fingerprint
+			? { clientSubmissionId, fingerprint, attachments: submissionAttachments }
+			: undefined;
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
 	const priority = queueMode ? queueMode !== "turn" : requestedPriority || interrupt;
@@ -2631,6 +2967,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
+		// Reconcile before command expansion, file snapshots, interruption or peer checks.
+		if (submission) {
+			const previous = await readUserSubmission(id, userId, submission.clientSubmissionId);
+			if (previous) {
+				assertUserSubmissionReplay(previous, submission);
+				return c.json({ buffered: true, id: previous.id, bufferedAt: previous.bufferedAt }, 202);
+			}
+		}
+		// Only a new interaction revives an archived session; a receipt replay does not.
+		if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		);
@@ -2695,6 +3041,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				interrupt: true,
 				queueMode,
 				executionIntent: { controlCommand: true },
+				submission,
 			});
 			// Controls do not consume attachments; retain the direct path's cleanup.
 			return c.json(result, result.buffered ? 202 : 201);
@@ -2829,7 +3176,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 						undefined,
 						undefined,
 						{ locale, replyInUserLanguage },
+						submission,
 					);
+					if (accepted.duplicate) return { accepted, outcome: null };
 					if (!accepted.ok) throw new ValidationError("Message queue is full");
 					try {
 						return await withInboxOwner(id, async () => {
@@ -3020,7 +3369,11 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			const currentCwd = narrator.cwd ?? undefined;
 			const newModel =
 				narrator.model === FOLLOW_PARENT_MODEL
-					? (await resolveSubagentModelForRun(narrator, userId)).model
+					? (
+							await resolveSubagentModelForRun(narrator, userId, undefined, {
+								signal: c.req.raw.signal,
+							})
+						).model
 					: (narrator.model ?? undefined);
 			const newNarrator = await narratorService.create({
 				model: newModel,
@@ -3075,10 +3428,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Every session takes the same admission: a running one (including a run the
 		// user holds) queues the input for its next safe boundary, an idle one starts.
 		// Model overrides belong to the accepted input, not to the running turn.
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+			narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+		);
 		const creator: BufferCreator | null = user
 			? {
 					id: user.id,
@@ -3090,6 +3447,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// The service atomically enqueues and claims this message, or leaves it queued
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
+			submission,
 			humanReplyContext: { locale, replyInUserLanguage },
 			images,
 			media,
@@ -3108,7 +3466,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			queueOnly: queueBehindCompaction,
 			executionIntent: modelOverride?.model ? { modelOverride } : undefined,
 		});
-		uploadsAccepted = true;
+		uploadsAccepted = !result.buffered || !result.duplicate;
 
 		if (result.buffered) {
 			return c.json(
@@ -3172,7 +3530,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 // Retry last user message — re-run agent loop without creating a new message
 narratorRoutes.post("/:id/retry", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -3193,7 +3551,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 narratorRoutes.post("/:id/continue", async (c) => {
 	const id = c.req.param("id");
 	const recoveryMessageId = c.req.query("recoveryMessageId");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Reconcile FIRST, then judge. This repairs a status that disagrees with the
 	// runtime in either direction: a stale idle status is promoted back to working (so
@@ -3201,7 +3559,9 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	// runtime owner is dropped to idle (so this request is admitted instead of being
 	// rejected forever by a row that outlived its writer).
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	// Busy = DB status running OR a loop actually running in memory (authoritative,
 	// catches a stale-idle DB status that would otherwise start a second loop).
@@ -3277,14 +3637,16 @@ narratorRoutes.post("/:id/continue", async (c) => {
 // Legacy "await" requests normalize to "watch"; no blocking tool is synthesized.
 narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	// Reconcile FIRST, then judge. The recovery card is shown precisely when a turn
 	// died, and a subagent's permission gate used to mirror `working` onto this
 	// narrator afterwards — leaving a status with no runtime owner that rejected this
 	// request forever. Reconciling before the check repairs such a zombie status and
 	// admits the click, while a genuinely running narrator is still refused.
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
@@ -3295,7 +3657,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const { resumed, skipped } = await resumeRecoverySubagents({
+	const { resumed, skipped, conflict } = await resumeRecoverySubagents({
 		narratorId: id,
 		subagentIds: body.subagentIds,
 		locale,
@@ -3311,6 +3673,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 	});
 
 	if (resumed.length === 0) {
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: body.mode, resumed: 0, skipped });
 	}
 
@@ -3323,6 +3686,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 			userId,
 			humanReplyContext: { locale, replyInUserLanguage },
 		});
+		if (conflict) throw conflict;
 		return c.json({ ok: true, mode: "watch", resumed: resumed.length, skipped });
 	}
 
@@ -3343,6 +3707,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		null,
 		{ origin: "system", originLabel: formatOriginLabel("recovery") },
 	);
+	if (conflict) throw conflict;
 	return c.json({ ok: true, mode: "notify", resumed: resumed.length, skipped });
 });
 
@@ -3356,13 +3721,15 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", (c) =>
 
 /** Re-execute a denied tool call. */
 async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Reconcile FIRST, then judge: repair a stale idle status (so the user regains the
 	// interrupt button) or a running status with no runtime owner (so a denied tool can
 	// still be retried after the turn that owned it died).
 	if (await reconcileRunningStatus(id)) {
-		narrator.status = (await narratorService.getById(id)).status;
+		narrator.status = (
+			await narratorService.getById(id, undefined, { signal: c.req.raw.signal })
+		).status;
 	}
 	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
 		throw new ValidationError("Cannot re-execute a tool call while narrator is already running");
@@ -3393,13 +3760,17 @@ async function resolveEditedFileReferences(
 	signal: AbortSignal,
 ): Promise<FileReferenceSnapshot[] | undefined> {
 	if (requested === undefined) return undefined;
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { messageId: true },
-	});
+	const ref = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { messageId: true },
+		}),
+		narratorSurfaceReadOptions({ signal }),
+	);
 	if (!ref) throw new NotFoundError("Message", messageId);
 	const message = fillBody(
 		await db.query.narratorMessages.findFirst({
@@ -3428,7 +3799,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
 	// Whether the truncated messages' file changes are rolled back, and how wide.
-	// Undefined => the legacy `rollback` field decides (see below), then default true.
+	// Undefined => honor the legacy `rollback` field, then the execution device default.
 	let skipRevert: boolean | undefined;
 	let legacyRollback: boolean | undefined;
 	let revertPlan:
@@ -3554,19 +3925,25 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		keepTextFilePaths = body.keepTextFilePaths;
 	}
 
-	// `skipRevert` is authoritative. A client that only sends the legacy `rollback`
-	// field gets that field's ORIGINAL meaning honoured — "revert files" — which is
-	// what the old UI offered and the server then ignored. Neither present => revert,
-	// preserving the behaviour every edit actually had.
-	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
+	// Explicit file recovery remains a request, never a hint we can silently discard.
+	// Without one, local edits only rewrite messages; remote defaults remain unchanged.
+	const historyOnly = await resolveNarratorMessageOnlyRevert(
+		id,
+		skipRevert ?? (legacyRollback === undefined ? undefined : !legacyRollback),
+		!!revertPlan || (skipRevert !== true && legacyRollback !== false && scope !== undefined),
+	);
+	const revertFiles = !historyOnly;
 	if (revertFiles && !revertPlan)
 		throw new AppError(
 			"Review a fresh edit preview before restoring files",
 			409,
 			"REVERT_CONFIRMATION_REQUIRED",
 		);
+	// Confirmed restores here execute through RevertPlannerLocalAccess, irrespective
+	// of a remote session default. Reject its disabled actual backend before interruption.
+	if (revertFiles || revertPlan) assertFileHistoryEnabledForDevice(localBackend.deviceId);
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	validateComposerProjection(composerDocument, content, fileReferences);
 	// Invalid/new references must fail before interrupting or rewriting history.
@@ -3628,7 +4005,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const body = await c.req.json();
 	const { content } = editAssistantMessageSchema.parse(body);
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -3645,7 +4022,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
 
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	if (narrator.status === "archived") {
 		await unarchiveAsCaller(c, id);
@@ -3673,6 +4050,47 @@ async function broadcastBufferQueue(narratorId: string): Promise<void> {
 narratorRoutes.get("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
 	return c.json(await resolveBufferQueue(id));
+});
+
+narratorRoutes.post("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await beginBufferedMessageEdit(
+			c.req.param("id"),
+			c.req.param("mid"),
+			c.get("user").sub,
+			parsed.data.token,
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.patch("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await bufferEditHolds.renew(
+			c.req.param("id"),
+			{
+				messageId: c.req.param("mid"),
+				userId: c.get("user").sub,
+				token: parsed.data.token,
+			},
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.delete("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse({ token: c.req.header("X-Buffer-Edit-Token") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await bufferEditHolds.release(c.req.param("id"), {
+		messageId: c.req.param("mid"),
+		userId: c.get("user").sub,
+		token: parsed.data.token,
+	});
+	return c.json({ ok: true });
 });
 
 interface LocatedBufferedMessage {
@@ -3983,7 +4401,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 				)
 			: [];
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
+		c.req.raw.signal.throwIfAborted();
 		const ok = await updateBufferedMessage(id, mid, text, {
+			signal: c.req.raw.signal,
 			images: [...keptImages, ...newImages],
 			media: [...keptMedia, ...createdMedia],
 			savedFiles,
@@ -4037,7 +4457,7 @@ async function applyPendingBufferModeControl(
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
 	);
-	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	await applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
 	return targetQueued && effectiveMode !== "turn";
 }
 
@@ -4097,6 +4517,7 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 		try {
 			retried = await retryBufferedMessage(id, mid);
 		} catch (error) {
+			if (error instanceof AppError) throw error;
 			throw new ValidationError(
 				error instanceof Error ? error.message : "Buffered payload unavailable",
 			);
@@ -4144,7 +4565,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4161,7 +4582,7 @@ narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
 	const id = c.req.param("id");
 	const [{ listPendingAgentMessages, blockingStopReason }, narrator] = await Promise.all([
 		import("../services/agent-runtime/inbox"),
-		narratorService.getById(id),
+		narratorService.getById(id, undefined, { signal: c.req.raw.signal }),
 	]);
 	const pending = await listPendingAgentMessages(id);
 	const running =
@@ -4177,7 +4598,7 @@ narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
 // Explicit user resume: lets queued agent messages restart a failed or user-stopped session.
 narratorRoutes.post("/:id/inbox/resume", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") throw new ValidationError("Narrator is archived");
 	const { wakeInboxIfEligible, notifyAgentInboxChanged } = await import(
 		"../services/agent-runtime/inbox"
@@ -4221,7 +4642,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const { clearBufferedMessages } = await import("../services/narrator-buffer");
 	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -4266,10 +4687,10 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// window in which any unrelated write on a live narrator turned a good page into
 	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQueryFirst(
+		db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, id), columns: { id: true } }),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
 	return c.json(toBlockPage(result));
@@ -4329,7 +4750,7 @@ narratorRoutes.get("/:id/export-turns", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const id = c.req.param("id");
 	// 先确认会话存在，再走可能很长的遍历。
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	return c.json(await listNarratorExportTurns(id, parsed.data.scope, c.req.raw.signal));
 });
 
@@ -4352,7 +4773,7 @@ narratorRoutes.get("/:id/export", async (c) => {
 
 	// Resolve the narrator up front so a bad id is a clean 404 rather than an
 	// attachment whose body happens to contain an error.
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	const fileName = buildExportFileName(narrator.title, options.format, new Date(), options.range);
 	// One controller shared by start() and cancel(): a client that closes the tab
@@ -4678,7 +5099,7 @@ export function buildRetryFailedCompactResponse(
 narratorRoutes.post("/:id/compact/:messageId/retry", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	if (isCompactInProgress(narratorId)) {
 		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
 	}
@@ -4773,8 +5194,14 @@ function requireHistoryOnlyDeletion(historyOnly: boolean): void {
 // Delete blocks.
 narratorRoutes.delete("/:id/blocks", async (c) => {
 	const narratorId = c.req.param("id");
-	const { blockIds, skipRevert } = deleteBlocksSchema.parse(await c.req.json());
-	requireHistoryOnlyDeletion(skipRevert === true);
+	const { blockIds, skipRevert, scope } = deleteBlocksSchema.parse(await c.req.json());
+	requireHistoryOnlyDeletion(
+		await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			skipRevert,
+			skipRevert !== true && scope !== undefined,
+		),
+	);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteBlocks(narratorId, blockIds, {
 		skipRevert: true,
@@ -4790,20 +5217,27 @@ narratorRoutes.post("/:id/blocks/rollback", async (c) => {
 	const { blockIds, skipRevert, scope, revertPlan } = rollbackToBlocksSchema.parse(
 		await c.req.json(),
 	);
-	if (skipRevert !== true && !revertPlan)
+	const historyOnly = await resolveNarratorMessageOnlyRevert(
+		id,
+		skipRevert,
+		!!revertPlan || (skipRevert !== true && scope !== undefined),
+	);
+	if (!historyOnly && !revertPlan)
 		throw new AppError(
 			"Review a fresh rollback preview before restoring files",
 			409,
 			"REVERT_CONFIRMATION_REQUIRED",
 		);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
-	const narrator = await narratorService.getById(id);
+	// The reviewed-plan executor is the local adapter, not the session default.
+	if (revertPlan || !historyOnly) assertFileHistoryEnabledForDevice(localBackend.deviceId);
+	if (!historyOnly) await assertWorkspaceHistoryRevertSupported(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	// As for the index route: the rollback discards the running turn it lands in.
 	await prepareHistoryRewrite(id);
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	const result = await rollbackToBlocks(id, blockIds, {
 		revertPlan,
-		skipRevert: skipRevert === true,
+		skipRevert: historyOnly,
 		principal: narratorPrincipalOf(c),
 		signal: c.req.raw.signal,
 		...(scope ? { scope } : {}),
@@ -4877,7 +5311,7 @@ narratorRoutes.get("/:id/blocks/:blockId/delete-preview", async (c) => {
 narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 	const id = c.req.param("id");
 	const { content } = editAssistantMessageSchema.parse(await c.req.json());
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await editOutputBlock(id, c.req.param("blockId"), content, c.get("user").sub));
 });
@@ -4885,7 +5319,7 @@ narratorRoutes.post("/:id/blocks/:blockId/edit", async (c) => {
 // Put an edited output block back to its text before its first edit.
 narratorRoutes.post("/:id/blocks/:blockId/restore", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 	return c.json(await restoreOutputBlock(id, c.req.param("blockId")));
 });
@@ -4911,7 +5345,13 @@ narratorRoutes.post("/:id/blocks/:blockId/allow-retry", async (c) => {
 narratorRoutes.delete("/:id/messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
+	const requestedSkipRevert = c.req.query("skipRevert");
+	requireHistoryOnlyDeletion(
+		await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			requestedSkipRevert === undefined ? undefined : requestedSkipRevert === "1",
+		),
+	);
 	await prepareHistoryRewrite(narratorId);
 	const result = await narratorService.deleteMessage(narratorId, messageId, {
 		skipRevert: true,
@@ -5010,7 +5450,7 @@ narratorRoutes.patch("/:id/compact/:messageId", async (c) => {
 // Trigger manual compact
 narratorRoutes.post("/:id/compact", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json().catch(() => ({}));
@@ -5035,7 +5475,7 @@ narratorRoutes.post("/:id/compact", async (c) => {
 // doRunCustomCompact's abort branch once the aborted request rejects.
 narratorRoutes.post("/:id/compact/cancel", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const cancelled = cancelCompact(narratorId);
 	if (!cancelled) {
 		return c.json({ ok: false, reason: "no_compact_in_progress" }, 409);
@@ -5048,7 +5488,7 @@ narratorRoutes.post("/:id/compact/cancel", async (c) => {
 // (discarding earlier context up to that point); otherwise it is appended at the end.
 narratorRoutes.post("/:id/clear-context", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json().catch(() => ({}));
 	const beforeMessageId = body.beforeMessageId ?? undefined;
 	const msg = beforeMessageId
@@ -5070,7 +5510,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 // Create a plan compact message
 narratorRoutes.post("/:id/plan", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const { content } = await c.req.json();
 	if (!content || typeof content !== "string") throw new ValidationError("content is required");
 	const msg = await narratorService.persistPlanMessage(narratorId, content);
@@ -5082,7 +5522,7 @@ narratorRoutes.post("/:id/plan", async (c) => {
 // Trigger segment compact for selected messages
 narratorRoutes.post("/:id/segment-compact", async (c) => {
 	const narratorId = c.req.param("id");
-	await narratorService.getById(narratorId);
+	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const body = await c.req.json();
@@ -5157,7 +5597,7 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	// hot reload or unhandled error). Force-reset to interrupted. A held run is
 	// never a zombie: overwriting its status would erase `taken_over`.
 	if (!interrupted && !parked && !getRunHold(id)) {
-		const narrator = await narratorService.getById(id);
+		const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 		if (narrator.status === "working" || narrator.status === "waiting") {
 			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 			interrupted = true;
@@ -5200,6 +5640,10 @@ narratorRoutes.post("/:id/detach", async (c) => {
 	return c.json({ detached: true });
 });
 
+/** How long a takeover waits for a run caught between passes to reappear. */
+const TAKEOVER_OWNER_WAIT_MS = 1_500;
+const TAKEOVER_OWNER_POLL_MS = 50;
+
 /**
  * Take over a running run WITHOUT stopping what it is doing.
  *
@@ -5212,7 +5656,7 @@ narratorRoutes.post("/:id/detach", async (c) => {
  */
 narratorRoutes.post("/:id/takeover", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const { readSessionDeliverTo } = await import("../services/narrator-session");
 	const deliverTo = await readSessionDeliverTo(id);
 	if (!deliverTo) return c.json({ error: "This session does not deliver a result" }, 400);
@@ -5220,19 +5664,39 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		return c.json({ error: "Subagent is not running" }, 400);
 	}
 	const { getRunControl } = await import("../services/agent-runtime/ownership");
-	if (!getRunControl(id) && !isLoopRunning(id)) {
-		// The DB says working/waiting but no run owns it: a run caught between passes,
-		// or a zombie row. Retry rather than recording a hold nothing will honour.
-		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+	const owned = () => Boolean(getRunControl(id)) || isLoopRunning(id);
+	// The DB says working/waiting but no run owns it: either a run caught between
+	// passes (it reappears within moments) or a zombie row whose writer is gone.
+	for (let waited = 0; !owned() && waited < TAKEOVER_OWNER_WAIT_MS; ) {
+		await Bun.sleep(TAKEOVER_OWNER_POLL_MS);
+		waited += TAKEOVER_OWNER_POLL_MS;
+	}
+	let status: "idle" | "working" | "waiting" = narrator.status;
+	const zombie = !owned();
+	if (zombie) {
+		// Work owned without a run (a recovery stage, a pending permission) is not a
+		// zombie: it still asks for a retry.
+		const { isNarratorRuntimeBusy } = await import("../services/narrator-session-state");
+		if (isNarratorRuntimeBusy(id)) {
+			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+		}
 	}
 	const { controlRun } = await import("../services/agent-runtime/run");
 	await controlRun(id, { kind: "hold" });
+	if (zombie) {
+		// A zombie would refuse every takeover forever, leaving Stop as the only way
+		// out. Repair it to idle only after the hold exists, so a waiting parent sees
+		// `taken_over` instead of a settled result: the user's next message then runs
+		// as a held turn, exactly like a hold that survived a restart.
+		const { reconcileRunningStatus } = await import("../services/narrator-session");
+		if (await reconcileRunningStatus(id)) status = "idle";
+	}
 	// Display adapters for the destination's panel chip and tool card.
 	broadcastToNarrator(deliverTo.narratorId, {
 		type: "subagent_status_changed",
 		narratorId: deliverTo.narratorId,
 		subagentNarratorId: id,
-		status: narrator.status,
+		status,
 		substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
 	});
 	await broadcastSubagentTakeoverChanged({
@@ -5276,7 +5740,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 // is refreshed with what the user produced since.
 narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const {
 		getSubagentFinalText,
 		prepareSubagentConclusionReference,
@@ -5318,7 +5782,7 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 // User left the narrator page — reset interrupted status to idle
 narratorRoutes.post("/:id/leave", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator?.substatus?.includes("interrupted")) {
 		await narratorService.updateStatus(id, "idle", { substatus: [] });
 	}
@@ -5555,7 +6019,7 @@ narratorRoutes.patch("/:id/model", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorModelSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (parsed.data.model === FOLLOW_PARENT_MODEL) {
 		// Following is relative to the registered source, whatever created the session.
 		if (!policySourceIdOf(narrator)) {
@@ -5564,6 +6028,8 @@ narratorRoutes.patch("/:id/model", async (c) => {
 		await resolveSubagentModelForRun(
 			{ ...narrator, model: FOLLOW_PARENT_MODEL },
 			c.get("user").sub,
+			undefined,
+			{ signal: c.req.raw.signal },
 		);
 	}
 	const model = normalizeAutoModelValueForSave(parsed.data.model);
@@ -5579,7 +6045,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	if (!isPermissionMode(permissionMode)) {
 		throw new ValidationError(`permissionMode must be one of: ${PERMISSION_MODES.join(", ")}`);
 	}
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	// Ask-in-passing narrators are locked to readOnly until promoted
 	if (hasTrait(parseTraits(narrator.traits), "ask-in-passing")) {
@@ -5612,7 +6078,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 // Enter plan mode as a narrator trait (not a permission mode)
 narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const planState = await enterNarratorPlanMode(id);
 	const active = activeNarrators.get(id);
 	if (active) {
@@ -5663,14 +6129,18 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			],
 		},
 	});
-	const manualToolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.messageId, msg.id),
-			eq(narratorToolCalls.narratorId, id),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true },
-	});
+	const manualToolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorToolCalls.messageId, msg.id),
+				eq(narratorToolCalls.narratorId, id),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
 	// An outline session plans in the outline (outline P2 PR 8): its plan root is made or resumed
 	// now, and the result names it instead of a plan file.
@@ -5742,7 +6212,7 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 // Cancel plan mode trait without changing the narrator's permission policy.
 narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = (await getUserLanguage(userId)) as Locale;
 	const message = getToolMessage("planModeCancelled", locale);
@@ -5816,7 +6286,7 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	) {
 		throw new ValidationError(`reasoningEffort must be one of: ${validEfforts.join(", ")} or null`);
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	await narratorService.updateReasoningEffort(id, reasoningEffort);
 	updateNarratorReasoningEffort(id, reasoningEffort ?? null);
 	return c.json({ ok: true });
@@ -5838,7 +6308,7 @@ narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	} else {
 		throw new ValidationError("fastModeOverride must be one of: inherit, on, off");
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	await narratorService.updateFastModeOverride(id, override);
 	const fastMode = await resolveNarratorFastMode(id, { signal: c.req.raw.signal });
 	return c.json({
@@ -5856,7 +6326,7 @@ narratorRoutes.patch("/:id/relaxed-plan", async (c) => {
 	if (typeof relaxedPlan !== "boolean") {
 		throw new ValidationError("relaxedPlan must be a boolean");
 	}
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const effectiveRelaxedPlan = await narratorService.updateRelaxedPlan(id, relaxedPlan);
 	broadcastToNarrator(id, {
 		type: "relaxed_plan_changed",
@@ -5932,9 +6402,22 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	) {
 		throw new ValidationError("At least one override must be provided");
 	}
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateReflectionOverrides(id, updates);
 	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
+	// A plan that blocked earlier did so because this switch was off, and only a review can
+	// release it without a click: turning it on is this session asking for exactly that.
+	// Fire-and-forget — a review takes minutes and must not hold the settings write open.
+	if (updates.planReflectionAutoApproveOverride === "on") {
+		// Whoever turned the switch on must still be allowed to drive this session when a review's
+		// verdict lands, minutes later.
+		const principal = narratorPrincipalOf(c);
+		startAutomaticPlanReflectionForNarrator(id, {
+			assertStillAllowed: async () => {
+				await loadNarratorForAccess(id, principal, "write");
+			},
+		});
+	}
 	return c.json({ ok: true });
 });
 
@@ -5980,7 +6463,7 @@ narratorRoutes.patch("/:id/behavior-fence", async (c) => {
 	) {
 		throw new ValidationError("At least one behavior-fence setting must be provided");
 	}
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateBehaviorFenceSettings(id, updates);
 	broadcastToNarrator(id, { type: "behavior_fence_settings_changed", narratorId: id, ...updates });
 	return c.json({ ok: true });
@@ -5991,7 +6474,7 @@ narratorRoutes.patch("/:id/title", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorTitleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await persistTitle(id, parsed.data.title);
 	return c.json({ ok: true, title: parsed.data.title });
 });
@@ -6001,7 +6484,9 @@ narratorRoutes.patch("/:id/handle", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateNarratorHandleSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const updated = await narratorService.setHandle(id, parsed.data.handle);
+	const updated = await narratorService.setHandle(id, parsed.data.handle, {
+		signal: c.req.raw.signal,
+	});
 	return c.json(publicNarratorResponse(updated));
 });
 
@@ -6017,7 +6502,7 @@ narratorRoutes.get("/:id/permission-rule-requests", async (c) => {
 // Regenerate narrator title via AI
 narratorRoutes.post("/:id/generate-title", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const title = await generateTitle(id, locale, userId);
@@ -6044,7 +6529,7 @@ narratorRoutes.patch("/:id/unarchive", async (c) => {
 // Delete narrator (must be archived)
 narratorRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (narrator.status !== "archived") {
 		throw new ValidationError("Only archived narrators can be deleted");
 	}
@@ -6059,7 +6544,7 @@ narratorRoutes.delete("/:id", async (c) => {
 // outcome and must be preserved for follow-up Send.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	if (await readSessionDeliverTo(id)) return c.json({ ok: true });
 	const currentSubstatus = parseSubstatus(narrator.substatus);
 	if (narrator.status === "idle" && currentSubstatus.includes("unread") && !narrator.errorMessage) {
@@ -6113,6 +6598,7 @@ narratorRoutes.post("/:id/extract-primary", async (c) => {
 	const { extractPrimarySchema } = await import("../lib/validators");
 	const parsed = extractPrimarySchema.parse(body ?? {});
 	const newNarrator = await narratorService.extractSubagentToPrimary(id, {
+		signal: c.req.raw.signal,
 		title: parsed.title,
 		inheritMode: parsed.inheritMode ?? "full",
 		locale: parsed.locale ?? "en",
@@ -6196,6 +6682,46 @@ narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 		await getUserLanguage(userId),
 	);
 	return c.json(result);
+});
+
+// Reuse the sample associated with an eligible result in the diagnostic narrator.
+narratorRoutes.post("/:id/modeltrace/calibrate", async (c) => {
+	const userId = c.get("user").sub;
+	const bytes = new Uint8Array(512);
+	let length = 0;
+	const reader = c.req.raw.body?.getReader();
+	if (reader) {
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (length + value.byteLength > bytes.byteLength) {
+					void reader.cancel().catch(() => {});
+					return c.json({ error: "ModelTrace calibration request is too large" }, 413);
+				}
+				bytes.set(value, length);
+				length += value.byteLength;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+	} catch {
+		throw new ValidationError("Invalid ModelTrace calibration JSON");
+	}
+	const parsed = modelTraceCalibrationSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { calibrateModelTrace } = await import("../services/modeltrace-service");
+	const result = await calibrateModelTrace(
+		c.req.param("id"),
+		parsed.data.resultId,
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+	);
+	return c.json(result, 202);
 });
 
 // Start: create a persistent pending message in the source narrator's chat
@@ -6461,7 +6987,7 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 // Unlocks the narrator (drops the ask-in-passing label); never broadens its execution policy.
 narratorRoutes.post("/:id/promote", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 
 	const narratorTraits = parseTraits(narrator.traits);
 
@@ -6470,7 +6996,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	}
 
 	await narratorTraitsLock.acquire(id, async () => {
-		const current = await narratorService.getById(id);
+		const current = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 		const unlockedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
 		await db
 			.update(narrators)
@@ -6485,7 +7011,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	// Promotion removes the ask label, never broadens the existing execution policy.
 	await updateNarratorPermissionMode(id, narrator.permissionMode ?? "readOnly");
 
-	const updated = await narratorService.getById(id);
+	const updated = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	broadcastToNarrator(id, {
 		type: "permission_mode_changed",
 		narratorId: id,
@@ -6508,7 +7034,12 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 	return c.json(
 		permissions.map((p) => {
 			const reflectionDeadline = getQuestionReflectionDeadline(p.id);
-			return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			const withDeadline = reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			// Only a plan approval carries 计划反思, and only while the loop that raised it still
+			// holds a reflection runner (in-memory, so it does not survive a restart by itself).
+			return p.toolName === "ExitPlanMode"
+				? { ...withDeadline, planReflectionAvailable: isPendingPlanReflectionAvailable(p.id) }
+				: withDeadline;
 		}),
 	);
 });
@@ -6532,6 +7063,7 @@ narratorRoutes.get("/:id/questions", async (c) => {
 	if (parsed.data.filter || !parsed.data.status) {
 		return c.json(
 			await listQuestionSummaries({
+				signal: c.req.raw.signal,
 				narratorId: id,
 				filter: parsed.data.filter ?? "all",
 				cursor: parsed.data.cursor,
@@ -6540,12 +7072,13 @@ narratorRoutes.get("/:id/questions", async (c) => {
 		);
 	}
 	const { items, nextCursor } = await listAsyncQuestions({
+		signal: c.req.raw.signal,
 		narratorId: id,
 		status: parsed.data.status,
 		cursor: parsed.data.cursor,
 		limit: parsed.data.limit,
 	});
-	const openCount = await countOpenAsyncQuestions(id);
+	const openCount = await countOpenAsyncQuestions(id, { signal: c.req.raw.signal });
 	return c.json({ items, nextCursor, openCount });
 });
 
@@ -6555,6 +7088,7 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	c.header("Cache-Control", "no-store");
 	const detail = await getBoundedQuestionDetail(c.req.param("questionId"), {
+		signal: c.req.raw.signal,
 		narratorId,
 		cursor: parsed.data.cursor,
 		limit: parsed.data.limit,
@@ -6563,10 +7097,14 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 		return c.json({ error: "Question detail exceeds the byte limit", tooLarge: true }, 413);
 	}
 	if (!detail.record) return c.json({ error: "Question not found" }, 404);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	const canAct = !!narrator && (await canWriteNarrator(narrator, narratorPrincipalOf(c)));
 	return c.json({
 		question: detail.record,
@@ -6598,11 +7136,14 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const questionId = c.req.param("questionId");
 	const parsed = asyncQuestionSupplementSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const [existing] = await db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1);
+	const [existing] = await readQuery(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6611,6 +7152,8 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	// Last await before deciding: the gate ran before the body arrived.
 	await requireNarratorAccess(c, narratorId, "write");
 	const result = await supplementAsyncQuestion(questionId, {
+		signal: c.req.raw.signal,
+		narratorId,
 		text: parsed.data.text,
 		expectedAnswerMessageId: parsed.data.answerMessageId,
 		userId,
@@ -6637,12 +7180,14 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Ownership is checked against the question's own narrator rather than trusting the
 	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
 	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6651,6 +7196,8 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Last await before deciding: the gate ran before the body arrived.
 	await requireNarratorAccess(c, narratorId, "write");
 	const result = await answerAsyncQuestion(questionId, {
+		signal: c.req.raw.signal,
+		narratorId,
 		answers: parsed.data.answers,
 		annotations: parsed.data.annotations ?? null,
 		userId,
@@ -6671,12 +7218,14 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6684,7 +7233,12 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const locale = (await getUserLanguage(userId)) as Locale;
 	// Last await before deciding (the gate ran before the request was read).
 	await requireNarratorAccess(c, narratorId, "write");
-	const result = await dismissAsyncQuestion(questionId, { userId, locale });
+	const result = await dismissAsyncQuestion(questionId, {
+		userId,
+		locale,
+		narratorId,
+		signal: c.req.raw.signal,
+	});
 	if (!result.ok) {
 		return c.json(
 			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
@@ -6702,12 +7256,14 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -6715,7 +7271,12 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const locale = (await getUserLanguage(userId)) as Locale;
 	// Last await before deciding (the gate ran before the request was read).
 	await requireNarratorAccess(c, narratorId, "write");
-	const result = await ignoreAsyncQuestion(questionId, { userId, locale });
+	const result = await ignoreAsyncQuestion(questionId, {
+		userId,
+		locale,
+		narratorId,
+		signal: c.req.raw.signal,
+	});
 	if (!result.ok) {
 		return c.json(
 			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
@@ -6737,7 +7298,11 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 async function prepareDecision(c: Context, requestId: string) {
 	const target = await readDecisionTarget(requestId);
 	const assertStillAllowed = () =>
-		requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
+		requireOwningNarratorAccess(
+			c,
+			() => resolveDecisionNarratorId(requestId, { signal: c.req.raw.signal }),
+			"write",
+		);
 	await assertStillAllowed();
 	return { target, assertStillAllowed };
 }
@@ -6877,6 +7442,37 @@ narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 	return c.json({ ok: true, answers: result.answers ?? {} });
 });
 
+/**
+ * Run one plan reflection for a plan that is ALREADY waiting for approval, then apply its
+ * decision to that request: confirm approves it (skipping the person), revise sends the feedback
+ * back to the model, an undecidable review leaves the card with the person.
+ *
+ * Answers as soon as the review is STARTED. A review takes minutes and must not hold an HTTP
+ * request open; the card follows it through the ordinary `plan_reflection_*` frames.
+ */
+narratorRoutes.post("/permissions/:requestId/reflect-plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	if (!isPendingPlanReflectionAvailable(requestId)) {
+		return c.json({ error: "Plan reflection is not available for this request" }, 409);
+	}
+	// The middleware above checked write access when the review STARTED; its verdict lands
+	// minutes later, so the same check runs again right before it is applied. The principal is
+	// captured now: this request has long been answered by then.
+	const principal = narratorPrincipalOf(c);
+	const assertStillAllowed = async () => {
+		const narratorId = await resolveDecisionNarratorId(requestId);
+		if (!narratorId) throw new NotFoundError("Narrator", "unknown");
+		await loadNarratorForAccess(narratorId, principal, "write");
+	};
+	void reflectPendingExitPlanMode(requestId, { assertStillAllowed }).catch((err) => {
+		logger.warn("Plan reflection request failed", {
+			requestId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
+	return c.json({ ok: true, started: true });
+});
+
 // Silently cancel the automatic AskUserQuestion reflection countdown (e.g. the
 // user started answering). Idempotent — always succeeds even if nothing was armed.
 narratorRoutes.post("/permissions/:requestId/disarm-question-reflection", async (c) => {
@@ -6929,7 +7525,7 @@ narratorRoutes.post("/permissions/:requestId/stop-task-reflection", async (c) =>
 // Suggest best-practice answers for AskUserQuestion
 narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
+	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const userId = c.get("user").sub;
 	const locale = (await getUserLanguage(userId)) as Locale;
 
@@ -6962,7 +7558,9 @@ function fileHistoryConflictBody(error: unknown) {
 	const historyError = error instanceof FileHistoryError ? error : null;
 	return {
 		error: error instanceof Error ? error.message : String(error),
-		code: historyError?.code ?? "FILE_HISTORY_PREPARE_FAILED",
+		code:
+			historyError?.code ??
+			(error instanceof AppError ? error.code : "FILE_HISTORY_PREPARE_FAILED"),
 	};
 }
 
@@ -7328,7 +7926,109 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 
 	let currentContent: string | null;
 	try {
-		currentContent = await rebuildDeviceFileState(narratorId, identity);
+		if (isFileHistoryEnabledForDevice(identity.deviceId)) {
+			currentContent = await rebuildDeviceFileState(narratorId, identity);
+		} else {
+			const unavailable = () =>
+				new AppError(
+					"Current file cannot be read safely for this permission preview",
+					409,
+					"PERMISSION_FILE_PREVIEW_UNAVAILABLE",
+				);
+			const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+			// Keep both frozen names: canonical identity does not replace the lexical
+			// path, whose own secret/Read rules and later symlink changes still apply.
+			const filePath = toolCall.resolvedFilePath;
+			const deviceId = identity.deviceId;
+			const expectedCanonicalPath = toolCall.canonicalFilePath;
+			const expectedCwd = toolCall.executionCwd;
+			const expectedGeneration = toolCall.runtimeGeneration;
+			if (
+				!filePath ||
+				!expectedCanonicalPath ||
+				!expectedCwd ||
+				toolCall.executionDeviceId !== deviceId ||
+				identity.pathFlavor !== localBackend.pathFlavor ||
+				toolCall.executionPathFlavor !== localBackend.pathFlavor ||
+				expectedGeneration !== localBackend.runtimeGeneration ||
+				!localBackend.paths.isAbsolute(filePath) ||
+				!localBackend.paths.isAbsolute(expectedCanonicalPath) ||
+				!localBackend.paths.isAbsolute(expectedCwd) ||
+				!localBackend.paths.equals(identity.filePath, expectedCanonicalPath)
+			)
+				throw unavailable();
+			const authorizeCurrent = async () => {
+				signal.throwIfAborted();
+				let abort = () => {};
+				const cancelled = new Promise<never>((_resolve, reject) => {
+					abort = () => reject(unavailable());
+					signal.addEventListener("abort", abort, { once: true });
+					if (signal.aborted) abort();
+				});
+				try {
+					// The formal read boundary authorizes the actual user, device, Read
+					// rules and secret paths before any content IO. Ask is not approval.
+					const current = await Promise.race([
+						authorizeEditorReferenceContext(
+							narratorId,
+							c.get("user").sub,
+							filePath,
+							deviceId,
+							"read",
+						),
+						cancelled,
+					]);
+					signal.throwIfAborted();
+					const canonical = current.target.canonicalPath;
+					if (
+						current.backend.kind !== "local" ||
+						current.backend.deviceId !== deviceId ||
+						current.target.runtimeGeneration !== expectedGeneration ||
+						!canonical ||
+						!localBackend.paths.equals(canonical, expectedCanonicalPath) ||
+						!localBackend.paths.equals(current.target.cwd, expectedCwd)
+					)
+						throw unavailable();
+					return current;
+				} catch {
+					throw unavailable();
+				} finally {
+					signal.removeEventListener("abort", abort);
+				}
+			};
+			const authorized = await authorizeCurrent();
+			const boundary = checkWriteBoundary(filePath, [
+				authorized.target.cwd,
+				...(settings.paths.extraWritableDirs ?? []),
+			]);
+			if (
+				!boundary.allowed ||
+				!boundary.physicalPath ||
+				!expectedCanonicalPath ||
+				!localBackend.paths.equals(boundary.physicalPath, expectedCanonicalPath)
+			)
+				throw unavailable();
+			const live = await localBackend.resolvePathIdentity(filePath, { signal }).catch(() => {
+				throw unavailable();
+			});
+			if (!localBackend.paths.equals(live.canonicalPath, boundary.physicalPath))
+				throw unavailable();
+			if (!live.exists) currentContent = null;
+			else {
+				const read = await localBackend
+					.readFileBytes(filePath, {
+						maxBytes: 1024 * 1024,
+						expectedResolvedPath: boundary.physicalPath,
+						signal,
+					})
+					.catch(() => {
+						throw unavailable();
+					});
+				if (read.truncated || looksBinary(read.bytes)) throw unavailable();
+				currentContent = decodeFileBytes(read.bytes).text;
+			}
+			await authorizeCurrent();
+		}
 	} catch (error) {
 		return c.json(fileHistoryConflictBody(error), 409);
 	}
@@ -7468,7 +8168,12 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	}
 
 	const subagentId = task?.type === "agent" ? (task.subagentNarratorId ?? task.id) : taskId;
-	const subagent = await narratorService.getById(subagentId).catch(() => null);
+	const subagent = await narratorService
+		.getById(subagentId, undefined, { signal: c.req.raw.signal })
+		.catch((error: unknown) => {
+			if (error instanceof NotFoundError) return null;
+			throw error;
+		});
 	if (!task && subagent?.parentNarratorId !== parentNarratorId) {
 		return c.json({ error: "Task is not running or does not exist" }, 404);
 	}
@@ -7569,14 +8274,14 @@ narratorRoutes.get("/:id/background-tasks/:taskId/output/tail", async (c) => {
 
 narratorRoutes.get("/:id/whitelist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.directoryWhitelist);
 });
 
 narratorRoutes.post("/:id/whitelist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7592,23 +8297,35 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistDirs.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistDirs.id, dirId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "directoryWhitelist",
-		value: { ...existing, ...parsed.data, id: dirId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "directoryWhitelist",
+			value: { ...existing, ...parsed.data, id: dirId },
+		},
+		{ ruleType: "directoryWhitelist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistDirs.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryWhitelist", dirId);
 	return c.json({ ok: true });
@@ -7618,14 +8335,14 @@ narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 
 narratorRoutes.get("/:id/blacklist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id); // ensure exists
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // ensure exists
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.directoryBlacklist);
 });
 
 narratorRoutes.post("/:id/blacklist-dirs", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7641,23 +8358,35 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistDirs.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistDirs.id, dirId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "directoryBlacklist",
-		value: { ...existing, ...parsed.data, id: dirId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "directoryBlacklist",
+			value: { ...existing, ...parsed.data, id: dirId },
+		},
+		{ ruleType: "directoryBlacklist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistDirs.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryBlacklist", dirId);
 	return c.json({ ok: true });
@@ -7667,14 +8396,14 @@ narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 
 narratorRoutes.get("/:id/cmd-whitelist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.commandWhitelist);
 });
 
 narratorRoutes.post("/:id/cmd-whitelist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7690,23 +8419,35 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistCmds.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistCmds.id, entryId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "commandWhitelist",
-		value: { ...existing, ...parsed.data, id: entryId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "commandWhitelist",
+			value: { ...existing, ...parsed.data, id: entryId },
+		},
+		{ ruleType: "commandWhitelist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorWhitelistCmds.findMany({
+			limit: 1,
+			where: eq(narratorWhitelistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandWhitelist", entryId);
 	return c.json({ ok: true });
@@ -7716,14 +8457,14 @@ narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 
 narratorRoutes.get("/:id/cmd-blacklist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const rules = await permissionRuleService.listNarratorRules(id);
 	return c.json(rules.commandBlacklist);
 });
 
 narratorRoutes.post("/:id/cmd-blacklist", async (c) => {
 	const id = c.req.param("id");
-	await narratorService.getById(id);
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	const body = await c.req.json();
 	const parsed = createBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -7739,23 +8480,35 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistCmds.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistCmds.id, entryId),
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
-	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
-		ruleType: "commandBlacklist",
-		value: { ...existing, ...parsed.data, id: entryId },
-	});
+	const rule = await permissionRuleService.updateNarratorRule(
+		existing.narratorId,
+		{
+			ruleType: "commandBlacklist",
+			value: { ...existing, ...parsed.data, id: entryId },
+		},
+		{ ruleType: "commandBlacklist", value: existing },
+	);
 	return c.json(rule);
 });
 
 narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQueryFirst(
+		db.query.narratorBlacklistCmds.findMany({
+			limit: 1,
+			where: eq(narratorBlacklistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandBlacklist", entryId);
 	return c.json({ ok: true });
@@ -7771,7 +8524,7 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 narratorRoutes.get("/:id/optional-tools/:toolId", async (c) => {
 	const id = c.req.param("id");
 	const toolId = c.req.param("toolId");
-	await narratorService.getById(id); // 404 if missing
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // 404 if missing
 
 	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
 	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);
@@ -7799,7 +8552,7 @@ narratorRoutes.post("/:id/optional-tools/:toolId/load", async (c) => {
 	const id = c.req.param("id");
 	const toolId = c.req.param("toolId");
 	const userId = c.get("user").sub;
-	await narratorService.getById(id); // 404 if missing
+	await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // 404 if missing
 
 	const routine = getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
 	if (!routine?.tool) throw new NotFoundError("OptionalTool", toolId);

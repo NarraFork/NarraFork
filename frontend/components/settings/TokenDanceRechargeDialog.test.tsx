@@ -1,11 +1,17 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import type { TokenDancePaymentSession, TokenDancePublicConnection } from "@shared/tokendance";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import type {
+	TokenDanceLoginChoice,
+	TokenDancePaymentSession,
+	TokenDancePublicConnection,
+} from "@shared/tokendance";
 import type { QueryClient as QueryClientType } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../../lib/api";
+import { providerKeysApi } from "../../lib/api/provider-keys";
 import { openTokenDanceRecharge, TOKENDANCE_RECOVERY_EVENT } from "../../lib/tokendance-recovery";
 import errors from "../../locales/en/errors.json";
 import narratorEn from "../../locales/en/narrator.json";
@@ -39,6 +45,7 @@ const globals = {
 	ShadowRoot: window.ShadowRoot ?? class {},
 	getComputedStyle: () => ({ getPropertyValue: () => "", overflow: "visible" }),
 	matchMedia: window.matchMedia,
+	MutationObserver: window.MutationObserver,
 	ResizeObserver: class {
 		observe() {}
 		unobserve() {}
@@ -53,10 +60,10 @@ for (const [key, value] of Object.entries(globals)) {
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
 (window.document as unknown as Record<string, unknown>).oninput = null;
+Object.assign(window.document, { fonts: { addEventListener() {}, removeEventListener() {} } });
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
-const { formatTokenDanceMoney, useTokenDanceBalance } = await import(
-	"../../hooks/useTokenDanceBalance"
-);
+const { formatTokenDanceMoney } = await import("../../lib/tokendance-money");
+const { useQuotaSnapshot, quotaSnapshotsReadKey } = await import("../../hooks/useQuotaSnapshots");
 const { createRoot } = await import("react-dom/client");
 const { MantineProvider } = await import("@mantine/core");
 const { I18nextProvider } = await import("react-i18next");
@@ -70,7 +77,7 @@ await i18n.init({
 	lng: "en",
 	defaultNS: "errors",
 	initImmediate: false,
-	resources: { en: { errors, settings } },
+	resources: { en: { errors, settings, narrator: narratorEn } },
 });
 let root: Root;
 let qc: QueryClientType;
@@ -97,20 +104,41 @@ const session = (
 	createdAt: Date.now(),
 	expiresAt: Date.now() + 60_000,
 });
-const balance = {
-	generation: 7,
-	credits: 10_000_000,
-	creditsUsed: 1,
-	balance: 9_999_999,
-	updatedAt: Date.now(),
-	loading: false,
-	hasError: false,
-};
+function snapshots(
+	input: { balance?: number | null; loading?: boolean; hasError?: boolean } = {},
+): QuotaSnapshotsResponse {
+	return {
+		entries: [
+			{
+				groupId: "tokendance",
+				prefix: "tokendance",
+				templateId: "tokendance",
+				credentialId: "account",
+				refreshing: input.loading && !input.hasError,
+				snapshot: {
+					scope: "account",
+					fetchedAt: 1,
+					windows: [],
+					balances: [
+						{
+							unit: "CNY",
+							remaining: input.balance === null ? null : (input.balance ?? 9_999_999) / 1_000_000,
+							total: 10,
+						},
+					],
+					hasError: input.hasError,
+				},
+			},
+		],
+	};
+}
+const balance = snapshots();
 let create: ReturnType<typeof spyOn<typeof api, "tokenDanceCreatePayment">>;
 let poll: ReturnType<typeof spyOn<typeof api, "tokenDancePaymentSession">>;
-let refresh: ReturnType<typeof spyOn<typeof api, "tokenDanceRefreshBalance">>;
-let getBalance: ReturnType<typeof spyOn<typeof api, "tokenDanceBalance">>;
+let refresh: ReturnType<typeof spyOn<typeof api, "refreshQuotaSnapshots">>;
+let getBalance: ReturnType<typeof spyOn<typeof api, "quotaSnapshots">>;
 let getConnection: ReturnType<typeof spyOn<typeof api, "tokenDanceConnection">>;
+let getKeys: ReturnType<typeof spyOn<typeof providerKeysApi, "list">>;
 let timers: Map<number, { callback: () => void; delay: number }>;
 let nextTimer: number;
 let intervals: Map<number, { callback: () => void; delay: number }>;
@@ -135,9 +163,10 @@ beforeEach(() => {
 	);
 	create = spyOn(api, "tokenDanceCreatePayment").mockResolvedValue({ session: session() });
 	poll = spyOn(api, "tokenDancePaymentSession").mockResolvedValue({ session: session() });
-	refresh = spyOn(api, "tokenDanceRefreshBalance").mockResolvedValue(balance);
-	getBalance = spyOn(api, "tokenDanceBalance").mockResolvedValue(balance);
+	refresh = spyOn(api, "refreshQuotaSnapshots").mockResolvedValue(balance);
+	getBalance = spyOn(api, "quotaSnapshots").mockResolvedValue(balance);
 	getConnection = spyOn(api, "tokenDanceConnection").mockResolvedValue(connection);
+	getKeys = spyOn(providerKeysApi, "list").mockResolvedValue({ keys: [] });
 	timers = new Map();
 	intervals = new Map();
 	nextTimer = 100000;
@@ -180,6 +209,7 @@ afterEach(async () => {
 		refresh,
 		getBalance,
 		getConnection,
+		getKeys,
 		timerSpy,
 		clearSpy,
 		fetchSpy,
@@ -243,7 +273,12 @@ async function tick(delay: number) {
 	});
 	await settle();
 }
-async function renderSection() {
+async function renderSection(
+	options: {
+		connection?: TokenDancePublicConnection;
+		onLogin?: (choice?: TokenDanceLoginChoice) => Promise<void>;
+	} = {},
+) {
 	await act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
@@ -251,11 +286,11 @@ async function renderSection() {
 					<MantineProvider env="test">
 						<ConfirmDialogContext.Provider value={{ confirm: async () => true }}>
 							<TokenDanceSection
-								connection={connection}
+								connection={options.connection ?? connection}
 								enabled
 								onToggleEnabled={() => {}}
 								onToolResultImagesChange={() => {}}
-								onLogin={async () => {}}
+								onLogin={options.onLogin ?? (async () => {})}
 								onChanged={async () => {}}
 								onDeleted={() => {}}
 								hiddenModels={new Set()}
@@ -319,6 +354,71 @@ async function recovery(action = "top_up_balance") {
 	await settle();
 }
 describe("TokenDance recharge behavior", () => {
+	it.each([
+		"replace",
+		"add",
+	] as const)("an unmarked connection requires an explicit %s choice before OAuth", async (mode) => {
+		const choices: Array<TokenDanceLoginChoice | undefined> = [];
+		await renderSection({
+			connection: { ...connection, unboundKeys: [{ id: "old-slot", label: "Old login" }] },
+			onLogin: async (choice) => {
+				choices.push(choice);
+			},
+		});
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(true);
+		const select = container.querySelector(
+			`input[placeholder="${settings.tokendance.loginChoicePlaceholder}"]`,
+		);
+		if (!select) throw new Error("Missing login slot choice");
+		await act(async () => {
+			select.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		const label =
+			mode === "add"
+				? settings.tokendance.loginKeepKeys
+				: settings.tokendance.loginReplaceKey.replace("{{key}}", "Old login");
+		const option = [...document.querySelectorAll('[role="option"]')].find(
+			(entry) => entry.textContent === label,
+		);
+		if (!option) throw new Error(`Missing option ${label}: ${document.body.textContent}`);
+		await act(async () => {
+			option.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(false);
+		await act(async () => {
+			button(settings.tokendance.reauthorize).click();
+		});
+		expect(choices).toEqual([mode === "replace" ? { mode, credentialId: "old-slot" } : { mode }]);
+	});
+	it("a single ready TokenDance key exposes its working network editor", async () => {
+		getKeys.mockResolvedValue({
+			keys: [
+				{
+					id: "login-key",
+					label: null,
+					masked: "********login",
+					priority: 0,
+					disabled: false,
+					disabledReason: null,
+					network: {},
+					cooldown: null,
+				},
+			],
+		});
+		await renderSection();
+		const network = container.querySelector(`[aria-label="${settings.credentialNetwork.button}"]`);
+		if (!network) throw new Error("Missing single ready key network entry");
+		await act(async () => {
+			network.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+			settings.credentialNetwork.description,
+		);
+	});
+
 	it.each([
 		undefined,
 		"invalid",
@@ -457,7 +557,7 @@ describe("TokenDance recharge behavior", () => {
 		"hasError",
 	] as const)("balance refresh %s keeps confirmed payment successful", async (failure) => {
 		if (failure === "rejected") refresh.mockRejectedValue(new Error("PRIVATE BALANCE ERROR"));
-		else refresh.mockResolvedValue({ ...balance, hasError: true });
+		else refresh.mockResolvedValue(snapshots({ hasError: true }));
 		create.mockResolvedValue({ session: session("paid") });
 		await render();
 		await confirm();
@@ -659,9 +759,9 @@ describe("TokenDance recharge behavior", () => {
 		}
 	});
 	it("cold balance loading polls at three seconds then returns to thirty seconds", async () => {
-		getBalance.mockResolvedValueOnce({ ...balance, balance: null, loading: true });
+		getBalance.mockResolvedValueOnce(snapshots({ balance: null, loading: true }));
 		await renderSection();
-		expect(container.textContent).toContain("Balance: Unknown");
+		expect(container.textContent).toContain("Quota unknown CNY");
 		const interval = [...intervals.values()].find((timer) => timer.delay === 3000);
 		if (!interval) throw new Error("Missing cold balance interval");
 		await act(async () => {
@@ -669,19 +769,19 @@ describe("TokenDance recharge behavior", () => {
 		});
 		await settle();
 		expect(getBalance).toHaveBeenCalledTimes(2);
-		expect(container.textContent).toContain("Balance: ¥9.999999");
+		expect(container.textContent).toContain("9.999999 CNY");
 		expect([...intervals.values()].some((timer) => timer.delay === 3000)).toBe(false);
 		expect([...intervals.values()].some((timer) => timer.delay === 30000)).toBe(true);
 		expect(refresh).not.toHaveBeenCalled();
 	});
 	it("loading errors retain the normal read polling interval without a forced refresh", async () => {
-		getBalance.mockResolvedValue({ ...balance, loading: true, hasError: true });
+		getBalance.mockResolvedValue(snapshots({ loading: true, hasError: true }));
 		await renderSection();
 		expect([...intervals.values()].some((timer) => timer.delay === 3000)).toBe(false);
 		expect(refresh).not.toHaveBeenCalled();
 	});
 	it("hasError refresh response displays a safe failure and preserves known stale balance", async () => {
-		refresh.mockResolvedValue({ ...balance, hasError: true });
+		refresh.mockResolvedValue(snapshots({ hasError: true }));
 		await renderSection();
 		await act(async () => {
 			button(settings.tokendance.refreshBalance).click();
@@ -689,11 +789,32 @@ describe("TokenDance recharge behavior", () => {
 		await settle();
 		expect(container.textContent).toContain(settings.tokendance.balanceRefreshFailed);
 		expect(container.textContent).toContain(settings.tokendance.balanceStale);
-		expect(container.textContent).toContain("Balance: ¥9.999999");
+		expect(container.textContent).toContain("9.999999 CNY");
 		expect(create).not.toHaveBeenCalled();
 	});
+	it("another group's refresh error does not turn TokenDance refresh or paid confirmation into a failure", async () => {
+		const unrelated = snapshots().entries[0];
+		if (!unrelated?.snapshot) throw new Error("Missing fixture snapshot");
+		refresh.mockResolvedValue({
+			entries: [
+				...balance.entries,
+				{ ...unrelated, groupId: "other", snapshot: { ...unrelated.snapshot, hasError: true } },
+			],
+		});
+		await renderSection();
+		await act(() => button(settings.tokendance.refreshBalance).click());
+		await settle();
+		expect(container.textContent).not.toContain(settings.tokendance.balanceRefreshFailed);
+		await act(() => root.unmount());
+		root = createRoot(container);
+		create.mockResolvedValue({ session: session("paid") });
+		await render();
+		await confirm();
+		expect(container.textContent).toContain(errors.tokendancePayment_paid);
+		expect(container.textContent).not.toContain(errors.tokendanceRechargeBalanceDelayed);
+	});
 	it("cached zero balance warns without creating an order", async () => {
-		getBalance.mockResolvedValue({ ...balance, balance: 0 });
+		getBalance.mockResolvedValue(snapshots({ balance: 0 }));
 		await renderSection();
 		expect(container.textContent).toContain(settings.tokendance.balanceInsufficient);
 		expect(create).not.toHaveBeenCalled();
@@ -818,9 +939,9 @@ describe("TokenDance recharge behavior", () => {
 		expect(create).not.toHaveBeenCalled();
 	});
 	it("shows unknown balance rather than zero and opens recharge without creating", async () => {
-		getBalance.mockResolvedValue({ ...balance, balance: null, credits: null, creditsUsed: null });
+		getBalance.mockResolvedValue(snapshots({ balance: null }));
 		await renderSection();
-		expect(container.textContent).toContain("Balance: Unknown");
+		expect(container.textContent).toContain("Quota unknown CNY");
 		await act(async () => {
 			button(settings.tokendance.recharge).click();
 		});
@@ -828,16 +949,16 @@ describe("TokenDance recharge behavior", () => {
 		expect(container.textContent).toContain(errors.tokendanceRechargeConfirm);
 		expect(create).not.toHaveBeenCalled();
 	});
-	it("shows zero and micro-CNY totals separately", async () => {
-		getBalance.mockResolvedValue({ ...balance, balance: 0 });
+	it("shows a generic zero balance without retaining provider-private totals", async () => {
+		getBalance.mockResolvedValue(snapshots({ balance: 0 }));
 		await renderSection();
-		expect(container.textContent).toContain("Balance: ¥0.00");
-		expect(container.textContent).toContain("Total consumed: ¥0.000001");
+		expect(container.textContent).toContain("0 CNY");
+		expect(container.textContent).not.toContain("Total consumed:");
 	});
 	it("ordinary users see balance but no refresh or recharge button", async () => {
 		qc.setQueryData(["auth", "me"], { id: "ordinary", role: "user" });
 		await renderSection();
-		expect(container.textContent).toContain("Balance: ¥9.999999");
+		expect(container.textContent).toContain("9.999999 CNY");
 		expect(container.textContent).not.toContain(settings.tokendance.refreshBalance);
 		expect(
 			[...container.querySelectorAll("button")].some(
@@ -911,7 +1032,7 @@ describe("TokenDance recharge behavior", () => {
 		await tick(3000);
 		expect(refresh).toHaveBeenCalledTimes(1);
 		expect(paid).toBe(1);
-		expect(qc.getQueryData<typeof balance>(["tokendance", "balance", 7])).toEqual(balance);
+		expect(qc.getQueryData<typeof balance>(quotaSnapshotsReadKey())).toEqual(balance);
 		expect([...timers.values()].some((timer) => timer.delay === 3000)).toBe(false);
 	});
 	it.each([
@@ -1056,10 +1177,10 @@ describe("TokenDance recharge behavior", () => {
 		expect(container.querySelector("button")).toBeNull();
 		expect(create).not.toHaveBeenCalled();
 	});
-	it("hides mismatching generation balances", async () => {
+	it("selects credentials from the unified quota response without falling back to another account", async () => {
 		function Summary() {
-			const query = useTokenDanceBalance(8);
-			return <div>{formatTokenDanceMoney(query.data?.balance) ?? "Unknown"}</div>;
+			const query = useQuotaSnapshot("tokendance", "other-account");
+			return <div>{query.data?.balances[0]?.remaining ?? "Unknown"}</div>;
 		}
 		await act(() =>
 			root.render(

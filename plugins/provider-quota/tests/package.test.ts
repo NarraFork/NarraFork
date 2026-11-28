@@ -46,6 +46,16 @@ test("actual independent .nfplugin installs in an isolated store and passes rele
 		);
 		const store = new PluginPackageStore({ root: join(root, "store") });
 		const installed = await store.install(result.archivePath);
+		const archive = await readFile(result.archivePath);
+		const metadata = JSON.parse(await readFile(join(outDir, "provider-quota.asset.json"), "utf8"));
+		expect(metadata).toEqual({
+			schemaVersion: 1,
+			pluginId: installed.pluginId,
+			version: installed.version,
+			size: archive.byteLength,
+			sha256: createHash("sha256").update(archive).digest("hex"),
+			packageHash: installed.hash,
+		});
 		expect(installed.pluginId).toBe("io.narrafork.provider-quota");
 		expect(installed.manifest.contributes.quotaSources).toHaveLength(4);
 		const sourceMetadata = JSON.parse(

@@ -19,6 +19,13 @@ const connection = {
 	billingInstance: "a".repeat(32),
 };
 const updateConnection = mock((_disabled: boolean, _mode?: string) => connection);
+const startOAuth = mock(
+	(_owner: string, _callback: URL, _snapshot?: unknown, _choice?: unknown) => ({
+		flowId: "x".repeat(43),
+		authorizeUrl: "https://tokendance.space/auth",
+		expiresAt: Date.now() + 600000,
+	}),
+);
 mock.module("../services/tokendance-service", () => ({
 	getTokenDanceConnection: () => connection,
 	getTokenDanceBalance: () => ({
@@ -44,11 +51,7 @@ mock.module("../services/tokendance-service", () => ({
 		if (owner !== "test-owner") throw new AppError("Not found", 404, "TOKENDANCE_ERROR");
 		return { id: "payment-1", status: "pending" };
 	},
-	startTokenDanceOAuth: () => ({
-		flowId: "x".repeat(43),
-		authorizeUrl: "https://tokendance.space/auth",
-		expiresAt: Date.now() + 600000,
-	}),
+	startTokenDanceOAuth: startOAuth,
 	validateTokenDanceCallback: validateCallback,
 	completeTokenDanceOAuth: () => ({ connected: true, modelsRefreshed: true }),
 	cancelTokenDanceOAuth: () => {},
@@ -105,19 +108,16 @@ const endpoints = [
 	["POST", "/oauth/cancel"],
 	["POST", "/oauth/restore"],
 	["POST", "/models/refresh"],
-	["POST", "/balance/refresh"],
 	["POST", "/payment/sessions"],
 	["GET", "/payment/sessions/payment-1"],
 ] as const;
 describe("TokenDance first-party admin boundary", () => {
-	test("ordinary session users can read balance but anonymous users cannot", async () => {
+	test("old balance endpoints are retired; anonymous access is still rejected", async () => {
+		const instance = app({ type: "session", user });
+		expect((await instance.request("/api/tokendance/balance")).status).toBe(404);
 		expect(
-			(
-				await app({ type: "session", user: { ...user, role: "user" } }).request(
-					"/api/tokendance/balance",
-				)
-			).status,
-		).toBe(200);
+			(await instance.request("/api/tokendance/balance/refresh", { method: "POST" })).status,
+		).toBe(404);
 		expect((await app().request("/api/tokendance/balance")).status).toBe(401);
 	});
 	test("payment creation validates input and status is owner scoped", async () => {
@@ -156,6 +156,35 @@ describe("TokenDance first-party admin boundary", () => {
 				)
 			).status,
 		).toBe(404);
+	});
+	test.each([
+		{ mode: "add" },
+		{ mode: "replace", credentialId: "migrated-login-slot" },
+	] as const)("OAuth start forwards an explicit $mode choice without a second flow", async (loginChoice) => {
+		startOAuth.mockClear();
+		const callbackUrl = "https://public.example/settings/providers/tokendance/callback";
+		const response = await app({ type: "session", user }).request("/api/tokendance/oauth/start", {
+			method: "POST",
+			body: JSON.stringify({ callbackUrl, loginChoice }),
+		});
+		expect(response.status).toBe(200);
+		expect(startOAuth).toHaveBeenCalledWith(
+			"test-owner",
+			new URL(callbackUrl),
+			undefined,
+			loginChoice,
+		);
+		for (const invalid of [
+			{ mode: "replace" },
+			{ mode: "add", credentialId: "unexpected" },
+			{ mode: "first" },
+		]) {
+			const rejected = await app({ type: "session", user }).request("/api/tokendance/oauth/start", {
+				method: "POST",
+				body: JSON.stringify({ callbackUrl, loginChoice: invalid }),
+			});
+			expect(rejected.status).toBe(400);
+		}
 	});
 	test("OAuth start forwards actual browser Fetch Metadata without trusting forwarded hosts", async () => {
 		validateCallback.mockClear();

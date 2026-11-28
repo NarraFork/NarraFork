@@ -1,11 +1,15 @@
+import { createHash } from "node:crypto";
 import type { GitLineStats } from "../../shared/git-line-stats";
 import type {
 	GitStatusPage,
+	GitStatusPageCacheState,
 	GitStatusPageErrorCode,
 	GitStatusPageLimitReason,
 	GitStatusPageQuery,
+	GitStatusPageResult,
 	GitStatusPageScopeProof,
 	GitStatusPageStatsQuery,
+	GitStatusPageStatsResponse,
 	GitStatusPageStatsResult,
 	GitStatusPageValidation,
 } from "../../shared/git-status-page";
@@ -69,11 +73,26 @@ export type GitStatusPageSource =
 			read: (signal: AbortSignal) => Promise<GitStatusPageRawResult>;
 	  };
 
+export function gitStatusPageSourceIdentity(source: GitStatusPageSourceDescriptor): string {
+	const descriptor =
+		source.kind === "local"
+			? { kind: source.kind, cwd: source.cwd }
+			: { kind: source.kind, identity: source.identity };
+	return createHash("sha256").update(JSON.stringify(descriptor)).digest("base64url");
+}
+
 export interface GitStatusPageRequest {
 	scope: GitStatusPageScope;
 	query: GitStatusPageQuery;
 	source: GitStatusPageSourceDescriptor;
-	operation?: "validate" | "assert" | "stats";
+	operation?:
+		| "validate"
+		| "assert"
+		| "stats"
+		| "observe"
+		| "cache-state"
+		| "read-on-demand"
+		| "stats-on-demand";
 	statsQuery?: GitStatusPageStatsQuery;
 	proof?: GitStatusPageScopeProof;
 	files?: string[];
@@ -110,11 +129,16 @@ export type GitStatusPageWorkerInput =
 	| { action: "stats"; id: number; result?: GitLineStats; error?: string }
 	| { action: "invalidate-stats"; queryKey: string }
 	| { action: "invalidate"; queryKey: string }
+	| { action: "retain"; queryKey: string; sourceIdentity?: string }
+	| { action: "release"; queryKey: string; sourceIdentity?: string }
 	| { action: "close" };
 
 export type GitStatusPageWorkerValue =
 	| GitStatusPage
 	| GitStatusPageStatsResult
+	| GitStatusPageResult
+	| GitStatusPageStatsResponse
+	| GitStatusPageCacheState
 	| GitStatusPageValidation
 	| true;
 
@@ -123,6 +147,7 @@ export type GitStatusPageWorkerOutput =
 	| { action: "remote"; id: number }
 	| { action: "stats"; id: number; readId: number }
 	| { action: "stats-cancel"; readId: number }
+	| { action: "cache-published"; id: number; cache: GitStatusPageCacheState }
 	| { action: "result"; id: number; value: GitStatusPageWorkerValue }
 	| { action: "error"; id: number; code: GitStatusPageErrorCode; message: string }
 	| { action: "closed" };

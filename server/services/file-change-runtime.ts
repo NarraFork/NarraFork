@@ -271,12 +271,26 @@ export class LocalFileChangeRuntime {
 		return this.initialization;
 	}
 
-	private async initializeNamespace(): Promise<Namespace> {
-		this.historyDiagnostics.clearIdentity();
+	private async initializeSourceIdentity(): Promise<string> {
 		const privateRoot = resolve(this.options.privateRoot);
 		await mkdir(privateRoot, { recursive: true, mode: 0o700 });
 		await requireApplicationDataDirectory(privateRoot);
-		const sourceInstanceId = await persistentSourceId(privateRoot);
+		return persistentSourceId(privateRoot);
+	}
+
+	/** Querying an old receipt must never create a replacement source identity. */
+	async readExistingSourceInstanceId(signal?: AbortSignal): Promise<string> {
+		signal?.throwIfAborted();
+		await requireApplicationDataDirectory(resolve(this.options.privateRoot));
+		const sourceInstanceId = await persistentSourceId(this.options.privateRoot, false);
+		signal?.throwIfAborted();
+		return sourceInstanceId;
+	}
+
+	private async initializeNamespace(): Promise<Namespace> {
+		this.historyDiagnostics.clearIdentity();
+		const privateRoot = resolve(this.options.privateRoot);
+		const sourceInstanceId = await this.initializeSourceIdentity();
 		const root = join(privateRoot, "file-change-blobs");
 		await mkdir(root, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "EEXIST") throw error;
@@ -523,11 +537,11 @@ export class LocalFileChangeRuntime {
 			.get();
 		if (!actorRow) throw new Error("Executing narrator no longer exists");
 		await boundedFileHistory(async () => {
-			const source = await this.initialize();
+			const sourceInstanceId = await this.initializeSourceIdentity();
 			const subagent = actorRow.type === "subagent" || actorRow.variant.startsWith("subagent");
 			this.evidence.beginNoDispatchOperation(
 				{
-					sourceInstanceId: source.sourceInstanceId,
+					sourceInstanceId,
 					sourceKind: "tool",
 					sourceId: binding.toolCallId,
 					toolCallId: binding.toolCallId,
@@ -774,12 +788,15 @@ export class LocalFileChangeRuntime {
 		}
 		const summary: AttemptSummary = { running: true };
 		records.set(key, summary);
+		// Local writes retain only identity, replay protection and real IO metadata.
+		const historyEnabled = backend.kind !== "local";
+		let sourceInstanceId: string | undefined;
 		let namespace: Namespace | undefined;
 		let operation: FileChangeOperationRecord | undefined;
 		let scope: FileChangeScopeIdentity | undefined;
 		let beforeState: FileChangeState = { kind: "unknown", reason: "history_unavailable" };
 		let intendedAfter: FileChangeState = { kind: "unknown", reason: "history_unavailable" };
-		let historyStatus: FileHistoryStatus = "complete";
+		let historyStatus: FileHistoryStatus = historyEnabled ? "complete" : "disabled";
 		let diskOutcome: FileWriteOutcome = "not_applied";
 		let prepared: PreparedFileChange<Result> | undefined;
 		let observed: LocalFileObservation | undefined;
@@ -790,12 +807,17 @@ export class LocalFileChangeRuntime {
 		let effect: FileChangeEffectRecord | undefined;
 		let historyStage: FileHistoryStage = "initialize";
 		const historyUnavailable = (cause: unknown, diagnose = true, stage = historyStage) => {
-			historyStatus = "unavailable";
-			if (diagnose) this.historyDiagnostics.failure(stage, cause);
-			logger.warn("File history unavailable for this request", {
-				sourceId: request.sourceId,
-				error: String(cause),
-			});
+			if (historyEnabled) historyStatus = "unavailable";
+			if (diagnose && historyEnabled) this.historyDiagnostics.failure(stage, cause);
+			logger.warn(
+				historyEnabled
+					? "File history unavailable for this request"
+					: "File write metadata unavailable",
+				{
+					sourceId: request.sourceId,
+					error: String(cause),
+				},
+			);
 		};
 		try {
 			const digest = await hashLocalFileChangeRequest(
@@ -803,15 +825,20 @@ export class LocalFileChangeRuntime {
 				request.input,
 				request.signal,
 			);
-			// Initialization is optional history work, outside the file's IO queue.
+			// Identity and optional history preparation stay outside the file's IO queue.
 			let initializationRejected = false;
 			try {
-				namespace = await boundedFileHistory(() =>
-					this.initialize().catch((cause) => {
-						initializationRejected = true;
-						throw cause;
-					}),
-				);
+				if (historyEnabled) {
+					namespace = await boundedFileHistory(() =>
+						this.initialize().catch((cause) => {
+							initializationRejected = true;
+							throw cause;
+						}),
+					);
+					sourceInstanceId = namespace.sourceInstanceId;
+				} else {
+					sourceInstanceId = await boundedFileHistory(() => this.initializeSourceIdentity());
+				}
 			} catch (cause) {
 				// Shared initialization failures are diagnosed by initialize(), not each waiter.
 				// A request's own history budget timeout still needs a diagnostic.
@@ -863,7 +890,7 @@ export class LocalFileChangeRuntime {
 					prepared = await request.construct(before);
 					if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 						throw new LocalFileValidationError("Output exceeds the 32 MiB file limit");
-					if (namespace) {
+					if (sourceInstanceId) {
 						try {
 							historyStage = "resolve_scope";
 							const cwd = request.remote
@@ -878,21 +905,16 @@ export class LocalFileChangeRuntime {
 									: footprint.anchor;
 							historyStage = "prepare_scope";
 							scope = this.evidence.prepareScope({
-								sourceInstanceId: namespace.sourceInstanceId,
+								sourceInstanceId,
 								deviceId: backend.deviceId,
 								workspaceInstanceId: request.remote
-									? hash([
-											namespace.sourceInstanceId,
-											backend.deviceId,
-											root,
-											request.remote.rootIdentity,
-										])
-									: hash([namespace.sourceInstanceId, root]),
+									? hash([sourceInstanceId, backend.deviceId, root, request.remote.rootIdentity])
+									: hash([sourceInstanceId, root]),
 								canonicalRoot: root,
 								pathFlavor: backend.pathFlavor as "posix" | "windows",
 							});
 							const input: BeginFileChangeOperation = {
-								sourceInstanceId: namespace.sourceInstanceId,
+								sourceInstanceId,
 								sourceKind: request.sourceKind,
 								sourceId: request.sourceId,
 								attempt: request.attempt,
@@ -904,14 +926,15 @@ export class LocalFileChangeRuntime {
 										? Number(request.input.snapshotRevision)
 										: null,
 								actor: request.actor,
-								executionBinding: request.remote
-									? {
-											deviceId: backend.deviceId,
-											runtimeEpoch: request.runtime.runtimeEpoch,
-											runtimeGeneration: request.runtime.runtimeGeneration,
-											fencingToken: request.runtime.runtimeGeneration,
-										}
-									: null,
+								executionBinding:
+									request.remote || request.sourceKind === "editor"
+										? {
+												deviceId: backend.deviceId,
+												runtimeEpoch: request.runtime.runtimeEpoch,
+												runtimeGeneration: request.runtime.runtimeGeneration,
+												fencingToken: request.runtime.runtimeGeneration,
+											}
+										: null,
 								toolCallId:
 									request.sourceKind === "tool" && request.linkOperation ? request.sourceId : null,
 								toolUseId: request.toolUseId,
@@ -945,7 +968,7 @@ export class LocalFileChangeRuntime {
 						}
 						// Without both records settlement cannot reference any blobs. Do not spend
 						// quota or hold the write queue publishing history that cannot be attached.
-						if (operation && scope) {
+						if (operation && scope && namespace) {
 							const ns = namespace;
 							let publicationStage: FileHistoryStage = "publish_before";
 							try {
@@ -985,7 +1008,7 @@ export class LocalFileChangeRuntime {
 									? {
 											sourceId: request.sourceId,
 											userId: request.userId as string,
-											sourceInstanceId: namespace?.sourceInstanceId,
+											sourceInstanceId,
 											operationId: operation?.id,
 											snapshotRevision: Number(request.input.snapshotRevision),
 											requestDigest: digest,
@@ -1061,9 +1084,12 @@ export class LocalFileChangeRuntime {
 			if (cause instanceof LocalFileValidationError) diskOutcome = "conflict";
 		} finally {
 			// All metadata settlement runs after withFileWrite has released the target.
-			if (operation && scope && namespace) {
+			if (operation && scope) {
 				try {
-					let observedAfter: FileChangeState = { kind: "unknown", reason: "missing_after" };
+					let observedAfter: FileChangeState = {
+						kind: "unknown",
+						reason: historyEnabled ? "missing_after" : "history_unavailable",
+					};
 					if (
 						observed &&
 						prepared &&
@@ -1074,7 +1100,7 @@ export class LocalFileChangeRuntime {
 						observedAfter = intendedAfter;
 					else if (observed && before && sameObservedBytes(observed, before))
 						observedAfter = beforeState;
-					else if (observed) {
+					else if (observed && namespace) {
 						const ns = namespace;
 						const captured = observed;
 						historyStage = "publish_observed_after";
@@ -1116,7 +1142,7 @@ export class LocalFileChangeRuntime {
 					historyUnavailable(cause);
 				}
 			} else {
-				historyStatus = "unavailable";
+				if (historyEnabled) historyStatus = "unavailable";
 				if (
 					!dispatched &&
 					failed &&
@@ -1372,6 +1398,8 @@ export function withFileToolNoDispatch(
 					suppressed = true;
 				},
 			});
+			if (!writing && ctx.executionTarget?.backendKind === "local")
+				result.metadata = { ...result.metadata, historyStatus: "disabled" };
 			return withFileHistoryNotice(result, ctx.locale);
 		} finally {
 			if (remoteAttempt) remoteAttempt.running = false;
@@ -1379,7 +1407,12 @@ export function withFileToolNoDispatch(
 				try {
 					await boundedFileHistory(() => record(reason));
 				} catch (error) {
-					if (result) result.metadata = { ...result.metadata, historyStatus: "unavailable" };
+					if (result)
+						result.metadata = {
+							...result.metadata,
+							historyStatus:
+								ctx.executionTarget?.backendKind === "local" ? "disabled" : "unavailable",
+						};
 					logger.warn("Host no-dispatch history unavailable", { toolName, error: String(error) });
 				}
 			}

@@ -24,6 +24,7 @@ import {
 	recordDeniedGrantEvent,
 	revokeOAuthGrantForUser,
 } from "../oauth-grant-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const userId = generateId();
 const otherUserId = generateId();
@@ -411,9 +412,11 @@ describe("oauth grant service", () => {
 			return originalMarkOrphaned(...args);
 		};
 		try {
-			await expect(
-				revokeOAuthGrantForUser({ grantId: grant.id, userId, reason: "retry cleanup" }),
-			).rejects.toThrow("injected orphan cleanup failure");
+			expect(
+				await captureWorkerRejectionThrower(
+					revokeOAuthGrantForUser({ grantId: grant.id, userId, reason: "retry cleanup" }),
+				),
+			).toThrow("injected orphan cleanup failure");
 			expect((await getUserOAuthGrant(userId, grant.id))?.revokedAt).toBeTruthy();
 			expect(
 				(
@@ -473,14 +476,16 @@ describe("oauth grant service", () => {
 		expect(denyAll.projectIds).toEqual([]);
 		expect(await isOAuthGrantProjectAllowed(denyAll.id, projectA, otherUserId)).toBe(false);
 
-		await expect(
-			createOAuthGrant({
-				userId: generateId(),
-				clientId: clientPublicId,
-				scopes: ["device.provision"],
-				projectIds: Array.from({ length: 101 }, () => generateId()),
-			}),
-		).rejects.toThrow(/cannot exceed/);
+		expect(
+			await captureWorkerRejectionThrower(
+				createOAuthGrant({
+					userId: generateId(),
+					clientId: clientPublicId,
+					scopes: ["device.provision"],
+					projectIds: Array.from({ length: 101 }, () => generateId()),
+				}),
+			),
+		).toThrow(/cannot exceed/);
 	});
 
 	test("records denied consent with nullable grant and event user ids", async () => {

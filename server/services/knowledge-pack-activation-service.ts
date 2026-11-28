@@ -3,6 +3,7 @@ import { relative, resolve, sep } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { knowledgePackActivations } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -16,6 +17,7 @@ import {
 import { isInsidePath } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { extractZipArchive } from "../lib/zip-archive";
+import type { KnowledgeReadOptions } from "./knowledge/read-store";
 import { knowledgeWriteStore } from "./knowledge/store";
 import type { Principal } from "./knowledge-acl";
 import { knowledgePackService, type Pack } from "./knowledge-pack-service";
@@ -126,14 +128,22 @@ function inspectExtraction(destDir: string): { files: string[]; totalBytes: numb
 }
 
 /** Find an active activation row for (narrator, pack), if any. */
-async function findActiveActivation(narratorId: string, packId: string) {
-	return db.query.knowledgePackActivations.findFirst({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.packId, packId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-	});
+async function findActiveActivation(
+	narratorId: string,
+	packId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	return readQueryFirst(
+		db.query.knowledgePackActivations.findMany({
+			limit: 1,
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.packId, packId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 }
 
 /**
@@ -148,11 +158,12 @@ async function activate(
 	narratorId: string,
 	packId: string,
 	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<ActivationResult> {
 	// ACL gate (throws NotFound if not accessible — never leaks existence).
-	const pack: Pack = await knowledgePackService.loadAccessiblePack(packId, principal);
+	const pack: Pack = await knowledgePackService.loadAccessiblePack(packId, principal, readOptions);
 
-	const existing = await findActiveActivation(narratorId, packId);
+	const existing = await findActiveActivation(narratorId, packId, readOptions);
 	const destDir = packExtractDir(narratorId, packId);
 
 	// Reuse path: same archive hash + extract dir still present → return as-is.
@@ -250,8 +261,12 @@ async function releaseActivation(
 }
 
 /** Deactivate a pack for a narrator (idempotent): release the active activation if any. */
-async function deactivate(narratorId: string, packId: string): Promise<{ released: boolean }> {
-	const existing = await findActiveActivation(narratorId, packId);
+async function deactivate(
+	narratorId: string,
+	packId: string,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<{ released: boolean }> {
+	const existing = await findActiveActivation(narratorId, packId, readOptions);
 	if (!existing) return { released: false };
 	await releaseActivation(existing.id, existing.whitelistDirId, existing.extractDir);
 	logger.info("Pack deactivated", { packId, narratorId });
@@ -259,20 +274,26 @@ async function deactivate(narratorId: string, packId: string): Promise<{ release
 }
 
 /** List a narrator's active activations (with pack name for display). */
-async function listActive(narratorId: string) {
-	const rows = await db.query.knowledgePackActivations.findMany({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-		orderBy: (a, { desc: d }) => [d(a.createdAt)],
-	});
+async function listActive(narratorId: string, readOptions: KnowledgeReadOptions = {}) {
+	const rows = await readQuery(
+		db.query.knowledgePackActivations.findMany({
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+			orderBy: (a, { desc: d }) => [d(a.createdAt)],
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (rows.length === 0) return [];
 	const packIds = [...new Set(rows.map((r) => r.packId))];
-	const packs = await db.query.knowledgePacks.findMany({
-		where: (p, { inArray }) => inArray(p.id, packIds),
-		columns: { id: true, name: true, slug: true },
-	});
+	const packs = await readQuery(
+		db.query.knowledgePacks.findMany({
+			where: (p, { inArray }) => inArray(p.id, packIds),
+			columns: { id: true, name: true, slug: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const byId = new Map(packs.map((p) => [p.id, p]));
 	return rows.map((r) => ({
 		id: r.id,
@@ -284,13 +305,19 @@ async function listActive(narratorId: string) {
 }
 
 /** Release ALL active activations for a narrator (called when the narrator is removed). */
-async function cleanupNarrator(narratorId: string): Promise<void> {
-	const rows = await db.query.knowledgePackActivations.findMany({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-	});
+async function cleanupNarrator(
+	narratorId: string,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<void> {
+	const rows = await readQuery(
+		db.query.knowledgePackActivations.findMany({
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	for (const r of rows) {
 		await releaseActivation(r.id, r.whitelistDirId, r.extractDir);
 	}

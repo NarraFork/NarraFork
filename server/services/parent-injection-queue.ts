@@ -1,3 +1,4 @@
+import { watchCommandTargetType } from "@shared/watch-command";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
@@ -176,7 +177,11 @@ export function projectPendingInjection(
 		}>(row);
 		if (!metadata.taskId || !metadata.eventKind) throw new Error("Invalid task notice metadata");
 		const task = db
-			.select({ title: backgroundTasks.title, alias: backgroundTasks.alias })
+			.select({
+				title: backgroundTasks.title,
+				alias: backgroundTasks.alias,
+				command: backgroundTasks.command,
+			})
 			.from(backgroundTasks)
 			.where(eq(backgroundTasks.id, metadata.taskId))
 			.get();
@@ -220,6 +225,7 @@ export function projectPendingInjection(
 					alias: task?.alias ?? null,
 					status,
 					outputPreview,
+					watch: watchCommandTargetType(task?.command),
 					userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 				},
 			};

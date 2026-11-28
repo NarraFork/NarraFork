@@ -7,6 +7,7 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -18,6 +19,7 @@ import i18next from "i18next";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../hooks/useRuntimeSettings";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import outlineEn from "../../locales/en/outline.json";
 import type { LiveTransport } from "./editor/live-client";
@@ -122,7 +124,13 @@ export function open(options: {
 	// The page subscription (`useOutlinePageLive`) rides the narrator socket, as in the app.
 	narratorWSManager.connect();
 	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+		revision: 1,
+		agent: { defaultModel: "", summaryModel: "" },
+		outline: { enabled: true },
+		requestEvidence: { autoPin: "off" },
+		summaryModelAvailable: null,
+	} satisfies RuntimeSettings);
 	const client = queryClient;
 	const rootRoute = createRootRoute({
 		component: () => (

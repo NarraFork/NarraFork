@@ -250,6 +250,32 @@ export function DataPortabilityCard() {
 								{t("dataImportKeysFailed", { count: importResult.keysFailed })}
 							</Text>
 						)}
+						{importResult.communication && (
+							<>
+								<Text
+									size="sm"
+									c={importResult.communication.peersSkipped > 0 ? "orange.6" : undefined}
+									mt={4}
+								>
+									{t("dataImportCommunication", {
+										restored: importResult.communication.peersRestored,
+										skipped: importResult.communication.peersSkipped,
+										preserved: importResult.communication.nodesPreserved,
+									})}
+								</Text>
+								{importResult.communication.parentsDetachedMissingEndpoints +
+									importResult.communication.parentsDetachedUnauthorized >
+									0 && (
+									<Text size="sm" c="orange.6" mt={4}>
+										{t("dataImportCommunicationDetached", {
+											count:
+												importResult.communication.parentsDetachedMissingEndpoints +
+												importResult.communication.parentsDetachedUnauthorized,
+										})}
+									</Text>
+								)}
+							</>
+						)}
 					</Alert>
 				)}
 

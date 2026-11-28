@@ -39,6 +39,8 @@ export interface MirrorRelayConfig {
 	bearerTokenEnv?: string;
 	signingKeyEnv?: string;
 	pollIntervalSeconds?: number;
+	/** Concurrent relay asset downloads (1–8), default 8. */
+	downloadConcurrency?: number;
 	/** Overall relay job (1–300 minutes); default main 25, auxiliary 120. */
 	totalTimeoutMinutes?: number;
 	/** Single streamed DAV object (1–100 minutes), default 15. */

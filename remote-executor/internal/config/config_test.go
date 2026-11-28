@@ -608,3 +608,30 @@ func TestDisableShellFlag(t *testing.T) {
 		t.Error("DisableShell should be true")
 	}
 }
+
+func TestDefaultStateDirFollowsThePlatformConvention(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	dir, err := DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"windows": filepath.Join(home, "AppData", "Local", "narrafork-executor"),
+		"darwin":  filepath.Join(home, "Library", "Application Support", "narrafork-executor"),
+	}[runtime.GOOS]
+	if want == "" {
+		want = filepath.Join(home, ".local", "state", "narrafork-executor")
+	}
+	if dir != want {
+		t.Fatalf("DefaultStateDir() = %q, want %q", dir, want)
+	}
+	if runtime.GOOS == "linux" {
+		t.Setenv("XDG_STATE_HOME", filepath.Join(home, "xdg"))
+		if dir, _ := DefaultStateDir(); dir != filepath.Join(home, "xdg", "narrafork-executor") {
+			t.Fatalf("XDG_STATE_HOME ignored: %q", dir)
+		}
+	}
+}

@@ -134,7 +134,7 @@ afterEach(async () => {
 	settings.agent.subagentAllowedModels = originalAllowedModels;
 	for (const id of ids) {
 		clearTakenOver(id);
-		drainPendingInjections(id);
+		await drainPendingInjections(id);
 		clearAliasRegistry(id);
 	}
 	if (ids.length) {
@@ -299,6 +299,41 @@ describe("registered background startup boundaries", () => {
 				({ event }) => (event as { type?: string }).type === "background_task_started",
 			),
 		).toBe(false);
+	});
+
+	test("a refusing creation hook archives the subagent before any run and is rethrown", async () => {
+		const runtime = await import("../agent-runtime/run");
+		const start = spyOn(runtime, "startNarratorRun");
+		const create = spyOn(backgroundTaskService, "createAgentTask");
+		restoreSpies.push(
+			() => start.mockRestore(),
+			() => create.mockRestore(),
+		);
+		// A team work item refusing its worker (another one attached first, or a dependency).
+		const refusal = Object.assign(new Error("Work item w already has a worker"), {
+			code: "TEAM_WORK_ITEM_CHANGED",
+		});
+		let created: string | undefined;
+		await expect(
+			runSubagent({
+				...input(),
+				onCreated: (id: string) => {
+					created = id;
+					ids.push(id);
+					throw refusal;
+				},
+			}),
+		).rejects.toBe(refusal);
+		expect(created).toBeTruthy();
+		expect(start).not.toHaveBeenCalled();
+		expect(create).not.toHaveBeenCalled();
+		const row = db
+			.select()
+			.from(narrators)
+			.where(eq(narrators.id, created as string))
+			.get();
+		expect(row?.status).toBe("archived");
+		expect(getExecutionOwner(created as string)).toBeUndefined();
 	});
 
 	test("a synchronous start exception settles exactly this task and is rethrown unchanged", async () => {

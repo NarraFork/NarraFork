@@ -8,7 +8,12 @@ import {
 	setNugCachedCapabilities,
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
-import { ensureNugRelayClient, getNugRelayChannelId, usesLocalEgress } from "../nug-relay/manager";
+import {
+	assertNugConnectionCurrent,
+	getNugRelayChannelIdForCredential,
+	reconcileNugRelayProvider,
+	usesLocalEgress,
+} from "../nug-relay/manager";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
 import { AnthropicProvider } from "./anthropic-provider";
@@ -163,12 +168,16 @@ export class NugProvider implements ProviderAdapter {
 	private activeMeta: ResolvedNugModelMeta | null = null;
 	private activeDelegate: ProviderAdapter | null = null;
 
-	constructor(config: NUGProviderConfig) {
-		this.config = config;
+	constructor(config: NUGProviderConfig, relayConfig: NUGProviderConfig = config) {
+		assertNugConnectionCurrent(config);
+		assertNugConnectionCurrent(relayConfig);
+		// Provider-key projection mutates settings entries in place; keep the attempted secret fixed.
+		this.config = { ...config };
 		// Client-egress relay lifecycle follows provider construction: with
 		// egressMode local-* a relay channel to the gateway is established (or
 		// reused); reverting to "nug" tears it down. Idempotent per provider id.
-		ensureNugRelayClient(config);
+		// A captured request owns its inference config, not live relay credentials or endpoints.
+		reconcileNugRelayProvider(relayConfig.id);
 	}
 
 	/**
@@ -221,6 +230,16 @@ export class NugProvider implements ProviderAdapter {
 		this.activeDelegate = delegate;
 	}
 
+	private relayHeaders(): Record<string, string> {
+		const channelId = getNugRelayChannelIdForCredential(this.config);
+		if (channelId) return { "X-NUG-Relay-Channel": channelId };
+		if (this.config.egressAllowDirectFallback === true) return {};
+		throw new Error(
+			`Local egress is selected for NUG provider "${this.config.name}" but no online relay matches this credential and connection. ` +
+				"Check the local network/proxy (clash) and the NUG connection, or enable egressAllowDirectFallback.",
+		);
+	}
+
 	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter {
 		const extraHeaders = this.modelHashHeaders();
 		const delegateBase = buildNugDelegateBaseConfig(this.config, meta, extraHeaders);
@@ -232,35 +251,46 @@ export class NugProvider implements ProviderAdapter {
 				// (`encrypted_content`), which are only replayable against the same
 				// gateway channel — tag them with the NUG channel identity instead of
 				// the delegate's own prefix.
-				const delegate = new OpenAIProvider({
-					...delegateBase,
-					baseUrl: `${this.baseUrl}/v1`,
-					apiMode:
-						meta.channelType === "codex"
-							? "codex"
-							: meta.channelType === "responses"
-								? "responses"
-								: "completions",
-					// Client-egress relay: only the codex channel honors the relay
-					// channel id; the value rotates on reconnect, so it must be read
-					// per request via dynamicHeaders rather than baked into
-					// extraHeaders.
-					...(usesLocalEgress(this.config) && meta.channelType === "codex"
+				const delegate = new OpenAIProvider(
+					{
+						...delegateBase,
+						baseUrl: `${this.baseUrl}/v1`,
+						apiMode:
+							meta.channelType === "codex"
+								? "codex"
+								: meta.channelType === "responses"
+									? "responses"
+									: "completions",
+						// Client-egress relay: only the codex channel honors the relay
+						// channel id; the value rotates on reconnect, so it must be read
+						// per request via dynamicHeaders rather than baked into
+						// extraHeaders.
+						...(usesLocalEgress(this.config) && meta.channelType === "codex"
+							? {
+									dynamicHeaders: () => this.relayHeaders(),
+								}
+							: {}),
+						...(meta.channelType === "codex"
+							? {
+									codexWebSocket: false,
+									// apiMode codex already presents the codex-tui originator,
+									// installation id and the stable codex body contract.
+								}
+							: {}),
+					},
+					undefined,
+					usesLocalEgress(this.config) && meta.channelType === "codex"
 						? {
-								dynamicHeaders: (): Record<string, string> => {
-									const channelId = getNugRelayChannelId(this.config.id);
-									return channelId ? { "X-NUG-Relay-Channel": channelId } : {};
+								transportHeaders: (headers) => {
+									// Runs at the final HTTP boundary, after callbacks/user headers. A relay
+									// may have reconnected under another key since request assembly.
+									const relay = this.relayHeaders();
+									headers.delete("X-NUG-Relay-Channel");
+									for (const [name, value] of Object.entries(relay)) headers.set(name, value);
 								},
 							}
-						: {}),
-					...(meta.channelType === "codex"
-						? {
-								codexWebSocket: false,
-								// apiMode codex already presents the codex-tui originator,
-								// installation id and the stable codex body contract.
-							}
-						: {}),
-				});
+						: undefined,
+				);
 				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
 				return delegate;
 			}
@@ -449,17 +479,7 @@ export class NugProvider implements ProviderAdapter {
 		// request while the relay channel is down would silently switch the
 		// egress IP back to NUG-direct. Fail loudly instead unless the user
 		// explicitly opted into the fallback.
-		if (
-			usesLocalEgress(this.config) &&
-			meta.channelType === "codex" &&
-			!getNugRelayChannelId(this.config.id) &&
-			!this.config.egressAllowDirectFallback
-		) {
-			throw new Error(
-				`Local egress is selected for NUG provider "${this.config.name}" but the relay channel is not online. ` +
-					"Check the local network/proxy (clash) and the NUG connection, or enable egressAllowDirectFallback.",
-			);
-		}
+		if (usesLocalEgress(this.config) && meta.channelType === "codex") this.relayHeaders();
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
@@ -629,9 +649,10 @@ export class NugProvider implements ProviderAdapter {
 		);
 	}
 
-	async getQuota(): Promise<NugQuota> {
+	async getQuota(signal?: AbortSignal): Promise<NugQuota> {
 		const response = await this.pfetch(`${this.baseUrl}/v1/quota`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+			signal,
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

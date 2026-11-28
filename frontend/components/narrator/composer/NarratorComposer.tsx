@@ -18,27 +18,40 @@ import {
 	type RefObject,
 	useCallback,
 	useEffect,
+	useId,
 	useImperativeHandle,
 	useMemo,
 	useRef,
 	useState,
+	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import { useDraftComposerCommands, useNarratorCommands } from "../../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
-import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
+import { useNarratorMentionCandidates } from "../../../hooks/useNarratorMentionCandidates";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { api } from "../../../lib/api";
+import { getToken, onTokenChange } from "../../../lib/api/client";
+import {
+	createNarratorPanelReadScope,
+	type NarratorPanelReadScope,
+} from "../../../lib/api/narrators";
 import { listenComposerAppend } from "../../../lib/composer-append-queue";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
+import {
+	PANEL_DROP_PRIORITY,
+	type PanelDragState,
+	registerPanelDropTarget,
+} from "../../../lib/panel-drag";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { enterOwnedByTarget } from "../interaction/enter-ownership";
 import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
+import { useEditorPanelVisible } from "../narrator-panel-visibility";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
@@ -69,7 +82,11 @@ import {
 	rememberFileReference,
 	sameFileReferenceInput,
 } from "./file-reference-input";
-import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
+import {
+	InlineComposerEditor,
+	type InlineComposerEditorHandle,
+	type InlineComposerTextContext,
+} from "./InlineComposerEditor";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import classes from "./NarratorComposer.module.css";
 import {
@@ -90,6 +107,28 @@ import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 const EMPTY_FILES: File[] = [];
+
+function sameTextContext(a: InlineComposerTextContext | null, b: InlineComposerTextContext | null) {
+	return a?.text === b?.text && a?.start === b?.start && a?.end === b?.end && a?.caret === b?.caret;
+}
+
+// A native selection may move before ProseMirror consumes selectionchange.
+function captureNativeSelectionCheck(doc: Document) {
+	const selection = doc.getSelection();
+	const anchor = selection?.anchorNode;
+	const anchorOffset = selection?.anchorOffset;
+	const focus = selection?.focusNode;
+	const focusOffset = selection?.focusOffset;
+	return () => {
+		const current = doc.getSelection();
+		return (
+			current?.anchorNode === anchor &&
+			current?.anchorOffset === anchorOffset &&
+			current?.focusNode === focus &&
+			current?.focusOffset === focusOffset
+		);
+	};
+}
 
 function createDraftSourceId(): string {
 	return (
@@ -179,6 +218,7 @@ export interface NarratorComposerHandle {
 
 export interface NarratorComposerProps {
 	narratorId: string;
+	readScope?: NarratorPanelReadScope;
 	sendingRef: RefObject<boolean>;
 	appendInputRef?: RefObject<((text: string) => void) | null>;
 	permEnterActive: boolean;
@@ -239,6 +279,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 	function NarratorComposer(
 		{
 			narratorId,
+			readScope: parentReadScope,
 			sendingRef,
 			appendInputRef,
 			permEnterActive,
@@ -270,6 +311,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const qc = useQueryClient();
 		const { data: currentUser } = useCurrentUser();
 		const currentUserId = currentUser?.id ? String(currentUser.id) : null;
+		const token = useSyncExternalStore(onTokenChange, getToken, () => null);
+		// Standalone composers get the same isolation, without borrowing any panel's read.
+		// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
+		const ownReadScope = useMemo(
+			() => createNarratorPanelReadScope(),
+			[token, currentUserId, narratorId],
+		);
+		const readScope = parentReadScope ?? ownReadScope;
 		const currentDraftScope = currentUserId
 			? getNarratorDraftStorageId(currentUserId, narratorId)
 			: null;
@@ -380,9 +429,16 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
 		const draftReadEpochRef = useRef(0);
+		const hydrationEpochRef = useRef<number | null>(null);
+		const pendingDraftMetaRef = useRef<
+			Parameters<NarratorComposerHandle["handleDraftMeta"]>[0] | null
+		>(null);
+		const metaReadRef = useRef<AbortController | null>(null);
+		const drainDraftMetaRef = useRef<() => void>(() => {});
 		const draftOwnerScopeRef = useRef<string | null>(null);
 		const textareaRef = useRef<HTMLDivElement>(null);
 		const editorRef = useRef<InlineComposerEditorHandle>(null);
+		const dropTargetId = useId();
 		const [editorElement, setEditorElement] = useState<HTMLDivElement | null>(null);
 		const [editorFocused, setEditorFocused] = useState(false);
 		useEffect(() => {
@@ -842,7 +898,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				composerDocument: ComposerDocument | null = inputStateRef.current.composerDocument ?? null,
 			) => {
 				const refs = copyFileReferences(references, text);
-				if (!currentUserId) throw new Error("Current user is unavailable");
+				if (!currentUserId || getToken() !== token) throw new Error("Current user is unavailable");
 				if (draftOwnerScopeRef.current !== currentDraftScope)
 					throw new Error("Draft belongs to a previous account or narrator");
 				if (lastDraftRevisionRef.current == null)
@@ -864,6 +920,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				);
 				if (
 					seq === draftSyncSeqRef.current &&
+					getToken() === token &&
 					qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
 				) {
 					lastSyncedDraftRef.current = {
@@ -897,7 +954,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return result;
 			},
-			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
+			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument, token],
 		);
 
 		const clearTextAndDraft = useCallback(() => {
@@ -931,6 +988,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			// An old account/narrator's in-flight save must not overwrite the newly hydrated pair.
 			draftSyncSeqRef.current++;
 			const readEpoch = ++draftReadEpochRef.current;
+			hydrationEpochRef.current = readEpoch;
+			metaReadRef.current?.abort();
+			metaReadRef.current = null;
+			pendingDraftMetaRef.current = null;
 			draftOwnerScopeRef.current = null;
 			seenDraftRevisionRef.current = null;
 			unsyncedBaseRevisionRef.current = null;
@@ -947,10 +1008,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			let cancelled = false;
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), 15_000);
-			const alive = () =>
+			const isCurrent = () =>
 				!cancelled &&
+				getToken() === token &&
 				draftReadEpochRef.current === readEpoch &&
 				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
+			const alive = () => isCurrent() && !controller.signal.aborted;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
 			setDisplacedDraft(null);
@@ -981,6 +1044,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			draftOwnerScopeRef.current = currentDraftScope;
 			setDraftHydrated(true);
 			if (localDraftOnly) {
+				hydrationEpochRef.current = null;
 				clearTimeout(timer);
 				setDraftSyncState("local");
 				return;
@@ -989,10 +1053,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			const loadDraft = async () => {
 				try {
 					const panel = await api.getNarratorPanelState(narratorId, {
+						readScope,
 						signal: controller.signal,
 						fresh: draftLoadAttempt > 0,
 					});
 					if (!alive()) return;
+					seenDraftRevisionRef.current = Math.max(
+						seenDraftRevisionRef.current ?? -1,
+						panel.draft.revision,
+					);
 					if (canHydrateNarratorDraftFromMeta(localDraft, panel.draft)) {
 						// The local snapshot is acknowledged. Keep any text/references typed while metadata loaded.
 						lastSyncedDraftRef.current = {
@@ -1015,9 +1084,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						);
 						return;
 					}
+					if (!panel.draft.hasDraft) {
+						// A tombstone has no body, references or rich document to retrieve.
+						return {
+							...panel.draft,
+							text: "",
+							fileReferences: [],
+							sourceId: null,
+							updatedBy: null,
+						};
+					}
 				} catch (error) {
 					if (!alive() || !shouldFallbackPanelState(error)) throw error;
 				}
+				if (!alive()) return;
 				return api.getNarratorDraft(narratorId, controller.signal);
 			};
 
@@ -1081,11 +1161,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setDraftSyncState("ready");
 				})
 				.catch(() => {
-					if (alive()) setDraftSyncState("error");
+					// A timeout is an actionable error, not a lifecycle cancellation.
+					if (isCurrent()) setDraftSyncState("error");
 				})
-				.finally(() => clearTimeout(timer));
+				.finally(() => {
+					clearTimeout(timer);
+					if (hydrationEpochRef.current !== readEpoch) return;
+					hydrationEpochRef.current = null;
+					if (!cancelled && getToken() === token) drainDraftMetaRef.current();
+				});
 			return () => {
 				cancelled = true;
+				if (hydrationEpochRef.current === readEpoch) hydrationEpochRef.current = null;
+				metaReadRef.current?.abort();
+				metaReadRef.current = null;
 				clearTimeout(timer);
 				draftSyncSeqRef.current++;
 				controller.abort();
@@ -1093,6 +1182,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}, [
 			currentUserId,
 			currentDraftScope,
+			readScope,
+			token,
 			draftLoadAttempt,
 			localDraftOnly,
 			narratorId,
@@ -1149,16 +1240,26 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
 			(draft: NarratorRemoteDraft) => {
+				if (getToken() !== token) return;
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
 				seenDraftRevisionRef.current = Math.max(seenDraftRevisionRef.current ?? -1, draft.revision);
 				if (draft.hasDraft && draft.hasComposerDocument && !draft.composerDocument) {
+					if (hydrationEpochRef.current !== null || metaReadRef.current) {
+						if (
+							!pendingDraftMetaRef.current ||
+							draft.revision > pendingDraftMetaRef.current.revision
+						)
+							pendingDraftMetaRef.current = draft;
+						return;
+					}
 					const epoch = ++draftReadEpochRef.current;
 					const scope = draftOwnerScopeRef.current;
 					void api
 						.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
 						.then((detail) => {
 							if (
+								getToken() !== token ||
 								epoch !== draftReadEpochRef.current ||
 								scope !== draftOwnerScopeRef.current ||
 								detail.revision < draft.revision ||
@@ -1177,6 +1278,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})
 						.catch(() => {
 							if (
+								getToken() === token &&
 								epoch === draftReadEpochRef.current &&
 								scope === draftOwnerScopeRef.current &&
 								// PUT already returns the full draft after broadcasting its summary.
@@ -1266,6 +1368,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				restoreRemoteInput,
 				readPersistableDocument,
 				hasUnsyncedLocalInput,
+				token,
 			],
 		);
 
@@ -1277,26 +1380,85 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		 * write (WS gap), pull the body and run it through the normal state machine.
 		 * The local-keystrokes-win rule inside handleDraftChanged still applies.
 		 */
+		const drainDraftMeta = useCallback(() => {
+			if (
+				localDraftOnly ||
+				hydrationEpochRef.current !== null ||
+				metaReadRef.current ||
+				getToken() !== token
+			)
+				return;
+			if (!pendingDraftMetaRef.current) return;
+			if (pendingDraftMetaRef.current.revision <= (lastDraftRevisionRef.current ?? -1)) {
+				pendingDraftMetaRef.current = null;
+				return;
+			}
+			const controller = new AbortController();
+			metaReadRef.current = controller;
+			const scope = draftOwnerScopeRef.current;
+			const unsubscribe = onTokenChange(() => {
+				if (getToken() !== token) controller.abort();
+			});
+			let timedOut = false;
+			const timer = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, 15_000);
+			void (async () => {
+				// Coalesce all announcements during hydration/in-flight reads. A busy
+				// remote editor cannot create an unbounded catch-up request loop.
+				for (let reads = 0; reads < 3; reads++) {
+					const meta = pendingDraftMetaRef.current;
+					if (!meta || meta.revision <= (lastDraftRevisionRef.current ?? -1)) {
+						pendingDraftMetaRef.current = null;
+						return;
+					}
+					const epoch = draftReadEpochRef.current;
+					const detail = await api.getNarratorDraft(narratorId, controller.signal);
+					if (
+						controller.signal.aborted ||
+						getToken() !== token ||
+						scope !== draftOwnerScopeRef.current
+					)
+						return;
+					if (epoch !== draftReadEpochRef.current) continue;
+					if (detail.revision < meta.revision)
+						throw new Error("Draft detail predates announced revision");
+					if (detail.revision > (lastDraftRevisionRef.current ?? -1))
+						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
+				}
+				if ((pendingDraftMetaRef.current?.revision ?? -1) > (lastDraftRevisionRef.current ?? -1))
+					throw new Error("Draft recovery budget exceeded");
+			})()
+				.catch(() => {
+					if (
+						(timedOut || !controller.signal.aborted) &&
+						getToken() === token &&
+						scope === draftOwnerScopeRef.current
+					)
+						setDraftSyncState("error");
+				})
+				.finally(() => {
+					clearTimeout(timer);
+					unsubscribe();
+					if (metaReadRef.current === controller) metaReadRef.current = null;
+				});
+		}, [localDraftOnly, narratorId, token]);
+		drainDraftMetaRef.current = drainDraftMeta;
 		const handleDraftMeta = useCallback(
 			(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => {
-				const current = lastDraftRevisionRef.current;
-				if (current == null || meta.revision <= current) return;
-				const epoch = draftReadEpochRef.current;
-				const scope = draftOwnerScopeRef.current;
-				void api
-					.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
-					.then((detail) => {
-						if (
-							epoch !== draftReadEpochRef.current ||
-							scope !== draftOwnerScopeRef.current ||
-							detail.revision <= (lastDraftRevisionRef.current ?? 0)
-						)
-							return;
-						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
-					})
-					.catch(() => {});
+				if (
+					localDraftOnly ||
+					getToken() !== token ||
+					meta.revision <= (lastDraftRevisionRef.current ?? -1)
+				)
+					return;
+				seenDraftRevisionRef.current = Math.max(seenDraftRevisionRef.current ?? -1, meta.revision);
+				if (!pendingDraftMetaRef.current || meta.revision > pendingDraftMetaRef.current.revision)
+					pendingDraftMetaRef.current = meta;
+				drainDraftMeta();
 			},
-			[narratorId],
+			[drainDraftMeta, localDraftOnly, token],
 		);
 
 		// --- Command popover ---
@@ -1362,74 +1524,246 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			clearTextAndDraft();
 		}, [clearTextAndDraft]);
 
-		// === @mention of named narrators ===========================================
-		const { data: namedNarrators } = useNamedNarrators();
+		// === Authored narrator references (ordinary @text is never promoted) =========
+		const composerVisible = useEditorPanelVisible();
 		const [mentionCaret, setMentionCaret] = useState<number | null>(null);
-		const [queryContext, setQueryContext] =
-			useState<ReturnType<InlineComposerEditorHandle["getTextContext"]>>(null);
-		const handleComposerSelection = useCallback((selection: { start: number; end: number }) => {
-			const input = editorRef.current?.getElement();
-			if (!input?.contains(input.ownerDocument.activeElement)) {
-				setMentionCaret(null);
-				setQueryContext(null);
-				return;
-			}
-			setMentionCaret(selection.start);
-			const next = editorRef.current?.getTextContext() ?? null;
-			setQueryContext((current) =>
-				current?.text === next?.text &&
-				current?.start === next?.start &&
-				current?.end === next?.end &&
-				current?.caret === next?.caret
-					? current
-					: next,
-			);
-		}, []);
+		const [queryContext, setQueryContext] = useState<InlineComposerTextContext | null>(null);
+		const mentionContextRef = useRef<InlineComposerTextContext | null>(null);
+		const mentionComposing = useRef(false);
 		const mentionQuery = useMemo(() => {
 			if (mentionCaret === null || !queryContext) return null;
 			// Atom boundaries must never be joined into a mention token.
 			if (commandInput.startsWith("/")) return null;
 			return getMentionQuery(queryContext.text, queryContext.caret - queryContext.start);
 		}, [commandInput, mentionCaret, queryContext]);
-		const mentionCandidates = useMemo<MentionCandidate[]>(() => {
-			if (!namedNarrators) return [];
-			return namedNarrators
-				.filter((n: { handle?: string | null }) => !!n.handle)
-				.map((n: { id: string; handle: string; title?: string | null; status?: string }) => ({
-					id: n.id,
-					handle: n.handle,
-					title: n.title,
-					status: n.status,
-				}));
-		}, [namedNarrators]);
 		const mentionPopoverVisible =
+			composerVisible &&
 			editorFocused &&
 			mentionQuery !== null &&
 			!inputHistory.isBrowsing &&
-			mentionCandidates.length > 0;
+			!draft;
+		const {
+			candidates: mentionCandidates,
+			loading: mentionLoading,
+			error: mentionError,
+			verification: mentionVerification,
+			verifyCandidate: verifyMentionCandidate,
+			verifyExactCandidate,
+			cancelVerification: cancelMentionVerification,
+		} = useNarratorMentionCandidates(
+			narratorId,
+			mentionQuery,
+			mentionPopoverVisible,
+			composerVisible && !draft,
+		);
+		const handleComposerSelection = useCallback(
+			(selection: { start: number; end: number }) => {
+				const input = editorRef.current?.getElement();
+				const focused = input?.contains(input.ownerDocument.activeElement);
+				const next = focused ? (editorRef.current?.getTextContext() ?? null) : null;
+				if (!sameTextContext(mentionContextRef.current, next)) {
+					mentionContextRef.current = next;
+					cancelMentionVerification();
+					setQueryContext(next);
+				}
+				setMentionCaret(focused ? selection.start : null);
+			},
+			[cancelMentionVerification],
+		);
+		useEffect(() => {
+			if (!editorElement) return;
+			const start = () => {
+				mentionComposing.current = true;
+				cancelMentionVerification();
+			};
+			const end = () => {
+				mentionComposing.current = false;
+			};
+			editorElement.addEventListener("compositionstart", start, true);
+			editorElement.addEventListener("compositionend", end, true);
+			return () => {
+				editorElement.removeEventListener("compositionstart", start, true);
+				editorElement.removeEventListener("compositionend", end, true);
+				end();
+			};
+		}, [editorElement, cancelMentionVerification]);
+		const insertNarratorReference = useCallback(
+			(candidate: MentionCandidate) => {
+				if (candidate.id === narratorId || candidate.canConnect === false) return;
+				const editor = editorRef.current;
+				if (!editor) return;
+				editor.focus();
+				editor.insertNodes([
+					{
+						type: "narratorReference",
+						id: composerNodeId(),
+						narratorId: candidate.id,
+						label: (
+							candidate.title?.replace(/\p{Cc}/gu, " ").trim() ||
+							candidate.handle ||
+							candidate.id
+						).slice(0, 256),
+					},
+					{ type: "text", text: " " },
+				]);
+				mentionContextRef.current = null;
+				setMentionCaret(null);
+				setQueryContext(null);
+			},
+			[narratorId],
+		);
 		const handleMentionSelect = useCallback(
 			(candidate: MentionCandidate) => {
-				const caret = mentionCaret;
-				if (caret === null) return;
-				const upto = bodyText.slice(0, caret);
-				const at = upto.lastIndexOf("@");
-				if (at === -1) return;
-				const before = bodyText.slice(0, at);
-				const after = bodyText.slice(caret);
-				const insert = `@${candidate.handle} `;
-				const next = before + insert + after;
-				setBodyText(next);
-				// Move caret to just after the inserted handle.
-				const nextCaret = before.length + insert.length;
-				requestAnimationFrame(() => {
-					editorRef.current?.focus();
-					editorRef.current?.setSelection(nextCaret, nextCaret);
-					setMentionCaret(nextCaret);
+				const editor = editorRef.current;
+				const input = editor?.getElement();
+				if (
+					!editor ||
+					!input?.contains(input.ownerDocument.activeElement) ||
+					!queryContext ||
+					mentionComposing.current ||
+					sendingRef.current ||
+					!sameTextContext(queryContext, editor.getTextContext())
+				)
+					return;
+				const at = queryContext.text
+					.slice(0, queryContext.caret - queryContext.start)
+					.lastIndexOf("@");
+				if (at < 0) return;
+				const stillSelected = captureNativeSelectionCheck(input.ownerDocument);
+				verifyMentionCandidate(candidate.id, (eligible) => {
+					// Leave the token and caret untouched until authorized.
+					if (
+						editorRef.current?.getElement() !== input ||
+						!input.contains(input.ownerDocument.activeElement) ||
+						mentionComposing.current ||
+						sendingRef.current ||
+						!input.ownerDocument.hasFocus() ||
+						!stillSelected() ||
+						!sameTextContext(queryContext, editor.getTextContext())
+					)
+						return;
+					editor.setSelection(queryContext.start + at, queryContext.caret);
+					insertNarratorReference(eligible);
 				});
 			},
-			[bodyText, mentionCaret, setBodyText],
+			[queryContext, sendingRef, verifyMentionCandidate, insertNarratorReference],
 		);
-		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
+		const handleNarratorDrop = useCallback(
+			(hit: PanelDragState) => {
+				if (sendingRef.current || mentionComposing.current || hit.id === narratorId) return;
+				const editor = editorRef.current;
+				const input = editor?.getElement();
+				if (!editor || !input) return;
+				cancelMentionVerification();
+				// Capture the precise drop point without moving the original selection while
+				// permissions are pending (or at all if the target is rejected).
+				const previous = editor.captureSelectionBookmark();
+				if (!editor.setSelectionAtPoint(hit.x, hit.y)) {
+					previous.cancel();
+					return;
+				}
+				const droppedAt = editor.captureSelectionBookmark();
+				if (!previous.restore()) {
+					droppedAt.cancel();
+					return;
+				}
+				const doc = input.ownerDocument;
+				const view = doc.defaultView;
+				const focusedBefore = doc.activeElement;
+				const stillSelected = captureNativeSelectionCheck(doc);
+				const onKey = (event: KeyboardEvent) => {
+					if (event.isComposing || event.keyCode === 229) return;
+					if (event.key === "Escape") cancelMentionVerification();
+					if (
+						event.key === "Enter" &&
+						!event.shiftKey &&
+						(event.target as Node | null)?.nodeType &&
+						input.contains(event.target as Node)
+					) {
+						event.preventDefault();
+						event.stopPropagation();
+					}
+				};
+				const stopWatching = () => {
+					doc.removeEventListener("focusin", cancelMentionVerification, true);
+					doc.removeEventListener("keydown", onKey, true);
+					view?.removeEventListener("blur", cancelMentionVerification);
+				};
+				const discard = () => {
+					stopWatching();
+					droppedAt.cancel();
+				};
+				const signal = verifyExactCandidate(
+					hit.id,
+					(eligible) => {
+						stopWatching();
+						if (
+							editorRef.current?.getElement() !== input ||
+							doc.activeElement !== focusedBefore ||
+							!doc.hasFocus() ||
+							!stillSelected() ||
+							mentionComposing.current ||
+							sendingRef.current
+						) {
+							droppedAt.cancel();
+							return;
+						}
+						if (droppedAt.restore())
+							insertNarratorReference({ ...eligible, title: hit.title || eligible.title });
+					},
+					(status) => {
+						discard();
+						notifications.show({
+							color: "red",
+							message: t(status === "denied" ? "mentionVerifyDenied" : "mentionVerifyError"),
+						});
+					},
+				);
+				if (!signal) {
+					droppedAt.cancel();
+					return;
+				}
+				signal.addEventListener("abort", discard, { once: true });
+				doc.addEventListener("focusin", cancelMentionVerification, true);
+				doc.addEventListener("keydown", onKey, true);
+				view?.addEventListener("blur", cancelMentionVerification);
+			},
+			[
+				narratorId,
+				sendingRef,
+				cancelMentionVerification,
+				verifyExactCandidate,
+				insertNarratorReference,
+				t,
+			],
+		);
+		useEffect(
+			() =>
+				registerPanelDropTarget({
+					id: `composer:${narratorId}:${dropTargetId}`,
+					priority: PANEL_DROP_PRIORITY.composer,
+					hitTest: (state) => {
+						const element = editorRef.current?.getElement();
+						if (!element || !composerVisible || draft || state.subjectKind !== "narrator")
+							return null;
+						const rect = element.getBoundingClientRect();
+						return rect.width > 0 &&
+							rect.height > 0 &&
+							state.x >= rect.left &&
+							state.x <= rect.right &&
+							state.y >= rect.top &&
+							state.y <= rect.bottom
+							? state
+							: null;
+					},
+					onDrop: (_state, hit) => handleNarratorDrop(hit),
+				}),
+			[narratorId, dropTargetId, composerVisible, draft, handleNarratorDrop],
+		);
+		const closeMentionPopover = useCallback(() => {
+			cancelMentionVerification();
+			setMentionCaret(null);
+		}, [cancelMentionVerification]);
 
 		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
 		const fileQuery = useMemo(() => {
@@ -1675,7 +2009,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			if (commandPopoverVisible && e.key !== "Enter") return;
 			// Same for the @mention popover: it consumes arrow/tab/escape/enter via a
 			// capture-phase listener; guard here so navigation keys don't double-handle.
-			if (mentionPopoverVisible && e.key !== "Enter") return;
+			if (mentionPopoverVisible) {
+				// Even before the popover's effect installs its capture listener, a visible
+				// empty/loading list owns Enter; the editor must never race it into sending.
+				if (e.key === "Enter" && !e.shiftKey) {
+					e.preventDefault();
+					e.stopPropagation();
+				}
+				return;
+			}
 
 			if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 				// 全屏编辑模式下 Enter/Shift+Enter 一律只换行,不发送(发送走按钮或 mod+Enter)。
@@ -1863,6 +2205,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					candidates={mentionCandidates}
 					query={mentionQuery}
 					visible={mentionPopoverVisible}
+					loading={mentionLoading}
+					error={mentionError}
+					verification={mentionVerification?.status}
 					onSelect={handleMentionSelect}
 					onClose={closeMentionPopover}
 				/>
@@ -1950,7 +2295,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					value={document}
 					adaptive={adaptive && !fullscreenOpened}
 					leadingControls={controls}
-					onChange={applyDocument}
+					onChange={(next) => {
+						cancelMentionVerification();
+						applyDocument(next);
+					}}
 					resources={resources}
 					attachmentsHydrating={attachmentsHydrating}
 					attachmentsRestoreFailed={attachmentsRestoreFailed}
@@ -1959,6 +2307,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onSelectionChange={handleComposerSelection}
 					onFocus={() => setEditorFocused(true)}
 					onBlur={() => {
+						cancelMentionVerification();
+						mentionContextRef.current = null;
+						mentionComposing.current = false;
 						setEditorFocused(false);
 						setMentionCaret(null);
 						setQueryContext(null);

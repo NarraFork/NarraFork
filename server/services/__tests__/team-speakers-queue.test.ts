@@ -100,10 +100,10 @@ function seed(narratorId: string) {
 	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
-async function waitFor(check: () => boolean, label: string): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, label: string): Promise<void> {
 	const deadline = Date.now() + 5_000;
 	while (Date.now() < deadline) {
-		if (check()) return;
+		if (await check()) return;
 		await Bun.sleep(10);
 	}
 	throw new Error(`Timed out waiting for ${label}`);
@@ -160,8 +160,8 @@ test("two people speaking in turn while the session is busy: arrival order, one 
 
 	gate.resolve();
 	await waitFor(
-		() =>
-			!hasPendingBufferedWork(narratorId) &&
+		async () =>
+			!(await hasPendingBufferedWork(narratorId)) &&
 			!getExecutionOwner(narratorId) &&
 			db
 				.select({ status: narrators.status })

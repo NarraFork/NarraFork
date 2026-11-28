@@ -99,11 +99,11 @@ test.skipIf(!executablePath)(
 			expect(await stripDisplay()).toBe("none");
 			await page.evaluate(() => {
 				document.documentElement.setAttribute("data-nf-wco", "right");
-				document.getElementById("content")?.setAttribute("data-nf-wco-titlebar", "");
+				document.documentElement.setAttribute("data-nf-wco-titlebar-page", "");
 			});
 			expect(await stripDisplay()).toBe("none");
 			await page.evaluate(() => {
-				document.getElementById("content")?.removeAttribute("data-nf-wco-titlebar");
+				document.documentElement.removeAttribute("data-nf-wco-titlebar-page");
 			});
 			await page.setViewport({ width: 700, height: 900 });
 			expect(await stripDisplay()).toBe("none");

@@ -1,3 +1,4 @@
+import { isNonTurnHostRow } from "@shared/continue-tail";
 import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isNestedRow } from "../message/nested-rows";
 /**
@@ -39,8 +40,14 @@ export interface TailMetaOptions {
 	findSpecTasksToolUseId: (messages: TailMetaMessage[]) => string | null;
 }
 
-/** Error cards and hidden epoch bookkeeping do not replace the conversation tail. */
+/**
+ * Error cards, hidden epoch bookkeeping and host-written rows that are nobody's turn (the team
+ * conversion notes and the tool-declaration rebaseline notice, `isNonTurnHostRow`) do not
+ * replace the conversation tail: neither Retry nor Continue targets them.
+ */
 function isNonTurnSystemMessage(msg: TailMetaMessage): boolean {
+	if (msg.role === "sys" || msg.role === "user")
+		return isNonTurnHostRow(msg.role, messageBody(msg));
 	if (msg.role !== "system") return false;
 	const blocks = messageBody(msg);
 	// Match message-segments' hidden epoch rule; do not skip compact boundaries.
@@ -69,7 +76,12 @@ export function buildTailMeta(
 		if (!lastRealMessage && id !== opts.streamingMsgId && !isNonTurnSystemMessage(msg)) {
 			lastRealMessage = { id, role: msg.role };
 		}
-		if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
+		if (
+			!lastUserMessageId &&
+			msg.role === "user" &&
+			!id.startsWith("optimistic-") &&
+			!isNonTurnSystemMessage(msg)
+		) {
 			lastUserMessageId = id;
 		}
 		if (contextPercent == null && msg.contextPercent != null) {

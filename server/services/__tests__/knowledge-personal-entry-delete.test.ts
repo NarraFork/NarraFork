@@ -25,6 +25,7 @@ import { eventBus, type NarraForkEvent } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 type InvalidatedEvent = Extract<NarraForkEvent, { type: "knowledge:submission_invalidated" }>;
 
@@ -66,7 +67,11 @@ describe("deletePersonalEntry authorization", () => {
 			content: "mine only",
 		});
 
-		expect(knowledgeBranchService.deletePersonalEntry(stranger, created.id)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.deletePersonalEntry(stranger, created.id),
+			),
+		).toThrow();
 
 		// Still active from the author's point of view — the failed delete changed nothing.
 		const after = await knowledgeBranchService.getMine(author, created.id);
@@ -258,12 +263,20 @@ describe("a soft-deleted entry leaves the active library", () => {
 		await knowledgeBranchService.deletePersonalEntry(author, created.id);
 
 		expect(
-			knowledgeBranchService.updateDraft(author, created.id, { content: "changed" }),
-		).rejects.toThrow();
-		expect(knowledgeBranchService.submitForReview(author, created.id, {})).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.updateDraft(author, created.id, { content: "changed" }),
+			),
+		).toThrow();
 		expect(
-			knowledgeBranchService.updateStandaloneMeta(author, created.id, { title: "new" }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.submitForReview(author, created.id, {}),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.updateStandaloneMeta(author, created.id, { title: "new" }),
+			),
+		).toThrow();
 	});
 });
 
@@ -289,7 +302,11 @@ describe("author-scoped publish history", () => {
 		expect(asReviewer.some((s) => s.id === submissionId)).toBe(false);
 
 		// A stranger cannot read the author's publish history.
-		expect(knowledgeBranchService.listSubmissionsForDraft(stranger, created.id)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.listSubmissionsForDraft(stranger, created.id),
+			),
+		).toThrow();
 	});
 
 	test("listMyOpenSubmissions returns only in-flight requests, keyed by draft", async () => {

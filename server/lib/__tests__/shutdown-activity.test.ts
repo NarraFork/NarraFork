@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
 import { createServerRequestLifecycle } from "../../http-request-lifecycle";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
 import {
 	canRunCleanShutdownHooks,
 	fenceUnattendedShutdown,
@@ -128,17 +129,16 @@ describe("clean shutdown marker lifecycle", () => {
 describe("main shutdown wiring without booting the server", () => {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 	test.each([
-		"sqlite",
-		"postgres",
-	])("%s startup schedules maintenance only once on SQLite", async (backend) => {
+		["sqlite", true],
+		["postgres", true],
+		["sqlite", false],
+		["postgres", false],
+	] as const)("%s startup with reader admission=%s schedules maintenance only once on SQLite", async (backend, admitted) => {
 		const maintenanceStart = main.lastIndexOf(
 			'if (activeDatabaseBackend === "sqlite") {',
 			main.indexOf('startTeamDatabaseMaintenance("status"'),
 		);
-		const maintenanceEnd = main.indexOf(
-			"// Establish client-egress relay channels",
-			maintenanceStart,
-		);
+		const maintenanceEnd = main.indexOf("\n}\n\nconst databaseStartup =", maintenanceStart);
 		expect(maintenanceStart).toBeGreaterThanOrEqual(0);
 		expect(maintenanceEnd).toBeGreaterThan(maintenanceStart);
 		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
@@ -147,17 +147,50 @@ describe("main shutdown wiring without booting the server", () => {
 		const cleanup = mock(async () => {});
 		const rebuild = mock(async () => {});
 		const migrate = mock(async () => {});
-		await new Function(
+		const initialize = new Function(
 			"activeDatabaseBackend",
 			"startTeamDatabaseMaintenance",
 			"retireLegacyChapterResources",
 			"scheduleProjectIndexRebuild",
 			"migrateAggregationsOnStartup",
 			"logger",
-			`${code}\nreturn start();`,
-		)(backend, () => {}, cleanup, rebuild, migrate, { warn() {} });
+			"narratorRecovery",
+			`${code}\nreturn start;`,
+		)(
+			backend,
+			() => {},
+			cleanup,
+			rebuild,
+			migrate,
+			{ warn() {} },
+			Promise.resolve(),
+		) as () => Promise<void>;
+		const startup = createDatabaseReaderStartup({
+			readiness: {
+				state: admitted
+					? { status: "ready" }
+					: { status: "failed", code: "DB_READERS_UNAVAILABLE" },
+				wait: async () => (admitted ? { ok: true } : { ok: false, code: "DB_READERS_UNAVAILABLE" }),
+			},
+			initialize,
+			onUnavailable: () => {},
+			onError: (error) => {
+				throw error;
+			},
+		});
+		await startup.start();
+		startup.stop();
 		for (const operation of [cleanup, rebuild, migrate])
-			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" ? 1 : 0);
+			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" && admitted ? 1 : 0);
+	});
+	test("shutdown cancels reader startup before stopping its producers", () => {
+		const stop = main.indexOf(
+			"databaseStartup.stop();",
+			main.indexOf("async function performGracefulShutdown("),
+		);
+		expect(stop).toBeGreaterThanOrEqual(0);
+		expect(stop).toBeLessThan(main.indexOf("backgroundOccupancyInitializer.stop();", stop));
+		expect(stop).toBeLessThan(main.indexOf("stopHeartbeat();", stop));
 	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
@@ -167,55 +200,74 @@ describe("main shutdown wiring without booting the server", () => {
 		return at;
 	};
 
-	test.each([
-		"ok",
-		"failed",
-		"timeout",
-	] as const)("signal cleanup preserves Agent runs only after checkpoint preparation returns %s", async (outcome) => {
-		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
-		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
-		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
-		const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
-		expect(prepareStart).toBeGreaterThanOrEqual(0);
-		expect(prepareEnd).toBeGreaterThan(prepareStart);
-		expect(cleanupStart).toBeGreaterThan(prepareEnd);
-		expect(cleanupEnd).toBeGreaterThan(cleanupStart);
-		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
-			`async function close() { ${shutdown.slice(prepareStart, prepareEnd)}\n${shutdown.slice(cleanupStart, cleanupEnd)} }`,
-		);
-		const calls: unknown[] = [];
-		const close = new Function(
-			"options",
-			"tracker",
-			"step",
-			"prepareSignalRestartRecovery",
-			"markUpdateRestarting",
-			"killAllBashProcesses",
-			`${code}\nreturn close();`,
-		);
-		await close(
-			{ reason: "signal" },
-			new ShutdownActivityTracker(),
-			async (label: string, action: () => Promise<unknown>) => {
-				await action();
-				return label === "restartRecovery.prepare" ? outcome : "ok";
-			},
-			async () => {
-				calls.push("checkpoint");
-			},
-			() => {
-				calls.push("restarting");
-			},
-			async (options: unknown) => {
-				calls.push(options);
-			},
-		);
-		expect(calls).toEqual([
-			"checkpoint",
-			...(outcome === "ok" ? ["restarting"] : []),
-			{ preserveAgents: outcome === "ok" },
-		]);
-	});
+	for (const reason of ["signal", "replacement_started", "system_prepared_shutdown"] as const) {
+		for (const producerOutcome of ["ok", "failed"] as const) {
+			const outcomes =
+				reason === "signal" ? (["ok", "failed", "timeout"] as const) : (["ok"] as const);
+			test.each(
+				outcomes,
+			)(`${reason} cleanup with producer outcome ${producerOutcome} handles recovery preparation %s`, async (outcome) => {
+				const prepareStart = shutdown.indexOf("httpLifecycle.abortAll();");
+				const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
+				const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
+				const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
+				expect(prepareStart).toBeGreaterThanOrEqual(0);
+				expect(prepareEnd).toBeGreaterThan(prepareStart);
+				expect(cleanupStart).toBeGreaterThan(prepareEnd);
+				expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+				const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+					`async function close() { ${shutdown.slice(prepareStart, prepareEnd)}\n${shutdown.slice(cleanupStart, cleanupEnd)} }`,
+				);
+				const calls: unknown[] = [];
+				let phase = reason === "signal" ? "quiescing_tools" : "restarting";
+				const close = new Function(
+					"options",
+					"tracker",
+					"step",
+					"prepareSignalRestartRecovery",
+					"markUpdateRestarting",
+					"killAllBashProcesses",
+					"httpLifecycle",
+					"producerOutcome",
+					"stopCheckpointedNarratorRuns",
+					`${code}\nreturn close();`,
+				);
+				await close(
+					{ reason },
+					new ShutdownActivityTracker(),
+					async (label: string, action: () => unknown) => {
+						await action();
+						return label === "restartRecovery.prepare" ? outcome : "ok";
+					},
+					async () => {
+						calls.push("prepare");
+					},
+					() => {
+						phase = "restarting";
+						calls.push("restarting");
+					},
+					async (options: unknown) => {
+						calls.push(options);
+					},
+					{ abortAll: () => calls.push("abort") },
+					producerOutcome,
+					() => {
+						calls.push(`pause:${phase}`);
+						return phase === "restarting" ? 1 : 0;
+					},
+				);
+				const prepared = reason === "signal" && outcome === "ok";
+				expect(calls).toEqual([
+					"abort",
+					...(reason === "signal" ? ["prepare", ...(prepared ? ["restarting"] : [])] : []),
+					...(producerOutcome === "ok"
+						? [`pause:${reason !== "signal" || prepared ? "restarting" : "quiescing_tools"}`]
+						: []),
+					{ preserveAgents: prepared },
+				]);
+			});
+		}
+	}
 	test("owners and compute threads drain before database closure and the clean marker", () => {
 		const db = position("dbWorkerPool.shutdown");
 		const pg = position("postgresRuntime.close");
@@ -328,6 +380,7 @@ describe("main shutdown wiring without booting the server", () => {
 			"owner.closeRevertRewriteWorkers()",
 			"owner.closeSharePreviewHtmlWorkers()",
 			"owner.closeRequestJsonWorkers()",
+			"owner.closeStructuralWorkers()",
 			"owner.closeImageGenerationResponseWorkers()",
 		])
 			expect(shutdown).toContain(close);

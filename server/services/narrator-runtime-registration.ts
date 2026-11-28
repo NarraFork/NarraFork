@@ -14,7 +14,7 @@
 import { and, eq } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narrators } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import {
@@ -35,10 +35,14 @@ import {
 export async function getRuntimeRegistration(
 	narratorId: string,
 ): Promise<RuntimeRegistration | null> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { runtimeRegistrationJson: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { runtimeRegistrationJson: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return readRuntimeRegistrationColumn(row.runtimeRegistrationJson);
 }
@@ -49,10 +53,14 @@ async function assertPolicySource(narratorId: string, sourceId: string): Promise
 	for (let depth = 0; current; depth++) {
 		if (current === narratorId) throw new ValidationError("Policy source would form a cycle");
 		if (depth >= MAX_POLICY_SOURCE_DEPTH) throw new ValidationError("Policy source chain too deep");
-		const row: RuntimeSourceRow | undefined = await db.query.narrators.findFirst({
-			where: eq(narrators.id, current),
-			columns: RUNTIME_SOURCE_COLUMNS,
-		});
+		const row: RuntimeSourceRow | undefined = await readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, current),
+				columns: RUNTIME_SOURCE_COLUMNS,
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
 		if (!row) throw new NotFoundError("Narrator", current);
 		current = policySourceIdOf(row);
 	}
@@ -106,7 +114,7 @@ export async function registerRunPrincipal(
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
 			.limit(1),
-		{ maxRows: 1, timeoutMs: 30_000 },
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
 	);
 	if (!source) throw new NotFoundError("Narrator", narratorId);
 	const registration = readRuntimeRegistrationColumn(source.runtimeRegistrationJson);
@@ -124,6 +132,8 @@ export async function registerRunPrincipal(
 			const latest = readRuntimeRegistrationColumn(current.runtimeRegistrationJson);
 			if (latest?.run?.logicalRunId !== logicalRunId) return false;
 			if (latest.run.principal?.userId === userId) return false;
+			// Keep relationships changed during the Worker pre-read and update only
+			// the still-current run's principal under the same small write lock.
 			tx.update(narrators)
 				.set({
 					runtimeRegistrationJson: registerRun(

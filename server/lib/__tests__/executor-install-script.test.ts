@@ -396,6 +396,10 @@ describe("install locations and service wiring", () => {
 		expect(script).toContain("/etc/systemd/system/narrafork-executor.service");
 		expect(script).toContain("useradd --system");
 		expect(script).toContain("NoNewPrivileges=true");
+		// The account has no home directory: session records go to a managed state dir.
+		expect(script).toContain("StateDirectory=narrafork-executor");
+		// A default only: an explicit stateDir in the config must still win.
+		expect(script).not.toContain("NARRAFORK_EXECUTOR_STATE_DIR");
 	});
 
 	test("user mode stays inside the invoking account and never uses sudo", () => {
@@ -405,6 +409,8 @@ describe("install locations and service wiring", () => {
 		expect(script).toContain("systemctl --user enable narrafork-executor");
 		expect(script).toContain("systemctl --user restart narrafork-executor");
 		expect(script).not.toContain("sudo ");
+		// A user service keeps the per-user default state directory.
+		expect(script).not.toContain("StateDirectory=");
 	});
 });
 

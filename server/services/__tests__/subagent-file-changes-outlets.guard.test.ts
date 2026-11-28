@@ -62,8 +62,9 @@ function assertOutletAttribution(site: string, fileName: (typeof OUTLET_FILES)[n
 		expect(site).toMatch(/parentNarratorId:\s*deliverTo\.narratorId,/);
 		expect(site).toMatch(/childNarratorId:\s*id,/);
 		expect(site).toMatch(
-			/executionBoundary:\s*await boundary\.readSubagentExecutionBoundary\(\s*id,\s*publicationRun\.logicalRunId,?\s*\)/,
+			/executionBoundary = await boundary\.readSubagentExecutionBoundary\(\s*id,\s*publicationRun\.logicalRunId,?\s*\)/,
 		);
+		expect(site).toMatch(/childNarratorId:\s*id,\s*executionBoundary,/);
 		expect(site).toMatch(/scope:\s*\{\s*sourceToolUseId:\s*deliverTo\.toolUseId,/);
 	} else {
 		expect(site).toMatch(/parentNarratorId,/);
@@ -87,7 +88,7 @@ describe("subagent result outlets carry the file-change summary", () => {
 			// the destination tool call's window.
 			let from = source.indexOf("appendSubagentFileChanges(");
 			while (from !== -1) {
-				const site = source.slice(from, from + 600);
+				const site = source.slice(Math.max(0, from - 650), from + 600);
 				assertOutletAttribution(site, fileName);
 				from = source.indexOf("appendSubagentFileChanges(", from + 1);
 			}
@@ -98,7 +99,7 @@ describe("subagent result outlets carry the file-change summary", () => {
 		for (const fileName of OUTLET_FILES) {
 			const source = executableSource(fileName);
 			const from = source.indexOf("appendSubagentFileChanges(");
-			const site = source.slice(from, from + 600);
+			const site = source.slice(Math.max(0, from - 650), from + 600);
 			const mutations =
 				fileName === "agent-runtime/run.ts"
 					? [

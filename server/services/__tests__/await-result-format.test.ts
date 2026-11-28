@@ -1,12 +1,14 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-// Use a functional in-memory test db rather than empty stubs. Bun's mock.module
+// Use a functional test db rather than empty stubs. Bun's mock.module
 // is process-global and leaks to later suites, so empty stubs ({}) would make
 // `db.insert`/`db.delete` undefined in every subsequently-loaded real-db test.
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -40,7 +42,7 @@ beforeEach(async () => {
 	await backgroundOccupancyStore.start();
 });
 
-afterAll(() => {
+afterAll(async () => {
 	runtimePublication.stop();
 	runtimePublication.setWake(async (narratorId) => {
 		await wakeInboxIfEligible(narratorId);
@@ -48,6 +50,7 @@ afterAll(() => {
 	backgroundOccupancyStore.resetForTests();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await closeRuntimeTestDb(sqlite);
 });
 
 afterEach(async () => {
@@ -483,7 +486,7 @@ describe("background agent task lifecycle", () => {
 			output: "actual completed result",
 		});
 		expect(reconciled).toBe(true);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "completed",
 			output: "actual completed result",
 		});
@@ -546,7 +549,7 @@ describe("background agent task lifecycle", () => {
 				output: "stale result",
 			}),
 		).toBe(false);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "running",
 			toolUseId: "second-tool",
 		});
@@ -580,14 +583,14 @@ describe("background agent task lifecycle", () => {
 				staleController,
 			),
 		).toBe(false);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "running",
 		});
 
 		expect(await backgroundTaskService.cancel(subagentNarratorId)).toBe(true);
 		expect(staleController.signal.aborted).toBe(false);
 		expect(controller.signal.aborted).toBe(true);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "cancelled",
 		});
 	});
@@ -603,7 +606,7 @@ describe("background agent task lifecycle", () => {
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		backgroundTaskService.beginAgentContinuation(subagentNarratorId);
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
+		expect(await backgroundTaskService.getById(subagentNarratorId)).not.toBeNull();
 		backgroundTaskService.endAgentContinuation(subagentNarratorId);
 		// Publication retention is independent of the foreground-continuation guard.
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
@@ -632,7 +635,7 @@ describe("background agent task lifecycle", () => {
 		expect(
 			await backgroundTaskService.recoverStaleAgentTasksAfterRestart(new Set([subagentNarratorId])),
 		).toBe(0);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "running",
 		});
 		const protectedNarrator = await db.query.narrators.findFirst({
@@ -656,7 +659,7 @@ describe("background agent task lifecycle", () => {
 
 		// Nothing emitted yet: a running task reports an empty live tail, not the
 		// (still null) stored column.
-		await expect(backgroundTaskService.readOutputTail(taskId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.readOutputTail(taskId)).toMatchObject({
 			status: "running",
 			type: "bash",
 			command: "echo hello && sleep 1",
@@ -680,7 +683,7 @@ describe("background agent task lifecycle", () => {
 		});
 
 		// A tail wider than the buffer returns everything without duplication.
-		await expect(backgroundTaskService.readOutputTail(taskId, 100)).resolves.toMatchObject({
+		expect(await backgroundTaskService.readOutputTail(taskId, 100)).toMatchObject({
 			tail: "aaaabbbbcccc",
 			totalChars: 12,
 			truncated: false,
@@ -700,7 +703,7 @@ describe("background agent task lifecycle", () => {
 	});
 
 	test("readOutputTail reports a missing task as null", async () => {
-		await expect(backgroundTaskService.readOutputTail("no-such-task")).resolves.toBeNull();
+		expect(await backgroundTaskService.readOutputTail("no-such-task")).toBeNull();
 	});
 
 	test("reaps stale running bash rows after an unclean restart", async () => {
@@ -719,7 +722,7 @@ describe("background agent task lifecycle", () => {
 		});
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
-		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(taskId)).toMatchObject({
 			status: "failed",
 			output: "Execution outcome unknown after restart; the command was not rerun.",
 			type: "bash",
@@ -741,7 +744,7 @@ describe("background agent task lifecycle", () => {
 		});
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set([taskId]))).toBe(1);
-		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(taskId)).toMatchObject({
 			status: "failed",
 			output: "Execution outcome unknown after restart; the command was not rerun.",
 		});
@@ -818,7 +821,7 @@ describe("background agent task lifecycle", () => {
 		});
 
 		expect(await backgroundTaskService.recoverStaleAgentTasksAfterRestart()).toBe(1);
-		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.toMatchObject({
+		expect(await backgroundTaskService.getById(subagentNarratorId)).toMatchObject({
 			status: "cancelled",
 		});
 		const recoveredNarrator = await db.query.narrators.findFirst({

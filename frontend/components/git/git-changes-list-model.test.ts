@@ -183,6 +183,78 @@ function appendFolderTreePage(
 	}
 }
 
+test("published statistics preserve same-member values and reject every foreign version before Worker merge", () => {
+	const model = new GitChangesListModel(flat, "pages");
+	const cache = {
+		status: "ready" as const,
+		workerEpoch: "worker",
+		memberVersion: 1,
+		statsVersion: 1,
+		updating: false,
+	};
+	const first = { ...page([{ path: "a", status: " M" }]), cache };
+	model.append([first]);
+	const source = {
+		snapshotId: "snapshot",
+		pageGeneration: "pages",
+		filterKey: "",
+		epoch: "one",
+		workspaceIdentity: "workspace",
+		workerEpoch: "worker",
+		memberVersion: 1,
+		statsVersion: 1,
+	};
+	const result = {
+		snapshotId: "snapshot",
+		cache,
+		workspaceIdentity: "workspace",
+		filterKey: "",
+		rows: [
+			{
+				type: "file" as const,
+				section: "unstaged" as const,
+				path: "a",
+				added: 7,
+				removed: 0,
+				complete: true,
+			},
+		],
+	};
+	model.setStatsSource(source);
+	model.mergePageStats(source, result);
+	const added = () =>
+		model.window().rows.flatMap((row) => (row.type === "file" ? [row.file.displayLinesAdded] : []));
+	expect(added()).toEqual([7]);
+	model.setStatsSource({ ...source, updating: true });
+	expect(added()).toEqual([7]);
+	expect(model.window().statsRefreshing).toBe(true);
+	const next = { ...source, epoch: "two", statsVersion: 2 };
+	model.setStatsSource(next);
+	expect(added()).toEqual([7]);
+	for (const invalid of [
+		{ ...result, cache: { ...cache, statsVersion: 1 } },
+		{ ...result, cache: { ...cache, statsVersion: 2, memberVersion: 2 } },
+		{ ...result, cache: { ...cache, statsVersion: 2, workerEpoch: "foreign" } },
+		{ ...result, cache: { ...cache, statsVersion: 2 }, workspaceIdentity: "foreign" },
+		{ ...result, cache: { ...cache, statsVersion: 2 }, filterKey: "M" },
+	]) {
+		model.mergePageStats(next, {
+			...invalid,
+			rows: result.rows.map((row) => ({ ...row, added: 999 })),
+		});
+		expect(added()).toEqual([7]);
+	}
+	model.mergePageStats(next, {
+		...result,
+		cache: { ...cache, statsVersion: 2 },
+		rows: result.rows.map((row) => ({ ...row, added: 11 })),
+	});
+	expect(added()).toEqual([11]);
+	expect(model.window().statsRefreshing).toBe(false);
+	const foreignPage = { ...page([]), cache: { ...cache, memberVersion: 2 } };
+	expect(() => model.append([foreignPage])).toThrow("membership");
+});
+
 describe("Git changes Worker row index", () => {
 	test("ChangeLists use their own observation and keep current pages across unrelated generations", () => {
 		const config = stagingConfig();

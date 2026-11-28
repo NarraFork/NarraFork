@@ -134,7 +134,7 @@ test("every production run entry supplies identity or explicitly relies on its o
 					// registered logical run: identity comes from that run's own registration.
 					const checkpointResume =
 						path === "server/services/background-task-service.ts" &&
-						context === "recoverStaleTasksAfterRestart" &&
+						context === "recoverStaleTaskPages" &&
 						name === "startNarratorRun" &&
 						/resumeRunId: task\.logicalRunId/.test(args[0]?.getText(file) ?? "") &&
 						/recovered: true/.test(args[0]?.getText(file) ?? "");

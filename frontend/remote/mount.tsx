@@ -1,4 +1,5 @@
 import "@frontend/lib/legacy-browser-polyfills";
+import { clearCurrentUserCache } from "@frontend/lib/current-user-cache";
 import type { RemoteFrontendMountOptions } from "@shared/remote-access/business-transport";
 import { authenticateRemoteSession, clearRemoteRuntime, initializeRemoteRuntime } from "./runtime";
 
@@ -12,6 +13,7 @@ export async function mount(options: RemoteFrontendMountOptions): Promise<() => 
 				await authenticateRemoteSession(token);
 			} catch {
 				localStorage.removeItem("narrafork_token");
+				clearCurrentUserCache();
 			}
 		}
 		const { mountApplication } = await import("./application");

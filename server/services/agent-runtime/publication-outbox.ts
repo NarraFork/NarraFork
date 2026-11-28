@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
@@ -23,6 +24,7 @@ import { AWAITED_TERMINAL_CONSUMED_REASON } from "./mailbox-shared";
 import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
 import { publicationDedupeKey } from "./publication-key";
 import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
+import type { RuntimeReadOptions } from "./read-options";
 import { runAtomicWrite } from "./runtime-write";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -1239,25 +1241,27 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		registerLegacyRunningRunSlots,
 		registerLegacyUnknownBashFailure,
 		registerLegacyCompletedRunSlots,
-		listPending(options: { afterId?: string; limit?: number } = {}, tx: RuntimeStoreDb = db) {
-			return tx
-				.select({
-					id: outbox.id,
-					recipientId: outbox.recipientId,
-					producerKind: outbox.producerKind,
-					logicalRunId: outbox.logicalRunId,
-					arrivalSeq: outbox.arrivalSeq,
-				})
-				.from(outbox)
-				.where(
-					and(
-						eq(outbox.state, "pending"),
-						options.afterId ? gt(outbox.id, options.afterId) : undefined,
-					),
-				)
-				.orderBy(asc(outbox.id))
-				.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1)
-				.all();
+		async listPending(options: { afterId?: string; limit?: number } & RuntimeReadOptions = {}) {
+			return readQuery(
+				db
+					.select({
+						id: outbox.id,
+						recipientId: outbox.recipientId,
+						producerKind: outbox.producerKind,
+						logicalRunId: outbox.logicalRunId,
+						arrivalSeq: outbox.arrivalSeq,
+					})
+					.from(outbox)
+					.where(
+						and(
+							eq(outbox.state, "pending"),
+							options.afterId ? gt(outbox.id, options.afterId) : undefined,
+						),
+					)
+					.orderBy(asc(outbox.id))
+					.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1),
+				{ ...options, executionPolicy: "worker-required", maxRows: L.pageSize + 1 },
+			);
 		},
 		/** Fail actual events, but preserve running tasks' reserved capacity until their result commits. */
 		failRecipient(recipientId: string, reason: string) {

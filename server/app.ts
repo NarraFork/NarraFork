@@ -1,5 +1,5 @@
 import { count } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { matchedRoutes } from "hono/route";
 import type { UnofficialStatusCode } from "hono/utils/http-status";
@@ -7,13 +7,16 @@ import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "./lib/cors-origin";
+import { getDbReadAbortDiagnostics } from "./lib/db-worker/read-diagnostics";
 import { DiskSpaceError, isDiskFullError } from "./lib/disk-safety";
 import { catalogError } from "./lib/errors";
 import { stallTimeBetween, trackInFlight } from "./lib/event-loop-monitor";
 import { gitAvailable, recheckGit } from "./lib/git-status";
+import { generateId } from "./lib/id";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { readFanoutHttpMiddleware } from "./lib/read-fanout-diagnostics";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -33,9 +36,9 @@ import { containerRoutes } from "./routes/containers";
 import { credentialTransferRoutes } from "./routes/credential-transfer";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
-import { deepseekRoutes } from "./routes/deepseek";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
+import { diagnosticsRoutes } from "./routes/diagnostics";
 import { editorDocumentRoutes } from "./routes/editor-documents";
 import executionLogRoutes from "./routes/execution-log";
 import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
@@ -49,12 +52,11 @@ import { narratorGitRoutes } from "./routes/git";
 import { grammarRoutes } from "./routes/grammars";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
-import { kimiRoutes } from "./routes/kimi";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
-import { mcpRoutes } from "./routes/mcp";
+import { mcpOAuthCallbackRoutes, mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
 import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
@@ -67,7 +69,6 @@ import { oauthRoutes } from "./routes/oauth";
 import { oauthAppRoutes } from "./routes/oauth-apps";
 import { oauthGrantRoutes } from "./routes/oauth-grants";
 import { openaiRoutes } from "./routes/openai";
-import { opencodeRoutes } from "./routes/opencode";
 import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginUpdateRoutes } from "./routes/plugin-updates";
@@ -86,6 +87,7 @@ import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
 } from "./routes/public-narrator-shares";
+import { quotaSnapshotRoutes } from "./routes/quota-snapshots";
 import { remoteAccessRoutes } from "./routes/remote-access";
 import { routineRoutes } from "./routes/routines";
 import { runtimeRoutes } from "./routes/runtime";
@@ -95,6 +97,7 @@ import { sessionInterchangeRoutes } from "./routes/session-interchange";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
+import { sourcingRoutes } from "./routes/sourcing";
 import { specRoutes } from "./routes/spec";
 import { speechRoutes } from "./routes/speech";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
@@ -128,6 +131,57 @@ export interface AppEnv {
 const app = new Hono<AppEnv>();
 
 const SLOW_API_REQUEST_MS = 1_000;
+const HTTP_LOG_METHOD_MAX_LENGTH = 32;
+const HTTP_LOG_PATH_MAX_LENGTH = 1_024;
+
+// Context-local correlation also covers errors before the API timer starts. Never attach
+// request fields to an Error: the same error may be observed by concurrent requests.
+const httpRequestLogContexts = new WeakMap<
+	Context<AppEnv>,
+	{ httpRequestId?: string; startedAt?: number }
+>();
+
+function httpRequestLogContext(c: Context<AppEnv>) {
+	let context = httpRequestLogContexts.get(c);
+	if (!context) {
+		context = {};
+		httpRequestLogContexts.set(c, context);
+		try {
+			context.httpRequestId = generateId();
+		} catch {
+			// Correlation is best-effort; retain this context without retrying the ID factory.
+		}
+	}
+	return context;
+}
+
+function httpRequestLogFields(c: Context<AppEnv>, endedAt?: number) {
+	const context = httpRequestLogContext(c);
+	const durationMs =
+		context.startedAt === undefined
+			? undefined
+			: Math.round(((endedAt ?? performance.now()) - context.startedAt) * 100) / 100;
+	return {
+		...(context.httpRequestId ? { httpRequestId: context.httpRequestId } : {}),
+		method: c.req.method.slice(0, HTTP_LOG_METHOD_MAX_LENGTH),
+		path: c.req.path.slice(0, HTTP_LOG_PATH_MAX_LENGTH),
+		requestAborted: c.req.raw.signal.aborted,
+		...(durationMs !== undefined && Number.isFinite(durationMs) ? { durationMs } : {}),
+	};
+}
+
+function dbReadErrorLogFields(error: unknown) {
+	try {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "DB_READ_ABORTED") {
+			return {};
+		}
+		const dbRead = getDbReadAbortDiagnostics(error);
+		return { errorCode: "DB_READ_ABORTED", ...(dbRead ? { dbRead } : {}) };
+	} catch {
+		// Diagnostics must not turn an unusual error code/getter into another request failure.
+		return {};
+	}
+}
 
 /*
  * `frame-ancestors` for the SPA shell — who may embed this app in a frame.
@@ -164,6 +218,9 @@ app.use("*", async (c, next) => {
 	const directive = `frame-ancestors ${spaFrameAncestors()}`;
 	c.res.headers.set("Content-Security-Policy", existing ? `${existing}; ${directive}` : directive);
 });
+
+// Establish attribution before API middleware/authentication; control routes exclude auth reads too.
+app.use("/api/*", readFanoutHttpMiddleware);
 
 /*
  * Cross-origin policy for `/api/*`.
@@ -245,6 +302,7 @@ app.use(
 
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
+	httpRequestLogContext(c).startedAt = startedAt;
 	const done = trackInFlight(`${c.req.method} ${c.req.path}`);
 	// SQL tracing (NF_SQL_TRACE): every statement this request runs is attributed to this span.
 	// The label is refined to the matched route pattern once routing has happened.
@@ -276,8 +334,7 @@ app.use("/api/*", async (c, next) => {
 			// stalledMs ≈ durationMs: the main thread was blocked (by this request or another, see
 			// "Event loop lag detected"). stalledMs ≈ 0: the request itself awaited slow work.
 			logger.warn("Slow API request", {
-				method: c.req.method,
-				path: c.req.path,
+				...httpRequestLogFields(c, endedAt),
 				status: c.res.status,
 				durationMs,
 				...stallTimeBetween(startedAt, endedAt),
@@ -379,6 +436,10 @@ app.route("/api/plugins", pluginUiRoutes);
 // a NarraFork session. Consent explicitly requires a first-party session.
 app.route("/api/oauth", oauthRoutes);
 
+// Public: redirect target for OAuth authorization of external MCP servers. Only a
+// single-use `state` minted by an admin's authorization request is accepted.
+app.route("/api/mcp/oauth", mcpOAuthCallbackRoutes);
+
 // Versioned external resource facade. It is mounted before the session-only gate,
 // but the router itself requires an OAuth principal and enforces scope + resource ownership.
 app.route("/api/external/v1", externalV1Routes);
@@ -470,6 +531,7 @@ app.route("/api/settings/tls", tlsRoutes);
 app.route("/api/learning", learningRoutes);
 app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
+app.route("/api/diagnostics", diagnosticsRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/session-interchange", sessionInterchangeRoutes);
 app.route("/api/mcp", mcpRoutes);
@@ -495,16 +557,15 @@ app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/speech", speechRoutes);
 app.route("/api/notifications", notificationRoutes);
-app.route("/api/kimi", kimiRoutes);
-app.route("/api/deepseek", deepseekRoutes);
+app.route("/api/quota-snapshots", quotaSnapshotRoutes);
 app.route("/api/provider-balances", providerBalanceRoutes);
 app.route("/api/provider-quotas", providerQuotaRoutes);
 app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
-app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/credential-transfer", credentialTransferRoutes);
 app.route("/api/provider-keys", providerKeyRoutes);
+app.route("/api/sourcing", sourcingRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);
@@ -544,10 +605,15 @@ app.onError((err, c) => {
 	// The client went away (closed the page, switched narrators) and the abort surfaced from
 	// whatever the handler awaited. Not a server fault, and nobody receives this response.
 	if (c.req.raw.signal.aborted && (err as Error).name === "AbortError") {
-		logger.debug("Request aborted by client", { path: c.req.path, error: String(err) });
+		logger.debug("Request aborted by client", { ...httpRequestLogFields(c), error: String(err) });
 		return c.body(null, 499 as UnofficialStatusCode);
 	}
-	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
+	logger.error("Unhandled error", {
+		...httpRequestLogFields(c),
+		...dbReadErrorLogFields(err),
+		error: String(err),
+		stack: (err as Error).stack,
+	});
 	// The message stays deliberately generic (an unhandled error may quote internals), but it
 	// still carries a code so the client can localize it rather than print English.
 	//

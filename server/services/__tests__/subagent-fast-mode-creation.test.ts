@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { narrators } from "../../db/schema";
+import { narratorCommunicationNodes, narrators } from "../../db/schema";
 import type { BooleanOverride } from "../../lib/boolean-override";
 import { legacyFastModeMirror } from "../../lib/fast-mode";
 import { generateId } from "../../lib/id";
+import { ensureCommunicationNodeTx } from "../narrator-communication/store";
 import { resolveNarratorFastMode } from "../narrator-fast-mode";
 import { narratorService } from "../narrator-service";
 
@@ -28,6 +29,7 @@ async function primary(fastModeOverride: BooleanOverride) {
 		createdAt: now,
 		updatedAt: now,
 	});
+	ensureCommunicationNodeTx(db, id, null);
 	return id;
 }
 async function child(parentNarratorId: string) {
@@ -40,6 +42,13 @@ async function child(parentNarratorId: string) {
 		runtimePolicy: { version: 1 },
 	});
 	ids.push(created.id);
+	expect(
+		db
+			.select()
+			.from(narratorCommunicationNodes)
+			.where(eq(narratorCommunicationNodes.narratorId, created.id))
+			.get(),
+	).toMatchObject({ parentNarratorId, originalParentNarratorId: parentNarratorId, version: 1 });
 	return created;
 }
 
@@ -98,6 +107,13 @@ describe("subagent creation fast-mode inheritance", () => {
 			const fork = await narratorService.forkNarrator(root, null, { inheritMode: "fresh" });
 			ids.push(fork.id);
 			expect(fork.type).toBe("primary");
+			expect(
+				db
+					.select()
+					.from(narratorCommunicationNodes)
+					.where(eq(narratorCommunicationNodes.narratorId, fork.id))
+					.get(),
+			).toMatchObject({ parentNarratorId: null, originalParentNarratorId: null });
 			expect(fork.fastModeOverride).toBe(override);
 			expect(fork.fastMode).toBe(legacyFastModeMirror(override));
 			const before = await resolveNarratorFastMode(fork.id);

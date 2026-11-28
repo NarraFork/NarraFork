@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { ProviderPreset } from "@shared/sourcing/presets";
+import { getSourcingCatalog } from "../../../server/lib/sourcing/presets";
 import { parseModelId } from "../../../shared/model-id";
 import type { AddProviderDraft } from "./provider-add-draft";
 import {
@@ -9,7 +11,6 @@ import {
 	sanitizeProviderPrefix,
 	updateDraftConnection,
 } from "./provider-add-draft";
-import { PROVIDER_PRESETS, type ProviderPreset } from "./provider-presets";
 import { providersStateFromSettings } from "./providers-reducer";
 
 const draft: AddProviderDraft = {
@@ -89,7 +90,7 @@ describe("provider addition draft", () => {
 			["groq", "completions-compatible"],
 			["gemini", "gemini-compatible"],
 		] as const) {
-			const preset = PROVIDER_PRESETS.find((item) => item.id === id);
+			const preset = getSourcingCatalog().presets.find((item) => item.id === id);
 			if (!preset) throw new Error(`Missing preset ${id}`);
 			expect(draftFromPreset(preset)).toMatchObject({
 				protocol,

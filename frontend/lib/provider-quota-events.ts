@@ -1,4 +1,5 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import type { QuotaSnapshotReadScope } from "@shared/quota-snapshot";
 import type { QueryClient } from "@tanstack/react-query";
 import { narratorWSManager } from "./narrator-ws-manager";
 
@@ -43,6 +44,16 @@ export function invalidateProviderQuotaQueries(client: QueryClient, providerIds?
 			return false;
 		},
 	});
+	const snapshots = {
+		queryKey: ["quota-snapshots"],
+		predicate: ({ queryKey }: { queryKey: readonly unknown[] }) => {
+			const scope = queryKey[1] as QuotaSnapshotReadScope | null | undefined;
+			// Cached-only platform reads are refreshed by their own stream/runtime events.
+			return !scope?.cachedOnly && (!ids || !scope?.groupId || ids.has(scope.groupId));
+		},
+	};
+	// Cancel reads begun before the hint so they cannot republish a replaced account.
+	void client.cancelQueries(snapshots).then(() => client.invalidateQueries(snapshots));
 }
 
 const subscriptions = new WeakMap<QueryClient, { references: number; dispose: () => void }>();
@@ -70,6 +81,7 @@ export function subscribeProviderQuotaEvents(client: QueryClient): () => void {
 				(event as CustomEvent<{ type?: string }>).detail?.type === "plugin:contributions_changed"
 			) {
 				invalidateProviderQuotaQueries(client);
+				void client.invalidateQueries({ queryKey: ["provider-settings"] });
 				void client.invalidateQueries({ queryKey: ["settings"] });
 				void client.invalidateQueries({ queryKey: ["admin", "settings"] });
 			}

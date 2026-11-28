@@ -1,7 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { DockviewApi, DockviewWillShowOverlayLocationEvent } from "dockview-react";
 import { parseHTML } from "linkedom";
-import type { PanelDragState } from "../../lib/panel-drag";
+import { createElement, Fragment } from "react";
+import { flushSync } from "react-dom";
+import { createRoot, type Root } from "react-dom/client";
+import {
+	cancelDrag,
+	endDrag,
+	getPanelDrag,
+	moveDrag,
+	PANEL_DROP_PRIORITY,
+	type PanelDragState,
+	registerPanelDropTarget,
+	startDragManual,
+} from "../../lib/panel-drag";
 import { type DropIndicator, resolveNativeDrop, toIndicator } from "./drop-intent";
 import type { DockviewDropTarget } from "./useDockviewDnd";
 import {
@@ -13,6 +25,8 @@ import {
 	isLocalPanelDrag,
 	isTopmostSurface,
 	NATIVE_DROP_PREVIEW_CLASS,
+	type UseDockviewDndOptions,
+	useDockviewDnd,
 } from "./useDockviewDnd";
 
 /**
@@ -573,5 +587,237 @@ describe("isTopmostSurface", () => {
 	test("a descendant of the surface counts as that surface", () => {
 		const { el } = surfaceStack(html);
 		expect(isTopmostSurface(el("front"), [el("frontInner")])).toBe(true);
+	});
+});
+
+describe("mounted dock release arbitration", () => {
+	let root: Root;
+	let stack: Element[];
+	let front: HTMLElement;
+	let back: HTMLElement;
+	const globals = new Map<string, PropertyDescriptor | undefined>();
+	const subscriptions: (() => void)[] = [];
+	const indicators = new Map<string, DropIndicator | null>();
+
+	function Probe({ name, options }: { name: string; options: UseDockviewDndOptions }) {
+		indicators.set(name, useDockviewDnd(options).dropIndicator);
+		return null;
+	}
+	function mount(options: UseDockviewDndOptions, second?: UseDockviewDndOptions) {
+		flushSync(() =>
+			root.render(
+				createElement(
+					Fragment,
+					null,
+					createElement(Probe, { name: "first", options }),
+					second ? createElement(Probe, { name: "second", options: second }) : null,
+				),
+			),
+		);
+	}
+	function watchPage() {
+		const calls: string[] = [];
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: "page",
+				priority: PANEL_DROP_PRIORITY.page,
+				hitTest: () => true,
+				onDrop: () => calls.push("workspace created"),
+			}),
+		);
+		return calls;
+	}
+	beforeEach(() => {
+		const { window } = parseHTML(`<html><body><div id="host"></div>
+			<div id="front" ${DOCKVIEW_SURFACE_ATTR}="front"></div>
+			<div id="back" ${DOCKVIEW_SURFACE_ATTR}="back"></div></body></html>`);
+		for (const [key, value] of Object.entries({
+			window,
+			document: window.document,
+			navigator: window.navigator,
+			HTMLElement: window.HTMLElement,
+			IS_REACT_ACT_ENVIRONMENT: false,
+		})) {
+			globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+			Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+		}
+		front = document.getElementById("front") as HTMLElement;
+		back = document.getElementById("back") as HTMLElement;
+		stack = [front, back];
+		document.elementsFromPoint = () => stack;
+		indicators.clear();
+		root = createRoot(document.getElementById("host") as HTMLElement);
+	});
+	afterEach(async () => {
+		for (const off of subscriptions.splice(0)) off();
+		flushSync(() => root.unmount());
+		cancelDrag();
+		// Drain React's scheduled passive-effect task before removing its window.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		for (const [key, descriptor] of globals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+		globals.clear();
+	});
+
+	test("composer consumption prevents a real dock mutation and the page fallback", () => {
+		const page = watchPage();
+		const { api, moves } = makeApi({ a: { groupId: "g1" }, b: { groupId: "g2" } }, ["g1", "g2"]);
+		const dock: DockviewDropTarget[] = [];
+		mount({
+			apiRef: { current: api },
+			rootRef: { current: front },
+			onDropSubject: (_s, hit) => dock.push(hit),
+		});
+		const references: string[] = [];
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: "composer",
+				priority: PANEL_DROP_PRIORITY.composer,
+				hitTest: (state) => ({ narratorId: state.id }),
+				onDrop: (_state, hit) => references.push(hit.narratorId),
+			}),
+		);
+		flushSync(() => startDragManual("external", "External", 650, 400));
+		expect(indicators.get("first")?.variant).toBe("merge");
+		flushSync(() => endDrag());
+		expect(references).toEqual(["external"]);
+		expect(dock).toEqual([]);
+		expect(moves).toEqual([]);
+		expect(page).toEqual([]);
+		expect(indicators.get("first")).toBeNull();
+	});
+
+	test("a local panel is moved by the dock only when no composer consumes its release", () => {
+		const { api, moves } = makeApi({ a: { groupId: "g1" }, b: { groupId: "g2" } }, ["g1", "g2"]);
+		mount({ apiRef: { current: api }, rootRef: { current: front }, surfaceId: "local" });
+		let references = 0;
+		const offComposer = registerPanelDropTarget({
+			id: "composer",
+			priority: PANEL_DROP_PRIORITY.composer,
+			hitTest: () => true,
+			onDrop: () => {
+				references++;
+			},
+		});
+		subscriptions.push(offComposer);
+		const startLocal = () => {
+			startDragManual("a", "A", 650, 400);
+			const state = getPanelDrag();
+			if (!state) throw new Error("missing local panel drag");
+			Object.assign(state, { panelId: "a", surfaceId: "local", subjectKind: "narrator" });
+			moveDrag(650, 400);
+		};
+		flushSync(startLocal);
+		expect(indicators.get("first")?.variant).toBe("merge");
+		flushSync(() => endDrag());
+		expect(references).toBe(1);
+		expect(moves).toEqual([]);
+		offComposer();
+		flushSync(startLocal);
+		flushSync(() => endDrag());
+		expect(moves).toEqual([{ panel: "a", group: "g2", index: 1, position: undefined }]);
+		expect(references).toBe(1);
+	});
+
+	test("dock owns the release before page and resolves fresh coordinates, not its preview", () => {
+		const page = watchPage();
+		const { api } = makeApi({ b: { groupId: "g2" } }, ["g1", "g2"]);
+		const dock: DockviewDropTarget[] = [];
+		mount({
+			apiRef: { current: api },
+			rootRef: { current: front },
+			onDropSubject: (_s, hit) => dock.push(hit),
+		});
+		flushSync(() => startDragManual("external", "External", 650, 400));
+		expect(indicators.get("first")?.variant).toBe("merge");
+		const state = getPanelDrag();
+		if (!state) throw new Error("missing manual drag");
+		state.x = 550;
+		flushSync(() => endDrag());
+		expect(dock).toEqual([{ groupId: "g2", intent: "left", targetPanelId: "b" }]);
+		expect(page).toEqual([]);
+		expect(indicators.get("first")).toBeNull();
+	});
+
+	test("release outside every group cannot commit the old dock preview", () => {
+		const page = watchPage();
+		const { api } = makeApi({}, ["g1", "g2"]);
+		let dock = 0;
+		mount({
+			apiRef: { current: api },
+			rootRef: { current: front },
+			onDropSubject: () => {
+				dock++;
+			},
+		});
+		flushSync(() => startDragManual("external", "External", 650, 400));
+		const state = getPanelDrag();
+		if (!state) throw new Error("missing manual drag");
+		state.x = 1200;
+		flushSync(() => endDrag());
+		expect(dock).toBe(0);
+		expect(page).toEqual(["workspace created"]);
+		expect(indicators.get("first")).toBeNull();
+	});
+
+	test("only the actual front surface accepts an overlapping cross-surface drop", () => {
+		const { api: first } = makeApi({}, ["g1", "g2"]);
+		const { api: second } = makeApi({}, ["g1", "g2"]);
+		const drops: string[] = [];
+		mount(
+			{
+				apiRef: { current: first },
+				rootRef: { current: back },
+				surfaceId: "a-back",
+				onDropSubject: () => drops.push("back"),
+			},
+			{
+				apiRef: { current: second },
+				rootRef: { current: front },
+				surfaceId: "z-front",
+				onDropSubject: () => drops.push("front"),
+			},
+		);
+		flushSync(() => startDragManual("external", "External", 650, 400));
+		flushSync(() => endDrag());
+		expect(drops).toEqual(["front"]);
+		expect(indicators.get("first")).toBeNull();
+		expect(indicators.get("second")).toBeNull();
+	});
+
+	test("a throwing dock consumer never becomes a page split and still clears its indicator", () => {
+		const page = watchPage();
+		const { api } = makeApi({}, ["g1", "g2"]);
+		mount({
+			apiRef: { current: api },
+			rootRef: { current: front },
+			onDropSubject: () => {
+				throw new Error("rejected dock");
+			},
+		});
+		flushSync(() => startDragManual("external", "External", 650, 400));
+		flushSync(() => expect(endDrag).toThrow("rejected dock"));
+		expect(page).toEqual([]);
+		expect(indicators.get("first")).toBeNull();
+	});
+
+	test("unmount unregisters the dock drop target", () => {
+		const page = watchPage();
+		const { api } = makeApi({}, ["g1", "g2"]);
+		let dock = 0;
+		mount({
+			apiRef: { current: api },
+			rootRef: { current: front },
+			onDropSubject: () => {
+				dock++;
+			},
+		});
+		flushSync(() => root.render(null));
+		startDragManual("external", "External", 650, 400);
+		endDrag();
+		expect(dock).toBe(0);
+		expect(page).toEqual(["workspace created"]);
 	});
 });

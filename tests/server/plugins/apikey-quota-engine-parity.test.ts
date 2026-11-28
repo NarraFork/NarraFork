@@ -32,7 +32,9 @@ const payloads = {
 			daily_limit_usd: 10,
 			daily_usage_usd: 2,
 			weekly_limit_usd: 40,
-			weekly_usage_usd: 4,
+			weekly_usage_usd: 40,
+			monthly_limit_usd: 0,
+			monthly_usage_usd: 0,
 			weekly_window_start: "2029-12-25T00:00:00Z",
 		},
 	},
@@ -53,6 +55,7 @@ beforeAll(async () => {
 		},
 	});
 	f = await archivedQuotaFixture({
+		approveSettings: true,
 		fetch: async (...args) => {
 			calls.push(args);
 			const url = new URL(String(args[0]));

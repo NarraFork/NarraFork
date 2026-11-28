@@ -23,6 +23,7 @@ export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
 import type { PublicationRun } from "../../services/agent-runtime/publication-outbox";
 import type { AgentTerminalResultReadOptions } from "../../services/agent-runtime/publication-result";
+import type { BenchmarkReadParams } from "../../services/benchmark-read";
 import type {
 	BlockBackfillSliceParams,
 	BlockIndexQueueSliceParams,
@@ -30,12 +31,10 @@ import type {
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
 } from "./block-backfill-query";
-import type { ComposerDocumentParams } from "./composer-document-query";
 import type { RecallConversationParams } from "./recall-conversation-query";
 import type { RecallToolCallParams } from "./recall-tool-call-query";
 import type { StorageHistoryBodyParams, StorageHistoryReadParams } from "./storage-history-query";
 import type { SubagentActivityParams } from "./subagent-activity-query";
-import type { ToolDetailSnapshotParams } from "./tool-detail-query";
 
 export type { StorageHistoryBodyParams, StorageHistoryBodyResult } from "./storage-history-query";
 
@@ -46,7 +45,6 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
-	| "composerDocument"
 	| "compactSummary"
 	| "storageScanContext"
 	| "storageScanTables"
@@ -55,11 +53,14 @@ export type DbReadTaskName =
 	| "storageScanSessionPreview"
 	| "revertSelectionBody"
 	| "databaseCleanupContext"
-	| "toolDetailSnapshot"
 	| "selectRows"
 	| "executionPolicyFacts"
 	| "toolEditPreview"
 	| "knowledgeEntryDetail"
+	| "selectDigestBatch"
+	| "selectValues"
+	| "selectChunks"
+	| "domainRead"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
@@ -72,12 +73,13 @@ export type DbReadTaskName =
 	| "storageHistoryRead"
 	| "subagentActivity"
 	| "storageHistoryBody"
-	| "publicationTerminalResult";
+	| "publicationTerminalResult"
+	| "benchmarkRead";
 
-/** Shared read-query budgets; importing these must never bootstrap a database. */
+/** Shared observation thresholds, never rejection or truncation limits. No database bootstrap. */
 export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
 export const SELECT_ROWS_MAX_PARAMS_BYTES = 128 * 1024;
-export const SELECT_ROWS_MAX_PARAMS = 256;
+export const SELECT_ROWS_MAX_PARAMS = 4096;
 export const SELECT_ROWS_MAX_ROWS = 10_000;
 export const SELECT_ROWS_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -107,6 +109,49 @@ export interface RevertSelectionInspectionSource {
 export interface RevertSelectionBodyParams extends RevertSelectionInspectionSource {
 	kind: "revertSelectionBody";
 	blockReads: boolean;
+}
+
+export interface SelectDigestBatchEntry {
+	ordinal: number;
+	query: string;
+	params: readonly ReadBind[];
+	digest: string;
+	rows: number;
+	bytes: number;
+}
+export type EncodedSelectDigestBatchEntry = Omit<SelectDigestBatchEntry, "params"> & {
+	params: EncodedReadBind[];
+};
+export interface SelectDigestBatchParams {
+	kind: "selectDigestBatch";
+	entries: EncodedSelectDigestBatchEntry[];
+}
+export interface SelectDigestBatchResult {
+	matches: boolean;
+	entries: Array<{ ordinal: number; matches: boolean }>;
+}
+export type ReadBind = string | number | null | boolean | bigint | Uint8Array;
+export type EncodedReadBind =
+	| string
+	| number
+	| null
+	| { type: "bigint"; value: string }
+	| { type: "blob"; value: Uint8Array };
+export interface SelectValuesParams {
+	kind: "selectValues" | "selectChunks";
+	sql: string;
+	params: EncodedReadBind[];
+	maxRows: number;
+}
+/** Chunk targets; an oversized row owns its ACK-controlled chunk. */
+export const SELECT_CHUNK_MAX_ROWS = 128;
+export const SELECT_CHUNK_MAX_BYTES = 256 * 1024;
+export interface SelectChunk extends SelectRowsResult {
+	sequence: number;
+}
+export interface SelectChunksResult {
+	rowCount: number;
+	bytes: number;
 }
 
 export interface StorageScanContextParams {
@@ -286,7 +331,7 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
-	| ComposerDocumentParams
+	| BenchmarkReadParams
 	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
 	| RecallToolCallParams
 	| RecallConversationParams
@@ -311,11 +356,13 @@ export type DbReadTaskParams =
 	| StorageScanSessionPreviewParams
 	| RevertSelectionBodyParams
 	| { kind: "databaseCleanupContext" }
-	| ToolDetailSnapshotParams
 	| SelectRowsParams
 	| { kind: "executionPolicyFacts"; narratorId: string }
 	| { kind: "toolEditPreview"; toolCallId: string }
 	| { kind: "knowledgeEntryDetail"; entryId: string }
+	| SelectDigestBatchParams
+	| SelectValuesParams
+	| import("./domain-protocol").DomainReadParams
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;
 
@@ -323,6 +370,8 @@ export interface DbWorkerRequest {
 	type: "task";
 	requestId: string;
 	dbPath: string;
+	databaseId?: string;
+	deadlineAt?: number;
 	params: DbReadTaskParams;
 	/** SQL trace span that issued the task; the worker attributes its SQL to a child span. */
 	traceParent?: string;
@@ -339,7 +388,16 @@ export interface DbWorkerCancel {
 	requestId: string;
 }
 
-export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown | DbWorkerCancel;
+export interface DbWorkerChunkAck {
+	type: "chunkAck";
+	requestId: string;
+	sequence: number;
+}
+export type DbWorkerInbound =
+	| DbWorkerRequest
+	| DbWorkerShutdown
+	| DbWorkerCancel
+	| DbWorkerChunkAck;
 
 export interface DbWorkerReady {
 	type: "ready";
@@ -362,6 +420,8 @@ export interface DbWorkerSuccess {
 	// biome-ignore lint/suspicious/noExplicitAny: payload shape is task-specific
 	result: any;
 	durationMs: number;
+	/** Numeric observations outside the business DTO. */
+	diagnostics?: import("./read-budget").ReadBudgetSnapshot;
 }
 
 export interface DbWorkerFailure {
@@ -371,11 +431,22 @@ export interface DbWorkerFailure {
 	/** Task-specific fail-closed diagnostics; never contains raw JSON. */
 	code?: string;
 	diagnostic?: ReturnType<typeof import("./failure").workerFailureDetails>;
+	statusCode?: number;
+	errorType?: "AppError" | "NotFoundError" | "ValidationError" | "ForbiddenError";
+	messageCode?: import("@shared/error-catalog").ErrorMessageCode;
+	messageParams?: import("@shared/error-catalog").ErrorMessageParams;
+	diagnostics?: import("./read-budget").ReadBudgetSnapshot;
 }
-
+export interface DbWorkerChunk {
+	type: "chunk";
+	requestId: string;
+	chunk: SelectChunk;
+	diagnostics?: import("./read-budget").ReadBudgetSnapshot;
+}
 export type DbWorkerOutbound =
+	| import("./sql-diagnostics").SqlDiagnosticEvent
 	| DbWorkerReady
 	| DbWorkerProgress
 	| DbWorkerSuccess
 	| DbWorkerFailure
-	| import("./sql-diagnostics").SqlDiagnosticEvent;
+	| DbWorkerChunk;

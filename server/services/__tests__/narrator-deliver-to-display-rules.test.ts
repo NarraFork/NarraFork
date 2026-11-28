@@ -6,10 +6,13 @@
  * delegated shape but no destination gets neither.
  */
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const ws = await import("../../websocket/narrator-ws");
@@ -46,9 +49,10 @@ const shapes = [
 	},
 ] as const;
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
+	await fixture.close();
 });
 
 beforeEach(() => {

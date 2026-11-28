@@ -1,9 +1,11 @@
 import { lstat, realpath } from "node:fs/promises";
 import type {
+	GitStatusPageCacheState,
 	GitStatusPageQuery,
 	GitStatusPageScopeProof,
 	GitStatusPageStatsQuery,
 } from "@shared/git-status-page";
+import type { GitLineStats } from "../../shared/git-line-stats";
 import type { PathFlavor } from "../lib/agent/execution/path-semantics";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -20,10 +22,14 @@ import { invalidateStatus } from "./git-status-cache";
 import {
 	assertGitStatusPageScope,
 	type GitStatusPageSource,
+	getGitStatusPagesCacheState,
 	invalidateGitStatusPageStats,
 	invalidateGitStatusPages,
+	observeGitStatusPages,
 	readGitStatusPage,
 	readGitStatusPageStats,
+	releaseGitStatusPages,
+	retainGitStatusPages,
 	validateGitStatusPages,
 } from "./git-status-page";
 import {
@@ -126,9 +132,36 @@ export function getGitWorkspaceStatusPageStats(
 		scope: { actorId, workspaceKey, queryKey },
 		source,
 		query,
-		readStats: (readSignal) => getGitWorkspaceLineStats(pinnedTarget, readSignal),
 		signal,
 	});
+}
+
+/** Shared producer receives full measurements before the bounded WebSocket projection. */
+export function observeGitWorkspaceStatusPages(
+	target: GitWorkspaceTarget,
+	signal: AbortSignal,
+	readStats: (signal: AbortSignal) => Promise<GitLineStats>,
+	onPublished?: (cache: GitStatusPageCacheState) => void,
+) {
+	const { queryKey, source } = gitStatusPageTarget(target);
+	return observeGitStatusPages({ queryKey, source, signal, readStats, onPublished });
+}
+export function getGitWorkspaceStatusPagesCacheState(
+	target: GitWorkspaceTarget,
+	signal?: AbortSignal,
+) {
+	const { queryKey, source } = gitStatusPageTarget(target);
+	return getGitStatusPagesCacheState({ queryKey, source, signal });
+}
+export function retainGitWorkspaceStatusPages(target: GitWorkspaceTarget): void {
+	if (!target.backend || !target.workspace.rootPath || !target.workspace.workspaceKey) return;
+	const { queryKey, source } = gitStatusPageTarget(target);
+	retainGitStatusPages(queryKey, source);
+}
+export function releaseGitWorkspaceStatusPages(target: GitWorkspaceTarget): void {
+	if (!target.backend || !target.workspace.rootPath || !target.workspace.workspaceKey) return;
+	const { queryKey, source } = gitStatusPageTarget(target);
+	releaseGitStatusPages(queryKey, source);
 }
 
 /** Watch uncertainty is checked in the paging Worker, independently of summary revalidation. */

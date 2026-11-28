@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { oauthClients, remoteDevices } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import {
 	intersectOAuthClientPolicies,
 	normalizeOAuthClientPolicy,
@@ -36,8 +37,10 @@ function denied(reason: string): OAuthDeviceRuntimeAuthorization {
  */
 export async function resolveOAuthDeviceRuntimeAuthorization(
 	device: OAuthDeviceRuntimeResource,
+	readOptions?: ReadQueryOptions,
 ): Promise<OAuthDeviceRuntimeAuthorization> {
-	const provenance = await integrationResourceBindingService.get("device", device.id);
+	readOptions?.signal?.throwIfAborted();
+	const provenance = await integrationResourceBindingService.get("device", device.id, readOptions);
 	if (
 		!provenance ||
 		provenance.sourceType !== "oauth_client" ||
@@ -48,21 +51,30 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 	if (provenance.state !== "active") {
 		return denied("OAuth device provenance is inactive");
 	}
-	const liveDevice = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, device.id),
-		columns: {
-			id: true,
-			createdBy: true,
-			scope: true,
-			projectId: true,
-			revokedAt: true,
-		},
-	});
+	readOptions?.signal?.throwIfAborted();
+	const liveDevice = await readQueryFirst(
+		db.query.remoteDevices.findMany({
+			limit: 1,
+			where: eq(remoteDevices.id, device.id),
+			columns: {
+				id: true,
+				createdBy: true,
+				scope: true,
+				projectId: true,
+				revokedAt: true,
+			},
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!liveDevice || liveDevice.revokedAt) return denied("Device revoked");
 	// OAuth grants are no longer project-bound: the resource binding (grant
 	// ownership) is the isolation boundary, so a missing projectId is allowed.
 
-	const authority = await integrationAuthorityService.getSnapshot(provenance.authorityId);
+	const authority = await integrationAuthorityService.getSnapshot(
+		provenance.authorityId,
+		{},
+		readOptions,
+	);
 	if (
 		!authority ||
 		authority.authority.kind !== "oauth_grant" ||
@@ -76,12 +88,17 @@ export async function resolveOAuthDeviceRuntimeAuthorization(
 		return denied("OAuth device owner no longer matches the authority");
 	}
 
-	const client = await db.query.oauthClients.findFirst({
-		where: and(
-			eq(oauthClients.id, authority.authority.integrationId),
-			isNull(oauthClients.revokedAt),
-		),
-	});
+	readOptions?.signal?.throwIfAborted();
+	const client = await readQueryFirst(
+		db.query.oauthClients.findMany({
+			limit: 1,
+			where: and(
+				eq(oauthClients.id, authority.authority.integrationId),
+				isNull(oauthClients.revokedAt),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!client?.publicClient) return denied("OAuth client is inactive");
 
 	// Grant ownership (verified above via the active resource binding + live

@@ -140,9 +140,12 @@ details { margin-top: 16px; }
 			getSelection().selectAllChildren($("command"));
 		}
 	});
+	const POLL_TIMEOUT_MS = 5000;
 	const poll = async () => {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), POLL_TIMEOUT_MS);
 		try {
-			const response = await fetch("api/startup", { cache: "no-store" });
+			const response = await fetch("api/startup", { cache: "no-store", signal: controller.signal });
 			// NarraFork itself answering means it is up. A proxy's own 502/504 during the takeover
 			// lacks the header too, and reloading onto it would strand the page there.
 			if (!response.headers.has("${STARTUP_STATUS_HEADER}")) {
@@ -162,6 +165,8 @@ details { margin-top: 16px; }
 				render({ ...state, problem: { message: { en: text.gone, zh: text.gone } } });
 				$("stopped").textContent = text.goneHint;
 			}
+		} finally {
+			clearTimeout(timeout);
 		}
 		setTimeout(poll, 1000);
 	};

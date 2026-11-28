@@ -95,7 +95,7 @@ describe("owned process lifecycle", () => {
 		expect(await run).toBe(7);
 	});
 
-	test("hybrid mode keeps Vite ports and trace defaults; frontend exit stops only its backend", async () => {
+	test("hybrid mode keeps the source backend and its live filesystem frontend beside Vite", async () => {
 		const h = harness();
 		const run = runDevAll(
 			parseLaunchOptions(["--production", "--frontend-dev"]),
@@ -104,15 +104,17 @@ describe("owned process lifecycle", () => {
 			h.deps,
 		);
 		await h.backendStarted.promise;
-		expect(h.builds[0].frontend).toBe(false);
-		expect(h.calls).toHaveLength(2);
-		expect(h.calls[0].env).toMatchObject({ NODE_ENV: "production", NF_SQL_TRACE: "summary" });
-		expect(h.calls[0].env.PORT).toBeUndefined();
-		expect(h.calls[1].env).toMatchObject({ VITE_PORT: "41221", BACKEND_PORT: "7778" });
-		expect(h.calls[1].command.slice(-2)).toEqual(["--mode", "production"]);
-		h.children[1].finish(3);
+		expect(h.builds).toHaveLength(0);
+		expect(h.calls).toHaveLength(3);
+		expect(h.calls[0].command).toEqual([process.execPath, "run", "db:migrate"]);
+		expect(h.calls[1].command).toEqual([process.execPath, "run", "--hot", "server/index.ts"]);
+		expect(h.calls[1].env).toMatchObject({ NODE_ENV: "production", NF_SQL_TRACE: "summary" });
+		expect(h.calls[1].env.PORT).toBeUndefined();
+		expect(h.calls[2].env).toMatchObject({ VITE_PORT: "41221", BACKEND_PORT: "7778" });
+		expect(h.calls[2].command.slice(-2)).toEqual(["--mode", "production"]);
+		h.children[2].finish(3);
 		expect(await run).toBe(3);
-		expect(h.stopped).toEqual([h.children[0].process.pid]);
+		expect(h.stopped).toEqual([h.children[1].process.pid]);
 	});
 
 	test("source development still migrates and hot reloads on its existing ports", async () => {
@@ -200,7 +202,7 @@ describe("owned process lifecycle", () => {
 		await expect(
 			runDevAll(parseLaunchOptions(["--production", "--frontend-dev"]), {}, undefined, h.deps),
 		).rejects.toThrow("frontend spawn failed");
-		expect(h.stopped).toEqual([h.children[0].process.pid]);
+		expect(h.stopped).toEqual([h.children[1].process.pid]);
 	});
 
 	test("cancellation of a running pair stops only both owned children", async () => {
@@ -213,8 +215,9 @@ describe("owned process lifecycle", () => {
 			h.deps,
 		);
 		await h.backendStarted.promise;
+		const running = h.children.filter((current) => current.process.exitCode === null);
 		controller.abort();
 		await run;
-		expect(h.stopped).toEqual(h.children.map((current) => current.process.pid));
+		expect(h.stopped).toEqual(running.map((current) => current.process.pid));
 	});
 });

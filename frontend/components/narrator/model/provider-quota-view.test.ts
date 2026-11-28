@@ -8,7 +8,7 @@ import {
 import { parseSub2ApiBalance, relayQuotaData } from "../../../../plugins/provider-quota/src/relay";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
-import { customApiQuotaDisplayFor } from "./custom-api-usage-source";
+import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import { buildProviderQuotaView, formatProviderQuotaAmount } from "./provider-quota-view";
 import { formatQuotaBadgeText, formatQuotaSummaryLines } from "./quota-panel-view";
 
@@ -735,43 +735,15 @@ describe("normalized provider quota view", () => {
 	});
 });
 
-describe("normalized Custom API display identity and precedence", () => {
-	test("account replacement or a different provider hides old snapshots immediately", () => {
-		for (const identity of [
-			{ providerId: "p1", generation: "account-B" },
-			{ providerId: "p2", generation: "account-A" },
-			{ providerId: "p1", generation: undefined },
-		]) {
-			expect(
-				customApiQuotaDisplayFor({ ...identity, snapshot: snapshot() }).quotaSnapshot,
-			).toBeNull();
-		}
-		expect(
-			customApiQuotaDisplayFor({ providerId: "p1", generation: "account-A", snapshot: snapshot() })
-				.quotaSnapshot?.data,
-		).not.toBeNull();
-	});
-	test("pushed text including zero wins over every plugin status without rewriting snapshots", () => {
-		for (const status of ["supported", "error", "unavailable", "probing"] as const) {
-			const value = snapshot({ status });
-			const display = customApiQuotaDisplayFor({
-				providerId: "p1",
-				generation: "account-A",
-				pushedQuotas: { p1: { quotaBalance: "0", detailedQuotaBalance: "Live details" } },
-				snapshot: value,
-			});
-			expect(display.pushedQuota?.quotaBalance).toBe("0");
-			expect(display.quotaSnapshot).toBeNull();
-			expect(value.data?.amounts[0]?.remaining).toBe(37.5);
-		}
-	});
-	test("a pushed value explicitly tied to the old account cannot survive replacement", () => {
-		const display = customApiQuotaDisplayFor({
-			providerId: "p1",
-			generation: "account-B",
-			pushedQuotas: { p1: { generation: "account-A", quotaBalance: "Old private balance" } },
-			snapshot: snapshot(),
-		});
-		expect(display).toEqual({ pushedQuota: null, quotaSnapshot: null });
-	});
+test("account replacement or a different provider hides old diagnostic snapshots immediately", () => {
+	for (const identity of [
+		{ providerId: "p1", generation: "account-B" },
+		{ providerId: "p2", generation: "account-A" },
+		{ providerId: "p1", generation: undefined },
+	]) {
+		expect(matchesProviderQuotaIdentity(snapshot(), identity.providerId, identity.generation)).toBe(
+			false,
+		);
+	}
+	expect(matchesProviderQuotaIdentity(snapshot(), "p1", "account-A")).toBe(true);
 });

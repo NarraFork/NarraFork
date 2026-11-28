@@ -25,7 +25,7 @@ mock.module("@tanstack/react-router", () => ({
 		...rest
 	}: {
 		to: string;
-		params?: { narratorId?: string };
+		params?: { narratorId?: string; projectId?: string };
 		search?: { create?: boolean };
 		children?: ReactNode;
 	}) => (
@@ -34,7 +34,9 @@ mock.module("@tanstack/react-router", () => ({
 			href={
 				params?.narratorId
 					? to.replace("$narratorId", params.narratorId)
-					: `${to}${search?.create ? "?create=true" : ""}`
+					: params?.projectId
+						? to.replace("$projectId", params.projectId)
+						: `${to}${search?.create ? "?create=true" : ""}`
 			}
 		>
 			{children}
@@ -87,35 +89,52 @@ function render(children: ReactNode) {
 }
 
 describe("project settings panel", () => {
-	test("exposes project, ACL, workspace, device and knowledge paths in read-only mode", () => {
+	test("names the project and leads to its settings page, read-only by default", () => {
 		const html = render(<ProjectSettingsPanel projectId="original" />);
 		expect(html).toContain("original-source");
-		expect(html).toContain('data-access-source="original"');
 		expect(html).toContain("compatibility.readOnly");
-		expect(html.match(/disabled=""/g)?.length).toBe(4);
+		expect(html).toContain('href="/projects/original/settings"');
 		for (const path of ["/settings/workspace", "/settings/devices", "/knowledge"])
 			expect(html).toContain(`href="${path}"`);
+		// The editors live on the settings page now, not in dialogs here.
+		expect(html).not.toContain("data-access-source");
 	});
-	test("only verified canManage enables the existing project editors", () => {
+	test("only verified canManage says the configuration can be managed", () => {
 		canManage = true;
-		const html = render(<ProjectSettingsPanel projectId="original" />);
-		expect(html).toContain("compatibility.manage");
-		expect(html).not.toContain('disabled=""');
-		for (const key of ["compatibility.settingsTraits", "skills", "routines", "commands"])
-			expect(html).toContain(key);
-	});
-	test("failed permission refresh does not keep stale management controls enabled", () => {
-		canManage = true;
+		expect(render(<ProjectSettingsPanel projectId="original" />)).toContain("compatibility.manage");
 		accessUnavailable = true;
 		const html = render(<ProjectSettingsPanel projectId="original" />);
 		expect(html).toContain("compatibility.accessUnavailable");
-		expect(html.match(/disabled=""/g)?.length).toBe(4);
+		expect(html).toContain("compatibility.readOnly");
 	});
-	test("load errors are terminal and never show an editor or spinner", () => {
+	test("load errors are terminal and never show a link or spinner", () => {
 		projectUnavailable = true;
 		const html = render(<ProjectSettingsPanel projectId="original" />);
 		expect(html).toContain("compatibility.unavailable");
-		expect(html).not.toContain("compatibility.settingsTraits");
+		expect(html).not.toContain("/settings");
+	});
+	test("every label the panel shows is translated in both locales", () => {
+		const source = readFileSync(new URL("./ProjectSettingsPanel.tsx", import.meta.url), "utf8");
+		const keys = [...source.matchAll(/\bt\("([^"]+)"/g)].map((match) => match[1] as string);
+		expect(keys).toEqual(expect.arrayContaining(["settingsPage.open", "compatibility.title"]));
+		for (const locale of ["en", "zh-CN"]) {
+			const resources = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			);
+			for (const key of keys) {
+				const value = key
+					.split(".")
+					.reduce<unknown>(
+						(node, part) => (node as Record<string, unknown> | undefined)?.[part],
+						resources,
+					);
+				expect({ locale, key, translated: typeof value === "string" && value !== key }).toEqual({
+					locale,
+					key,
+					translated: true,
+				});
+			}
+		}
 	});
 	test("narrator entry lazy-loads the panel", () => {
 		const entry = readFileSync(new URL("./NarratorProjectSettings.tsx", import.meta.url), "utf8");

@@ -167,6 +167,8 @@ export interface ExactRowProps {
 	closingRowKeys?: ReadonlySet<string>;
 	/** Panel narrator id — injected into extra so media/tool details load images. */
 	narratorId: string;
+	/** Do not enable ModelTrace writes on external/read-only transcript sources. */
+	canCalibrateModelTrace?: boolean;
 	/**
 	 * Open a text-file attachment in a read-only file panel. Injected into the
 	 * render extra (the pure render layer owns no dock knowledge); absent → user
@@ -370,6 +372,7 @@ export const ExactRow = memo(
 		interaction,
 		rowInteraction,
 		closingRowKeys,
+		canCalibrateModelTrace,
 		onOpenFilePanel,
 		onFetchAttachment,
 		openAttachmentLabel,
@@ -407,6 +410,10 @@ export const ExactRow = memo(
 		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
+		const translationSource = item.spec.reasoningTranslationSources?.[0];
+		if (translationSource) extra.reasoningTranslationSource = translationSource;
+		if (item.spec.reasoningTranslationEvidence)
+			extra.reasoningTranslationEvidence = item.spec.reasoningTranslationEvidence;
 		const resolveContentTarget: ContentTargetResolver = (target) =>
 			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;
@@ -427,7 +434,12 @@ export const ExactRow = memo(
 		}
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
-		injectUserBubbleHeader(kind, extra);
+		injectUserBubbleHeader(kind, extra, {
+			narratorId,
+			composerDocumentSource: (
+				item.spec.data as { composerDocumentSource?: { messageId: string; revision: number } }
+			).composerDocumentSource,
+		});
 		// Reply quote strip: wire the jump when the strip carries a reachable target.
 		if (kind === "message-bubble" && onQuoteJump) {
 			const quote = (item.spec.data as { quote?: { targetId?: string | null } | null })?.quote;
@@ -725,6 +737,9 @@ export const ExactRow = memo(
 		if (onOpenAskInPassingTarget) extra.onOpenAskInPassingTarget = onOpenAskInPassingTarget;
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
+		if (kind === "modeltrace-result" && canCalibrateModelTrace) {
+			extra.modelTraceCalibrationNarratorId = narratorId;
+		}
 		// Per-grapheme fade-in for freshly appended text, for the LIVE row only.
 		//
 		// The streaming row is an ordinary document row now, so this is gated on the
@@ -1080,6 +1095,8 @@ export const ExactRow = memo(
 		prev.item.spec.key === next.item.spec.key &&
 		prev.item.spec.kind === next.item.spec.kind &&
 		prev.item.spec.opts === next.item.spec.opts &&
+		prev.item.spec.reasoningTranslationSources === next.item.spec.reasoningTranslationSources &&
+		prev.item.spec.reasoningTranslationEvidence === next.item.spec.reasoningTranslationEvidence &&
 		prev.item.spec.lifecycleId === next.item.spec.lifecycleId &&
 		// Painted as `data-nf-unit` (the LOD-independent row identity), so a change
 		// must reach the DOM even though it affects nothing else.
@@ -1096,6 +1113,7 @@ export const ExactRow = memo(
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
+		prev.canCalibrateModelTrace === next.canCalibrateModelTrace &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.onFetchAttachment === next.onFetchAttachment &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&

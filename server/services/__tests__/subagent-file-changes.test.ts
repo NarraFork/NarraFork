@@ -20,7 +20,7 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileAttributions,
 	fileChangeEffects,
@@ -33,10 +33,14 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../../db/schema";
+import * as workerPool from "../../lib/db-worker/pool";
+import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 // The real module is captured and restored in `afterAll`: `mock.module` is
-// PROCESS-GLOBAL in Bun, so leaving it installed hands this in-memory database to
+// PROCESS-GLOBAL in Bun, so leaving it installed hands this fixture database to
 // every other suite that runs afterwards in the same process — they then query a
 // database with none of their fixtures in it and fail for no visible reason.
 const realDbModule = { ...(await import("../../db")) };
@@ -319,9 +323,10 @@ beforeEach(async () => {
 	await makeNarrator("sub-b", PARENT);
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
+	await fixture.close();
 });
 
 afterEach(() => {
@@ -699,7 +704,7 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
 		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
 		await parentExecutionCall("current");
-		const prepare = spyOn(sqlite, "prepare");
+		const worker = spyOn(workerPool, "runReadTask");
 		try {
 			const changes = await getChildSubagentFileChanges({
 				parentNarratorId: PARENT,
@@ -718,19 +723,25 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				files: [{ filePath: "src/current.ts", linesAdded: 4 }],
 				countsTruncated: false,
 			});
-			const lookups = prepare.mock.calls
-				.map(([text]) => text)
+			const lookups = worker.mock.calls
+				.flatMap(([, task]) => (task.kind === "selectRows" ? [task.sql] : []))
 				.filter((text) => text.includes('from "file_change_effects"'));
 			expect(lookups).toHaveLength(1);
-			const plan = sqlite
-				.query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${lookups[0]}`)
-				.all("current-op", "apply", "changed", "settled", "measured", 2)
-				.map(({ detail }) => detail);
-			expect(plan).toContainEqual(
-				expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
+			const statement = sqlite.query<{ detail: string }, SQLQueryBindings[]>(
+				`EXPLAIN QUERY PLAN ${lookups[0]}`,
 			);
+			try {
+				const plan = statement
+					.all("current-op", "apply", "changed", "settled", "measured", 2)
+					.map(({ detail }) => detail);
+				expect(plan).toContainEqual(
+					expect.stringMatching(/SEARCH .*idx_fc_effect_operation_file.*operation_id=/),
+				);
+			} finally {
+				statement.finalize();
+			}
 		} finally {
-			prepare.mockRestore();
+			worker.mockRestore();
 		}
 	});
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
@@ -806,8 +817,8 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				await getCurrentSubagentFileChangeOptions(["sub-a"], "wrong-parent")
 			).executionBoundariesBySubagent?.get("sub-a"),
 		).toBeNull();
-		recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
-		recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1557,6 +1568,50 @@ describe("execution and device isolation regressions", () => {
 	});
 });
 
+describe("Worker read admission", () => {
+	test("Worker failure rejects evidence instead of reporting empty success or reading locally", async () => {
+		const failure = new Error("injected Worker failure");
+		const worker = spyOn(workerPool, "runReadTask").mockRejectedValue(failure);
+		const local = spyOn(sqlite, "query");
+		try {
+			expect(await captureWorkerRejection(getFileChangesBySubagent(["sub-a"]))).toBe(failure);
+			expect(await captureWorkerRejection(getTeamSubagentFileChanges(PARENT))).toBe(failure);
+			expect(local).not.toHaveBeenCalled();
+			expect(worker).toHaveBeenCalledTimes(2);
+		} finally {
+			local.mockRestore();
+			worker.mockRestore();
+		}
+	});
+
+	test("cancellation and deadline reach Worker admission without local reads", async () => {
+		const local = spyOn(sqlite, "query");
+		try {
+			for (const options of [{ signal: AbortSignal.abort() }, { deadlineAt: Date.now() - 1 }]) {
+				const error = await captureWorkerRejection(getFileChangesBySubagent(["sub-a"], options));
+				expect(error).toBeInstanceOf(Error);
+			}
+			expect(local).not.toHaveBeenCalled();
+		} finally {
+			local.mockRestore();
+		}
+	});
+
+	test("resolved run options retain the caller's cancellation budget", async () => {
+		const signal = new AbortController().signal;
+		const deadlineAt = Date.now() + 30_000;
+		const options = await getCurrentSubagentFileChangeOptions(["sub-a"], PARENT, {
+			signal,
+			deadlineAt,
+			timeoutMs: 5000,
+		});
+		expect(options.signal).toBe(signal);
+		expect(options.deadlineAt).toBe(deadlineAt);
+		expect(options.timeoutMs).toBe(5000);
+		expect(await getFileChangesBySubagent([], options)).toEqual(new Map());
+	});
+});
+
 describe("appendSubagentFileChanges", () => {
 	test("appends the block to a result", async () => {
 		await attribute({ narratorId: "sub-a", filePath: "w.ts", linesAdded: 4, linesRemoved: 1 });
@@ -1625,7 +1680,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 			["remote-a", WORKSPACE],
 			["remote-a", OTHER_WORKSPACE],
 		]) {
-			recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
+			await recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
 			await attribute({
 				narratorId: "sub-a",
 				filePath: "same.ts",
@@ -1634,7 +1689,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 				linesAdded: 1,
 			});
 		}
-		recordTeamFileChange(PARENT, "sub-a", "same.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "same.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1656,11 +1711,11 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		} = await import("../subagent-team");
 		clearTeamFileChanges(PARENT);
 		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
-		recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
+		await recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
-		recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
 		expect(getTeamFileChanges(PARENT).has("ordinary-fork")).toBe(false);
 		expect(getTeamFileChangeEntries(PARENT).get("sub-a")?.[0]).toEqual({
 			deviceId: null,
@@ -1682,7 +1737,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 
 		// One change, recorded the way `trackFileChange` records it: the in-memory team
 		// map AND an attribution row.
-		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1719,7 +1774,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		clearTeamFileChanges(PARENT);
 		clearTeamFileChanges("other-parent");
 
-		recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
+		await recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
 		expect(getTeamFileChanges(PARENT).size).toBe(0);
 		expect((await getSubagentFileChanges(PARENT)).totalFiles).toBe(0);
 

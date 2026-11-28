@@ -1,12 +1,9 @@
 import type { GitStagingFilesPage } from "../../../shared/git-staging-lists";
-import type {
-	GitStatusPage,
-	GitStatusPageSection,
-	GitStatusPageStatsResult,
-} from "../../../shared/git-status-page";
+import type { GitStatusPage, GitStatusPageSection } from "../../../shared/git-status-page";
 import type {
 	GitChangesListConfig,
 	GitChangesListWindow,
+	GitChangesPageStatsResult,
 	GitChangesStatsSettlement,
 	GitChangesStatsSource,
 } from "./git-changes-list-model";
@@ -25,7 +22,7 @@ export type GitChangesWorkerCommand =
 	| {
 			type: "page-stats";
 			source: GitChangesStatsSource;
-			result?: GitStatusPageStatsResult;
+			result?: GitChangesPageStatsResult;
 			options?: GitChangesStatsSettlement;
 	  }
 	| { type: "window"; start: number; count: number }

@@ -117,7 +117,7 @@ afterEach(async () => {
 	settings.agent.subagentAllowedModels = originalAllowedModels;
 	for (const id of ids) {
 		setRunHold(id, undefined);
-		drainPendingInjections(id);
+		await drainPendingInjections(id);
 		clearAliasRegistry(id);
 		activeNarrators.delete(id);
 	}

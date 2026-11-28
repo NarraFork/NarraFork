@@ -1,11 +1,13 @@
 import { afterAll, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { ProviderQuotaSnapshot } from "@shared/provider-quota";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { providerQuotaKey } from "../../hooks/useProviderQuota";
+import { quotaSnapshotsReadKey } from "../../hooks/useQuotaSnapshots";
 import narratorEn from "../../locales/en/narrator.json";
 import settingsEn from "../../locales/en/settings.json";
 import narratorZh from "../../locales/zh-CN/narrator.json";
@@ -73,6 +75,26 @@ function render(role: string, enabled: boolean | undefined, locale: keyof typeof
 		...(enabled === undefined ? {} : { providerBalanceCapability: { enabled } }),
 	});
 	client.setQueryData(providerQuotaKey("p", "saved"), quota);
+	client.setQueryData(quotaSnapshotsReadKey(), {
+		entries: [
+			{
+				groupId: "p",
+				prefix: "site",
+				templateId: "custom-api",
+				credentialId: null,
+				generation: "saved",
+				primary: true,
+				supported: true,
+				snapshot: {
+					scope: "wallet",
+					fetchedAt: 1,
+					windows: [],
+					balances: [{ unit: "USD", remaining: 19.5 }],
+					plan: "Saved site group",
+				},
+			},
+		],
+	} satisfies QuotaSnapshotsResponse);
 	let updates = 0;
 	try {
 		const html = renderToStaticMarkup(
@@ -124,7 +146,7 @@ test.each([
 	const disabled = render(role, false, locale);
 	for (const key of labels) expect(disabled).not.toContain(translate(key));
 	expect(disabled).not.toContain("draft-site-test-token");
-	expect(disabled).not.toContain("USD 19.5");
+	expect(disabled).not.toContain("19.5 USD");
 	expect(disabled).not.toContain("Saved site group");
 	expect(disabled).toContain(translate("customApiKey"));
 	for (const enabled of [true, undefined]) {
@@ -132,7 +154,7 @@ test.each([
 		for (const key of labels) expect(restored).not.toContain(translate(key));
 		expect(restored).not.toContain("https://draft-site.example");
 		expect(restored).not.toContain("draft-site-test-token");
-		expect(restored).toContain("USD 19.5");
+		expect(restored).toContain("19.5 USD");
 		expect(restored).toContain("Saved site group");
 	}
 	expect(provider).toEqual(before);

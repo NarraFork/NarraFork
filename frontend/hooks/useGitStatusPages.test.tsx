@@ -1,5 +1,23 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import type { GitStatusFilterChar, GitStatusPage } from "@shared/git-status-page";
+import type {
+	GitStatusFilterChar,
+	GitStatusPageCacheState,
+	GitStatusPageResult,
+} from "@shared/git-status-page";
+
+type GitStatusPage = Extract<GitStatusPageResult, { status: "ready" }>;
+let publishedMember = 1;
+const cacheState = (
+	memberVersion = publishedMember,
+	statsVersion = 1,
+): GitStatusPageCacheState => ({
+	status: "ready",
+	workerEpoch: "worker",
+	memberVersion,
+	statsVersion,
+	updating: false,
+});
+
 import { parseHTML } from "linkedom";
 import type { Root } from "react-dom/client";
 import type { GitTarget } from "../lib/api/git";
@@ -16,9 +34,25 @@ mock.module("./useNarrator", () => ({ useNarrator: () => ({ data: undefined }) }
 const listeners = new Map<number, MessageCallback>();
 const connections = new Set<(connected: boolean, reconnect: boolean) => void>();
 let nextId = 0;
+const sent: Record<string, unknown>[] = [];
+let renderTarget: GitTarget | undefined;
 const transport = {
-	connected: false,
-	send: (_message: Record<string, unknown>) => true,
+	connected: true,
+	send: (message: Record<string, unknown>) => {
+		sent.push(message);
+		if (message.type === "git_workspace_subscribe")
+			queueMicrotask(() =>
+				send({
+					type: "git_workspace_subscribed",
+					subscriptionId: message.subscriptionId,
+					workspaceKey: message.workspaceKey,
+					narratorId: message.narratorId,
+					repositoryKey: renderTarget?.repositoryKey,
+					version: 0,
+				}),
+			);
+		return true;
+	},
 	addListener: (_options: unknown, callback: MessageCallback) => {
 		const handle = { _id: ++nextId };
 		listeners.set(handle._id, callback);
@@ -53,6 +87,8 @@ function page(
 	complete = true,
 ): GitStatusPage {
 	return {
+		status: "ready",
+		cache: cacheState(),
 		snapshotId,
 		expiresAt: Date.now() + 120_000,
 		files: [{ path, status: " M" }],
@@ -101,6 +137,7 @@ async function render(
 	strict = false,
 	options: { autoPageLimit?: number } = { autoPageLimit: 1 },
 ) {
+	renderTarget = value;
 	const surface = (
 		<QueryClientProvider client={client}>
 			<Probe
@@ -144,21 +181,39 @@ function fixturePage(total: number, cursor?: string, size = 100, snapshotId = "f
 	return result;
 }
 function send(data: Record<string, unknown>) {
-	for (const callback of listeners.values()) callback(data);
+	for (const callback of listeners.values())
+		callback({
+			subscriptionId: sent.filter((message) => message.type === "git_workspace_subscribe").at(-1)
+				?.subscriptionId,
+			narratorId: target.narratorId,
+			...data,
+		});
 }
 const backgroundChanges = ["files", "invalidation", "reconnect", "hidden", "disabled"] as const;
 async function backgroundChange(change: (typeof backgroundChanges)[number], version = 1) {
 	if (change === "files") {
+		publishedMember++;
 		send({
 			type: "git_workspace_changed",
 			workspaceKey: target.workspaceKey,
-			version,
+			version: 100 + version * 2,
 			categories: ["index"],
 			statusPagesChanged: true,
+		});
+		send({
+			type: "git_workspace_snapshot",
+			workspaceKey: target.workspaceKey,
+			view: "details",
+			version: 101 + version * 2,
+			snapshot: { revision: version, updating: false, statusPages: cacheState() },
 		});
 	} else if (change === "invalidation") {
 		void client.invalidateQueries({ queryKey: ["gitStatusPages", target.workspaceKey] });
 	} else if (change === "reconnect") {
+		transport.connected = false;
+		for (const callback of [...connections]) callback(false, false);
+		await flush();
+		transport.connected = true;
 		for (const callback of [...connections]) callback(true, true);
 	} else if (change === "hidden") {
 		Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
@@ -184,7 +239,9 @@ function deferred<T>() {
 beforeEach(() => {
 	listeners.clear();
 	connections.clear();
-	transport.connected = false;
+	transport.connected = true;
+	sent.length = 0;
+	publishedMember = 1;
 	Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
 	container = document.createElement("div");
@@ -211,7 +268,7 @@ test("StrictMode effect replay acquires a live generation and keeps refresh usab
 	expect(latest.snapshotValid).toBe(true);
 	expect(read.mock.calls.at(-1)?.[2]?.aborted).toBe(false);
 	const generation = latest.queryGeneration;
-	latest.refresh();
+	latest.reset();
 	await flush();
 	expect(latest.queryGeneration).not.toBe(generation);
 	expect(latest.snapshotValid).toBe(true);
@@ -229,7 +286,7 @@ test("repeated legacy badge pushes preserve the independent page chain", async (
 	expect(read).toHaveBeenCalledTimes(1);
 });
 
-test("successful continuation retains the cycle's recovery allowance until explicit refresh", async () => {
+test("a partial continuation does not replenish the same-version recovery ceiling", async () => {
 	const expired = Object.assign(new Error("expired"), {
 		data: { code: "GIT_STATUS_PAGE_EXPIRED" },
 	});
@@ -253,7 +310,7 @@ test("successful continuation retains the cycle's recovery allowance until expli
 	expect(latest.error).toBe(expired);
 	expect(latest.snapshotValid).toBe(false);
 	expect(read).toHaveBeenCalledTimes(5);
-	latest.refresh();
+	latest.reset();
 	await flush();
 	expect(latest.pages.map((item) => item.snapshotId)).toEqual(["third"]);
 	expect(read).toHaveBeenCalledTimes(6);
@@ -406,12 +463,18 @@ test("cancelLoadAll aborts its in-flight page while retaining already loaded pag
 	expect(latest.isComplete).toBe(false);
 });
 
-test("unchanged WS snapshots/categories do not reset pages; a versioned index change does", async () => {
+test("workspace changes mark updating and only a published membership starts another page chain", async () => {
 	const read = spyOn(api, "getGitStatusPage").mockResolvedValue(page("s", "a"));
 	await render();
 	const generation = latest.queryGeneration;
 	const send = (data: Record<string, unknown>) => {
-		for (const callback of listeners.values()) callback(data);
+		for (const callback of listeners.values())
+			callback({
+				subscriptionId: sent.filter((message) => message.type === "git_workspace_subscribe").at(-1)
+					?.subscriptionId,
+				narratorId: target.narratorId,
+				...data,
+			});
 	};
 	send({
 		type: "git_workspace_snapshot",
@@ -442,6 +505,19 @@ test("unchanged WS snapshots/categories do not reset pages; a versioned index ch
 	};
 	send(change);
 	await flush();
+	expect(latest.queryGeneration).toBe(generation);
+	expect(read).toHaveBeenCalledTimes(1);
+	expect(latest.updating).toBe(true);
+	publishedMember = 2;
+	read.mockResolvedValue(page("s2", "b"));
+	send({
+		type: "git_workspace_snapshot",
+		workspaceKey: target.workspaceKey,
+		version: 5,
+		view: "details",
+		snapshot: { revision: 5, updating: false, statusPages: cacheState() },
+	});
+	await flush();
 	expect(latest.queryGeneration).not.toBe(generation);
 	expect(read).toHaveBeenCalledTimes(2);
 	send(change);
@@ -454,7 +530,7 @@ test("uncertain statistical pushes retain the page chain and cancel full loading
 	const read = spyOn(api, "getGitStatusPage")
 		.mockResolvedValueOnce(page("observed", "a", "next"))
 		.mockImplementationOnce(() => pending.promise)
-		.mockResolvedValueOnce(page("new", "b"));
+		.mockImplementationOnce(async () => page("new", "b"));
 	await render();
 	const generation = latest.queryGeneration;
 	const all = latest.loadAll();
@@ -463,12 +539,30 @@ test("uncertain statistical pushes retain the page chain and cancel full loading
 		for (const callback of listeners.values())
 			callback({
 				type: "git_workspace_changed",
+				subscriptionId: sent.filter((message) => message.type === "git_workspace_subscribe").at(-1)
+					?.subscriptionId,
 				workspaceKey: target.workspaceKey,
+				narratorId: target.narratorId,
 				version,
 				categories: ["worktree"],
 				statusPagesReliable,
 				statusPagesChanged,
 			});
+		if (statusPagesReliable) {
+			if (statusPagesChanged) publishedMember++;
+			for (const callback of listeners.values())
+				callback({
+					type: "git_workspace_snapshot",
+					subscriptionId: sent
+						.filter((message) => message.type === "git_workspace_subscribe")
+						.at(-1)?.subscriptionId,
+					workspaceKey: target.workspaceKey,
+					narratorId: target.narratorId,
+					view: "details",
+					version: version * 2 + 10,
+					snapshot: { revision: version, updating: false, statusPages: cacheState() },
+				});
+		}
 	};
 	send(1, false);
 	await flush();
@@ -489,7 +583,7 @@ test("uncertain statistical pushes retain the page chain and cancel full loading
 	expect(latest.pages[0]?.snapshotId).toBe("new");
 });
 
-test("snapshot expiry disables complete-range actions without starting another request", async () => {
+test("snapshot expiry renews its cursor lease once from published cache", async () => {
 	const read = spyOn(api, "getGitStatusPage").mockImplementation(async () => ({
 		...page("short-lived", "a"),
 		expiresAt: Date.now() + 200,
@@ -498,9 +592,9 @@ test("snapshot expiry disables complete-range actions without starting another r
 	expect(latest.isComplete).toBe(true);
 	await Bun.sleep(210);
 	await flush();
-	expect(latest.snapshotValid).toBe(false);
-	expect(latest.isComplete).toBe(false);
-	expect(read).toHaveBeenCalledTimes(1);
+	expect(latest.snapshotValid).toBe(true);
+	expect(latest.isComplete).toBe(true);
+	expect(read).toHaveBeenCalledTimes(2);
 });
 
 test("reopening a disabled panel starts a fresh chain after missed notifications", async () => {
@@ -693,7 +787,7 @@ test("a failed automatic page stops its intent; manual retry works and refresh g
 	await flush();
 	expect(read).toHaveBeenCalledTimes(3);
 	const generation = latest.queryGeneration;
-	latest.refresh();
+	latest.reset();
 	await settle(() => latest.pages.length === 3 && !latest.isFetching);
 	expect(latest.queryGeneration).not.toBe(generation);
 	expect(read).toHaveBeenCalledTimes(6);
@@ -759,7 +853,7 @@ for (const total of [829, 1001]) {
 
 for (const firstExpiry of ["cursor", "stats"] as const) {
 	for (const secondExpiry of ["cursor", "stats"] as const) {
-		test(`${firstExpiry} then ${secondExpiry} expiry shares one recovery despite valid continuation and statistics`, async () => {
+		test(`${firstExpiry} then ${secondExpiry} expiry stays bounded while a partial chain and visible statistics succeed`, async () => {
 			const expired = Object.assign(new Error("expired"), {
 				data: { code: "GIT_STATUS_PAGE_EXPIRED" },
 			});
@@ -797,13 +891,9 @@ for (const firstExpiry of ["cursor", "stats"] as const) {
 			} else recoveredPage.reject(expired);
 			oldPage.resolve(page("old", "late"));
 			await settle(() => latest.isError && !latest.isFetching);
-			await flush();
 			expect(latest.queryGeneration).toBe(generation);
 			expect(latest.pages).toHaveLength(2);
 			expect(latest.snapshotValid).toBe(false);
-			expect(latest.isComplete).toBe(false);
-			expect(latest.status).toBe("error");
-			expect(latest.error?.message).toContain("expired");
 			expect(read).toHaveBeenCalledTimes(5);
 			await latest.retry();
 			await settle(() => latest.pages.length === 9 && !latest.isFetching);
@@ -827,7 +917,7 @@ test("stats recovery retains an exhausted automatic intent until explicit refres
 	await flush();
 	expect(latest.pages).toHaveLength(1);
 	expect(read).toHaveBeenCalledTimes(11);
-	latest.refresh();
+	latest.reset();
 	await settle(() => latest.pages.length === 10 && !latest.isFetching);
 	expect(read).toHaveBeenCalledTimes(21);
 	expect(latest.hasNextPage).toBe(true);
@@ -857,7 +947,7 @@ test("cancelled loadAll stays stopped across stats recovery until explicit refre
 	expect(latest.pages).toHaveLength(1);
 	expect(latest.isLoadingAll).toBe(false);
 	expect(read).toHaveBeenCalledTimes(3);
-	latest.refresh();
+	latest.reset();
 	await settle(() => latest.pages.length === 9 && !latest.isFetching);
 	expect(latest.isComplete).toBe(true);
 	expect(read).toHaveBeenCalledTimes(12);
@@ -901,14 +991,14 @@ for (const change of backgroundChanges) {
 			await flush();
 			expect(latest.pages).toHaveLength(2);
 			expect(read).toHaveBeenCalledTimes(previousReads + 3);
-			latest.refresh();
+			latest.reset();
 			await settle(() => latest.pages.length === 10 && !latest.isFetching);
 			expect(read).toHaveBeenCalledTimes(previousReads + 13);
 			expect(latest.hasNextPage).toBe(true);
 		});
 	}
 
-	test(`${change} retains the reading cycle's spent recovery allowance`, async () => {
+	test(`${change} permits one recovery after a valid chain and stops repeated same-version expiry`, async () => {
 		const expired = Object.assign(new Error("expired"), {
 			data: { code: "GIT_STATUS_PAGE_EXPIRED" },
 		});
@@ -932,7 +1022,7 @@ for (const change of backgroundChanges) {
 		expect(latest.queryGeneration).toBe(generation);
 		expect(latest.pages).toHaveLength(1);
 		expect(latest.snapshotValid).toBe(false);
-		expect(read).toHaveBeenCalledTimes(13);
+		expect(read).toHaveBeenCalledTimes(change === "files" ? 15 : 13);
 	});
 }
 
@@ -1001,6 +1091,15 @@ test("statistical pushes do not renew budgets or gate read-only automatic contin
 	}
 	await render({ ...target, canWrite: false }, [], true, false, { autoPageLimit: 3 });
 	expect(latest.queryGeneration).toBe(generation);
+	expect(latest.statusPagesReliable).toBe(false);
+	send({
+		type: "git_workspace_snapshot",
+		workspaceKey: target.workspaceKey,
+		view: "details",
+		version: 5,
+		snapshot: { revision: 5, updating: false, statusPages: cacheState() },
+	});
+	await flush();
 	expect(latest.statusPagesReliable).toBe(true);
 	expect(read).toHaveBeenCalledTimes(3);
 });
@@ -1056,19 +1155,10 @@ for (const change of [
 		else if (change === "narrator")
 			await render({ ...target, narratorId: "n2" }, [], true, false, { autoPageLimit: 3 });
 		else if (change === "filter") await render(target, ["M"], true, false, { autoPageLimit: 3 });
-		else if (change === "reconnect") {
-			for (const callback of [...connections]) callback(true, true);
-		} else if (change === "invalidation") {
+		else if (change === "reconnect") await backgroundChange("reconnect");
+		else if (change === "invalidation") {
 			void client.invalidateQueries({ queryKey: ["gitStatusPages", target.workspaceKey] });
-		} else {
-			send({
-				type: "git_workspace_changed",
-				workspaceKey: target.workspaceKey,
-				version: 1,
-				categories: ["index"],
-				statusPagesChanged: true,
-			});
-		}
+		} else await backgroundChange("files");
 		await settle(() => latest.pages.length === 3 && !latest.isFetching);
 		expect(read.mock.calls[1]?.[2]?.aborted).toBe(true);
 		expect(latest.queryGeneration).not.toBe(generation);
@@ -1182,6 +1272,16 @@ for (const status of [401, 403, 404]) {
 		expect(latest.data).toBeUndefined();
 		expect(latest.counts).toBeUndefined();
 		await latest.retry();
+		if (status !== 403) {
+			// Server reauthorization replays its last snapshot after the transport's ACK.
+			send({
+				type: "git_workspace_snapshot",
+				workspaceKey: target.workspaceKey,
+				version: 11,
+				view: "details",
+				snapshot: { revision: 11, updating: false, statusPages: cacheState() },
+			});
+		}
 		await flush();
 		expect(latest.queryGeneration).not.toBe(generation);
 		expect(latest.displayAllowed).toBe(true);

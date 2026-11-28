@@ -127,14 +127,14 @@ test("returns no stale body after an edit", async () => {
 test("propagates Worker failures and turn cancellation without falling back", async () => {
 	const scope = fixture();
 	const query = spyOn(sqlite, "query");
-	const worker = spyOn(pool, "runReadTask");
+	const worker = spyOn(pool, "runTrackedEphemeralReadTask");
 	const controller = new AbortController();
 	for (const error of [
 		new pool.WorkersUnavailableError("creation_failed"),
 		new pool.DbReadTaskExecutionError("execution failed"),
 		new pool.DbReadTaskTimeoutError("timed out"),
 	]) {
-		worker.mockRejectedValueOnce(error);
+		worker.mockReturnValueOnce({ result: Promise.reject(error), released: Promise.resolve() });
 		await expect(read(scope, allow, controller.signal)).rejects.toBe(error);
 		expect(worker.mock.lastCall?.[2]?.signal).toBe(controller.signal);
 	}

@@ -3,6 +3,7 @@ import {
 	normalizeCompactAttempts,
 	parseCompactMessageBlock,
 } from "@shared/compact-message";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -36,10 +37,12 @@ import {
 	isNull,
 	lt,
 	ne,
+	notInArray,
 	or,
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import * as modelHistoryDatabase from "../db";
 import { db } from "../db";
 import {
@@ -53,6 +56,7 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
@@ -108,6 +112,7 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { resolveNarratorMessageOnlyRevert } from "./file-history-policy";
 import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
@@ -156,6 +161,15 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import {
+	committedNarratorStatusPatch,
+	narratorStatusPatchColumns,
+	versionNarratorStatusCommit,
+} from "./narrator-status-version";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { toolDetailSelectionRequired, validateToolDetailReference } from "./narrator-tool-detail";
 import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
@@ -317,6 +331,11 @@ type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
 type BlockDeleteOptions = ScopedRevertOptions & {
 	skipRevert?: boolean;
+	/**
+	 * Range deletion only: rows inside the range that stay (Retry keeps host-written rows that
+	 * are nobody's turn, `narrator-session.ts:retryKeptHostRowIds`). Bounded by the caller.
+	 */
+	keepMessageIds?: readonly string[];
 	skipNarratorUpdate?: boolean;
 	preserveConversationId?: boolean;
 	scope?: RevertScope;
@@ -376,6 +395,10 @@ type HistoryToolMetadata = Pick<
 	typeof narratorToolCalls.$inferSelect,
 	keyof typeof historyToolMetadataColumns
 >;
+type FileHistoryTargetMetadata = Pick<
+	typeof narratorToolCalls.$inferSelect,
+	"executionDeviceId" | "executionTargetsJson"
+>;
 type DerivedHistorySeed = { call: HistoryToolMetadata; seq: number; shared: boolean };
 
 function createHistoryBudget(): HistoryBudget {
@@ -400,6 +423,8 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	const rows = tx
 		.select({
 			...historyToolMetadataColumns,
+			executionDeviceId: narratorToolCalls.executionDeviceId,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 			bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))),
 		})
 		.from(narratorToolCalls)
@@ -413,12 +438,29 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	return rows;
 }
 
+function hasEnabledFileHistoryTarget(call: FileHistoryTargetMetadata): boolean {
+	// Stored execution endpoints are server-frozen targets, not tool input hints.
+	// Preserve remote evidence even in a local-default, mixed-device selection.
+	const targets = toolCallWithExecutionTargets(call).executionTargets;
+	if (targets.length > 0)
+		return targets.some(
+			(target) => target.backendKind === "remote" && isFileHistoryEnabledForDevice(target.deviceId),
+		);
+	// Legacy calls without a frozen device are local/unknown, never evidence of
+	// the narrator's current default device after a workspace/device switch.
+	return isFileHistoryEnabledForDevice(call.executionDeviceId);
+}
+
 function checkpointGroupsTx(
 	tx: MessageTx,
 	refs: Array<{ messageId: string; seq: number }>,
 	reserve: HistoryBudget,
+	calls: Array<HistoryToolMetadata & FileHistoryTargetMetadata>,
 ): FileHistoryCheckpointGroup[] {
-	if (refs.length === 0) return [];
+	const retainedCallIds = calls
+		.filter((call) => hasEnabledFileHistoryTarget(call))
+		.map((call) => call.id);
+	if (refs.length === 0 || retainedCallIds.length === 0) return [];
 	// loadHistoryToolsTx (or the block planner) already admitted every row's bytes.
 	const rows = tx
 		.select()
@@ -431,6 +473,7 @@ function checkpointGroupsTx(
 				),
 				eq(narratorToolCalls.status, "success"),
 				checkpointWorthyToolCall(),
+				inArray(narratorToolCalls.id, retainedCallIds),
 			),
 		)
 		.orderBy(narratorToolCalls.createdAt, narratorToolCalls.id)
@@ -638,7 +681,9 @@ function planDerivedHistoryCleanup(
 				messageIds.push(row.id);
 				toolCallIds.push(...childTools.map((tool) => tool.id));
 				if (skipRevert)
-					checkpoints.push(...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve));
+					checkpoints.push(
+						...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve, childTools),
+					);
 				pending.push(
 					...childTools.map((tool) => ({ call: tool, seq, shared: false, depth: depth + 1 })),
 				);
@@ -817,7 +862,8 @@ function planBlockDeletions(
 			? toolCalls.filter(
 					(call) =>
 						(remaining.length === 0 || removedToolIds.has(call.toolUseId)) &&
-						isCheckpointWorthyCall(call),
+						isCheckpointWorthyCall(call) &&
+						hasEnabledFileHistoryTarget(call),
 				)
 			: [];
 		plans.push({
@@ -1012,6 +1058,14 @@ async function deleteBlockSelection(
 	opts?: BlockDeleteOptions,
 	byBlock?: { retiredRows: readonly string[] },
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
@@ -1501,6 +1555,9 @@ function planMessageRangeDeletion(
 				inclusive
 					? gte(narratorMessageRefs.seq, boundary.seq)
 					: gt(narratorMessageRefs.seq, boundary.seq),
+				opts?.keepMessageIds?.length
+					? notInArray(narratorMessageRefs.messageId, [...opts.keepMessageIds])
+					: undefined,
 				// A history-only action must retain previously detached file evidence,
 				// not delete/recreate its IDs on every retry. Match only our internal
 				// checkpoint shape, never all hidden/compacted refs. File rollback still
@@ -1582,7 +1639,7 @@ function planMessageRangeDeletion(
 		...derived.toolCallIds,
 	];
 	const checkpoints = opts?.skipRevert
-		? [...checkpointGroupsTx(tx, refs, reserve), ...derived.checkpoints]
+		? [...checkpointGroupsTx(tx, refs, reserve, tools), ...derived.checkpoints]
 		: [];
 	const associations = collectHistoryDeleteAssociations(tx, orphanIds, removedTools, reserve);
 	return {
@@ -1612,6 +1669,14 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	const timingId = generateId();
 	const startedAt = new Date().toISOString();
 	const context = { timingId, narratorId, messageId, inclusive, skipRevert: !!opts?.skipRevert };
@@ -2020,15 +2085,10 @@ async function resolveCatchUpChildAnchors(
 }
 
 function childCatchUpCondition(anchor: ResolvedChildAnchor): SQL<unknown> {
-	const conditions = [
+	return and(
 		gt(narratorMessageRefs.seq, anchor.seq),
-		isNull(narratorMessageRefs.segmentCompactId),
 		eq(narratorMessages.parentToolUseId, anchor.parentToolUseId),
-	];
-	if (anchor.narratorId) {
-		conditions.push(eq(narratorMessageRefs.narratorId, anchor.narratorId));
-	}
-	return and(...conditions) as SQL<unknown>;
+	) as SQL<unknown>;
 }
 
 function combineOrConditions(conditions: SQL<unknown>[]): SQL<unknown> | undefined {
@@ -2593,7 +2653,10 @@ async function buildSubagentActivities(
 		});
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
-	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds, undefined, {
+		signal,
+		deadlineAt,
+	});
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
@@ -3467,15 +3530,21 @@ const narratorMessageQueriesUnlocked = {
 		}));
 	},
 
-	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+	async getLatestCompactSeq(
+		narratorId: string,
+		options: NarratorSurfaceReadBudget = {},
+	): Promise<number | null> {
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
@@ -3874,17 +3943,20 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
-	async _getPostCompactTopLevelRefs(narratorId: string) {
+	async _getPostCompactTopLevelRefs(narratorId: string, options: NarratorSurfaceReadBudget = {}) {
 		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
@@ -4595,15 +4667,34 @@ const narratorMessageQueriesUnlocked = {
 				.limit(limit + 1);
 		}
 
+		// CROSS JOIN fixes join order, not index choice: ANALYZE can turn the OR
+		// into a global message scan when parentToolUseId is mostly NULL. On SQLite,
+		// the existing index plus a message-only IN predicate keeps this a seek.
+		// Resolved anchors all use the caller's refs, never a cursor's narratorId.
+		const sqliteChildLookup = modelHistoryDatabase.activeDatabaseBackend === "sqlite";
 		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
 			? await db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 					})
-					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(childWhere)
+					.from(
+						sqliteChildLookup
+							? sql`${narratorMessages} INDEXED BY idx_messages_parent_tool_use_lookup`
+							: narratorMessages,
+					)
+					.crossJoin(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.messageId, narratorMessages.id),
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+							sqliteChildLookup
+								? inArray(narratorMessages.parentToolUseId, [...resolvedChildAnchors.keys()])
+								: undefined,
+							childWhere,
+						),
+					)
 					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
 					.limit(limit + 1)
 			: [];
@@ -5228,23 +5319,25 @@ const narratorMessageQueriesUnlocked = {
 		// idempotent success: just clear the narrator-level error and notify, so the
 		// user never sees a spurious "Message not found" when clicking dismiss.
 		if (!msg) {
-			await db
-				.update(narrators)
-				.set({
-					errorMessage: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-				})
-				.where(eq(narrators.id, narratorId));
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { status: true },
-			});
-			broadcastToNarrator(narratorId, {
-				type: "status_change",
-				narratorId,
-				status: narrator?.status ?? "idle",
-			});
+			const committed = versionNarratorStatusCommit(
+				db
+					.update(narrators)
+					.set({
+						errorMessage: null,
+						errorRetryable: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+					})
+					.where(eq(narrators.id, narratorId))
+					.returning(narratorStatusPatchColumns)
+					.get(),
+			);
+			if (committed)
+				broadcastToNarrator(narratorId, {
+					type: "status_change",
+					narratorId,
+					...(await committedNarratorStatusPatch(narratorId, committed)),
+				});
 			return;
 		}
 
@@ -5260,7 +5353,7 @@ const narratorMessageQueriesUnlocked = {
 		// Delete the ref (if any) and the orphaned message idempotently. A missing
 		// ref is NOT an error here: a non-atomic-write orphan still needs cleanup,
 		// and the user-facing dismiss must always succeed for a real error notice.
-		db.transaction((tx) => {
+		const committed = db.transaction((tx) => {
 			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
@@ -5277,25 +5370,27 @@ const narratorMessageQueriesUnlocked = {
 			if (!otherRef) {
 				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 			}
-			tx.update(narrators)
-				.set({
-					errorMessage: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+			return versionNarratorStatusCommit(
+				tx
+					.update(narrators)
+					.set({
+						errorMessage: null,
+						errorRetryable: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+					})
+					.where(eq(narrators.id, narratorId))
+					.returning(narratorStatusPatchColumns)
+					.get(),
+			);
 		});
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true },
-		});
-		broadcastToNarrator(narratorId, {
-			type: "status_change",
-			narratorId,
-			status: narrator?.status ?? "idle",
-		});
+		if (committed)
+			broadcastToNarrator(narratorId, {
+				type: "status_change",
+				narratorId,
+				...(await committedNarratorStatusPatch(narratorId, committed)),
+			});
 	},
 
 	async deleteMessagesAfter(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {
@@ -5480,25 +5575,30 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getPendingPermissions(narratorId: string) {
-		const visibleSubagentToolRows = await db
-			.select({ toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-					eq(narratorMessageRefs.narratorId, narratorId),
-				),
-			)
-			.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES]));
-		const visibleSubagentToolUseIds = visibleSubagentToolRows.map((row) => row.toolUseId);
-		const childVisibility =
-			visibleSubagentToolUseIds.length > 0
-				? and(
-						eq(narrators.parentNarratorId, narratorId),
-						inArray(narratorMessages.parentToolUseId, visibleSubagentToolUseIds),
+		const callerTool = alias(narratorToolCalls, "permission_caller_tool");
+		// Start at pending rows, then check the caller's actual refs for each child.
+		// Do not enumerate (or truncate) the caller's entire subagent-tool history.
+		const childVisibility = and(
+			eq(narrators.parentNarratorId, narratorId),
+			exists(
+				db
+					.select({ one: sql`1` })
+					.from(callerTool)
+					.innerJoin(
+						narratorMessageRefs,
+						and(
+							eq(narratorMessageRefs.messageId, callerTool.messageId),
+							eq(narratorMessageRefs.narratorId, narratorId),
+						),
 					)
-				: sql`0`;
+					.where(
+						and(
+							eq(callerTool.toolUseId, narratorMessages.parentToolUseId),
+							inArray(callerTool.toolName, [...SUBAGENT_TOOL_NAMES]),
+						),
+					),
+			),
+		);
 		const tcs = await db
 			.select({
 				id: narratorToolCalls.id,

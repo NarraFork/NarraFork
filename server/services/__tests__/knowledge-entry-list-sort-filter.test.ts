@@ -24,6 +24,7 @@ import {
 	encodeTitleCursor,
 	knowledgeService,
 } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 let adminId: string;
@@ -157,21 +158,25 @@ describe("listEntriesPage sort=title", () => {
 		await seedEntry(col.id, "a");
 		const updated = encodeEntryCursor({ updatedAt: "2020-01-01T00:00:00.000Z", id: "x" });
 		const title = encodeTitleCursor({ title: "a", id: "x" });
-		await expect(
-			knowledgeService.listEntriesPage({
-				principal: P(adminId, "admin"),
-				collectionId: col.id,
-				sort: "title",
-				cursor: updated,
-			}),
-		).rejects.toThrow("Invalid cursor");
-		await expect(
-			knowledgeService.listEntriesPage({
-				principal: P(adminId, "admin"),
-				collectionId: col.id,
-				cursor: title,
-			}),
-		).rejects.toThrow("Invalid cursor");
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.listEntriesPage({
+					principal: P(adminId, "admin"),
+					collectionId: col.id,
+					sort: "title",
+					cursor: updated,
+				}),
+			),
+		).toThrow("Invalid cursor");
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeService.listEntriesPage({
+					principal: P(adminId, "admin"),
+					collectionId: col.id,
+					cursor: title,
+				}),
+			),
+		).toThrow("Invalid cursor");
 	});
 
 	test("title cursors round-trip long CJK titles", () => {
