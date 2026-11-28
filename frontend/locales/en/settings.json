@@ -53,6 +53,14 @@
 			"unknown": "Unknown"
 		}
 	},
+	"integrations": {
+		"capabilities": {
+			"quota": { "provide": "Provide Custom API quota snapshots" },
+			"provider": {
+				"connection": { "request": "Read quota through a host-managed provider connection" }
+			}
+		}
+	},
 	"providerBalance": {
 		"wallet": "Wallet balance",
 		"key": "Key remaining allowance",
@@ -71,7 +79,7 @@
 		"errorAuth": "Site access token or user id was rejected (401/403); check the quota query settings",
 		"errorInvalidResponse": "The site returned no recognisable allowance; check the site interface root",
 		"errorInvalidConfiguration": "Quota query is incomplete: fill in the site root, access token and user id",
-		"errorPluginNotEnabled": "The quota query plugin (apikey-quota) is disabled; enable it on the plugins page to query",
+		"errorPluginNotEnabled": "The Provider Quota plugin is disabled; enable it on the plugins page to query",
 		"group": "Group: {{name}}",
 		"stale": "Data may be outdated",
 		"source": "Source: {{source}}",
@@ -2987,9 +2995,11 @@
 	"dataImportDoneBody": "Added {{requests}} requests, {{sessions}} sessions ({{overwritten}} overwritten, {{skipped}} skipped), {{providers}} providers ({{renamed}} renamed).",
 	"dataImportRejected": "{{count}} sessions could not be imported because of a unique constraint; their messages were skipped too.",
 	"dataImportKeys": "Restored {{count}} provider keys",
+	"dataImportProviderSettingsResult": "Imported {{imported}} provider extensions; kept {{skipped}} existing configurations or deletion records. Rebind retained settings separately.",
 	"dataImportKeysFailed": "{{count}} provider keys could not be saved; see the server log. You can add them on the provider page.",
 	"dataImportPassphraseLabel": "Passphrase for provider keys",
-	"dataImportPassphraseDesc": "The provider keys in this file ({{count}} providers) are encrypted; enter the passphrase set at export. Not needed to import only requests or sessions.",
+	"dataImportPassphraseDesc": "Provider credentials in this file are encrypted. Enter the passphrase set at export; requests and sessions do not need it.",
+	"dataImportProviderSettingsNotice": "Includes {{count}} plugin provider settings. Imported settings remain unbound until you confirm their plugin binding; previous permissions are not restored.",
 	"dataExportProvidersSealed": "Exporting providers includes all their keys, encrypted with the passphrase you set below. Importing needs the same passphrase; if it is lost the keys cannot be recovered, but settings and sessions still import.",
 	"dataExportProvidersNeedMfa": "Exporting providers includes their keys and needs two-factor authentication. Requests and sessions can still be exported.",
 	"dataExportSelectTitle": "Choose data to export",

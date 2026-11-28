@@ -544,6 +544,7 @@ export function useAllModels(enabled = true) {
 			models: ModelOption[];
 			pluginId?: string;
 			contributionId?: string;
+			providerInstanceId?: string;
 		}> = (settingsData?.pluginProviderModelsGrouped ?? [])
 			.map(
 				(group: {
@@ -551,6 +552,7 @@ export function useAllModels(enabled = true) {
 					name?: unknown;
 					pluginId?: unknown;
 					contributionId?: unknown;
+					providerInstanceId?: unknown;
 					models?: Array<Record<string, unknown>>;
 				}) => {
 					const prefix = typeof group.prefix === "string" ? group.prefix : "";
@@ -588,6 +590,9 @@ export function useAllModels(enabled = true) {
 						...(typeof group.pluginId === "string" ? { pluginId: group.pluginId } : {}),
 						...(typeof group.contributionId === "string"
 							? { contributionId: group.contributionId }
+							: {}),
+						...(typeof group.providerInstanceId === "string"
+							? { providerInstanceId: group.providerInstanceId }
 							: {}),
 					};
 				},

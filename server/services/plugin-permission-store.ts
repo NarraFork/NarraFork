@@ -76,6 +76,8 @@ export interface PluginPermissionSet {
 	pluginId: string;
 	installationId: string;
 	revision: number;
+	/** Present only on a compatibility projection; runtime bindings use this canonical revision. */
+	authorityRevision?: number;
 	grants: StoredPermissionGrant[];
 	updatedAt: string;
 }
@@ -156,6 +158,8 @@ interface PermissionInstallationDocument {
 	installationId: string;
 	revision: number;
 	grants: StoredPermissionGrant[];
+	/** Last canonical revision projected into this installation; file CAS uses revision above. */
+	authorityRevision?: number;
 	/** Runtime permission prompts awaiting user resolution (capability not yet granted). */
 	pendingRequests: PluginPermissionRequest[];
 	/** "Deny and never ask again" records; matched requests are never queued. */
@@ -468,6 +472,13 @@ function parseInstallation(
 	if (!parsedRevision.success) {
 		throw new ValidationError("Stored plugin permission set revision is invalid");
 	}
+	if (
+		value.authorityRevision !== undefined &&
+		(!revisionSchema.safeParse(value.authorityRevision).success ||
+			(value.authorityRevision as number) < 1)
+	) {
+		throw new ValidationError("Stored authority projection revision is invalid");
+	}
 	if (!Array.isArray(value.grants) || value.grants.length > limits.maxGrantsPerInstallation) {
 		throw new ValidationError("Stored plugin permission grant list is invalid");
 	}
@@ -509,6 +520,9 @@ function parseInstallation(
 		pluginId,
 		installationId,
 		revision: parsedRevision.data,
+		...(value.authorityRevision === undefined
+			? {}
+			: { authorityRevision: value.authorityRevision as number }),
 		grants,
 		pendingRequests,
 		permanentDenials,
@@ -768,6 +782,73 @@ export class PluginPermissionStore {
 		);
 	}
 
+	/** Host-only projection. Read the live authority while holding the file lock so a
+	 * delayed caller cannot publish an earlier snapshot over a completed revocation.
+	 * File revisions remain monotonic and independent from per-installation authority revisions.
+	 */
+	async mirrorAuthorityGrants(
+		pluginId: string,
+		installationId: string,
+		readAuthority: () => Promise<PluginPermissionSet>,
+	): Promise<void> {
+		assertPluginIdentity(pluginId, installationId);
+		await this.mutex.acquire("permissions", async () => {
+			await this.ensureLoadedLocked();
+			const authority = await readAuthority();
+			if (
+				authority.pluginId !== pluginId ||
+				authority.installationId !== installationId ||
+				!revisionSchema.safeParse(authority.revision).success ||
+				authority.revision < 1 ||
+				authority.grants.length > this.limits.maxGrantsPerInstallation
+			)
+				throw new ValidationError("Invalid authority permission projection");
+			const previous = this.document?.plugins[pluginId]?.[installationId];
+			if (
+				previous?.authorityRevision !== undefined &&
+				authority.revision < previous.authorityRevision
+			) {
+				throw new PluginPermissionConflictError(
+					pluginId,
+					authority.revision,
+					previous.authorityRevision,
+				);
+			}
+			const normalized = authority.grants.map((grant) =>
+				this.normalizeInput(pluginId, installationId, grant, "integration-authority-mirror"),
+			);
+			if (new Set(normalized.map((grant) => grant.grantId)).size !== normalized.length)
+				throw new ValidationError("Plugin permission grant ids must be unique");
+			if (
+				previous?.authorityRevision === authority.revision &&
+				isSameGrantSet(authority.grants, previous.grants)
+			)
+				return;
+			const revision = this.targetRevision(
+				pluginId,
+				this.pluginRevision(pluginId),
+				Math.max(this.pluginRevision(pluginId) + 1, authority.revision),
+			);
+			const candidate = clone(this.requireDocument());
+			const next: PermissionInstallationDocument = {
+				pluginId,
+				installationId,
+				revision,
+				authorityRevision: authority.revision,
+				grants: normalized.map((grant) => ({ ...grant, revision: authority.revision })),
+				pendingRequests: clone(previous?.pendingRequests ?? []),
+				permanentDenials: clone(previous?.permanentDenials ?? []),
+				updatedAt: this.timestamp(),
+			};
+			candidate.plugins[pluginId] ??= {};
+			candidate.plugins[pluginId][installationId] = next;
+			this.assertInstallationCount(candidate, pluginId);
+			candidate.updatedAt = next.updatedAt;
+			await this.writeLocked(candidate);
+			this.document = candidate;
+			await this.syncStateSummary(pluginId);
+		});
+	}
 	async replace(
 		pluginId: string,
 		installationId: string,
@@ -928,6 +1009,7 @@ export class PluginPermissionStore {
 		pluginId: string,
 		installationId: string,
 		summary: PluginGrantSummary,
+		seedGrantedBy = "legacy-state",
 	): Promise<PluginPermissionSet> {
 		const current = await this.getSet(pluginId, installationId);
 		if (await this.hasSet(pluginId, installationId)) {
@@ -956,12 +1038,12 @@ export class PluginPermissionStore {
 				capability: capability as PermissionGrant["capability"],
 				scope: { type: "global" },
 				grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
-				grantedBy: "legacy-state",
+				grantedBy: seedGrantedBy,
 			}));
 		const result = await this.replace(pluginId, installationId, grants, {
 			expectedRevision: current.revision,
 			targetRevision: Math.max(summary.revision, current.revision + 1),
-			grantedBy: "legacy-state",
+			grantedBy: seedGrantedBy,
 		});
 		return result.set;
 	}
@@ -1349,6 +1431,7 @@ export class PluginPermissionStore {
 			pluginId: set.pluginId,
 			installationId: set.installationId,
 			revision,
+			...(set.authorityRevision === undefined ? {} : { authorityRevision: set.authorityRevision }),
 			grants: clone(set.grants),
 			updatedAt: set.updatedAt,
 		};
@@ -1387,7 +1470,7 @@ export class PluginPermissionStore {
 					b.updatedAt.localeCompare(a.updatedAt),
 				)[0];
 		const summary: PluginGrantSummaryUpdate = set
-			? summaryForSet(this.toPublicSet(set, this.pluginRevision(pluginId)))
+			? summaryForSet(this.toPublicSet(set, set.authorityRevision ?? this.pluginRevision(pluginId)))
 			: { count: 0, capabilities: [], revision: 0, updatedAt: this.timestamp() };
 		const summaryIsCurrent =
 			state.grants.count === summary.count &&

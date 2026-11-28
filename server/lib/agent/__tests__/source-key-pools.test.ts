@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
+import { legacyQuotaFixture, required } from "../../__tests__/provider-quota-legacy-fixture";
 import {
 	getCustomApiCachedQuota,
 	updateCustomApiQuotaByPrefix,
@@ -207,9 +208,8 @@ const { PooledProvider, resetProviderKeyRuntimeForTests, keyCooldown } = await i
 );
 const { resolveProviderAndModel } = await import("../provider");
 const { autoSourceFacts } = await import("../auto-route-signals");
-const network = spyOn(globalThis, "fetch").mockRejectedValue(
-	new Error("Unexpected external fetch"),
-);
+let network = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected external fetch"));
+let quotaFixture: ReturnType<typeof legacyQuotaFixture> | undefined;
 
 const NUG_ID = "source-key-pool-nug";
 const CUSTOM_ID = "source-key-pool-custom";
@@ -263,6 +263,7 @@ beforeEach(() => {
 	authCalls.length = 0;
 	cliToken = "test-cli-fallback";
 	network.mockClear();
+	network = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected external fetch"));
 	settings.agent.disabledProviders = [];
 	settings.customApiProviders = [];
 	settings.anthropicProviders = [];
@@ -297,7 +298,13 @@ afterEach(() => {
 	quotaStore.remove(CUSTOM_ID, STREAM_QUOTA_SOURCE);
 	store().removeProvider(CUSTOM_ID);
 	resetProviderKeyRuntimeForTests();
-	expect(network).not.toHaveBeenCalled();
+	quotaFixture?.dispose();
+	quotaFixture = undefined;
+	try {
+		expect(network).not.toHaveBeenCalled();
+	} finally {
+		mock.restore();
+	}
 });
 
 afterAll(() => {
@@ -697,6 +704,10 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 			const first = store().add(owner, { apiKey: "request-selected-old-key" });
 			if (pooled)
 				store().add(owner, { apiKey: "unused-backup-key", network: keyNetwork("second") });
+			if (custom) quotaFixture = legacyQuotaFixture(settings.customApiProviders);
+			const generation = custom
+				? required(required(quotaFixture).service.peekKey(first.id)).generation
+				: undefined;
 			const { adapter } = resolveProviderAndModel(model);
 			expect(adapter instanceof PooledProvider).toBe(pooled);
 			if (!pooled) expect(adapter.supportsDiagnosticFork).toBeUndefined();
@@ -761,7 +772,7 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 			expect(requests).toEqual([{ apiKey: "request-selected-old-key", operation: "chat" }]);
 			expect(streamQuotaIdentityForRequest(prefix, delivered)).toBeUndefined();
 			// Even a delayed writer holding the original capture must not relabel its balance.
-			if (custom) updateCustomApiQuotaByPrefix(prefix, "999", "stale balance", before);
+			if (custom) updateCustomApiQuotaByPrefix(prefix, "999", "stale balance", before, generation);
 			else updateNugQuotaByPrefix(prefix, 999, "stale balance", undefined, before);
 			for (const key of store().list(owner))
 				expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
@@ -788,11 +799,15 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 	});
 	const first = store().add(CUSTOM_ID, { apiKey: "old-key-A" });
 	const backup = store().add(CUSTOM_ID, { apiKey: "promoted-key-B" });
+	quotaFixture = legacyQuotaFixture(settings.customApiProviders);
 	const oldIdentity = streamQuotaIdentityForPrefix("poolcustom", first.id);
+	const oldGeneration = required(quotaFixture.service.peekKey(first.id)).generation;
+	const backupGeneration = required(quotaFixture.service.peekKey(backup.id)).generation;
 	expect(oldIdentity).toBeString();
+	expect(backupGeneration).not.toBe(oldGeneration);
 	store().update(first.id, { disabled: true });
 	store().reorder(CUSTOM_ID, [backup.id, first.id]);
-	updateCustomApiQuotaByPrefix("poolcustom", "999", "stale A balance", oldIdentity);
+	updateCustomApiQuotaByPrefix("poolcustom", "999", "stale A balance", oldIdentity, oldGeneration);
 	for (const key of [first, backup])
 		expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 	const { adapter, model } = resolveProviderAndModel("poolcustom:m");
@@ -806,16 +821,28 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 				publishedIdentity = streamQuotaIdentityForRequest("poolcustom", info);
 				expect(publishedIdentity).toBeString();
 				expect(publishedIdentity).toBe(streamQuotaIdentityForPrefix("poolcustom", backup.id));
-				updateCustomApiQuotaByPrefix("poolcustom", "73.5", "backup balance", publishedIdentity);
+				updateCustomApiQuotaByPrefix(
+					"poolcustom",
+					"73.5",
+					"backup balance",
+					publishedIdentity,
+					backupGeneration,
+				);
 			},
 		}),
 	);
 	expect(events).toEqual([{ text: backup.apiKey, credentialId: CUSTOM_ID }]);
 	expect(quotaStore.peek(backup.id, STREAM_QUOTA_SOURCE)?.detail).toEqual({
+		generation: backupGeneration,
 		quotaBalance: "73.5",
 		detailedQuotaBalance: "backup balance",
 	});
+	expect(quotaFixture.service.peek(CUSTOM_ID)).toMatchObject({
+		keyId: backup.id,
+		generation: backupGeneration,
+	});
 	expect(getCustomApiCachedQuota(CUSTOM_ID)).toMatchObject({
+		generation: backupGeneration,
 		quotaBalance: "73.5",
 		detailedQuotaBalance: "backup balance",
 	});

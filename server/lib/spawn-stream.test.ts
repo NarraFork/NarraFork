@@ -26,6 +26,7 @@ describe("safeSpawn opt-in streaming", () => {
 				maxBytes: 1234,
 				onChunk: (chunk) => {
 					bytes += chunk.byteLength;
+					return undefined;
 				},
 			},
 		});
@@ -68,6 +69,7 @@ describe("safeSpawn opt-in streaming", () => {
 				maxBytes: 10000,
 				onChunk: () => {
 					controller.abort();
+					return undefined;
 				},
 			},
 		});

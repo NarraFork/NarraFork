@@ -6,7 +6,7 @@
  *   bun scripts/build-cross-platform.ts --platform=darwin-arm64  # specific platform
  *   bun scripts/build-cross-platform.ts --skip-frontend    # skip Vite build
  */
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -15,6 +15,7 @@ import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
+import { collectPluginBuildModules } from "./generate-builtin-plugins";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { assetsUnder, collectBuildModules, renderBuildInfo } from "./lib/build-materials";
 import { ALPHA_BUILD_LOCK, frontendBuildDirectory, resolveBuildProfile } from "./lib/build-profile";
@@ -57,9 +58,7 @@ const BUILD_PROFILE = resolveBuildProfile(VERSION, process.env);
 const alphaFrontend = args.includes("--alpha-frontend");
 if (
 	alphaFrontend &&
-	(BUILD_PROFILE.name !== "diagnostic" ||
-		skipFrontend ||
-		!existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
+	(BUILD_PROFILE.name !== "diagnostic" || skipFrontend || !existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
 ) {
 	throw new Error("--alpha-frontend requires a full local build through make build-alpha");
 }
@@ -71,8 +70,9 @@ console.log(
 console.log(`Backend compile flags: ${BUILD_PROFILE.compileArgs.join(" ")}`);
 let commitHash = "";
 try {
-	commitHash = execSync(
-		releaseCi ? "git rev-parse --verify HEAD^{commit}" : "git rev-parse --short HEAD",
+	commitHash = execFileSync(
+		"git",
+		releaseCi ? ["rev-parse", "--verify", "HEAD^{commit}"] : ["rev-parse", "--short", "HEAD"],
 		{
 			cwd: ROOT,
 			encoding: "utf-8",
@@ -170,6 +170,15 @@ async function runBuildStep(command: string[]): Promise<{ exitCode: number }> {
 	});
 }
 
+// Step 0: Always generate independent bundled archives, including --skip-frontend builds.
+// This runs once before all target compilations; plugin JavaScript never enters the host graph.
+console.log("→ Building bundled plugin archives...");
+const bundledPluginModules = await collectPluginBuildModules(ROOT);
+if (!bundledPluginModules.has("embedded-bundled-plugins.ts")) {
+	throw new Error("Bundled plugin archive module is missing");
+}
+console.log("✓ Built bundled plugin archive materials");
+
 // Step 1: Build frontend with Vite
 if (!skipFrontend) {
 	console.log("→ Building frontend...");
@@ -216,11 +225,9 @@ const buildInfo = {
 };
 const generatedDir = join(ROOT, "server", "generated");
 mkdirSync(generatedDir, { recursive: true });
-for (const [name, source] of await collectBuildModules(
-	ROOT,
-	assetsUnder(FRONTEND_DIR),
-	buildInfo,
-)) {
+const buildModules = await collectBuildModules(ROOT, assetsUnder(FRONTEND_DIR), buildInfo);
+for (const [name, source] of bundledPluginModules) buildModules.set(name, source);
+for (const [name, source] of buildModules) {
 	const path = join(generatedDir, name);
 	writeFileSync(path, source);
 	console.log(`Generated ${relative(ROOT, path)}`);

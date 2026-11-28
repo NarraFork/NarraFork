@@ -20,6 +20,7 @@
 import { logger } from "../logger";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
 import { getProviderKeyStore, type ProviderKey } from "../provider-keys";
+import { bindFrozenQuotaTarget, type FrozenCustomApiQuotaTarget } from "../provider-quota-async";
 import {
 	isPoolCooldownActive,
 	type PoolCooldown,
@@ -373,6 +374,15 @@ export class PooledProvider implements ProviderAdapter {
 			if (!key) throw new Error("This provider has no usable API key or eligible transport");
 			tried.add(key.id);
 			const isAttemptCurrent = captureKeyAttempt(key, this);
+			let capturedQuota: FrozenCustomApiQuotaTarget | null = null;
+			if (params.captureCustomApiQuotaTarget) {
+				try {
+					const target = params.captureCustomApiQuotaTarget(this.providerId, key.id);
+					capturedQuota = target ? Object.freeze({ ...target }) : null;
+				} catch {
+					/* Display provenance failure must not change inference behavior. */
+				}
+			}
 			let streamed = false;
 			try {
 				const adapter = this.adapterFor(key, params.model);
@@ -388,7 +398,9 @@ export class PooledProvider implements ProviderAdapter {
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: key.id };
+					const decorated = { ...event, credentialId: key.id };
+					if (params.captureCustomApiQuotaTarget) bindFrozenQuotaTarget(decorated, capturedQuota);
+					yield decorated;
 				}
 				if (isAttemptCurrent() && !getProviderKeyStore().get(key.id)?.disabled)
 					clearKeyCooldown(key.id);

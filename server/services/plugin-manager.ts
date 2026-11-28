@@ -10,7 +10,10 @@ import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateShortId } from "@server/lib/id";
-import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
+import {
+	adaptPluginCapability,
+	requiresFreshPluginGrant,
+} from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
@@ -22,18 +25,33 @@ import {
 import {
 	PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES,
 	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
+	PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
 	PROVIDER_REQUEST_MAX_BYTES,
 } from "@server/lib/plugins/protocol";
+import { readPluginSourceMetadata } from "@server/lib/plugins/source-metadata";
+import { isCompiledRuntime } from "@server/lib/runtime-target";
 import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
+import { WorkerCleanupError, type WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
+import {
+	defaultPluginSourceBinding,
+	type PluginSource,
+	type PluginSourceView,
+	pluginSourceSchema,
+} from "@shared/plugin-source";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
+import {
+	type BundledPluginDescriptor,
+	legacyQuotaUpgradeDescriptor,
+} from "./bundled-plugin-assets";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type { PluginPermissionRequestInput, PluginPrincipal } from "./plugin-capability-broker";
 import {
 	PluginCatalog,
 	type PluginCatalogPlugin,
 	type PluginCatalogSnapshot,
+	type PluginDistributionSummary,
 	type PluginPackageSummary,
 } from "./plugin-catalog";
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
@@ -57,7 +75,9 @@ import {
 import {
 	type CurrentPackagePointer,
 	type InstalledPackageResult,
+	type PackageInstallOptions,
 	type PackageSource,
+	type PackageStoreLimits,
 	PluginPackageStore,
 	type SetCurrentOptions,
 } from "./plugin-package-store";
@@ -77,21 +97,23 @@ import {
 	type PodmanRunnerOptions,
 } from "./plugin-podman-runner";
 import { createCorePluginPublicApiAdapters } from "./plugin-public-api";
+import type { PluginQuotaRuntime } from "./plugin-quota-client";
+import { PluginQuotaRegistry } from "./plugin-quota-registry";
 import {
 	LocalProcessRunner,
+	type PluginPackageStageResult,
+	type PluginPackageStageWorker,
 	PluginRuntimeError,
 	type PluginRuntimeOptions,
 	type RuntimeDiagnostics,
 	RuntimeSupervisor,
 	reportPluginRuntimeHealth,
+	stagePluginPackage,
 } from "./plugin-runtime";
-import { checkSbomInstallPolicy, parseSbom, type SbomInstallPolicy } from "./plugin-sbom";
+import type { SbomInstallPolicy } from "./plugin-sbom";
+import type { PluginTrustKeyring } from "./plugin-signature";
 import {
-	type PluginTrustKeyring,
-	parsePluginSignature,
-	verifyPluginPackageSignature,
-} from "./plugin-signature";
-import {
+	type BundledPluginDefaultChoice,
 	createPluginStateRecord,
 	type PluginGrantSummary,
 	type PluginJournalContext,
@@ -102,12 +124,16 @@ import {
 	type PluginStateRecord,
 	PluginStateStore,
 	pluginStateError,
+	validatePluginStateRecord,
 } from "./plugin-state-store";
 import { PluginToolRegistry, type PluginToolRuntime } from "./plugin-tool-registry";
 
 const MAX_MANIFEST_BYTES = 1024 * 1024;
-const MAX_TRUST_ARTIFACT_BYTES = 1024 * 1024;
 const HOST_API_VERSION = "1.0";
+const MAX_BUNDLED_ARCHIVE_BYTES = 16 * 1024 * 1024;
+const BUNDLED_BOOTSTRAP_TIMEOUT_MS = 60_000;
+const QUOTA_PLUGIN_ID = "io.narrafork.provider-quota";
+const LEGACY_QUOTA_PLUGIN_ID = "com.narrafork.apikey-quota";
 
 interface RuntimeLike {
 	state: string;
@@ -142,12 +168,14 @@ export interface PluginLifecycleRevokeCoordinatorLike {
 
 export interface PluginRuntimeSupervisorLike {
 	register(options: PluginRuntimeOptions): RuntimeLike;
-	start(options: PluginRuntimeOptions): Promise<RuntimeLike>;
+	start(options: PluginRuntimeOptions, signal?: AbortSignal): Promise<RuntimeLike>;
 	start(pluginId: string, signal?: AbortSignal): Promise<RuntimeLike>;
 	activate?(options: PluginRuntimeOptions | string, signal?: AbortSignal): Promise<RuntimeLike>;
 	disable(pluginId: string): Promise<void>;
 	drain(pluginId: string): Promise<void>;
 	stopProducers?(): void;
+	/** Synchronous ownership diagnostic; a rendered runtime state is not proof of exit. */
+	hasPendingShutdownWork?(): boolean;
 	shutdown(): Promise<void>;
 	get(pluginId: string): RuntimeLike | undefined;
 	getDiagnostics(pluginId?: string): RuntimeDiagnostics[];
@@ -156,13 +184,14 @@ export interface PluginRuntimeSupervisorLike {
 
 export interface PluginPackageStoreLike {
 	readonly root: string;
+	readonly limits?: Partial<PackageStoreLimits>;
 	readonly paths?: {
 		root: string;
 		staging: string;
 		packages: string;
 		current: string;
 	};
-	install(source: PackageSource): Promise<InstalledPackageResult>;
+	install(source: PackageSource, options?: PackageInstallOptions): Promise<InstalledPackageResult>;
 	readCurrent(): Promise<{
 		version: number;
 		plugins: Record<string, PluginPackageReference>;
@@ -224,12 +253,15 @@ export interface PluginManagerOptions {
 	toolRegistry?: PluginToolRegistry;
 	agentToolBridge?: PluginAgentToolBridge;
 	contributionCoordinator?: PluginContributionCoordinator;
+	quotaRegistry?: PluginQuotaRegistry;
 	/**
 	 * Pulls plugin provider model catalogs after activation. Optional: without it,
 	 * providers keep whatever catalog the manifest declared.
 	 */
 	providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
 	runtimeSupervisor?: PluginRuntimeSupervisorLike;
+	/** Fault-injection factory; production uses an independent package staging Worker. */
+	packageStageWorkerFactory?: () => PluginPackageStageWorker | Promise<PluginPackageStageWorker>;
 	runtimeOptionsFactory?: (
 		context: PluginRuntimeBuildContext,
 	) => PluginRuntimeOptions | Promise<PluginRuntimeOptions>;
@@ -253,6 +285,19 @@ export interface PluginManagerOptions {
 
 export interface PluginInstallOptions {
 	pluginId?: string;
+}
+
+export interface PluginSourceUpdateOptions {
+	pluginId: string;
+	expectedCurrent: PluginPackageReference;
+	expectedSourceRevision: number;
+	expectedVersion?: string;
+	expectedInstallationId?: string;
+	automatic: boolean;
+	signal?: AbortSignal;
+	allowTrustChange?: boolean;
+	/** Host update-job hook, not an RPC/plugin-supplied callback. */
+	onCommit?: () => void;
 }
 
 export interface PluginActivationOptions {
@@ -282,8 +327,9 @@ export interface PluginPermissionMutationResult {
 	permissions: PluginPermissionSet;
 }
 
-export interface PluginManagerStatus extends PluginStateRecord {
+export interface PluginManagerStatus extends PluginStateRecord, PluginDistributionSummary {
 	installed: boolean;
+	canUpdate?: boolean;
 	/** Shipped with the application: no install step, no package-store record, no grant. */
 	builtin: boolean;
 	featureDisabled: boolean;
@@ -360,10 +406,12 @@ export function seedGrantsFromManifest(
 ): PluginGrantSummary {
 	const declared = [...new Set(manifestRequested)];
 	if (declared.length === 0) return summary;
-	const capabilities = declared.filter((capability) => adaptPluginCapability(capability));
-	const ignored = declared.filter((capability) => !adaptPluginCapability(capability));
+	const eligible = (capability: string) =>
+		adaptPluginCapability(capability) && !requiresFreshPluginGrant(capability);
+	const capabilities = declared.filter(eligible);
+	const ignored = declared.filter((capability) => !eligible(capability));
 	if (ignored.length > 0) {
-		logger.warn("Ignoring plugin capabilities with no canonical adapter while seeding grants", {
+		logger.warn("Plugin capabilities require explicit grants or have no canonical adapter", {
 			pluginId: context?.pluginId,
 			ignored,
 			seeded: capabilities.length,
@@ -513,9 +561,11 @@ export class PluginManager {
 	readonly toolRegistry: PluginToolRegistry;
 	readonly agentToolBridge: PluginAgentToolBridge;
 	readonly contributionCoordinator: PluginContributionCoordinator;
+	readonly quotaRegistry: PluginQuotaRegistry;
 	private readonly providerCatalogRefresher?: PluginProviderCatalogRefresherLike;
 	readonly runtimeSupervisor: PluginRuntimeSupervisorLike;
 	private readonly runtimeOptionsFactory?: PluginManagerOptions["runtimeOptionsFactory"];
+	private readonly packageStageWorkerFactory?: PluginManagerOptions["packageStageWorkerFactory"];
 	private readonly trustPolicy: Required<Pick<PluginTrustPolicy, "enabled" | "requireSignature">> &
 		Pick<PluginTrustPolicy, "keyring" | "sbomPolicy">;
 	private readonly podman?: PluginPodmanConfig;
@@ -533,8 +583,17 @@ export class PluginManager {
 	private initialized = false;
 	private shuttingDown = false;
 	private readonly runtimeEvents = new Set<Promise<void>>();
+	private runtimeEventsClosed = false;
+	private shutdownRuntimeEventFailure?: { error: unknown };
 	/** True when the caller supplied its own catalog, so builtin roots must not be re-resolved. */
 	private readonly catalogInjected: boolean;
+
+	private shutdownPromise?: Promise<void>;
+	private supervisorShutdown?: Promise<void>;
+	private readonly pendingLifecycleOperations = new Set<Promise<unknown>>();
+	private readonly uncertainLifecycleResources = new Set<WorkerHandle<unknown>>();
+	private readonly bundledBootstrapAbort = new AbortController();
+	private readonly sourceChangedListeners = new Set<(pluginId: string) => void>();
 
 	constructor(options: PluginManagerOptions = {}) {
 		const root = resolve(options.root ?? options.packageStore?.root ?? getNarraforkPath("plugins"));
@@ -567,7 +626,27 @@ export class PluginManager {
 			!options.contributionRegistry &&
 			!options.toolRegistry &&
 			!options.agentToolBridge &&
-			!options.contributionCoordinator;
+			!options.contributionCoordinator &&
+			!options.quotaRegistry;
+		this.quotaRegistry =
+			options.quotaRegistry ??
+			options.contributionCoordinator?.quotaRegistry ??
+			(useSharedPlatform
+				? pluginPlatformServices.quotaRegistry
+				: new PluginQuotaRegistry({
+						stateStore: this.stateStore,
+						permissionStore: this.permissionStore,
+						hostServices: this.hostServices,
+						capabilityBroker: this.hostServices.capabilityBroker,
+						providerConnectionService: pluginPlatformServices.providerConnectionService,
+						resolveRuntime: (pluginId) => {
+							const runtime = this.runtimeSupervisor.get(pluginId);
+							return runtime &&
+								typeof (runtime as Partial<PluginQuotaRuntime>).request === "function"
+								? (runtime as unknown as PluginQuotaRuntime)
+								: undefined;
+						},
+					}));
 		if (useSharedPlatform) {
 			this.contributionRegistry = pluginPlatformServices.contributionRegistry;
 			this.toolRegistry = pluginPlatformServices.toolRegistry;
@@ -603,12 +682,24 @@ export class PluginManager {
 				new PluginContributionCoordinator({
 					contributionRegistry: this.contributionRegistry,
 					toolRegistry: this.toolRegistry,
+					quotaRegistry: this.quotaRegistry,
 					agentToolBridge: this.agentToolBridge,
 					lifecycleStates: () => this.stateStore.listStates(),
 				});
 			// Injected-dependency mode has no platform default; catalog refresh is opt-in.
 			this.providerCatalogRefresher = options.providerCatalogRefresher;
 		}
+		if (
+			this.hostServices === pluginPlatformServices.hostServices &&
+			this.runtimeSupervisor === pluginPlatformServices.runtimeSupervisor
+		) {
+			pluginPlatformServices.providerSettingsService.setActivationHandler((pluginId, options) =>
+				this.activate(pluginId, { ...options, automatic: true }),
+			);
+		}
+		this.quotaRegistry.setActivationHandler((pluginId, activationOptions) =>
+			this.activate(pluginId, { ...activationOptions, automatic: true }),
+		);
 		this.agentToolBridge.setActivationHandler((pluginId, activationOptions) =>
 			this.activate(pluginId, activationOptions),
 		);
@@ -617,6 +708,7 @@ export class PluginManager {
 			return Boolean(runtime && ["active", "degraded"].includes(runtime.state));
 		});
 		this.runtimeOptionsFactory = options.runtimeOptionsFactory;
+		this.packageStageWorkerFactory = options.packageStageWorkerFactory;
 		this.trustPolicy = {
 			enabled: options.trustPolicy?.enabled ?? false,
 			requireSignature: options.trustPolicy?.requireSignature ?? false,
@@ -647,6 +739,7 @@ export class PluginManager {
 	}
 
 	async initialize(): Promise<PluginManagerStatus[]> {
+		if (this.shuttingDown && !this.initializePromise) return [];
 		if (this.initialized) return this.list();
 		if (this.initializePromise) return this.initializePromise;
 		this.initializePromise = this.initializeInternal();
@@ -661,10 +754,798 @@ export class PluginManager {
 		return !this.disabled;
 	}
 
-	async install(
+	isShuttingDown(): boolean {
+		return this.shuttingDown;
+	}
+
+	getHostApiVersion(): string {
+		return HOST_API_VERSION;
+	}
+
+	onSourceChanged(listener: (pluginId: string) => void): () => void {
+		this.sourceChangedListeners.add(listener);
+		return () => this.sourceChangedListeners.delete(listener);
+	}
+
+	private notifySourceChanged(pluginId: string): void {
+		for (const listener of this.sourceChangedListeners) {
+			try {
+				listener(pluginId);
+			} catch (error) {
+				logger.warn("Plugin source listener failed", { pluginId, error: errorMessage(error) });
+			}
+		}
+	}
+
+	async getSource(pluginId: string): Promise<PluginSourceView> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		return this.lifecycleMutex.acquire(pluginId, () => this.sourceViewLocked(pluginId));
+	}
+
+	private async sourceViewLocked(pluginId: string): Promise<PluginSourceView> {
+		const state = await this.requireState(pluginId);
+		const pkg = state.current
+			? this.catalogPlugin(pluginId)?.packages.find((item) =>
+					packagePointersEqual(item, state.current),
+				)
+			: undefined;
+		const metadata = pkg
+			? await readPluginSourceMetadata(pkg.path, pluginId)
+			: { source: null, diagnostics: [] };
+		const binding = state.sourceBinding ?? {
+			...defaultPluginSourceBinding(),
+			source: metadata.source,
+		};
+		return {
+			pluginId,
+			binding,
+			declaredSource: metadata.source,
+			origin:
+				binding.mode === "none" || binding.source === null
+					? "none"
+					: binding.mode === "configured"
+						? "configured"
+						: pkg?.origin === "builtin"
+							? "builtin"
+							: "package",
+			diagnostics: metadata.diagnostics,
+		};
+	}
+
+	async setSource(
+		pluginId: string,
+		source: PluginSource | null,
+		options: { expectedRevision: number },
+	): Promise<PluginSourceView> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const validated = source === null ? null : pluginSourceSchema.parse(source);
+		return this.trackLifecycleOperation(
+			this.lifecycleMutex.acquire(pluginId, async () => {
+				this.assertNotShuttingDown();
+				const state = await this.requireState(pluginId);
+				const binding = state.sourceBinding ?? defaultPluginSourceBinding();
+				this.assertSourceRevision(binding.revision, options.expectedRevision);
+				await this.stateStore.updateState(pluginId, {
+					sourceBinding: {
+						revision: binding.revision + 1,
+						mode: validated === null ? "none" : "configured",
+						source: validated,
+						autoUpdate: false,
+					},
+				});
+				this.notifySourceChanged(pluginId);
+				return this.sourceViewLocked(pluginId);
+			}),
+		);
+	}
+
+	async setAutoUpdate(
+		pluginId: string,
+		enabled: boolean,
+		options: { expectedRevision: number },
+	): Promise<PluginSourceView> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof enabled !== "boolean")
+			throw new ValidationError("Automatic update preference must be boolean");
+		return this.trackLifecycleOperation(
+			this.lifecycleMutex.acquire(pluginId, async () => {
+				this.assertNotShuttingDown();
+				const view = await this.sourceViewLocked(pluginId);
+				this.assertSourceRevision(view.binding.revision, options.expectedRevision);
+				if (enabled && view.binding.source === null)
+					throw new PluginManagerError(
+						"Plugin has no update source",
+						"PLUGIN_SOURCE_REQUIRED",
+						422,
+					);
+				await this.stateStore.updateState(pluginId, {
+					sourceBinding: {
+						...view.binding,
+						revision: view.binding.revision + 1,
+						autoUpdate: enabled,
+					},
+				});
+				this.notifySourceChanged(pluginId);
+				return this.sourceViewLocked(pluginId);
+			}),
+		);
+	}
+
+	private assertSourceRevision(actual: number, expected: number): void {
+		if (
+			!Number.isSafeInteger(expected) ||
+			expected < 0 ||
+			actual >= Number.MAX_SAFE_INTEGER ||
+			actual !== expected
+		) {
+			throw new PluginManagerError(
+				"Plugin source revision changed",
+				"PLUGIN_SOURCE_REVISION_CONFLICT",
+				409,
+			);
+		}
+	}
+
+	/** Synchronous fence: call before stopping dependent services or awaiting teardown. */
+	beginShutdown(): void {
+		this.shuttingDown = true;
+		this.bundledBootstrapAbort.abort(new Error("Plugin manager is shutting down"));
+	}
+
+	/** Existing owners only. Never start a read, retry a close, or infer exit from UI state. */
+	hasPendingShutdownWork(): boolean {
+		if (
+			this.initializePromise ||
+			this.pendingLifecycleOperations.size ||
+			this.runtimeEvents.size ||
+			this.uncertainLifecycleResources.size
+		)
+			return true;
+		if (this.runtimeSupervisor.hasPendingShutdownWork)
+			return this.runtimeSupervisor.hasPendingShutdownWork();
+		// Injected legacy supervisors without an ownership query must confirm their registered
+		// runtimes through the real shutdown promise; do not trust a displayed "stopped".
+		return (
+			(!this.supervisorShutdown || Bun.peek.status(this.supervisorShutdown) !== "fulfilled") &&
+			this.runtimeSupervisor.getDiagnostics().length > 0
+		);
+	}
+
+	/** Host-owned defaults, considered once. Ordinary uploads never call this path. */
+	bootstrapBundledPlugin(descriptor: BundledPluginDescriptor): Promise<PluginManagerStatus | null> {
+		if (this.shuttingDown) return Promise.resolve(null);
+		return this.trackLifecycleOperation(this.bootstrapBundledPluginInternal(descriptor));
+	}
+
+	private async bootstrapBundledPluginInternal(
+		descriptor: BundledPluginDescriptor,
+	): Promise<PluginManagerStatus | null> {
+		await this.ensureInitialized();
+		if (this.disabled || this.shuttingDown) return null;
+		assertPluginId(descriptor.pluginId);
+		const bootstrap = async () => {
+			const pluginId = descriptor.pluginId;
+			if (this.shuttingDown) return null;
+			await this.refreshCatalog();
+			const considered = await this.stateStore.getBundledBootstrap(pluginId);
+			if (considered) return (await this.buildStatus(pluginId)) ?? null;
+			const diagnostics = await this.stateStore.getDiagnostics();
+			if (
+				diagnostics.some((item) =>
+					["PLUGIN_STATE_CORRUPT", "PLUGIN_JOURNAL_CORRUPT"].includes(item.code),
+				)
+			) {
+				throw new PluginManagerError(
+					"Bundled plugin initialization requires intact lifecycle persistence",
+					"PLUGIN_BUNDLED_STATE_UNAVAILABLE",
+					503,
+				);
+			}
+			const existingState = await this.stateStore.getState(pluginId);
+			const existingPackage = this.catalogPlugin(pluginId);
+			if (existingState || existingPackage) {
+				await this.stateStore.setBundledBootstrap(pluginId, {
+					status: "adopted",
+					version:
+						existingState?.current?.version ??
+						currentPackage(existingPackage)?.version ??
+						descriptor.version,
+					archiveSha256: null,
+				});
+				return (await this.buildStatus(pluginId)) ?? null;
+			}
+			// Authorities outlive uninstall, including installs made before this ledger existed.
+			const [authorities, permissionSets] = await Promise.all([
+				this.integrationAuthorityService.listAuthorities(pluginId),
+				this.permissionStore.listSets(pluginId),
+			]);
+			if (authorities.length > 0 || permissionSets.length > 0) {
+				await this.stateStore.setBundledBootstrap(pluginId, {
+					status: "removed",
+					version: descriptor.version,
+					archiveSha256: null,
+				});
+				return null;
+			}
+			if (pluginId === QUOTA_PLUGIN_ID && (await this.inheritLegacyQuotaRefusal(descriptor))) {
+				return null;
+			}
+			if (
+				pluginId === QUOTA_PLUGIN_ID &&
+				descriptor.version === "1.0.4" &&
+				(await this.stateStore.getBundledBootstrap(LEGACY_QUOTA_PLUGIN_ID))?.defaultChoice ===
+					"enabled"
+			)
+				descriptor = legacyQuotaUpgradeDescriptor;
+			const controller = new AbortController();
+			const stop = () => controller.abort(this.bundledBootstrapAbort.signal.reason);
+			this.bundledBootstrapAbort.signal.addEventListener("abort", stop, { once: true });
+			if (this.bundledBootstrapAbort.signal.aborted) stop();
+			const timer = setTimeout(
+				() => controller.abort(new Error("Bundled plugin initialization timed out")),
+				BUNDLED_BOOTSTRAP_TIMEOUT_MS,
+			);
+			try {
+				controller.signal.throwIfAborted();
+				const payload = await descriptor.load(controller.signal);
+				controller.signal.throwIfAborted();
+				if (
+					!(payload.bytes instanceof Uint8Array) ||
+					payload.bytes.byteLength === 0 ||
+					payload.bytes.byteLength > MAX_BUNDLED_ARCHIVE_BYTES ||
+					!/^[a-f0-9]{64}$/.test(payload.sha256)
+				) {
+					throw new PluginManagerError(
+						"Bundled plugin archive failed its byte or digest check",
+						"PLUGIN_BUNDLED_INTEGRITY_FAILED",
+						422,
+					);
+				}
+				const staged = await this.stagePackage(payload.bytes, controller.signal, payload.sha256);
+				await this.stateStore.setBundledBootstrap(pluginId, {
+					status: "initializing",
+					version: descriptor.version,
+					archiveSha256: payload.sha256,
+				});
+				try {
+					await this.installLocked(payload.bytes, pluginId, {
+						expectedVersion: descriptor.version,
+						seedGrantedBy: "system",
+						signal: controller.signal,
+						staged,
+						trustVerified: true,
+					});
+				} catch (error) {
+					// Preserve a current pointer committed by another manager/process.
+					// Local uploads stage only; they cannot publish through this lifecycle lock.
+					if (error instanceof PluginManagerError && error.code === "PLUGIN_ALREADY_INSTALLED") {
+						await this.stateStore.setBundledBootstrap(pluginId, {
+							status: "adopted",
+							version: descriptor.version,
+							archiveSha256: null,
+						});
+						return (await this.buildStatus(pluginId)) ?? null;
+					}
+					throw error;
+				}
+				controller.signal.throwIfAborted();
+				await this.enableLocked(pluginId, controller.signal);
+				controller.signal.throwIfAborted();
+				const status = await this.activateLocked(pluginId, {
+					automatic: true,
+					reason: "bundled-default",
+					signal: controller.signal,
+				});
+				controller.signal.throwIfAborted();
+				await this.stateStore.setBundledBootstrap(pluginId, {
+					status: "seeded",
+					version: descriptor.version,
+					archiveSha256: payload.sha256,
+				});
+				logger.info("Bundled plugin installed and enabled", {
+					pluginId,
+					version: descriptor.version,
+				});
+				return status;
+			} finally {
+				clearTimeout(timer);
+				this.bundledBootstrapAbort.signal.removeEventListener("abort", stop);
+			}
+		};
+		// The one ID replacement shares a stable lock order with old enable/disable/revoke
+		// decisions. Other bundled plugins continue to hold only their own lifecycle lock.
+		if (descriptor.pluginId === QUOTA_PLUGIN_ID) {
+			return this.lifecycleMutex.acquire(LEGACY_QUOTA_PLUGIN_ID, () =>
+				this.lifecycleMutex.acquire(descriptor.pluginId, bootstrap),
+			);
+		}
+		return this.lifecycleMutex.acquire(descriptor.pluginId, bootstrap);
+	}
+
+	private async captureLegacyQuotaDefaultChoice(
+		states: readonly PluginStateRecord[],
+		operations: readonly PluginJournalEntry[],
+	): Promise<void> {
+		const bundled = await this.stateStore.getBundledBootstrap(LEGACY_QUOTA_PLUGIN_ID);
+		if (bundled?.defaultChoice !== undefined) return;
+		const state = states.find((item) => item.pluginId === LEGACY_QUOTA_PLUGIN_ID);
+		const [authorities, sets] = await Promise.all([
+			this.integrationAuthorityService.listAuthorities(LEGACY_QUOTA_PLUGIN_ID),
+			this.permissionStore.listSets(LEGACY_QUOTA_PLUGIN_ID),
+		]);
+		const legacyOperations = operations.filter((item) => item.pluginId === LEGACY_QUOTA_PLUGIN_ID);
+		if (!state && !bundled && !authorities.length && !sets.length && !legacyOperations.length)
+			return;
+		// Capture before missing-package reconciliation turns a retired, enabled builtin
+		// into disabled. The original choice must survive a shutdown before bootstrap.
+		const choice: BundledPluginDefaultChoice =
+			bundled?.status === "removed" || state?.desiredState === "uninstalling"
+				? "removed"
+				: state?.desiredState === "enabled"
+					? "enabled"
+					: state
+						? "disabled"
+						: authorities.length && authorities.every((item) => item.state !== "active")
+							? "revoked"
+							: "removed";
+		this.assertNotShuttingDown();
+		await this.recordLegacyQuotaChoice(LEGACY_QUOTA_PLUGIN_ID, choice, state);
+	}
+
+	private async recordLegacyQuotaChoice(
+		pluginId: string,
+		defaultChoice: BundledPluginDefaultChoice,
+		state?: PluginStateRecord,
+	): Promise<void> {
+		if (pluginId !== LEGACY_QUOTA_PLUGIN_ID) return;
+		const bundled = await this.stateStore.getBundledBootstrap(pluginId);
+		await this.stateStore.setBundledBootstrap(pluginId, {
+			status: defaultChoice === "removed" ? "removed" : "adopted",
+			version: bundled?.version ?? state?.current?.version ?? "1.0.0",
+			archiveSha256: bundled?.archiveSha256 ?? null,
+			defaultChoice,
+		});
+	}
+
+	private async inheritLegacyQuotaRefusal(descriptor: BundledPluginDescriptor): Promise<boolean> {
+		const legacy = await this.stateStore.getBundledBootstrap(LEGACY_QUOTA_PLUGIN_ID);
+		let choice: BundledPluginDefaultChoice | undefined =
+			legacy?.status === "removed" ? "removed" : legacy?.defaultChoice;
+		if (choice === undefined || choice === "enabled") {
+			const state = await this.stateStore.getState(LEGACY_QUOTA_PLUGIN_ID);
+			const installationId = state?.installationId ?? authorityInstallationId(state);
+			const [inspection, sets] = await Promise.all([
+				this.integrationAuthorityService.inspectAuthorization(LEGACY_QUOTA_PLUGIN_ID, {
+					installationId,
+					packageHash: state?.current?.hash,
+				}),
+				this.permissionStore.listSets(LEGACY_QUOTA_PLUGIN_ID),
+			]);
+			if (inspection.ambiguous) {
+				throw new PluginManagerError(
+					"Retired quota plugin has ambiguous authorization; explicit installation is required",
+					"PLUGIN_LEGACY_QUOTA_AUTHORIZATION_AMBIGUOUS",
+					503,
+				);
+			}
+			const authority =
+				inspection.authorities.find((item) => item.installationId === installationId) ??
+				inspection.authorities.find(
+					(item) => item.authorityId === inspection.canonicalAuthorityId,
+				) ??
+				(inspection.authorities.length === 1 ? inspection.authorities[0] : undefined);
+			if (
+				(authority &&
+					(authority.state !== "active" || !authority.grants.includes("provider.use"))) ||
+				(!authority && inspection.authorities.length > 0) ||
+				(!authority &&
+					sets.some(
+						(set) =>
+							(installationId === undefined || set.installationId === installationId) &&
+							!set.grants.some((grant) => grant.capability === "provider.use"),
+					))
+			) {
+				choice = "revoked";
+			}
+		}
+		if (choice === undefined || choice === "enabled") return false;
+		this.assertNotShuttingDown();
+		await this.stateStore.setBundledBootstrap(descriptor.pluginId, {
+			status: "removed",
+			version: descriptor.version,
+			archiveSha256: null,
+			defaultChoice: choice,
+			inheritedFrom: LEGACY_QUOTA_PLUGIN_ID,
+		});
+		logger.info("Bundled quota default suppressed by the retired plugin's operator choice", {
+			pluginId: descriptor.pluginId,
+			inheritedFrom: LEGACY_QUOTA_PLUGIN_ID,
+			defaultChoice: choice,
+		});
+		return true;
+	}
+
+	updateFromSource(
 		source: PackageSource,
-		options: PluginInstallOptions = {},
+		options: PluginSourceUpdateOptions,
 	): Promise<PluginManagerStatus> {
+		return this.trackLifecycleOperation(this.updateFromSourceInternal(source, options));
+	}
+
+	private async updateFromSourceInternal(
+		source: PackageSource,
+		options: PluginSourceUpdateOptions,
+	): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown(options.signal);
+		await this.ensureInitialized();
+		this.assertFeatureEnabled("update");
+		assertPluginId(options.pluginId);
+		return this.lifecycleMutex.acquire(options.pluginId, async () => {
+			this.assertNotShuttingDown(options.signal);
+			const pluginId = options.pluginId;
+			const previous = await this.requireState(pluginId);
+			const view = await this.sourceViewLocked(pluginId);
+			this.assertSourceRevision(view.binding.revision, options.expectedSourceRevision);
+			if (!view.binding.source || (options.automatic && !view.binding.autoUpdate)) {
+				throw new PluginManagerError(
+					"Source updates are not enabled for this installation",
+					"PLUGIN_SOURCE_REQUIRED",
+					422,
+				);
+			}
+			await this.assertSourceUpdateCurrent(previous, options);
+			if (!previous.installationId)
+				throw new PluginManagerError(
+					"Source updates require an existing approved installation",
+					"PLUGIN_UPDATE_MANUAL_REQUIRED",
+					409,
+				);
+			const approved = await this.integrationAuthorityService.get(
+				pluginId,
+				previous.installationId,
+			);
+			const oldPackage = currentPackage(this.catalogPlugin(pluginId));
+			if (!oldPackage || !previous.current)
+				throw new PluginManagerError(
+					"Installed package is unavailable",
+					"PLUGIN_PACKAGE_UNAVAILABLE",
+					422,
+				);
+			const oldManifest = await this.readPackageManifest(oldPackage);
+			const stageSignal = AbortSignal.any([
+				this.bundledBootstrapAbort.signal,
+				...(options.signal ? [options.signal] : []),
+			]);
+			const staged = await this.stagePackage(
+				source,
+				stageSignal,
+				undefined,
+				undefined,
+				oldPackage.path,
+			);
+			this.assertNotShuttingDown(options.signal);
+			if (
+				staged.pluginId !== pluginId ||
+				(options.expectedVersion !== undefined && staged.version !== options.expectedVersion)
+			) {
+				throw new PluginManagerError(
+					"Source artifact identity does not match the candidate",
+					"PLUGIN_IDENTITY_MISMATCH",
+					422,
+				);
+			}
+			if (Bun.semver.order(staged.version, previous.current.version) <= 0) {
+				throw new PluginManagerError(
+					"Source artifact is not newer than the installed version",
+					"PLUGIN_UPDATE_NOT_NEWER",
+					409,
+				);
+			}
+			this.assertSignatureKeyTrusted(pluginId, staged.signatureKeyId);
+			const scanned = await this.catalog.scan();
+			const candidate = scanned.packages.find(
+				(pkg) =>
+					pkg.pluginId === pluginId && pkg.hash === staged.hash && pkg.version === staged.version,
+			);
+			if (candidate?.status !== "compatible")
+				throw new PluginManagerError("Source artifact is incompatible", "PLUGIN_INCOMPATIBLE", 422);
+			const trustChanged = await this.sourceUpdateTrustChanged(
+				oldManifest,
+				staged.manifest,
+				staged,
+			);
+			if (trustChanged && (options.automatic || !options.allowTrustChange)) {
+				throw new PluginManagerError(
+					"Source update changes approved permissions or trust; manual confirmation is required",
+					"PLUGIN_UPDATE_MANUAL_REQUIRED",
+					409,
+				);
+			}
+			const checkpoint: PluginStateRecord = { ...previous, sourceBinding: view.binding };
+			const rollbackState = JSON.parse(JSON.stringify(checkpoint));
+			if (Buffer.byteLength(JSON.stringify(rollbackState)) > 64 * 1024)
+				throw new PluginManagerError(
+					"Update recovery state exceeds its byte budget",
+					"PLUGIN_UPDATE_RECOVERY_LIMIT",
+					422,
+				);
+			this.assertNotShuttingDown(options.signal);
+			const latestState = await this.requireState(pluginId);
+			this.assertSourceRevision(
+				latestState.sourceBinding?.revision ?? 0,
+				options.expectedSourceRevision,
+			);
+			await this.assertSourceUpdateCurrent(latestState, options);
+			const latestPermissions = await this.integrationAuthorityService.get(
+				pluginId,
+				previous.installationId,
+			);
+			if (latestPermissions.revision !== approved.revision)
+				throw new PluginManagerError(
+					"Approved permissions changed during source validation",
+					"PLUGIN_UPDATE_MANUAL_REQUIRED",
+					409,
+				);
+			const next = { version: staged.version, hash: staged.hash };
+			const operation = await this.stateStore.beginOperation({
+				pluginId,
+				operation: "upgrade",
+				context: {
+					from: previous.current,
+					to: next,
+					sourceUpdate: true,
+					rollbackState,
+				},
+			});
+			await this.stateStore.updateOperation(operation.id, { status: "running" });
+			let published = false;
+			const commitSignal = this.bundledBootstrapAbort.signal;
+			try {
+				this.assertNotShuttingDown(options.signal);
+				await this.packageMutex.acquire("package-store", async () => {
+					this.assertNotShuttingDown(options.signal);
+					this.assertSignatureKeyTrusted(pluginId, staged.signatureKeyId);
+					options.onCommit?.();
+					this.assertNotShuttingDown(commitSignal);
+					this.assertSignatureKeyTrusted(pluginId, staged.signatureKeyId);
+					await this.packageStore.setCurrent(pluginId, next, {
+						expectedCurrent: options.expectedCurrent,
+						operationId: operation.id,
+					});
+					published = true;
+				});
+				// Publication is an irreversible boundary for request cancellation. Complete or
+				// compensate under the host shutdown signal, never report committed work cancelled.
+				await this.finishInstalledPackage(
+					{ ...staged, currentUpdated: true },
+					operation,
+					undefined,
+					commitSignal,
+					{ deferJournalCompletion: true, replaceRevoked: false },
+				);
+				if (previous.desiredState === "enabled") {
+					await this.enableLocked(pluginId, commitSignal);
+					await this.activateLocked(pluginId, {
+						reason: "source-update",
+						automatic: options.automatic,
+						signal: commitSignal,
+					});
+				}
+				await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
+				this.notifySourceChanged(pluginId);
+				return this.requireStatus(pluginId);
+			} catch (error) {
+				if (published) {
+					try {
+						await this.runtimeSupervisor.disable(pluginId);
+						this.hostServices.revokeRuntime(pluginId);
+						await this.packageMutex.acquire("package-store", () =>
+							this.packageStore.setCurrent(pluginId, previous.current ?? undefined, {
+								expectedCurrent: next,
+								operationId: `rollback-${operation.id}`,
+							}),
+						);
+						const current = await this.requireState(pluginId);
+						await this.stateStore.upsert({
+							...checkpoint,
+							runtimeState: "inactive",
+							runtimeGeneration: Math.max(checkpoint.runtimeGeneration, current.runtimeGeneration),
+							updatedAt: this.timestamp(),
+						});
+						await this.refreshCatalog("install");
+						if (checkpoint.desiredState === "enabled" && !this.shuttingDown)
+							await this.activateLocked(pluginId, {
+								reason: "source-update-rollback",
+								signal: commitSignal,
+							});
+						await this.stateStore.updateOperation(operation.id, {
+							status: "rolled_back",
+							error: pluginStateError(error, { phase: "source-update", at: this.timestamp() }),
+						});
+					} catch (rollbackError) {
+						await this.failOperation(operation, rollbackError, "source-update-rollback");
+						await this.persistFailure(pluginId, rollbackError, "source-update-rollback", true);
+						throw new PluginManagerError(
+							`Source update rollback failed: ${errorMessage(rollbackError)}`,
+							"PLUGIN_UPDATE_ROLLBACK_FAILED",
+							503,
+						);
+					}
+				} else await this.failOperation(operation, error, "source-update");
+				throw error;
+			}
+		});
+	}
+
+	private async assertSourceUpdateCurrent(
+		state: PluginStateRecord,
+		options: PluginSourceUpdateOptions,
+	): Promise<void> {
+		const current = (await this.packageStore.readCurrent()).plugins[options.pluginId];
+		if (
+			!packagePointersEqual(current, options.expectedCurrent) ||
+			!packagePointersEqual(state.current, options.expectedCurrent) ||
+			(options.expectedInstallationId !== undefined &&
+				state.installationId !== options.expectedInstallationId)
+		) {
+			throw new PluginManagerError(
+				"Source candidate belongs to a different installation",
+				"PLUGIN_UPDATE_CURRENT_CONFLICT",
+				409,
+			);
+		}
+	}
+
+	private async sourceUpdateTrustChanged(
+		oldManifest: Manifest,
+		next: Manifest,
+		signatures: { previousSignatureIdentity: string | null; signatureIdentity: string | null },
+	): Promise<boolean> {
+		const changedEntries = (before: readonly unknown[], after: readonly unknown[]) =>
+			after.some((entry) => !before.some((old) => JSON.stringify(old) === JSON.stringify(entry)));
+		const changedMap = (before: Record<string, unknown>, after: Record<string, unknown>) =>
+			Object.entries(after).some(
+				([key, value]) => JSON.stringify(value) !== JSON.stringify(before[key]),
+			);
+		const oldPermissions = oldManifest.permissions;
+		const newPermissions = next.permissions;
+		// These legacy fields are optional opaque audit declarations, not enforced
+		// sandboxes. Unknown changes require confirmation rather than guessing a scope lattice.
+		const declarationChanged = (before: unknown, after: unknown) =>
+			JSON.stringify(before ?? {}) !== JSON.stringify(after ?? {});
+		if (
+			changedEntries(oldPermissions.host, newPermissions.host) ||
+			// Quota declarations define which saved credentials and HTTP paths an already
+			// granted provider.connection.request may use. Any change needs fresh consent.
+			declarationChanged(oldManifest.contributes.quotaSources, next.contributes.quotaSources) ||
+			oldManifest.engine.runner !== next.engine.runner ||
+			declarationChanged(oldPermissions.network, newPermissions.network) ||
+			declarationChanged(oldPermissions.filesystem, newPermissions.filesystem) ||
+			declarationChanged(oldPermissions.process, newPermissions.process) ||
+			changedEntries(oldManifest.secrets, next.secrets) ||
+			changedMap(oldManifest.dependencies.plugins, next.dependencies.plugins) ||
+			changedMap(oldManifest.dependencies.runtime, next.dependencies.runtime) ||
+			oldManifest.publisher?.id !== next.publisher?.id
+		)
+			return true;
+		return signatures.previousSignatureIdentity !== signatures.signatureIdentity;
+	}
+
+	installBuiltin(
+		descriptor: BundledPluginDescriptor,
+		options: { signal?: AbortSignal; onCommit?: () => void } = {},
+	): Promise<PluginManagerStatus> {
+		return this.trackLifecycleOperation(this.installBuiltinInternal(descriptor, options));
+	}
+
+	private async installBuiltinInternal(
+		descriptor: BundledPluginDescriptor,
+		options: { signal?: AbortSignal; onCommit?: () => void },
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		this.assertFeatureEnabled("install");
+		assertPluginId(descriptor.pluginId);
+		return this.lifecycleMutex.acquire(descriptor.pluginId, async () => {
+			const controller = new AbortController();
+			const signal = AbortSignal.any([
+				controller.signal,
+				this.bundledBootstrapAbort.signal,
+				...(options.signal ? [options.signal] : []),
+			]);
+			const timer = setTimeout(
+				() => controller.abort(new Error("Builtin installation deadline exceeded")),
+				BUNDLED_BOOTSTRAP_TIMEOUT_MS,
+			);
+			let attempted = false;
+			let installed = false;
+			let initialCurrent: PluginPackageReference | undefined;
+			try {
+				this.assertNotShuttingDown(signal);
+				const current = (await this.packageStore.readCurrent()).plugins[descriptor.pluginId];
+				initialCurrent = current;
+				if (current && Bun.semver.order(descriptor.version, current.version) < 0)
+					throw new PluginManagerError(
+						"Builtin installation cannot downgrade a newer package",
+						"PLUGIN_UPDATE_NOT_NEWER",
+						409,
+					);
+				const payload = await descriptor.load(signal);
+				this.assertNotShuttingDown(signal);
+				if (
+					!(payload.bytes instanceof Uint8Array) ||
+					payload.bytes.length === 0 ||
+					payload.bytes.length > MAX_BUNDLED_ARCHIVE_BYTES ||
+					!/^[a-f0-9]{64}$/.test(payload.sha256)
+				) {
+					throw new PluginManagerError(
+						"Builtin archive failed integrity validation",
+						"PLUGIN_BUNDLED_INTEGRITY_FAILED",
+						422,
+					);
+				}
+				const staged = await this.stagePackage(payload.bytes, signal, payload.sha256);
+				attempted = true;
+				await this.installLocked(payload.bytes, descriptor.pluginId, {
+					staged,
+					trustVerified: true,
+					expectedVersion: descriptor.version,
+					requireAbsent: false,
+					signal,
+					onCommit: options.onCommit,
+					ignoreCancellationAfterCommit: true,
+				});
+				installed = true;
+				await this.enableLocked(descriptor.pluginId, this.bundledBootstrapAbort.signal);
+				await this.activateLocked(descriptor.pluginId, {
+					reason: "builtin-install",
+					signal: this.bundledBootstrapAbort.signal,
+				});
+				await this.stateStore.setBundledBootstrap(descriptor.pluginId, {
+					status: "adopted",
+					version: descriptor.version,
+					archiveSha256: payload.sha256,
+				});
+				this.notifySourceChanged(descriptor.pluginId);
+				return this.requireStatus(descriptor.pluginId);
+			} catch (error) {
+				if (
+					attempted &&
+					(installed ||
+						!packagePointersEqual(
+							initialCurrent,
+							(await this.packageStore.readCurrent()).plugins[descriptor.pluginId],
+						))
+				) {
+					await this.runtimeSupervisor.disable(descriptor.pluginId);
+					if (await this.stateStore.getState(descriptor.pluginId))
+						await this.stateStore.updateState(descriptor.pluginId, {
+							desiredState: "disabled",
+							runtimeState: "failed",
+							lastError: pluginStateError(error, {
+								phase: "builtin-install",
+								at: this.timestamp(),
+							}),
+						});
+				}
+				throw error;
+			} finally {
+				clearTimeout(timer);
+			}
+		});
+	}
+
+	install(source: PackageSource, options: PluginInstallOptions = {}): Promise<PluginManagerStatus> {
+		return this.trackLifecycleOperation(this.installInternal(source, options));
+	}
+
+	private async installInternal(
+		source: PackageSource,
+		options: PluginInstallOptions,
+	): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown();
 		await this.ensureInitialized();
 		this.assertFeatureEnabled("install");
 		const hintedPluginId = options.pluginId ?? (await this.discoverSourcePluginId(source));
@@ -675,75 +1556,86 @@ export class PluginManager {
 			);
 		}
 
-		// Archive/byte sources do not reveal their identity before PackageStore validation.
-		const installed = await this.packageMutex.acquire("package-store", () =>
-			this.packageStore.install(source),
+		// Unknown identities may only stage immutable bytes. Publishing current, granting
+		// authority and changing desired state belong to the validated plugin's lifecycle lock.
+		const staged = await this.stagePackage(source);
+		assertPluginId(staged.pluginId);
+		return this.lifecycleMutex.acquire(staged.pluginId, () =>
+			this.installLocked(source, staged.pluginId, { staged, trustVerified: true }),
 		);
-		return this.lifecycleMutex.acquire(installed.pluginId, () =>
-			this.finishInstalledPackage(installed),
-		);
+	}
+
+	private admitLifecycleChange<T>(pluginId: string, change: () => Promise<T>): Promise<T> {
+		this.assertNotShuttingDown();
+		return this.trackLifecycleOperation(this.lifecycleMutex.acquire(pluginId, change));
 	}
 
 	async enable(pluginId: string): Promise<PluginManagerStatus> {
 		await this.ensureInitialized();
 		this.assertFeatureEnabled("enable");
 		assertPluginId(pluginId);
-		return this.lifecycleMutex.acquire(pluginId, async () => {
-			await this.refreshCatalog();
-			const state = await this.requireState(pluginId);
-			const plugin = this.catalogPlugin(pluginId);
-			if (packageCompatibility(plugin) !== "compatible") {
-				const operation = await this.stateStore.beginOperation({ pluginId, operation: "enable" });
-				const error = new PluginManagerError(
-					`Plugin is not compatible and cannot be enabled: ${pluginId}`,
-					"PLUGIN_INCOMPATIBLE",
-					422,
-				);
-				await this.failOperation(operation, error, "compatibility");
+		return this.admitLifecycleChange(pluginId, () => this.enableLocked(pluginId));
+	}
+
+	private async enableLocked(pluginId: string, signal?: AbortSignal): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown(signal);
+		await this.refreshCatalog();
+		const state = await this.requireState(pluginId);
+		this.assertNotShuttingDown(signal);
+		const plugin = this.catalogPlugin(pluginId);
+		if (packageCompatibility(plugin) !== "compatible") {
+			const operation = await this.stateStore.beginOperation({ pluginId, operation: "enable" });
+			const error = new PluginManagerError(
+				`Plugin is not compatible and cannot be enabled: ${pluginId}`,
+				"PLUGIN_INCOMPATIBLE",
+				422,
+			);
+			await this.failOperation(operation, error, "compatibility");
+			throw error;
+		}
+		if (state.desiredState === "enabled" && !this.lifecycleRevokeFailures.has(pluginId)) {
+			await this.recordLegacyQuotaChoice(pluginId, "enabled", state);
+			await this.refreshCatalog("enable");
+			return this.requireStatus(pluginId);
+		}
+		return this.runJournaled(pluginId, "enable", {}, async () => {
+			this.assertNotShuttingDown(signal);
+			await this.stateStore.updateState(pluginId, {
+				desiredState: "enabled",
+				compatibility: "compatible",
+				lastError: null,
+			});
+			try {
+				if (this.lifecycleRevokeFailures.has(pluginId)) {
+					// Failed generation/grant events are cached; explicit recovery needs a fresh event.
+					await this.revokePluginLifecycle(pluginId, "disable", "manager-enable-recovery");
+				}
+				const runtime = this.runtimeSupervisor.get(pluginId);
+				if (runtime && ["active", "degraded"].includes(runtime.state)) {
+					await this.reconcileActiveRuntimeAccess(pluginId);
+				} else {
+					await this.restorePluginAccess(pluginId);
+				}
+			} catch (error) {
+				await this.stateStore.updateState(pluginId, {
+					desiredState: "disabled",
+					lastError: pluginStateError(error, {
+						phase: "enable-restore",
+						at: this.timestamp(),
+					}),
+				});
 				throw error;
 			}
-			if (state.desiredState === "enabled" && !this.lifecycleRevokeFailures.has(pluginId)) {
-				await this.refreshCatalog("enable");
-				return this.requireStatus(pluginId);
-			}
-			return this.runJournaled(pluginId, "enable", {}, async () => {
-				await this.stateStore.updateState(pluginId, {
-					desiredState: "enabled",
-					compatibility: "compatible",
-					lastError: null,
-				});
-				try {
-					if (this.lifecycleRevokeFailures.has(pluginId)) {
-						// An explicit recovery attempt needs a fresh event ID: the coordinator
-						// caches failed generation/grant events even after an adapter recovers.
-						await this.revokePluginLifecycle(pluginId, "disable", "manager-enable-recovery");
-					}
-					const runtime = this.runtimeSupervisor.get(pluginId);
-					if (runtime && ["active", "degraded"].includes(runtime.state)) {
-						await this.reconcileActiveRuntimeAccess(pluginId);
-					} else {
-						await this.restorePluginAccess(pluginId);
-					}
-				} catch (error) {
-					await this.stateStore.updateState(pluginId, {
-						desiredState: "disabled",
-						lastError: pluginStateError(error, {
-							phase: "enable-restore",
-							at: this.timestamp(),
-						}),
-					});
-					throw error;
-				}
-				await this.refreshCatalog("enable");
-				return this.requireStatus(pluginId);
-			});
+			await this.recordLegacyQuotaChoice(pluginId, "enabled", state);
+			await this.refreshCatalog("enable");
+			return this.requireStatus(pluginId);
 		});
 	}
 
 	async disable(pluginId: string): Promise<PluginManagerStatus> {
 		await this.ensureInitialized();
 		assertPluginId(pluginId);
-		return this.lifecycleMutex.acquire(pluginId, async () => {
+		return this.admitLifecycleChange(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			const runtime = this.runtimeSupervisor.get(pluginId);
 			if (
@@ -751,6 +1643,7 @@ export class PluginManager {
 				(!runtime || runtime.state === "stopped") &&
 				!this.lifecycleRevokeFailures.has(pluginId)
 			) {
+				await this.recordLegacyQuotaChoice(pluginId, "disabled", state);
 				await this.refreshCatalog("disable");
 				return this.requireStatus(pluginId);
 			}
@@ -760,6 +1653,7 @@ export class PluginManager {
 					desiredState: "disabled",
 					runtimeState: runtime && runtime.state !== "stopped" ? "draining" : "inactive",
 				});
+				await this.recordLegacyQuotaChoice(pluginId, "disabled", state);
 				await this.refreshCatalog("disable");
 				try {
 					await this.runtimeSupervisor.disable(pluginId);
@@ -780,10 +1674,15 @@ export class PluginManager {
 		});
 	}
 
-	async activate(
+	activate(pluginId: string, options: PluginActivationOptions = {}): Promise<PluginManagerStatus> {
+		return this.trackLifecycleOperation(this.activateInternal(pluginId, options));
+	}
+
+	private async activateInternal(
 		pluginId: string,
-		options: PluginActivationOptions = {},
+		options: PluginActivationOptions,
 	): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown(options.signal);
 		await this.ensureInitialized();
 		assertPluginId(pluginId);
 		if (this.shuttingDown) {
@@ -808,7 +1707,7 @@ export class PluginManager {
 	async deactivate(pluginId: string): Promise<PluginManagerStatus> {
 		await this.ensureInitialized();
 		assertPluginId(pluginId);
-		return this.lifecycleMutex.acquire(pluginId, async () => {
+		return this.admitLifecycleChange(pluginId, async () => {
 			await this.requireState(pluginId);
 			const runtime = this.runtimeSupervisor.get(pluginId);
 			if (!runtime || runtime.state === "stopped") {
@@ -1014,7 +1913,7 @@ export class PluginManager {
 				status: "granted",
 			});
 
-			const permissions = await this.permissionStore.getSet(pluginId, installationId);
+			const permissions = await this.integrationAuthorityService.get(pluginId, installationId);
 			return {
 				status: await this.requireStatus(pluginId),
 				permissions,
@@ -1192,6 +2091,7 @@ export class PluginManager {
 	async uninstall(pluginId: string): Promise<void> {
 		await this.ensureInitialized();
 		assertPluginId(pluginId);
+		this.notifySourceChanged(pluginId);
 		await this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.stateStore.getState(pluginId);
 			const plugin = this.catalogPlugin(pluginId);
@@ -1201,6 +2101,17 @@ export class PluginManager {
 				"uninstall",
 				{ from: state?.current ?? plugin?.current ?? null },
 				async () => {
+					await this.recordLegacyQuotaChoice(pluginId, "removed", state);
+					const bundled = await this.stateStore.getBundledBootstrap(pluginId);
+					if (bundled) {
+						await this.stateStore.setBundledBootstrap(pluginId, {
+							status: "removed",
+							version: bundled.version,
+							archiveSha256: bundled.archiveSha256,
+							defaultChoice: bundled.defaultChoice,
+							inheritedFrom: bundled.inheritedFrom,
+						});
+					}
 					await this.revokePluginLifecycle(pluginId, "uninstall", "manager-uninstall", {
 						grantRevision: state ? state.grants.revision + 1 : undefined,
 					});
@@ -1364,6 +2275,7 @@ export class PluginManager {
 		if (!options.confirm) {
 			throw new ValidationError("Plugin authorization reset requires explicit confirmation");
 		}
+		this.notifySourceChanged(pluginId);
 		return this.lifecycleMutex.acquire(pluginId, async () => {
 			const state = await this.requireState(pluginId);
 			// Tear down UI sessions, bindings, subscriptions and tool grants for
@@ -1439,60 +2351,147 @@ export class PluginManager {
 		return this.list();
 	}
 
-	async shutdown(): Promise<void> {
-		this.shuttingDown = true;
+	shutdown(options: { timeoutMs?: number } = {}): Promise<void> {
+		this.beginShutdown();
+		if (this.shutdownPromise) return this.shutdownPromise;
+		const work = this.shutdownInternal(Date.now() + (options.timeoutMs ?? 125_000));
+		this.shutdownPromise = work;
+		void work.catch(() => {
+			// A failed drain is not a successful shutdown. Permit a later bounded retry.
+			if (this.shutdownPromise === work) this.shutdownPromise = undefined;
+		});
+		return work;
+	}
+
+	private async shutdownInternal(deadline: number): Promise<void> {
 		const failures: unknown[] = [];
+		const recordFailure = (error: unknown) => {
+			if (!failures.includes(error)) failures.push(error);
+		};
 		try {
 			this.runtimeSupervisor.stopProducers?.();
-			await this.initializePromise;
+			// Bootstrap/source operations release their own locks after cancellation. Runtime
+			// callbacks are a separate queue: waiting for a held write here could block real exit.
+			const work = await this.awaitShutdownWork(
+				Promise.allSettled([this.initializePromise, ...this.pendingLifecycleOperations]),
+				deadline,
+			);
+			if (work[0]?.status === "rejected") recordFailure(work[0].reason);
 			if (this.initialized) {
-				const states = await this.stateStore.listStates();
+				const states = await this.awaitShutdownWork(this.stateStore.listStates(), deadline);
 				const enabled = states.filter(
 					(state) =>
 						state.runtimeState !== "inactive" &&
 						state.runtimeState !== "stopped" &&
 						this.runtimeSupervisor.get(state.pluginId),
 				);
-				const results = await Promise.allSettled(
-					enabled.map((state) =>
-						this.lifecycleMutex.acquire(state.pluginId, async () => {
-							const operation = await this.stateStore.beginOperation({
-								pluginId: state.pluginId,
-								operation: "deactivate",
-								context: { reason: "host-shutdown" },
-							});
-							await this.stateStore.updateOperation(operation.id, { status: "running" });
-							try {
-								await this.runtimeSupervisor.disable(state.pluginId);
-								await this.stateStore.updateState(state.pluginId, { runtimeState: "inactive" });
-								await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
-							} catch (error) {
-								failures.push(error);
-								await this.persistFailure(state.pluginId, error, "shutdown", false);
-								await this.failOperation(operation, error, "shutdown");
-							}
-						}),
+				const results = await this.awaitShutdownWork(
+					Promise.allSettled(
+						enabled.map((state) =>
+							this.lifecycleMutex.acquire(state.pluginId, async () => {
+								const operation = await this.stateStore.beginOperation({
+									pluginId: state.pluginId,
+									operation: "deactivate",
+									context: { reason: "host-shutdown" },
+								});
+								await this.stateStore.updateOperation(operation.id, { status: "running" });
+								try {
+									await this.runtimeSupervisor.disable(state.pluginId);
+									await this.stateStore.updateState(state.pluginId, { runtimeState: "inactive" });
+									await this.stateStore.updateOperation(operation.id, { status: "succeeded" });
+								} catch (error) {
+									recordFailure(error);
+									await this.persistFailure(state.pluginId, error, "shutdown", false);
+									await this.failOperation(operation, error, "shutdown");
+								}
+							}),
+						),
 					),
+					deadline,
 				);
 				for (const result of results)
-					if (result.status === "rejected") failures.push(result.reason);
+					if (result.status === "rejected") recordFailure(result.reason);
 			}
 		} catch (error) {
-			failures.push(error);
+			recordFailure(error);
 		}
-		// Equivalent to an unconditional finally: metadata failures and an uninitialized manager
-		// never skip actual resource stop/exit, nor writes queued by its final runtime callbacks.
+		// Metadata failure, interrupted initialization and drain timeout never skip resource stop.
+		// A timeout still rejects; supervisor/Worker ownership remains until actual exit is known.
+		let resourcesExited = false;
 		try {
-			await this.runtimeSupervisor.shutdown();
+			this.supervisorShutdown = this.runtimeSupervisor.shutdown();
+			await this.awaitShutdownWork(this.supervisorShutdown, deadline);
+			resourcesExited = true;
 		} catch (error) {
-			failures.push(error);
+			recordFailure(error);
 		}
-		while (this.runtimeEvents.size) {
-			const results = await Promise.allSettled([...this.runtimeEvents]);
-			for (const result of results) if (result.status === "rejected") failures.push(result.reason);
+		try {
+			const results = await this.awaitShutdownWork(
+				Promise.allSettled(
+					[...this.uncertainLifecycleResources].map(async (handle) => {
+						try {
+							await handle.close();
+						} catch (error) {
+							throw error instanceof WorkerCleanupError
+								? error
+								: new WorkerCleanupError(handle, error);
+						}
+					}),
+				),
+				deadline,
+			);
+			for (const result of results) {
+				if (result.status === "rejected") {
+					resourcesExited = false;
+					recordFailure(result.reason);
+				}
+			}
+		} catch (error) {
+			resourcesExited = false;
+			recordFailure(error);
 		}
+		try {
+			while (this.runtimeEvents.size) {
+				const results = await this.awaitShutdownWork(
+					Promise.allSettled([...this.runtimeEvents]),
+					deadline,
+				);
+				for (const result of results)
+					if (result.status === "rejected") recordFailure(result.reason);
+			}
+			if (resourcesExited && !this.hasPendingShutdownWork()) this.runtimeEventsClosed = true;
+		} catch (error) {
+			recordFailure(error);
+		}
+		if (this.shutdownRuntimeEventFailure) recordFailure(this.shutdownRuntimeEventFailure.error);
 		if (failures.length === 1) throw failures[0];
 		if (failures.length) throw new AggregateError(failures, "Plugin shutdown failed");
+	}
+
+	private async awaitShutdownWork<T>(work: Promise<T>, deadline: number): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				// The deadline bounds the waiter, not the underlying journal/disable/close. A
+				// handoff (or retry) must still see that work until the original promise settles.
+				this.trackLifecycleOperation(work),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								new PluginManagerError(
+									"Plugin manager shutdown deadline exceeded",
+									"PLUGIN_SHUTDOWN_TIMEOUT",
+									503,
+								),
+							),
+						Math.max(0, deadline - Date.now()),
+					);
+				}),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 	}
 
 	private async initializeInternal(): Promise<PluginManagerStatus[]> {
@@ -1549,6 +2548,9 @@ export class PluginManager {
 			}
 		}
 		this.catalogSnapshot = await this.catalog.scan();
+		if (!persistenceCorrupt && !this.shuttingDown) {
+			await this.captureLegacyQuotaDefaultChoice(snapshot.states, snapshot.operations);
+		}
 
 		const stateById = new Map(snapshot.states.map((state) => [state.pluginId, state]));
 		const pluginIds = new Set([
@@ -1559,8 +2561,37 @@ export class PluginManager {
 		for (const pluginId of [...pluginIds].sort()) {
 			const plugin = this.catalogPlugin(pluginId);
 			const packageSummary = currentPackage(plugin);
-			const currentState =
+			let currentState =
 				stateById.get(pluginId) ?? createPluginStateRecord(pluginId, this.timestamp());
+			let sourceRollback = false;
+			const rollback = incompleteByPlugin
+				.get(pluginId)
+				?.find(
+					(operation) =>
+						operation.operation === "upgrade" &&
+						operation.context.sourceUpdate === true &&
+						operation.context.rollbackState !== undefined,
+				);
+			if (!persistenceCorrupt && rollback && pointerRecovery.get(pluginId)?.restored) {
+				try {
+					const checkpoint = validatePluginStateRecord(rollback.context.rollbackState, pluginId);
+					if (!packagePointersEqual(checkpoint.current, rollback.context.from))
+						throw new Error("Recovery state does not match the previous package");
+					currentState = {
+						...checkpoint,
+						runtimeGeneration: Math.max(
+							currentState.runtimeGeneration,
+							checkpoint.runtimeGeneration,
+						),
+					};
+					sourceRollback = true;
+				} catch (error) {
+					logger.warn("Invalid source-update recovery state; automatic activation disabled", {
+						pluginId,
+						error: errorMessage(error),
+					});
+				}
+			}
 			// A builtin plugin ships enabled: it is part of the application, not something an
 			// admin installed, so there is no moment at which someone opted in. Its state
 			// record is created implicitly here (no install step) and from then on is the same
@@ -1578,7 +2609,7 @@ export class PluginManager {
 			const incomplete = incompleteByPlugin.get(pluginId) ?? [];
 			const corruptOrIncomplete = persistenceCorrupt || incomplete.length > 0;
 			if (corruptOrIncomplete) {
-				next.desiredState = "disabled";
+				next.desiredState = sourceRollback ? currentState.desiredState : "disabled";
 				next.runtimeState = packageSummary ? "inactive" : "failed";
 				next.lastError = pluginStateError(
 					new Error(
@@ -1694,7 +2725,7 @@ export class PluginManager {
 		}
 
 		this.initialized = true;
-		if (!this.disabled) {
+		if (!this.disabled && !this.shuttingDown) {
 			const startupStates = await this.stateStore.listStates();
 			const startupPlugins = startupStates.filter((state) => {
 				const plugin = this.catalogPlugin(state.pluginId);
@@ -1717,27 +2748,76 @@ export class PluginManager {
 	private async installLocked(
 		source: PackageSource,
 		expectedPluginId: string,
+		options: {
+			expectedVersion?: string;
+			seedGrantedBy?: "system";
+			signal?: AbortSignal;
+			staged?: PluginPackageStageResult;
+			requireAbsent?: boolean;
+			onCommit?: () => void;
+			ignoreCancellationAfterCommit?: boolean;
+			trustVerified?: boolean;
+		} = {},
 	): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown(options.signal);
 		const before = await this.packageStore.readCurrent();
+		this.assertNotShuttingDown(options.signal);
+		const from = before.plugins[expectedPluginId] ?? null;
 		const operation = await this.stateStore.beginOperation({
 			pluginId: expectedPluginId,
 			operation: "install",
-			context: { from: before.plugins[expectedPluginId] ?? null },
+			context: { from },
 		});
 		await this.stateStore.updateOperation(operation.id, { status: "running" });
 		try {
-			const installed = await this.packageMutex.acquire("package-store", () =>
-				this.packageStore.install(source),
-			);
-			if (installed.pluginId !== expectedPluginId) {
+			this.assertNotShuttingDown(options.signal);
+			if ((options.requireAbsent ?? options.expectedVersion !== undefined) && from) {
 				throw new PluginManagerError(
-					`Installed package identity ${installed.pluginId} did not match ${expectedPluginId}`,
+					"An existing installation supersedes the bundled default",
+					"PLUGIN_ALREADY_INSTALLED",
+					409,
+				);
+			}
+			const staged = options.staged ?? (await this.stagePackage(source, options.signal));
+			this.assertNotShuttingDown(options.signal);
+			if (
+				staged.pluginId !== expectedPluginId ||
+				(options.expectedVersion !== undefined && staged.version !== options.expectedVersion)
+			) {
+				throw new PluginManagerError(
+					`Installed package identity ${staged.pluginId}@${staged.version} did not match ${expectedPluginId}${options.expectedVersion ? `@${options.expectedVersion}` : ""}`,
 					"PLUGIN_IDENTITY_MISMATCH",
 					422,
 				);
 			}
-			const status = await this.finishInstalledPackage(installed, operation);
-			return status;
+			// Every source follows the same trust-before-current policy; directory hints
+			// are not identities until PackageStore has validated the immutable package.
+			const signatureKeyId =
+				options.staged && !options.trustVerified
+					? await this.assertPackageTrust(staged.path, staged.manifest, staged.hash, options.signal)
+					: staged.signatureKeyId;
+			this.assertNotShuttingDown(options.signal);
+			await this.packageMutex.acquire("package-store", () => {
+				this.assertNotShuttingDown(options.signal);
+				this.assertSignatureKeyTrusted(expectedPluginId, signatureKeyId);
+				options.onCommit?.();
+				this.assertSignatureKeyTrusted(expectedPluginId, signatureKeyId);
+				return this.packageStore.setCurrent(
+					expectedPluginId,
+					{ version: staged.version, hash: staged.hash },
+					{ expectedCurrent: from, operationId: operation.id },
+				);
+			});
+			const finishSignal = options.ignoreCancellationAfterCommit
+				? this.bundledBootstrapAbort.signal
+				: options.signal;
+			this.assertNotShuttingDown(finishSignal);
+			return await this.finishInstalledPackage(
+				{ ...staged, currentUpdated: true },
+				operation,
+				options.seedGrantedBy,
+				finishSignal,
+			);
 		} catch (error) {
 			await this.failOperation(operation, error, "install");
 			throw error;
@@ -1747,7 +2827,11 @@ export class PluginManager {
 	private async finishInstalledPackage(
 		installed: InstalledPackageResult,
 		operation?: PluginJournalEntry,
+		seedGrantedBy?: "system",
+		signal?: AbortSignal,
+		finishOptions: { deferJournalCompletion?: boolean; replaceRevoked?: boolean } = {},
 	): Promise<PluginManagerStatus> {
+		this.assertNotShuttingDown(signal);
 		const journal =
 			operation ??
 			(await this.stateStore.beginOperation({
@@ -1757,6 +2841,24 @@ export class PluginManager {
 			}));
 		try {
 			const previousState = await this.stateStore.getState(installed.pluginId);
+			const sourceBinding = previousState?.sourceBinding ?? {
+				...defaultPluginSourceBinding(),
+				source: (
+					await readPluginSourceMetadata(
+						previousState?.current
+							? join(
+									this.root,
+									"packages",
+									installed.pluginId,
+									previousState.current.version,
+									previousState.current.hash,
+								)
+							: installed.path,
+						installed.pluginId,
+						{ signal },
+					)
+				).source,
+			};
 			const nextPackage = { version: installed.version, hash: installed.hash };
 			const samePackage = packagePointersEqual(previousState?.current, nextPackage);
 			const previousAuthorityInstallationId = authorityInstallationId(previousState);
@@ -1765,12 +2867,19 @@ export class PluginManager {
 				: installed.hash;
 			const isUpgrade =
 				previousState?.current !== null && previousState?.current !== undefined && !samePackage;
-			if (isUpgrade) {
-				const runtime = this.runtimeSupervisor.get(installed.pluginId);
-				await this.revokePluginLifecycle(installed.pluginId, "upgrade", "manager-upgrade", {
-					runtimeId: runtime?.getDiagnostics().runtimeId,
-					runtimeGeneration: runtime?.getDiagnostics().generation,
-				});
+			const runtime = this.runtimeSupervisor.get(installed.pluginId);
+			const liveReinstall =
+				samePackage && runtime && ["active", "degraded", "starting"].includes(runtime.state);
+			if (isUpgrade || liveReinstall) {
+				await this.revokePluginLifecycle(
+					installed.pluginId,
+					"upgrade",
+					isUpgrade ? "manager-upgrade" : "manager-reinstall",
+					{
+						runtimeId: runtime?.getDiagnostics().runtimeId,
+						runtimeGeneration: runtime?.getDiagnostics().generation,
+					},
+				);
 				try {
 					await this.runtimeSupervisor.disable(installed.pluginId);
 				} catch (error) {
@@ -1779,8 +2888,9 @@ export class PluginManager {
 					throw error;
 				}
 			}
-			await this.assertPackageTrust(installed.path, installed.manifest);
+			this.assertNotShuttingDown(signal);
 			this.catalogSnapshot = await this.catalog.scan();
+			this.assertNotShuttingDown(signal);
 			const plugin = this.catalogPlugin(installed.pluginId);
 			const packageSummary = currentPackage(plugin);
 			const compatibility = packageCompatibility(plugin);
@@ -1788,6 +2898,7 @@ export class PluginManager {
 				...current,
 				current: { version: installed.version, hash: installed.hash },
 				authorityInstallationId: requestedInstallationId,
+				sourceBinding,
 				desiredState: "disabled",
 				compatibility,
 				runtimeState: "inactive",
@@ -1834,7 +2945,7 @@ export class PluginManager {
 				// Legacy states predate the stable UUID: inherit the old hash's
 				// grants. First installs have no legacy record at all.
 				previousState?.current?.hash,
-				{ replaceRevoked: true },
+				{ replaceRevoked: finishOptions.replaceRevoked ?? true, seedGrantedBy },
 			);
 			if (!previousInstallationId) {
 				await this.stateStore.setInstallationId(installed.pluginId, installationId);
@@ -1855,10 +2966,13 @@ export class PluginManager {
 				reportPluginRuntimeHealth("approval_requests_failed");
 			});
 			await this.refreshCatalog("install");
-			await this.stateStore.updateOperation(journal.id, {
-				status: "succeeded",
-				context: { to: packageReference(packageSummary) },
-			});
+			if (!finishOptions.deferJournalCompletion) {
+				await this.stateStore.updateOperation(journal.id, {
+					status: "succeeded",
+					context: { to: packageReference(packageSummary) },
+				});
+				this.notifySourceChanged(installed.pluginId);
+			}
 			logger.info("Plugin installed into the host control plane", {
 				pluginId: installed.pluginId,
 				version: installed.version,
@@ -1880,11 +2994,12 @@ export class PluginManager {
 	 * an unreachable catalog is still a usable registration (the user can retry), and
 	 * failing activation over model discovery would be a worse outcome.
 	 */
-	private async refreshProviderCatalogs(_pluginId: string): Promise<void> {
+	private async refreshProviderCatalogs(_pluginId: string, signal?: AbortSignal): Promise<void> {
 		if (!this.providerCatalogRefresher) return;
 		try {
-			await this.providerCatalogRefresher.refreshStale();
-		} catch {
+			await this.providerCatalogRefresher.refreshStale({ signal });
+		} catch (error) {
+			if (signal?.aborted) throw error;
 			reportPluginRuntimeHealth("provider_catalog_refresh_failed");
 		}
 	}
@@ -1893,8 +3008,13 @@ export class PluginManager {
 		pluginId: string,
 		options: PluginActivationOptions,
 	): Promise<PluginManagerStatus> {
+		const signal = options.signal
+			? AbortSignal.any([options.signal, this.bundledBootstrapAbort.signal])
+			: this.bundledBootstrapAbort.signal;
+		this.assertNotShuttingDown(signal);
 		await this.refreshCatalog();
 		const state = await this.requireState(pluginId);
+		this.assertNotShuttingDown(signal);
 		if (state.desiredState !== "enabled") {
 			throw new PluginManagerError(
 				`Plugin must be enabled before activation: ${pluginId}`,
@@ -1920,7 +3040,11 @@ export class PluginManager {
 			// instead of trusting the active marker, so tool/UI calls recover
 			// without a host restart.
 			await this.reconcileActiveRuntimeAccess(pluginId);
+			this.assertNotShuttingDown(signal);
+			await this.stateStore.updateState(pluginId, { runtimeState: "active" });
+			this.assertNotShuttingDown(signal);
 			await this.refreshCatalog("activate");
+			this.assertNotShuttingDown(signal);
 			return this.requireStatus(pluginId);
 		}
 
@@ -1938,20 +3062,33 @@ export class PluginManager {
 			"activate",
 			{ to: packageReference(packageSummary), reason: options.reason ?? "explicit" },
 			async () => {
+				this.assertNotShuttingDown(signal);
 				await this.stateStore.updateState(pluginId, {
 					runtimeState: "starting",
 					lastError: null,
 				});
 				try {
+					this.assertNotShuttingDown(signal);
 					const manifest = await this.readPackageManifest(packageSummary);
-					await this.assertPackageTrust(packageSummary.path, manifest);
+					this.assertNotShuttingDown(signal);
+					const signatureKeyId = await this.assertPackageTrust(
+						packageSummary.path,
+						manifest,
+						packageSummary.hash,
+						signal,
+					);
+					this.assertNotShuttingDown(signal);
 					if (!manifest.server) {
+						this.assertSignatureKeyTrusted(pluginId, signatureKeyId);
 						await this.stateStore.updateState(pluginId, {
 							runtimeState: "active",
 							consecutiveFailures: 0,
 						});
+						this.assertNotShuttingDown(signal);
 						await this.restorePluginAccess(pluginId);
+						this.assertNotShuttingDown(signal);
 						await this.refreshCatalog("activate");
+						this.assertNotShuttingDown(signal);
 						return this.requireStatus(pluginId);
 					}
 					const runtimeOptions = await this.createRuntimeOptions(
@@ -1959,7 +3096,9 @@ export class PluginManager {
 						packageSummary,
 						manifest,
 						options.reason ?? "explicit",
+						signal,
 					);
+					this.assertNotShuttingDown(signal);
 					if (
 						runtimeOptions.runner instanceof PodmanRunner &&
 						!(await runtimeOptions.runner.isAvailable())
@@ -1975,16 +3114,19 @@ export class PluginManager {
 					// an upgrade the command changed, so it replaces the record and
 					// the new package actually starts (the old behavior restarted
 					// the stale package binary while state reported the new one).
-					const runtime = await this.runtimeSupervisor.start(runtimeOptions);
+					this.assertNotShuttingDown(signal);
+					this.assertSignatureKeyTrusted(pluginId, signatureKeyId);
+					const runtime = await this.runtimeSupervisor.start(runtimeOptions, signal);
+					this.assertNotShuttingDown(signal);
 					const diagnostics = runtime.getDiagnostics();
 					if (runtimeOptions.runtimeId && packageSummary.hash) {
 						await this.completePendingRuntimeRevocation(pluginId, diagnostics);
-						await this.bindRuntimeForRuntime(
-							pluginId,
-							await this.currentInstallationId(pluginId),
-							diagnostics,
-						);
+						this.assertNotShuttingDown(signal);
+						const installationId = await this.currentInstallationId(pluginId);
+						this.assertNotShuttingDown(signal);
+						await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
 					}
+					this.assertNotShuttingDown(signal);
 					await this.stateStore.updateState(pluginId, (current) => ({
 						...current,
 						runtimeState: "active",
@@ -1994,16 +3136,21 @@ export class PluginManager {
 						lastError: null,
 						updatedAt: this.timestamp(),
 					}));
+					this.assertNotShuttingDown(signal);
 					await this.restorePluginAccess(pluginId);
+					this.assertNotShuttingDown(signal);
 					await this.refreshCatalog("activate");
+					this.assertNotShuttingDown(signal);
 					// The runtime is already up, so pulling the model catalog costs no extra
 					// activation. Discovery failure must not fail activation: the provider stays
 					// registered with a stale catalog and can be refreshed again later.
-					await this.refreshProviderCatalogs(pluginId);
+					await this.refreshProviderCatalogs(pluginId, signal);
+					this.assertNotShuttingDown(signal);
 					return this.requireStatus(pluginId);
 				} catch (error) {
 					this.hostServices.revokeRuntime(pluginId);
-					const quarantine = shouldQuarantine(error);
+					if (signal.aborted) await this.runtimeSupervisor.disable(pluginId);
+					const quarantine = !signal.aborted && shouldQuarantine(error);
 					if (quarantine) {
 						this.runtimeSupervisor.quarantine(
 							pluginId,
@@ -2026,6 +3173,7 @@ export class PluginManager {
 					throw error;
 				}
 			},
+			signal,
 		);
 	}
 
@@ -2034,7 +3182,9 @@ export class PluginManager {
 		packageSummary: PluginPackageSummary,
 		manifest: Manifest,
 		reason: string,
+		signal?: AbortSignal,
 	): Promise<PluginRuntimeOptions> {
+		this.assertNotShuttingDown(signal);
 		const dataPath = join(this.root, "data", state.pluginId);
 		const tempPath = join(this.root, "temp", state.pluginId);
 		const logPath = join(this.root, "logs", state.pluginId);
@@ -2043,6 +3193,7 @@ export class PluginManager {
 			mkdir(tempPath, { recursive: true, mode: 0o700 }),
 			mkdir(logPath, { recursive: true, mode: 0o700 }),
 		]);
+		this.assertNotShuttingDown(signal);
 		const context: PluginRuntimeBuildContext = {
 			pluginId: state.pluginId,
 			state,
@@ -2058,6 +3209,7 @@ export class PluginManager {
 		const created = this.runtimeOptionsFactory
 			? await this.runtimeOptionsFactory(context)
 			: await this.defaultRuntimeOptions(context);
+		this.assertNotShuttingDown(signal);
 		let runtimeOptions = created;
 		if (manifest.server) {
 			const existingDiagnostics = this.runtimeSupervisor.get(state.pluginId)?.getDiagnostics();
@@ -2069,8 +3221,11 @@ export class PluginManager {
 					state.runtimeGeneration,
 					created.generation ?? 0,
 				) + 1;
+			this.assertNotShuttingDown(signal);
 			await this.stateStore.updateState(state.pluginId, { runtimeGeneration: nextGeneration });
+			this.assertNotShuttingDown(signal);
 			const binding = await this.bindRuntimeDescriptor(context, runtimeId, nextGeneration);
+			this.assertNotShuttingDown(signal);
 			// The spawned plugin process must carry the same stable installation
 			// UUID as the broker binding, otherwise every host call fails identity
 			// validation (the dispatcher would otherwise fall back to a
@@ -2387,8 +3542,7 @@ export class PluginManager {
 					// Windows pain point and previously fell back to spawning the
 					// host binary → instance lock conflict → QUARANTINED). Dev
 					// mode (host runs under Bun) keeps spawning bun directly.
-					const compiledBinary =
-						import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+					const compiledBinary = isCompiledRuntime();
 					if (compiledBinary) {
 						command = [process.execPath, PLUGIN_RUNTIME_WORKER_FLAG, entryPath, ...server.args];
 					} else {
@@ -2417,6 +3571,7 @@ export class PluginManager {
 			(tool) => tool.execution === "server",
 		);
 		const hasProviders = context.manifest.contributes.providers.length > 0;
+		const hasQuotaSources = context.manifest.contributes.quotaSources.length > 0;
 		return {
 			pluginId: context.pluginId,
 			pluginVersion: context.manifest.version,
@@ -2428,11 +3583,12 @@ export class PluginManager {
 			// Only server-tool plugins need larger replies. Mixed provider plugins retain
 			// their full-history request allowance; unrelated plugins keep their defaults.
 			...(hasServerTools ? { maxFrameBytes: PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES } : {}),
-			...(hasServerTools || hasProviders
+			...(hasServerTools || hasProviders || hasQuotaSources
 				? {
 						maxOutboundFrameBytes: Math.max(
 							hasServerTools ? PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES : 0,
 							hasProviders ? PROVIDER_REQUEST_MAX_BYTES : 0,
+							hasQuotaSources ? PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES : 0,
 						),
 					}
 				: {}),
@@ -2453,135 +3609,78 @@ export class PluginManager {
 		};
 	}
 
-	/**
-	 * Enforce the optional signature and SBOM policy over a package's own bytes.
-	 *
-	 * This used to also take the plugin's trust tier and refuse to activate a `T3` package.
-	 * That check is gone with the tier axis itself: every install produced `T3` and nothing
-	 * could raise it, so the branch only ever meant "no plugin may activate while a trust
-	 * policy is on". Signature and SBOM verification are unaffected — they read the package,
-	 * not a host-assigned rank — so the phase argument is no longer needed either.
-	 */
-	private async assertPackageTrust(packagePath: string, manifest: Manifest): Promise<void> {
-		if (!this.trustPolicy.enabled) return;
-
-		const rawSignature = await this.readOptionalTrustJson(packagePath, "signature.json");
-		if (rawSignature === undefined && this.trustPolicy.requireSignature) {
-			throw new PluginManagerError(
-				"Plugin signature is required by the host trust policy",
-				"PLUGIN_SIGNATURE_REQUIRED",
-				422,
-			);
-		}
-		if (rawSignature !== undefined) {
-			let signature: ReturnType<typeof parsePluginSignature>;
+	/** All archive, signature and SBOM computation belongs to the bounded package Worker. */
+	private async stagePackage(
+		source: PackageSource,
+		signal?: AbortSignal,
+		expectedArchiveSha256?: string,
+		inspectPackage?: { pluginId: string; version: string; hash: string },
+		oldPackagePath?: string,
+	) {
+		const stageSignal = AbortSignal.any([
+			this.bundledBootstrapAbort.signal,
+			...(signal ? [signal] : []),
+		]);
+		return this.packageMutex.acquire("package-store", async () => {
+			this.assertNotShuttingDown(stageSignal);
 			try {
-				signature = parsePluginSignature(rawSignature);
+				const staged = await stagePluginPackage(this.root, source, {
+					signal: stageSignal,
+					limits: this.packageStore.limits,
+					expectedArchiveSha256,
+					inspectPackage,
+					oldPackagePath,
+					trustPolicy: this.trustPolicy,
+					workerFactory: this.packageStageWorkerFactory,
+				});
+				// The Worker receives a policy snapshot. Recheck the live keyring here
+				// and again at publication/start after any intervening persistence or IO.
+				this.assertSignatureKeyTrusted(staged.pluginId, staged.signatureKeyId);
+				return staged;
 			} catch (error) {
-				throw new PluginManagerError(
-					error instanceof Error ? error.message : "Plugin signature is invalid",
-					"PLUGIN_SIGNATURE_INVALID",
-					422,
-				);
-			}
-			if (signature.pluginId !== manifest.pluginId || signature.version !== manifest.version) {
-				throw new PluginManagerError(
-					"Plugin signature identity does not match the manifest",
-					"PLUGIN_SIGNATURE_IDENTITY_MISMATCH",
-					422,
-				);
-			}
-			if (!this.trustPolicy.keyring) {
-				throw new PluginManagerError(
-					"Plugin signature verification requires a configured trust keyring",
-					"PLUGIN_TRUST_CONFIGURATION_MISSING",
-					503,
-				);
-			}
-			const verification = await verifyPluginPackageSignature(
-				packagePath,
-				signature,
-				this.trustPolicy.keyring,
-			);
-			if (!verification.valid || !verification.trusted) {
-				throw new PluginManagerError(
-					`Plugin signature verification failed: ${verification.reason ?? "UNTRUSTED_SIGNATURE"}`,
-					"PLUGIN_SIGNATURE_UNTRUSTED",
-					422,
-				);
-			}
-		}
-
-		const rawSpdx = await this.readOptionalTrustJson(packagePath, "sbom.spdx.json");
-		const rawSbom =
-			rawSpdx !== undefined
-				? rawSpdx
-				: await this.readOptionalTrustJson(packagePath, "sbom.cdx.json");
-		if (rawSbom === undefined && this.trustPolicy.sbomPolicy?.requireSbom) {
-			throw new PluginManagerError(
-				"Plugin SBOM is required by the host trust policy",
-				"PLUGIN_SBOM_REQUIRED",
-				422,
-			);
-		}
-		if (rawSbom !== undefined) {
-			let sbom: ReturnType<typeof parseSbom>;
-			try {
-				sbom = parseSbom(rawSbom);
-			} catch (error) {
-				throw new PluginManagerError(
-					error instanceof Error ? error.message : "Plugin SBOM is invalid",
-					"PLUGIN_SBOM_INVALID",
-					422,
-				);
-			}
-			if (this.trustPolicy.sbomPolicy) {
-				const result = checkSbomInstallPolicy(sbom, this.trustPolicy.sbomPolicy);
-				if (!result.allowed) {
+				// PackageStore rejects malformed uploads with a typed input error. Rebuild
+				// that type across the Worker boundary without relabelling isolation failures.
+				if (error instanceof PluginRuntimeError && error.code === "VALIDATION_ERROR")
+					throw new ValidationError(error.message);
+				if (error instanceof PluginRuntimeError && error.code.startsWith("PLUGIN_"))
 					throw new PluginManagerError(
-						`Plugin SBOM policy failed: ${result.violations.join(",")}`,
-						"PLUGIN_SBOM_POLICY",
-						422,
+						error.message,
+						error.code,
+						error.code === "PLUGIN_TRUST_CONFIGURATION_MISSING" ? 503 : 422,
 					);
-				}
+				throw error;
 			}
-		}
+		});
 	}
 
-	private async readOptionalTrustJson(root: string, name: string): Promise<unknown | undefined> {
-		const path = join(root, name);
-		let info: Awaited<ReturnType<typeof lstat>>;
-		try {
-			info = await lstat(path);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			throw error;
-		}
-		if (info.isSymbolicLink() || !info.isFile()) {
+	/** Synchronous fence; never performs signature or package computation on the host. */
+	private assertSignatureKeyTrusted(pluginId: string, signatureKeyId?: string): void {
+		if (
+			this.trustPolicy.enabled &&
+			signatureKeyId &&
+			!this.trustPolicy.keyring?.isTrusted(signatureKeyId, pluginId)
+		)
 			throw new PluginManagerError(
-				`Plugin trust artifact is not a regular file: ${name}`,
-				"PLUGIN_TRUST_ARTIFACT_INVALID",
+				"Plugin signing key is no longer trusted",
+				"PLUGIN_SIGNATURE_UNTRUSTED",
 				422,
 			);
-		}
-		if (info.size > MAX_TRUST_ARTIFACT_BYTES) {
-			throw new PluginManagerError(
-				`Plugin trust artifact is too large: ${name}`,
-				"PLUGIN_TRUST_ARTIFACT_TOO_LARGE",
-				422,
-			);
-		}
-		try {
-			return JSON.parse(await readFile(path, "utf8")) as unknown;
-		} catch {
-			throw new PluginManagerError(
-				`Plugin trust artifact is invalid JSON: ${name}`,
-				"PLUGIN_TRUST_ARTIFACT_INVALID",
-				422,
-			);
-		}
 	}
 
+	private async assertPackageTrust(
+		packagePath: string,
+		manifest: Manifest,
+		hash: string,
+		signal?: AbortSignal,
+	): Promise<string | undefined> {
+		if (!this.trustPolicy.enabled) return;
+		const inspected = await this.stagePackage(packagePath, signal, undefined, {
+			pluginId: manifest.pluginId,
+			version: manifest.version,
+			hash,
+		});
+		return inspected.signatureKeyId;
+	}
 	private async readPackageManifest(packageSummary: PluginPackageSummary): Promise<Manifest> {
 		const manifestPath = join(packageSummary.path, "manifest.json");
 		const info = await lstat(manifestPath);
@@ -2649,7 +3748,8 @@ export class PluginManager {
 						}
 					: state,
 			)
-			.catch(() => {
+			.catch((error: unknown) => {
+				this.recordShutdownRuntimeEventFailure(error);
 				reportPluginRuntimeHealth("state_persist_failed", "warn", {
 					generation: diagnostics.generation,
 				});
@@ -2696,11 +3796,15 @@ export class PluginManager {
 		operation: PluginJournalOperation,
 		context: PluginJournalContext,
 		action: () => Promise<T>,
+		signal?: AbortSignal,
 	): Promise<T> {
+		signal?.throwIfAborted();
 		const journal = await this.stateStore.beginOperation({ pluginId, operation, context });
 		await this.stateStore.updateOperation(journal.id, { status: "running" });
 		try {
+			signal?.throwIfAborted();
 			const result = await action();
+			signal?.throwIfAborted();
 			await this.stateStore.updateOperation(journal.id, { status: "succeeded" });
 			return result;
 		} catch (error) {
@@ -3002,12 +4106,23 @@ export class PluginManager {
 		return report;
 	}
 
+	private recordShutdownRuntimeEventFailure(error: unknown): void {
+		// A completed failure degrades the marker, but is not a live owner retaining the lock.
+		if (this.shuttingDown) this.shutdownRuntimeEventFailure ??= { error };
+	}
+
 	private handleRuntimeStateChange(pluginId: string, event: RuntimeStateEvent): Promise<void> {
+		if (this.runtimeEventsClosed) return Promise.resolve();
+		// Runtime callbacks drain after actual resource exit, separately from source/bootstrap work.
+		// Waiting for them before supervisor shutdown can block termination on a StateStore write.
 		const pending = this.applyRuntimeStateChange(pluginId, event);
 		this.runtimeEvents.add(pending);
 		void pending.then(
 			() => this.runtimeEvents.delete(pending),
-			() => this.runtimeEvents.delete(pending),
+			(error: unknown) => {
+				this.recordShutdownRuntimeEventFailure(error);
+				this.runtimeEvents.delete(pending);
+			},
 		);
 		return pending;
 	}
@@ -3016,7 +4131,15 @@ export class PluginManager {
 		// Share ordering with disable/uninstall/permission mutations. Supervisor
 		// callbacks only enqueue; locked manager operations never await this queue.
 		await this.lifecycleMutex.acquire(pluginId, async () => {
+			if (this.runtimeEventsClosed) return;
 			const { diagnostics, state: runtimeState } = event;
+			// Exit/failure callbacks must persist during close; no active/starting callback may
+			// restore host access, and the queue is sealed once real exit and its writes drain.
+			if (
+				this.shuttingDown &&
+				!["stopped", "crashed", "failed", "quarantine"].includes(runtimeState)
+			)
+				return;
 			try {
 				if (runtimeState === "active" && this.isCurrentRuntimeEvent(pluginId, event)) {
 					if (await this.isRuntimeGenerationChange(pluginId, diagnostics.generation)) {
@@ -3052,8 +4175,9 @@ export class PluginManager {
 				} else if (!event.failurePersisted) {
 					await this.persistRuntimeState(pluginId, event);
 				}
-				await this.refreshCatalog();
+				if (!this.shuttingDown) await this.refreshCatalog();
 			} catch (error) {
+				this.recordShutdownRuntimeEventFailure(error);
 				await this.handleObservedLifecycleRevokeFailure(
 					pluginId,
 					runtimeState,
@@ -3359,6 +4483,17 @@ export class PluginManager {
 			...effectiveState,
 			installed: Boolean(packageSummary),
 			builtin: plugin?.builtin === true,
+			origin: plugin?.origin ?? packageSummary?.origin,
+			packageKind: plugin?.packageKind ?? packageSummary?.packageKind,
+			canUninstall: plugin?.canUninstall ?? packageSummary?.canUninstall,
+			sourceHint: plugin?.sourceHint ?? packageSummary?.sourceHint ?? null,
+			sourceDiagnostics: plugin?.sourceDiagnostics ?? packageSummary?.sourceDiagnostics ?? [],
+			canUpdate:
+				!this.disabled &&
+				!this.shuttingDown &&
+				Boolean(state?.current) &&
+				plugin?.builtin !== true &&
+				Boolean(state?.sourceBinding ? state.sourceBinding.source : packageSummary?.sourceHint),
 			featureDisabled: this.disabled,
 			packageStatus: packageSummary?.status,
 			manifest: packageSummary?.manifest,
@@ -3427,6 +4562,34 @@ export class PluginManager {
 		}
 	}
 
+	private trackLifecycleOperation<T>(work: Promise<T>): Promise<T> {
+		this.pendingLifecycleOperations.add(work);
+		const settled = () => this.pendingLifecycleOperations.delete(work);
+		void work.then(settled, (error: unknown) => {
+			if (error instanceof WorkerCleanupError) {
+				const { handle } = error;
+				this.uncertainLifecycleResources.add(handle);
+				void handle.exited.then(
+					() => this.uncertainLifecycleResources.delete(handle),
+					() => {},
+				);
+			}
+			settled();
+		});
+		return work;
+	}
+
+	private assertNotShuttingDown(signal?: AbortSignal): void {
+		signal?.throwIfAborted();
+		if (this.shuttingDown) {
+			throw new PluginManagerError(
+				"Plugin manager is shutting down",
+				"PLUGIN_MANAGER_SHUTTING_DOWN",
+				503,
+			);
+		}
+	}
+
 	private timestamp(): string {
 		return this.now().toISOString();
 	}
@@ -3443,6 +4606,31 @@ export class PluginManager {
  * (operational kill switch: "0"/"false" force-disables). When neither is set,
  * fall back to `settings.plugins.enabled` (defaults to true).
  */
+/** Contributions precede quota discovery; shutdown must never be undone by late startup. */
+export async function initializePluginServices(
+	manager: Pick<PluginManager, "initialize" | "bootstrapBundledPlugin" | "isShuttingDown">,
+	descriptors: readonly BundledPluginDescriptor[],
+	options: {
+		startQuota: () => void | Promise<void>;
+		onBootstrapError: (descriptor: BundledPluginDescriptor, error: unknown) => void;
+	},
+): Promise<boolean> {
+	if (manager.isShuttingDown()) return false;
+	await manager.initialize();
+	for (const descriptor of descriptors) {
+		if (manager.isShuttingDown()) return false;
+		try {
+			await manager.bootstrapBundledPlugin(descriptor);
+		} catch (error) {
+			if (manager.isShuttingDown()) return false;
+			options.onBootstrapError(descriptor, error);
+		}
+	}
+	if (manager.isShuttingDown()) return false;
+	await options.startQuota();
+	return true;
+}
+
 function pluginsEnabledFromEnvironment(): boolean {
 	const value = process.env.NF_PLUGINS_ENABLED ?? process.env.NARRAFORK_PLUGINS_ENABLED;
 	if (value !== undefined) {
@@ -3492,6 +4680,7 @@ export const pluginManager = hotSafe(
 			toolRegistry: pluginPlatformServices.toolRegistry,
 			agentToolBridge: pluginPlatformServices.toolBridge,
 			contributionCoordinator: pluginPlatformServices.contributionCoordinator,
+			quotaRegistry: pluginPlatformServices.quotaRegistry,
 			providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
 			lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: pluginPlatformServices.restorePlugin,

@@ -30,6 +30,7 @@ mock.module("../lib/narrator-ws-manager", () => ({
 			return filter;
 		},
 		removeListener: (filter: unknown) => subscriptions.delete(filter),
+		onConnectionChange: () => () => {},
 	},
 }));
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
@@ -107,7 +108,7 @@ test("optional enabled defers companion GETs but never unbinds the real Spec WS 
 	expect(api.readSpecTasks).toHaveBeenCalledTimes(1);
 	expect(api.getNarratorCurrentTask).toHaveBeenCalledTimes(1);
 	expect(api.quotaSnapshots).toHaveBeenCalledTimes(1);
-	expect([...subscriptions]).toEqual(before);
+	expect([...subscriptions]).toEqual([...before, { types: ["provider_quota_changed"] }]);
 });
 test("existing callers retain immediate GETs when enabled is omitted", async () => {
 	render();

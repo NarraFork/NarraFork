@@ -1,5 +1,6 @@
 import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
+import { providerQuotaService } from "../services/provider-quota-service";
 import { getNarraforkPath } from "./narrafork-home";
 import { credentialForStream, firstCredential } from "./provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
@@ -8,6 +9,7 @@ import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface CustomApiQuotaCache {
+	generation?: string;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	fetchedAt: number;
@@ -57,6 +59,7 @@ function customApiQuotaSnapshot(cache: CustomApiQuotaCache): QuotaSnapshot {
 		detail: {
 			quotaBalance: cache.quotaBalance,
 			detailedQuotaBalance: cache.detailedQuotaBalance,
+			...(cache.generation ? { generation: cache.generation } : {}),
 		},
 	};
 }
@@ -68,6 +71,7 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 		quotaBalance: normalizeQuotaBalance(detail.quotaBalance),
 		detailedQuotaBalance: normalizeDetailedQuotaBalance(detail.detailedQuotaBalance),
 		fetchedAt: snapshot.fetchedAt,
+		...(typeof detail.generation === "string" ? { generation: detail.generation } : {}),
 	});
 }
 
@@ -80,6 +84,7 @@ export function updateCustomApiQuotaByPrefix(
 	quotaBalance: string | null,
 	detailedQuotaBalance?: string | null,
 	expectedProviderIdentity?: string,
+	generation?: string,
 ): void {
 	const config = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
 	if (!config) return;
@@ -93,6 +98,7 @@ export function updateCustomApiQuotaByPrefix(
 			quotaBalance: normalizeQuotaBalance(quotaBalance),
 			detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
 			fetchedAt: Date.now(),
+			...(generation ? { generation } : {}),
 		}),
 		true,
 		STREAM_QUOTA_SOURCE,
@@ -103,6 +109,7 @@ export function updateCustomApiQuotaByPrefix(
 export function getCustomApiQuotaSnapshot(
 	providerId: string,
 	credentialId: string,
+	expectedGeneration?: string,
 ): QuotaSnapshot | undefined {
 	const config = provider(providerId);
 	if (!config) return undefined;
@@ -113,27 +120,37 @@ export function getCustomApiQuotaSnapshot(
 		: keys.length === 0 && credentialId === config.id
 			? config
 			: undefined;
-	return effective
-		? quotaStore.get(
-				credentialId,
-				customApiStreamQuotaIdentity(effective),
-				restoreSnapshot,
-				STREAM_QUOTA_SOURCE,
-			)
-		: undefined;
+	const snapshot =
+		effective && !key?.disabled
+			? quotaStore.get(
+					credentialId,
+					customApiStreamQuotaIdentity(effective),
+					restoreSnapshot,
+					STREAM_QUOTA_SOURCE,
+				)
+			: undefined;
+	if (
+		expectedGeneration &&
+		(snapshot?.detail as CustomApiQuotaCache | undefined)?.generation !== expectedGeneration
+	)
+		return undefined;
+	return snapshot;
 }
 
 export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache | undefined {
 	const config = provider(providerId);
 	if (!config) return undefined;
-	const credential = firstCredential(config);
-	rememberCredential(providerId, credential.id);
-	const snapshot = quotaStore.get(
-		credential.id,
-		customApiStreamQuotaIdentity(credential.config),
-		restoreSnapshot,
-		STREAM_QUOTA_SOURCE,
-	);
+	const current = providerQuotaService.peek(providerId);
+	if (
+		!current ||
+		current.status === "unavailable" ||
+		current.error === "unavailable" ||
+		current.pushCompatible === false
+	)
+		return undefined;
+	const credentialId = current.keyId ?? config.id;
+	rememberCredential(providerId, credentialId);
+	const snapshot = getCustomApiQuotaSnapshot(providerId, credentialId, current.generation);
 	return snapshot
 		? {
 				...(snapshot.detail as Omit<CustomApiQuotaCache, "fetchedAt">),
@@ -142,10 +159,7 @@ export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache
 		: undefined;
 }
 
-export function getAllCustomApiCachedQuotas(): Record<
-	string,
-	{ quotaBalance: string | null; detailedQuotaBalance: string | null; fetchedAt: number }
-> {
+export function getAllCustomApiCachedQuotas(): Record<string, CustomApiQuotaCache> {
 	const result: ReturnType<typeof getAllCustomApiCachedQuotas> = {};
 	for (const config of settings.customApiProviders ?? []) {
 		const cache = getCustomApiCachedQuota(config.id);

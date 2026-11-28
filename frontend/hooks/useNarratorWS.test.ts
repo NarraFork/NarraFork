@@ -9,8 +9,35 @@ import {
 	coerceCompactProgressEvent,
 	coercePermissionRoutingFields,
 	normalizeSubagentActivityCatchUp,
+	readCustomApiQuotaPushTarget,
+	readQuotaCredentialId,
 	useNarratorWS,
 } from "./useNarratorWS";
+
+describe("Custom API quota push request identity", () => {
+	test("only an opaque bounded credential identity is forwarded", () => {
+		expect(readQuotaCredentialId("current-key")).toBe("current-key");
+		expect(readQuotaCredentialId(undefined)).toBeUndefined();
+		for (const value of [null, false, 1, {}, [], "", "x".repeat(257)])
+			expect(readQuotaCredentialId(value)).toBeNull();
+	});
+	test("preserves only stable ID/generation and distinguishes legacy from malformed targets", () => {
+		expect(
+			readCustomApiQuotaPushTarget({ providerId: "p", generation: "g1", apiKey: "not forwarded" }),
+		).toEqual({ providerId: "p", generation: "g1" });
+		expect(readCustomApiQuotaPushTarget(undefined)).toBeUndefined();
+		for (const value of [
+			null,
+			false,
+			[],
+			{},
+			{ providerId: "p" },
+			{ providerId: "p", generation: 2 },
+		]) {
+			expect(readCustomApiQuotaPushTarget(value)).toBeNull();
+		}
+	});
+});
 
 describe("coerceCompactProgressEvent", () => {
 	test("normalizes live compact progress", () => {

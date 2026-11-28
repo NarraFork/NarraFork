@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import {
 	cp,
 	mkdir,
@@ -13,14 +15,22 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+import { db } from "@server/db";
+import { integrationAuthorities } from "@server/db/schema";
+import { ValidationError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import {
 	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
 	PROVIDER_REQUEST_MAX_BYTES,
 } from "@server/lib/plugins/protocol";
+import { WorkerCleanupError, WorkerHandle } from "@server/lib/worker-runtime/lifecycle";
+import type { BundledPluginDescriptor } from "@server/services/bundled-plugin-assets";
 import { integrationAuthorityService } from "@server/services/integration-authority-service";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
+import { PluginCatalog } from "@server/services/plugin-catalog";
 import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
 import { PluginHostServices } from "@server/services/plugin-host-services";
 import { pluginInstallationAuthorityId } from "@server/services/plugin-integration-authority-service";
@@ -29,11 +39,13 @@ import {
 	type PluginLifecycleRevokeEvent,
 } from "@server/services/plugin-lifecycle-revoke-coordinator";
 import {
+	initializePluginServices,
 	type PluginLifecycleRevokeCoordinatorLike,
 	PluginManager,
 	type PluginRuntimeSupervisorLike,
 	pluginManager,
 } from "@server/services/plugin-manager";
+import type { PackageSource } from "@server/services/plugin-package-store";
 import { PluginPermissionStore } from "@server/services/plugin-permission-store";
 import {
 	createPluginPlatformServices,
@@ -47,21 +59,32 @@ import {
 	type RuntimeDiagnostics,
 	type RuntimeState,
 	RuntimeSupervisor,
+	type stagePluginPackage,
 } from "@server/services/plugin-runtime";
+import {
+	createPluginSignaturePayload,
+	digestPluginDirectory,
+	PluginTrustKeyring,
+	type TrustedPluginKey,
+} from "@server/services/plugin-signature";
 import { createPluginStateRecord, PluginStateStore } from "@server/services/plugin-state-store";
+import archiver from "archiver";
+import { and, eq, inArray } from "drizzle-orm";
 
 const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
 );
 const tempRoots: string[] = [];
 const drainBeforeCleanup: Array<() => Promise<void>> = [];
+const managerFixtures: Array<{ release: () => void; drain: () => Promise<void> }> = [];
 
 async function makeTempRoot(base = tmpdir()): Promise<string> {
 	const created = await mkdtemp(join(base, "narrafork-plugin-manager-"));
-	tempRoots.push(created);
 	// macOS /var and Windows short-name TEMP paths can alias the real directory.
-	// Give the catalog a canonical fixture root; never relax its containment checks.
-	return realpath(created);
+	// Give both the catalog and cleanup the newly-created canonical private root.
+	const root = await realpath(created);
+	tempRoots.push(root);
+	return root;
 }
 
 async function makePackage(
@@ -91,6 +114,33 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+/** Delay the host's Worker admission while leaving package computation in the real Worker. */
+function packageStaging(manager: PluginManager) {
+	return manager as unknown as {
+		stagePackage(
+			source: PackageSource,
+			signal?: AbortSignal,
+			digest?: string,
+		): ReturnType<typeof stagePluginPackage>;
+	};
+}
+
+async function expectPending(work: Promise<unknown>): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		expect(
+			await Promise.race([
+				work.then(() => "finished"),
+				new Promise<string>((resolve) => {
+					timer = setTimeout(() => resolve("pending"), 30);
+				}),
+			]),
+		).toBe("pending");
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 /** Await actual fire-and-forget lifecycle work, including handlers queued by another handler. */
 function trackRuntimeLifecycle(manager: PluginManager): () => Promise<void> {
 	const pending: Promise<void>[] = [];
@@ -106,6 +156,104 @@ function trackRuntimeLifecycle(manager: PluginManager): () => Promise<void> {
 	}
 	return async () => {
 		while (pending.length) await Promise.all(pending.splice(0));
+	};
+}
+
+/** Every test manager owns a tracked lifecycle; the imported production singleton is untouched. */
+function makeManager(options: ConstructorParameters<typeof PluginManager>[0] = {}): PluginManager {
+	const manager = new PluginManager(options);
+	const settle = trackRuntimeLifecycle(manager);
+	const supervisor = manager.runtimeSupervisor;
+	managerFixtures.push({
+		release: () => {
+			if (supervisor instanceof FakeSupervisor) {
+				for (const gate of supervisor.gates.values()) gate.release.resolve();
+			}
+		},
+		drain: async () => {
+			await manager.shutdown();
+			await supervisor.shutdown();
+			await settle();
+		},
+	});
+	return manager;
+}
+
+async function makeBundledFixture(
+	root: string,
+	pluginId: string,
+	version = "1.0.1",
+	prepare?: (source: string) => Promise<void>,
+) {
+	const source = await makePackage(root, pluginId, (manifest) => {
+		manifest.version = version;
+		manifest.activationEvents = ["onStartup"];
+		(manifest.permissions as Record<string, unknown>).host = [
+			"quota.provide",
+			"provider.connection.request",
+		];
+	});
+	await prepare?.(source);
+	const archivePath = join(root, `${pluginId}.nfplugin`);
+	const archive = archiver("zip");
+	const sink = createWriteStream(archivePath);
+	const completed = pipeline(archive, sink);
+	const timer = setTimeout(() => {
+		archive.abort();
+		sink.destroy(new Error("bundled fixture archive timeout"));
+	}, 10_000);
+	try {
+		archive.directory(source, false);
+		await Promise.all([archive.finalize(), completed]);
+	} finally {
+		clearTimeout(timer);
+	}
+	const bytes = await readFile(archivePath);
+	if (bytes.byteLength > 2 * 1024 * 1024) throw new Error("bundled fixture byte limit exceeded");
+	const sha256 = createHash("sha256").update(bytes).digest("hex");
+	let loads = 0;
+	const descriptor: BundledPluginDescriptor = {
+		pluginId,
+		version,
+		load: async () => {
+			loads++;
+			return { bytes, sha256 };
+		},
+	};
+	return { source, bytes, sha256, descriptor, loadCount: () => loads };
+}
+
+function packageSigner(pluginId: string) {
+	const keys = generateKeyPairSync("ed25519");
+	const key: TrustedPluginKey = {
+		keyId: "manager-race-test",
+		publicKey: keys.publicKey,
+		pluginIds: [pluginId],
+	};
+	return {
+		key,
+		keyring: new PluginTrustKeyring([key]),
+		sign: async (source: string, version: string) => {
+			// Explicit fixture preparation; production still verifies only in the real Worker.
+			const digest = await digestPluginDirectory(source);
+			const payload = {
+				algorithm: "ed25519" as const,
+				keyId: key.keyId,
+				pluginId,
+				version,
+				packageDigest: digest.packageDigest,
+				files: digest.files,
+			};
+			await writeFile(
+				join(source, "signature.json"),
+				JSON.stringify({
+					...payload,
+					signature: sign(null, createPluginSignaturePayload(payload), keys.privateKey).toString(
+						"base64",
+					),
+				}),
+			);
+		},
 	};
 }
 
@@ -155,9 +303,13 @@ class FakeSupervisor implements PluginRuntimeSupervisorLike {
 		return runtime;
 	}
 
-	async start(options: PluginRuntimeOptions): Promise<FakeRuntime>;
+	async start(options: PluginRuntimeOptions, signal?: AbortSignal): Promise<FakeRuntime>;
 	async start(pluginId: string, signal?: AbortSignal): Promise<FakeRuntime>;
-	async start(optionsOrPluginId: PluginRuntimeOptions | string): Promise<FakeRuntime> {
+	async start(
+		optionsOrPluginId: PluginRuntimeOptions | string,
+		signal?: AbortSignal,
+	): Promise<FakeRuntime> {
+		signal?.throwIfAborted();
 		const runtime =
 			typeof optionsOrPluginId === "string"
 				? this.runtimes.get(optionsOrPluginId)
@@ -174,6 +326,7 @@ class FakeSupervisor implements PluginRuntimeSupervisorLike {
 			gate.entered.resolve();
 			await gate.release.promise;
 		}
+		signal?.throwIfAborted();
 		if (this.failures.has(pluginId)) {
 			const error = new PluginRuntimeError("simulated handshake failure", {
 				code: "HELLO_PLUGIN_ID_MISMATCH",
@@ -278,7 +431,7 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 		}
 		return report;
 	};
-	const manager = new PluginManager({
+	const manager = makeManager({
 		root: storeRoot,
 		disabled: false,
 		stateStore,
@@ -294,6 +447,10 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 		},
 	});
 	const settle = trackRuntimeLifecycle(manager);
+	drainBeforeCleanup.push(async () => {
+		releaseCrash.resolve();
+		await settle();
+	});
 	const source = await makePackage(root, pluginId, (manifest) => {
 		(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 	});
@@ -345,8 +502,14 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 }
 
 afterEach(async () => {
-	// Also release and drain held operations when Bun times out a test body.
+	// Release controlled start gates before any drain can wait on the lifecycle mutex.
+	for (const fixture of managerFixtures) fixture.release();
 	for (const drain of drainBeforeCleanup.splice(0)) await drain();
+	// Runtime callbacks can enqueue more state writes while shutdown is running. The factory's
+	// tracked drain awaits all of them before any private fixture directory is removed.
+	while (managerFixtures.length) {
+		for (const fixture of managerFixtures.splice(0)) await fixture.drain();
+	}
 	for (const root of tempRoots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -409,11 +572,13 @@ describe("PluginManager", () => {
 			expect(disable).toHaveBeenCalledTimes(1);
 			expect(shutdown).toHaveBeenCalledTimes(1);
 			expect(supervisor.get(pluginId)?.state).toBe("stopped");
+			expect(manager.hasPendingShutdownWork()).toBe(true);
 			expect(settled).toBe(false);
 			release.resolve();
 			await expect(closing).rejects.toBe(failure);
 			await settle();
 			expect(settled).toBe(true);
+			expect(manager.hasPendingShutdownWork()).toBe(false);
 			expect((await stateStore.getState(pluginId))?.lastError?.message).toBe(failure.message);
 			const operations = await stateStore.listOperations(pluginId);
 			expect(
@@ -510,8 +675,10 @@ describe("PluginManager", () => {
 	test.each([
 		"uninitialized",
 		"metadata-read-failure",
+		"callback-write-failure",
 	] as const)("shutdown still exits real processes and drains actual StateStore callbacks (%s)", async (mode) => {
 		const root = await makeTempRoot();
+		const writeError = new Error("terminal callback rename failed");
 		const writing = deferred();
 		const release = deferred();
 		let delayWrites = false;
@@ -521,6 +688,7 @@ describe("PluginManager", () => {
 				if (delayWrites) {
 					writing.resolve();
 					await release.promise;
+					if (mode === "callback-write-failure") throw writeError;
 				}
 				await rename(from, to);
 			},
@@ -565,8 +733,10 @@ describe("PluginManager", () => {
 					.catch(() => {});
 			},
 		});
+		expect(manager.hasPendingShutdownWork()).toBe(false); // Registered, never started.
 		await supervisor.start(pluginId);
 		const pid = runtime.pid;
+		expect(manager.hasPendingShutdownWork()).toBe(true);
 		const exited = Promise.withResolvers<void>();
 		const shutdown = supervisor.shutdown.bind(supervisor);
 		const shutdownSpy = spyOn(supervisor, "shutdown").mockImplementation(() => {
@@ -599,21 +769,197 @@ describe("PluginManager", () => {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(shutdownSpy).toHaveBeenCalledTimes(1);
 			expect(() => process.kill(pid as number, 0)).toThrow();
+			expect(supervisor.hasPendingShutdownWork()).toBe(false);
+			expect(manager.hasPendingShutdownWork()).toBe(true); // Atomic StateStore rename still owned.
 			expect(settled).toBe(false);
 			release.resolve();
 			if (mode === "metadata-read-failure") await expect(closing).rejects.toBe(metadataError);
+			else if (mode === "callback-write-failure") await expect(closing).rejects.toBe(writeError);
 			else await expect(closing).resolves.toBeUndefined();
 			expect(settled).toBe(true);
+			expect(manager.hasPendingShutdownWork()).toBe(false);
 			const persisted = JSON.parse(await readFile(stateStore.statePath, "utf8"));
 			// Persistence deliberately maps a stopped runtime to the existing inactive business state.
 			expect(persisted.plugins[pluginId].runtimeState).toBe("inactive");
-			expect(persisted.plugins[pluginId].runtimeGeneration).toBe(runtime.generation);
+			expect(persisted.plugins[pluginId].runtimeGeneration).toBe(
+				mode === "callback-write-failure" ? 0 : runtime.generation,
+			);
 		} finally {
 			release.resolve();
 			restoreRead();
 			await closing?.catch(() => {});
 			await supervisor.shutdown().catch(() => {});
 			shutdownSpy.mockRestore();
+		}
+	});
+
+	test("shutdown timeout retains its real deactivate journal and disable until the last write settles", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.journal-deadline";
+		const journalEntered = deferred();
+		const releaseWrite = deferred();
+		const disableEntered = deferred();
+		const releaseDisable = deferred();
+		let holdWrite = false;
+		const store = new PluginStateStore({
+			root,
+			renameFile: async (from, to) => {
+				if (holdWrite && to === join(root, "journal.json")) {
+					journalEntered.resolve();
+					await releaseWrite.promise;
+				}
+				await rename(from, to);
+			},
+		});
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({ root, stateStore: store, runtimeSupervisor: supervisor });
+		await manager.initialize();
+		await store.upsert({ ...createPluginStateRecord(pluginId), runtimeState: "active" });
+		supervisor.register({ pluginId, command: ["fixture"], cwd: root });
+		await supervisor.start(pluginId);
+		const disable = supervisor.disable.bind(supervisor);
+		supervisor.shutdown = () => disable(pluginId); // No runtime callback is holding the write.
+		supervisor.disable = async (id) => {
+			disableEntered.resolve();
+			await releaseDisable.promise;
+			await disable(id);
+		};
+		// Give just the metadata read a settled snapshot so even a zero remaining budget reaches
+		// the real journal. No assertions depend on racing the filesystem against a short timer.
+		const states = await store.listStates();
+		const read = spyOn(store, "listStates").mockResolvedValueOnce(states);
+		const waits = spyOn(
+			manager as unknown as {
+				awaitShutdownWork<T>(work: Promise<T>, until: number): Promise<T>;
+			},
+			"awaitShutdownWork",
+		);
+		const settle = () => Promise.allSettled(waits.mock.calls.map(([work]) => work));
+		try {
+			holdWrite = true;
+			const result = manager.shutdown({ timeoutMs: 0 });
+			await expect(result).rejects.toMatchObject({ code: "PLUGIN_SHUTDOWN_TIMEOUT" });
+			await journalEntered.promise;
+			expect(supervisor.get(pluginId)?.state).toBe("stopped");
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			releaseWrite.resolve();
+			await disableEntered.promise;
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			releaseDisable.resolve();
+			await settle(); // Observe late children; don't initiate a second shutdown/repair.
+			expect(manager.hasPendingShutdownWork()).toBe(false);
+			expect((await store.listOperations(pluginId))[0]).toMatchObject({
+				operation: "deactivate",
+				status: "succeeded",
+			});
+		} finally {
+			releaseWrite.resolve();
+			releaseDisable.resolve();
+			await settle();
+			read.mockRestore();
+			waits.mockRestore();
+		}
+	});
+
+	test("shutdown fences new lifecycle requests but retains an admitted deactivate write", async () => {
+		const root = await makeTempRoot();
+		const writing = deferred();
+		const release = deferred();
+		let hold = false;
+		const store = new PluginStateStore({
+			root,
+			renameFile: async (from, to) => {
+				if (hold) {
+					writing.resolve();
+					await release.promise;
+				}
+				await rename(from, to);
+			},
+		});
+		const manager = new PluginManager({
+			root,
+			stateStore: store,
+			runtimeSupervisor: new RuntimeSupervisor(),
+		});
+		const id = "com.example.admitted-write";
+		await manager.initialize();
+		await store.upsert(createPluginStateRecord(id));
+		hold = true;
+		const waits = spyOn(
+			manager as unknown as {
+				awaitShutdownWork<T>(work: Promise<T>, until: number): Promise<T>;
+			},
+			"awaitShutdownWork",
+		);
+		const settle = () => Promise.allSettled(waits.mock.calls.map(([work]) => work));
+		const admitted = manager.deactivate(id);
+		try {
+			await writing.promise;
+			manager.beginShutdown();
+			for (const operation of ["disable", "deactivate"] as const) {
+				await expect(manager[operation](id)).rejects.toMatchObject({
+					code: "PLUGIN_MANAGER_SHUTTING_DOWN",
+				});
+			}
+			await expect(manager.shutdown({ timeoutMs: 0 })).rejects.toMatchObject({
+				code: "PLUGIN_SHUTDOWN_TIMEOUT",
+			});
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			release.resolve();
+			await admitted;
+			await settle(); // The underlying drain aggregate, not the already timed-out waiter.
+			expect(manager.hasPendingShutdownWork()).toBe(false);
+		} finally {
+			release.resolve();
+			await admitted;
+			await settle();
+			waits.mockRestore();
+		}
+	});
+
+	test("shutdown retains a real runner process even when its runtime renders stopped", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new RuntimeSupervisor();
+		const manager = new PluginManager({ root, runtimeSupervisor: supervisor });
+		const command = [process.execPath, "-e", "setInterval(() => {}, 1000)"];
+		const runtime = supervisor.register({
+			pluginId: "com.example.runner-owner",
+			command,
+			cwd: root,
+			runnerOptions: { allowUnboundedResourceUsage: true },
+		});
+		try {
+			// This process belongs to the runner, not to an activated protocol generation.
+			const handle = await runtime.startRunner({ command, cwd: root });
+			manager.beginShutdown();
+			expect(runtime.state).toBe("stopped");
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			await manager.shutdown();
+			expect(Bun.peek.status(handle.exited)).toBe("fulfilled");
+			expect(() => process.kill(handle.pid as number, 0)).toThrow();
+			expect(manager.hasPendingShutdownWork()).toBe(false);
+		} finally {
+			await supervisor.shutdown();
+		}
+	});
+
+	test("shutdown timeout retains the underlying supervisor close even with no runtime records", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const release = deferred();
+		supervisor.shutdown = () => release.promise;
+		const manager = new PluginManager({ root, runtimeSupervisor: supervisor });
+		try {
+			await expect(manager.shutdown({ timeoutMs: 0 })).rejects.toMatchObject({
+				code: "PLUGIN_SHUTDOWN_TIMEOUT",
+			});
+			expect(manager.hasPendingShutdownWork()).toBe(true);
+			release.resolve();
+			await release.promise;
+			expect(manager.hasPendingShutdownWork()).toBe(false);
+		} finally {
+			release.resolve();
+			await release.promise;
 		}
 	});
 
@@ -627,13 +973,47 @@ describe("PluginManager", () => {
 		};
 		await expect(manager.shutdown()).rejects.toThrow("resource exit unconfirmed");
 	});
+
+	test("retains a failed package Worker owner after its lifecycle call has already rejected", async () => {
+		const root = await makeTempRoot();
+		const manager = new PluginManager({ root, runtimeSupervisor: new FakeSupervisor() });
+		const exit = Promise.withResolvers<number>();
+		let stops = 0;
+		const handle = new WorkerHandle({}, exit.promise, () => {
+			stops++;
+			throw new Error("package worker exit unconfirmed");
+		});
+		const failure = new WorkerCleanupError(handle, new Error("initial package stop failed"));
+		const internal = manager as unknown as {
+			trackLifecycleOperation<T>(work: Promise<T>): Promise<T>;
+		};
+		try {
+			await expect(internal.trackLifecycleOperation(Promise.reject(failure))).rejects.toBe(failure);
+			const error = await manager.shutdown().then(
+				() => undefined,
+				(reason: unknown) => reason,
+			);
+			expect(error).toBeInstanceOf(WorkerCleanupError);
+			expect((error as WorkerCleanupError).handle).toBe(handle);
+			expect(stops).toBe(1);
+			await expect(manager.shutdown()).rejects.toBeInstanceOf(WorkerCleanupError);
+			exit.resolve(0);
+			await handle.exited;
+			await expect(manager.shutdown()).resolves.toBeUndefined();
+		} finally {
+			exit.resolve(0);
+			await handle.exited;
+			await manager.shutdown();
+		}
+	});
+
 	test.each([
 		false,
 		true,
 	])("production frame options preserve ordinary and mixed plugins (%s)", async (mixed) => {
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -678,7 +1058,7 @@ describe("PluginManager", () => {
 		await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
 		const root = await makeTempRoot(alias);
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -705,7 +1085,7 @@ describe("PluginManager", () => {
 		try {
 			Object.defineProperty(process, "platform", { ...original, value: hostOS });
 			const supervisor = new FakeSupervisor();
-			const manager = new PluginManager({
+			const manager = makeManager({
 				root: join(root, "plugins"),
 				disabled: false,
 				runtimeSupervisor: supervisor,
@@ -755,7 +1135,7 @@ describe("PluginManager", () => {
 		const source = await makePackage(root, "com.example.lifecycle");
 		const supervisor = new FakeSupervisor();
 		const revokedUiSessions: string[] = [];
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -864,7 +1244,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -904,9 +1284,10 @@ describe("PluginManager", () => {
 		// replacePermissions already lazily migrated the identity to a stable UUID.
 		const migratedUuid = granted.permissions.installationId;
 		expect(migratedUuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+		const mirrorBeforeEdit = await permissionStore.getSet(pluginId, migratedUuid);
+		expect(mirrorBeforeEdit.authorityRevision).toBe(2);
 		await permissionStore.replace(pluginId, migratedUuid, [], {
-			expectedRevision: 2,
-			targetRevision: 3,
+			expectedRevision: mirrorBeforeEdit.revision,
 			grantedBy: "legacy-file-editor",
 		});
 		expect((await permissionStore.getSet(pluginId, migratedUuid)).grants).toEqual([]);
@@ -994,7 +1375,7 @@ describe("PluginManager", () => {
 	test("grants the capabilities a Manifest declares when an installation first binds", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.seeded-grants";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1030,7 +1411,7 @@ describe("PluginManager", () => {
 	test("installs a plugin declaring wide capabilities without granting the unmappable ones", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.wide-permission";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1069,7 +1450,7 @@ describe("PluginManager", () => {
 	test("installs a plugin whose every declared capability is unmappable", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.only-wide";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1090,7 +1471,7 @@ describe("PluginManager", () => {
 	test("does not re-seed grants once an installation has a grant list", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.no-reseed";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1130,7 +1511,7 @@ describe("PluginManager", () => {
 	test("copies complete grants to a new package without widening scope during upgrade", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.permission-upgrade";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1189,7 +1570,7 @@ describe("PluginManager", () => {
 	test("withholds newly-declared capabilities on upgrade and queues them for approval", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.upgrade-new-capability";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1266,7 +1647,7 @@ describe("PluginManager", () => {
 	test("denying an upgrade capability leaves the upgrade in place without the grant", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.upgrade-denied-capability";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1305,7 +1686,7 @@ describe("PluginManager", () => {
 	test("re-running the same upgrade does not stack duplicate approval requests", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.upgrade-idempotent-request";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1338,7 +1719,7 @@ describe("PluginManager", () => {
 	test("a first install still auto-grants its declared capabilities", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.first-install-seeds";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1365,7 +1746,7 @@ describe("PluginManager", () => {
 	test("rejects enabling a package whose compatibility becomes unknown", async () => {
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -1402,7 +1783,7 @@ describe("PluginManager", () => {
 			const engine = manifest.engine as Record<string, unknown>;
 			engine.os = [process.platform === "linux" ? "darwin" : "linux"];
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1419,7 +1800,7 @@ describe("PluginManager", () => {
 	test("quarantines a failed plugin without blocking another plugin", async () => {
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -1443,7 +1824,7 @@ describe("PluginManager", () => {
 	test("serializes one plugin while allowing another plugin to activate in parallel", async () => {
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -1483,7 +1864,7 @@ describe("PluginManager", () => {
 	test("isolates a revoked residual plugin during initialization", async () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
-		const first = new PluginManager({
+		const first = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1503,7 +1884,7 @@ describe("PluginManager", () => {
 			runtimeState: "inactive",
 		});
 
-		const recovered = new PluginManager({
+		const recovered = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1525,7 +1906,7 @@ describe("PluginManager", () => {
 		const storeRoot = join(root, "plugins");
 		const pluginId = "com.example.startup-catalog";
 		const disabledId = "com.example.disabled-startup";
-		const first = new PluginManager({
+		const first = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1541,7 +1922,7 @@ describe("PluginManager", () => {
 		await first.shutdown();
 		const supervisor = new FakeSupervisor();
 		const refreshStates: Array<RuntimeState | undefined> = [];
-		const recovered = new PluginManager({
+		const recovered = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -1568,7 +1949,7 @@ describe("PluginManager", () => {
 	test("recovers incomplete journal operations by disabling automatic activation", async () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
-		const first = new PluginManager({
+		const first = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1582,7 +1963,7 @@ describe("PluginManager", () => {
 			status: "running",
 		});
 
-		const recovered = new PluginManager({
+		const recovered = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1599,7 +1980,7 @@ describe("PluginManager", () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
 		const pluginId = "com.example.upgrade-recovery";
-		const first = new PluginManager({
+		const first = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1622,7 +2003,7 @@ describe("PluginManager", () => {
 		await mkdir(join(storeRoot, "staging", "interrupted-upgrade"), { recursive: true });
 		await writeFile(join(storeRoot, "staging", "interrupted-upgrade", "leftover"), "stale");
 
-		const recovered = new PluginManager({
+		const recovered = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1639,7 +2020,7 @@ describe("PluginManager", () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
 		const pluginId = "com.example.install-recovery";
-		const first = new PluginManager({
+		const first = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1656,7 +2037,7 @@ describe("PluginManager", () => {
 			},
 		});
 
-		const recovered = new PluginManager({
+		const recovered = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1669,7 +2050,7 @@ describe("PluginManager", () => {
 	test("selects LocalProcessRunner or PodmanRunner from manifest.engine.runner", async () => {
 		const root = await makeTempRoot();
 		const localSupervisor = new FakeSupervisor();
-		const localManager = new PluginManager({
+		const localManager = makeManager({
 			root: join(root, "local-plugins"),
 			disabled: false,
 			runtimeSupervisor: localSupervisor,
@@ -1680,7 +2061,7 @@ describe("PluginManager", () => {
 		expect(localSupervisor.get(local.pluginId)?.options.runner).toBeInstanceOf(LocalProcessRunner);
 
 		const podmanSupervisor = new FakeSupervisor();
-		const podmanManager = new PluginManager({
+		const podmanManager = makeManager({
 			root: join(root, "podman-plugins"),
 			disabled: false,
 			runtimeSupervisor: podmanSupervisor,
@@ -1696,7 +2077,7 @@ describe("PluginManager", () => {
 		expect(podmanSupervisor.get(podman.pluginId)?.options.runner).toBeInstanceOf(PodmanRunner);
 
 		const unavailableSupervisor = new FakeSupervisor();
-		const unavailableManager = new PluginManager({
+		const unavailableManager = makeManager({
 			root: join(root, "unavailable-plugins"),
 			disabled: false,
 			runtimeSupervisor: unavailableSupervisor,
@@ -1711,7 +2092,7 @@ describe("PluginManager", () => {
 		await expect(unavailableManager.activate(unavailable.pluginId)).rejects.toMatchObject({
 			code: "PLUGIN_RUNNER_UNAVAILABLE",
 		});
-	});
+	}, 15_000);
 
 	test("activates an unsigned package under a trust policy that does not require a signature", async () => {
 		// Used to assert the opposite. A `trustTier === "T3"` check refused activation whenever
@@ -1720,7 +2101,7 @@ describe("PluginManager", () => {
 		// gone; an enabled policy now only enforces what it can actually read from the package.
 		const root = await makeTempRoot();
 		const supervisor = new FakeSupervisor();
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: supervisor,
@@ -1730,11 +2111,11 @@ describe("PluginManager", () => {
 		await manager.enable(installed.pluginId);
 		const active = await manager.activate(installed.pluginId);
 		expect(active.runtimeState).toBe("active");
-	});
+	}, 15_000);
 
 	test("fails closed when the trust policy requires a signature", async () => {
 		const root = await makeTempRoot();
-		const requiredSignature = new PluginManager({
+		const requiredSignature = makeManager({
 			root: join(root, "required-signature"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1743,18 +2124,314 @@ describe("PluginManager", () => {
 		await expect(
 			requiredSignature.install(await makePackage(root, "com.example.signature-required")),
 		).rejects.toMatchObject({ code: "PLUGIN_SIGNATURE_REQUIRED" });
+	}, 15_000);
+
+	test.each([
+		"install",
+		"source-update",
+	] as const)("rechecks signed keys after delayed %s journals before publication", async (kind) => {
+		const root = await makeTempRoot();
+		const pluginId = `com.example.signed-journal-${kind}`;
+		const signer = packageSigner(pluginId);
+		let fixture = await makeBundledFixture(root, pluginId, "1.0.0", (source) =>
+			signer.sign(source, "1.0.0"),
+		);
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			trustPolicy: { enabled: true, requireSignature: true, keyring: signer.keyring },
+		});
+		let updateOptions: Parameters<PluginManager["updateFromSource"]>[1] | undefined;
+		if (kind === "source-update") {
+			const installed = await manager.install(new File([fixture.bytes], "signed.nfplugin"));
+			if (!installed.current || !installed.installationId)
+				throw new Error("Signed installation did not persist its identity");
+			const binding = await manager.setSource(
+				pluginId,
+				{ type: "github", owner: "fixture", repo: "signed", assetName: "signed.nfplugin" },
+				{ expectedRevision: 0 },
+			);
+			updateOptions = {
+				pluginId,
+				expectedCurrent: installed.current,
+				expectedInstallationId: installed.installationId,
+				expectedSourceRevision: binding.binding.revision,
+				expectedVersion: "2.0.0",
+				automatic: false,
+			};
+			fixture = await makeBundledFixture(root, pluginId, "2.0.0", (source) =>
+				signer.sign(source, "2.0.0"),
+			);
+		}
+		const previous = (await manager.packageStore.readCurrent()).plugins[pluginId];
+		const entered = deferred();
+		const release = deferred();
+		let journalId = "";
+		const originalJournal = manager.stateStore.beginOperation.bind(manager.stateStore);
+		const journal = spyOn(manager.stateStore, "beginOperation").mockImplementation(
+			async (input) => {
+				const result = await originalJournal(input);
+				if (input.operation === (kind === "install" ? "install" : "upgrade")) {
+					journalId = result.id;
+					entered.resolve();
+					await release.promise;
+				}
+				return result;
+			},
+		);
+		const commits = spyOn(manager.packageStore, "setCurrent");
+		const work = (
+			updateOptions
+				? manager.updateFromSource(fixture.source, updateOptions)
+				: manager.install(new File([fixture.bytes], "signed.nfplugin"))
+		).then(
+			() => new Error("Revoked signed package was published"),
+			(error: unknown) => error,
+		);
+		try {
+			// Both paths have completed real Worker verification before creating this journal.
+			await entered.promise;
+			signer.key.revokedAt = new Date().toISOString();
+			release.resolve();
+			expect(await work).toMatchObject({ code: "PLUGIN_SIGNATURE_UNTRUSTED", statusCode: 422 });
+			expect(commits).not.toHaveBeenCalled();
+			expect((await manager.packageStore.readCurrent()).plugins[pluginId]).toEqual(previous);
+			expect((await manager.stateStore.getOperation(journalId))?.status).toBe("failed");
+			expect(supervisor.get(pluginId)).toBeUndefined();
+		} finally {
+			release.resolve();
+			await work;
+			journal.mockRestore();
+			commits.mockRestore();
+		}
+	}, 15_000);
+
+	test("rechecks signed keys after delayed runtime options before starting a process", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.signed-runtime-options";
+		const signer = packageSigner(pluginId);
+		const fixture = await makeBundledFixture(root, pluginId, "1.0.0", (source) =>
+			signer.sign(source, "1.0.0"),
+		);
+		const entered = deferred();
+		const release = deferred();
+		const supervisor = new RuntimeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			trustPolicy: { enabled: true, requireSignature: true, keyring: signer.keyring },
+			runtimeOptionsFactory: async (context) => {
+				entered.resolve();
+				await release.promise;
+				return {
+					pluginId: context.pluginId,
+					pluginVersion: context.manifest.version,
+					command: [
+						process.execPath,
+						join(import.meta.dir, "../../fixtures/plugins/runtime/fixture.ts"),
+					],
+					cwd: context.packagePath,
+					runner: new LocalProcessRunner({
+						allowedCwds: [context.packagePath],
+						allowUnboundedResourceUsage: process.platform === "win32",
+					}),
+				};
+			},
+		});
+		const installed = await manager.install(fixture.source);
+		if (!installed.current) throw new Error("Missing installed package reference fixture");
+		await manager.enable(pluginId);
+		const starts = spyOn(supervisor, "start");
+		const work = manager.activate(pluginId).then(
+			() => new Error("Revoked signed plugin started"),
+			(error: unknown) => error,
+		);
+		try {
+			await entered.promise;
+			signer.key.revokedAt = new Date().toISOString();
+			release.resolve();
+			expect(await work).toMatchObject({ code: "PLUGIN_SIGNATURE_UNTRUSTED", statusCode: 422 });
+			expect(starts).not.toHaveBeenCalled();
+			expect(supervisor.getDiagnostics()).toEqual([]);
+			expect((await manager.packageStore.readCurrent()).plugins[pluginId]).toEqual(
+				installed.current,
+			);
+			expect((await manager.stateStore.getState(pluginId))?.lastError?.code).toBe(
+				"PLUGIN_SIGNATURE_UNTRUSTED",
+			);
+		} finally {
+			release.resolve();
+			await work;
+			starts.mockRestore();
+		}
+	}, 15_000);
+
+	test("a disabled trust policy preserves signed package activation with a revoked key", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.disabled-signed-trust";
+		const signer = packageSigner(pluginId);
+		const fixture = await makeBundledFixture(root, pluginId, "1.0.0", (source) =>
+			signer.sign(source, "1.0.0"),
+		);
+		signer.key.revokedAt = new Date().toISOString();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			trustPolicy: { enabled: false, requireSignature: true, keyring: signer.keyring },
+		});
+		await manager.install(new File([fixture.bytes], "signed.nfplugin"));
+		await manager.enable(pluginId);
+		expect((await manager.activate(pluginId)).runtimeState).toBe("active");
+	}, 15_000);
+
+	test("ordinary installation and activation trust checks stay in owned Workers", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.worker-only-trust";
+		let refuseWorker = false;
+		let created = 0;
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			trustPolicy: { enabled: true },
+			packageStageWorkerFactory: () => {
+				created++;
+				if (refuseWorker) throw new Error("package Worker creation unavailable");
+				return new Worker(
+					new URL("../../../server/services/plugin-package-stage-worker.ts", import.meta.url),
+				);
+			},
+		});
+		const hostInstall = spyOn(manager.packageStore, "install").mockImplementation(async () => {
+			throw new Error("Package computation reached the host thread");
+		});
+		try {
+			const source = await makePackage(root, pluginId);
+			refuseWorker = true;
+			await expect(manager.install(source)).rejects.toThrow("package Worker creation unavailable");
+			expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+			expect(hostInstall).not.toHaveBeenCalled();
+			refuseWorker = false;
+			const installed = await manager.install(source);
+			if (!installed.current) throw new Error("Missing installed package reference fixture");
+			await manager.enable(pluginId);
+			const pointer = (await manager.packageStore.readCurrent()).plugins[pluginId];
+			const stagingBefore = await readdir(join(manager.root, "staging"));
+			refuseWorker = true;
+			await expect(manager.activate(pluginId)).rejects.toThrow(
+				"package Worker creation unavailable",
+			);
+			expect(manager.runtimeSupervisor.get(pluginId)).toBeUndefined();
+			expect((await manager.packageStore.readCurrent()).plugins[pluginId]).toEqual(pointer);
+			refuseWorker = false;
+			expect((await manager.activate(pluginId)).runtimeState).toBe("active");
+			expect((await manager.packageStore.readCurrent()).plugins[pluginId]).toEqual(
+				installed.current,
+			);
+			expect(await readdir(join(manager.root, "staging"))).toEqual(stagingBefore);
+			expect(created).toBe(4);
+			expect(hostInstall).not.toHaveBeenCalled();
+		} finally {
+			hostInstall.mockRestore();
+		}
+	}, 15_000);
+
+	test("a changed installed data file blocks activation and repeated installation before any publish", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.installed-hash-check";
+		const source = await makePackage(root, pluginId);
+		await writeFile(join(source, "data.txt"), "original sample\n");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			trustPolicy: { enabled: true },
+		});
+		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Missing package pointer");
+		await manager.enable(pluginId);
+		const grants = await manager.getPermissions(pluginId);
+		const dataPath = join(
+			manager.root,
+			"packages",
+			pluginId,
+			installed.current.version,
+			installed.current.hash,
+			"data.txt",
+		);
+		await writeFile(dataPath, "modified sample\n");
+		const starts = spyOn(supervisor, "start");
+		const commits = spyOn(manager.packageStore, "setCurrent");
+		try {
+			await expect(manager.activate(pluginId)).rejects.toMatchObject({
+				code: "PLUGIN_PACKAGE_HASH_MISMATCH",
+				statusCode: 422,
+			});
+			await expect(manager.install(source)).rejects.toMatchObject({
+				code: "PLUGIN_PACKAGE_HASH_MISMATCH",
+				statusCode: 422,
+			});
+			expect(starts).not.toHaveBeenCalled();
+			expect(commits).not.toHaveBeenCalled();
+			expect((await manager.packageStore.readCurrent()).plugins[pluginId]).toEqual(
+				installed.current,
+			);
+			expect(await manager.getPermissions(pluginId)).toEqual(grants);
+			await writeFile(dataPath, "original sample\n");
+			expect((await manager.activate(pluginId)).runtimeState).toBe("active");
+			expect(starts).toHaveBeenCalledTimes(1);
+		} finally {
+			starts.mockRestore();
+			commits.mockRestore();
+		}
+	}, 20_000);
+
+	test("malformed archive uploads preserve input errors while Worker faults stay internal failures", async () => {
+		const root = await makeTempRoot();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const malformed = await manager.install(new File(["not a zip"], "bad.nfplugin")).then(
+			() => new Error("Malformed upload was accepted"),
+			(error: unknown) => error,
+		);
+		expect(malformed).toBeInstanceOf(ValidationError);
+		expect(malformed).toMatchObject({ code: "VALIDATION_ERROR", statusCode: 400 });
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		const broken = makeManager({
+			root: join(root, "worker-fault"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			packageStageWorkerFactory: () => {
+				throw new Error("native Worker creation failed");
+			},
+		});
+		const failure = await broken.install(new File(["not a zip"], "bad.nfplugin")).then(
+			() => new Error("Worker failure was accepted"),
+			(error: unknown) => error,
+		);
+		expect(failure).not.toBeInstanceOf(ValidationError);
+		expect(failure).toMatchObject({ message: "native Worker creation failed" });
+		expect((await broken.packageStore.readCurrent()).plugins).toEqual({});
 	});
 
 	test("keeps management queries available while the feature flag is disabled", async () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
-		const enabled = new PluginManager({
+		const enabled = makeManager({
 			root: storeRoot,
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
 		});
 		const installed = await enabled.install(await makePackage(root, "com.example.featureflag"));
-		const disabled = new PluginManager({
+		const disabled = makeManager({
 			root: storeRoot,
 			disabled: true,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -1783,7 +2460,7 @@ describe("PluginManager", () => {
 			return realInitialize();
 		};
 
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -1831,7 +2508,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -1922,7 +2599,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -1992,6 +2669,7 @@ describe("PluginManager", () => {
 						secret_broker: () => undefined,
 						tool_registry: () => undefined,
 						mcp_adapter: () => undefined,
+						quota_registry: () => undefined,
 						provider_registry: ({ event }) => {
 							events.push(event);
 							if (failNextRevoke) {
@@ -2002,7 +2680,7 @@ describe("PluginManager", () => {
 						},
 					},
 				});
-				const manager = new PluginManager({
+				const manager = makeManager({
 					root: join(root, "plugins"),
 					disabled: false,
 					runtimeSupervisor: supervisor,
@@ -2225,7 +2903,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -2295,7 +2973,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -2366,7 +3044,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -2436,7 +3114,7 @@ describe("PluginManager", () => {
 			capabilityBroker,
 			hostServices,
 		});
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: storeRoot,
 			disabled: false,
 			stateStore,
@@ -2453,6 +3131,15 @@ describe("PluginManager", () => {
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,
 		});
+		const settle = trackRuntimeLifecycle(manager);
+		let cleanup: Promise<void> | undefined;
+		const drain = () =>
+			(cleanup ??= (async () => {
+				await manager.shutdown();
+				await supervisor.shutdown();
+				await settle();
+			})());
+		drainBeforeCleanup.push(drain);
 
 		// First install + activate (v1).
 		const v1Source = await makePackage(root, pluginId, (manifest) => {
@@ -2483,12 +3170,13 @@ describe("PluginManager", () => {
 		expect(v2Runtime.options.command[1]).not.toBe(v1Runtime.options.command[1]);
 		const status = await manager.getStatus(pluginId);
 		expect(status?.current?.version).toBe("2.0.0");
+		await drain();
 	});
 
 	test("approve writes the canonical grant to the DB authority, surviving a manager rebuild", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.approve-canonical";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2516,7 +3204,7 @@ describe("PluginManager", () => {
 
 		// A brand-new manager over the same root re-reads the authority and still
 		// sees the approved grant (a mirror-only grant would be lost here).
-		const rebuilt = new PluginManager({
+		const rebuilt = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2534,7 +3222,7 @@ describe("PluginManager", () => {
 	test("permanent deny records the pair and blocks every future request for it", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.deny-permanent";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2588,7 +3276,7 @@ describe("PluginManager", () => {
 	test("denying an already approved request fails instead of reporting success", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.deny-after-approve";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2606,16 +3294,26 @@ describe("PluginManager", () => {
 		if (!pending) throw new Error("expected a queued pending request");
 
 		await manager.approvePermissionRequest(pluginId, pending.requestId, "admin-approve");
-		await expect(
-			manager.denyPermissionRequest(pluginId, pending.requestId, { permanent: true }),
-		).rejects.toThrow();
+		// Bun's promise matcher can starve the reused DB read Worker. Settle the real
+		// operation first so cleanup cannot race a still-running authority lookup.
+		const rejection = await manager
+			.denyPermissionRequest(pluginId, pending.requestId, { permanent: true })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		expect(rejection).toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
 		expect(await manager.listPermanentDenials(pluginId)).toHaveLength(0);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+		expect((await manager.getPermissions(pluginId)).grants).toContainEqual(
+			expect.objectContaining({ capability: "query.read.projects", grantedBy: "admin-approve" }),
+		);
 	});
 
 	test("restores the stable UUID from the authority and retires legacy hash authorities on initialize", async () => {
 		const root = await makeTempRoot();
 		const pluginId = "com.example.legacy-restore";
-		const manager = new PluginManager({
+		const manager = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2655,7 +3353,7 @@ describe("PluginManager", () => {
 			],
 		});
 
-		const manager2 = new PluginManager({
+		const manager2 = makeManager({
 			root: join(root, "plugins"),
 			disabled: false,
 			runtimeSupervisor: new FakeSupervisor(),
@@ -2668,5 +3366,1689 @@ describe("PluginManager", () => {
 			includeExpired: true,
 		});
 		expect(legacy?.authority.state).toBe("revoked");
+	});
+});
+
+describe("host bundled plugin defaults", () => {
+	test("fresh defaults install once, activate and grant only manifest capabilities as system", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-fresh");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const results = await Promise.all([
+			manager.bootstrapBundledPlugin(fixture.descriptor),
+			manager.bootstrapBundledPlugin(fixture.descriptor),
+		]);
+		for (const result of results)
+			expect(result).toMatchObject({
+				desiredState: "enabled",
+				runtimeState: "active",
+				compatibility: "compatible",
+			});
+		expect(fixture.loadCount()).toBe(1);
+		expect(supervisor.startCount.get(fixture.descriptor.pluginId)).toBe(1);
+		const permissions = await manager.getPermissions(fixture.descriptor.pluginId);
+		expect(permissions.grants.map((grant) => grant.capability).sort()).toEqual([
+			"provider.connection.request",
+			"quota.provide",
+		]);
+		expect(permissions.grants.every((grant) => grant.grantedBy === "system")).toBe(true);
+		expect(
+			(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+		).toBe("seeded");
+	}, 15_000);
+
+	test("a disabled bundled plugin stays disabled across bootstrap and a new manager", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-disabled");
+		const storeRoot = join(root, "store");
+		const manager = makeManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.bootstrapBundledPlugin(fixture.descriptor);
+		await manager.disable(fixture.descriptor.pluginId);
+		const permissions = await manager.getPermissions(fixture.descriptor.pluginId);
+		expect((await manager.bootstrapBundledPlugin(fixture.descriptor))?.desiredState).toBe(
+			"disabled",
+		);
+		await manager.shutdown();
+		const reloaded = makeManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		expect((await reloaded.bootstrapBundledPlugin(fixture.descriptor))?.desiredState).toBe(
+			"disabled",
+		);
+		expect((await reloaded.getPermissions(fixture.descriptor.pluginId)).grants).toEqual(
+			permissions.grants,
+		);
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("uninstall survives restart, and explicit File reinstall can restore the plugin", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-removed");
+		const storeRoot = join(root, "store");
+		const manager = makeManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.bootstrapBundledPlugin(fixture.descriptor);
+		await manager.uninstall(fixture.descriptor.pluginId);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(
+			(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+		).toBe("removed");
+		await manager.shutdown();
+		const reloaded = makeManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		expect(await reloaded.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(await reloaded.list()).toEqual([]);
+		await reloaded.install(new File([fixture.bytes], "provider-quota.nfplugin"));
+		await reloaded.enable(fixture.descriptor.pluginId);
+		await reloaded.activate(fixture.descriptor.pluginId);
+		expect((await reloaded.bootstrapBundledPlugin(fixture.descriptor))?.runtimeState).toBe(
+			"active",
+		);
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("adopts a manually installed version without overwriting state or grants", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-adopted", "2.0.0");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const installed = await manager.install(fixture.source);
+		const permissions = await manager.getPermissions(fixture.descriptor.pluginId);
+		const status = await manager.bootstrapBundledPlugin({
+			...fixture.descriptor,
+			version: "1.0.1",
+		});
+		expect(status?.current).toEqual(installed.current);
+		expect(status?.desiredState).toBe("disabled");
+		expect((await manager.getPermissions(fixture.descriptor.pluginId)).grants).toEqual(
+			permissions.grants,
+		);
+		expect(
+			(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+		).toBe("adopted");
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("uninstall history from before the ledger suppresses default installation", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-old-removal");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(fixture.source);
+		await manager.uninstall(fixture.descriptor.pluginId);
+		expect(
+			await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId),
+		).toBeUndefined();
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(
+			(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+		).toBe("removed");
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("interrupted initialization never silently retries or resurrects a package", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-interrupted");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.stateStore.setBundledBootstrap(fixture.descriptor.pluginId, {
+			status: "initializing",
+			version: fixture.descriptor.version,
+			archiveSha256: fixture.sha256,
+		});
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(fixture.loadCount()).toBe(0);
+		expect(
+			(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+		).toBe("initializing");
+	});
+
+	test("corrupt persistence prevents automatic defaults before loading code", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-corrupt");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await mkdir(manager.root, { recursive: true });
+		await writeFile(manager.stateStore.statePath, "{broken");
+		await expect(manager.bootstrapBundledPlugin(fixture.descriptor)).rejects.toMatchObject({
+			code: "PLUGIN_BUNDLED_STATE_UNAVAILABLE",
+		});
+		expect(fixture.loadCount()).toBe(0);
+	});
+
+	test("the feature kill switch skips default installation", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-kill-switch");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: true,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(
+			await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId),
+		).toBeUndefined();
+		expect(fixture.loadCount()).toBe(0);
+	});
+
+	test("digest and manifest-version checks cannot publish an unexpected package", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-integrity");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await expect(
+			manager.bootstrapBundledPlugin({
+				...fixture.descriptor,
+				load: async () => ({ bytes: fixture.bytes, sha256: "0".repeat(64) }),
+			}),
+		).rejects.toMatchObject({ code: "PLUGIN_BUNDLED_INTEGRITY_FAILED" });
+		expect(
+			await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId),
+		).toBeUndefined();
+		await expect(
+			manager.bootstrapBundledPlugin({ ...fixture.descriptor, version: "9.0.0" }),
+		).rejects.toMatchObject({ code: "PLUGIN_IDENTITY_MISMATCH" });
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		expect(await manager.stateStore.getState(fixture.descriptor.pluginId)).toBeUndefined();
+	});
+
+	test("bundled identity is not a bypass for an explicit signature policy", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-signature");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			trustPolicy: { enabled: true, requireSignature: true },
+		});
+		await expect(manager.bootstrapBundledPlugin(fixture.descriptor)).rejects.toThrow();
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		expect(await manager.stateStore.getState(fixture.descriptor.pluginId)).toBeUndefined();
+	});
+
+	test("a concurrent File upload waits to publish and is never started by defaults", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-upload-race");
+		const winner = await makeBundledFixture(
+			await makeTempRoot(),
+			fixture.descriptor.pluginId,
+			"2.0.0",
+		);
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const entered = deferred();
+		const release = deferred();
+		const staged = deferred();
+		const upload = new File([winner.bytes], "winner.nfplugin");
+		const originalInstall = packageStaging(manager).stagePackage.bind(manager);
+		const spy = spyOn(packageStaging(manager), "stagePackage").mockImplementation(
+			async (source, ...args) => {
+				const installed = await originalInstall(source, ...args);
+				if (source === upload) {
+					expect(installed.currentUpdated).toBe(false);
+					staged.resolve();
+				}
+				return installed;
+			},
+		);
+		try {
+			const bootstrap = manager.bootstrapBundledPlugin({
+				...fixture.descriptor,
+				load: async () => {
+					entered.resolve();
+					await release.promise;
+					return { bytes: fixture.bytes, sha256: fixture.sha256 };
+				},
+			});
+			await entered.promise;
+			const installation = manager.install(upload);
+			await staged.promise;
+			expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+			release.resolve();
+			const bootstrapped = await bootstrap;
+			expect(bootstrapped?.current?.version).toBe(fixture.descriptor.version);
+			expect(supervisor.startCount.get(fixture.descriptor.pluginId)).toBe(1);
+			expect(supervisor.get(fixture.descriptor.pluginId)?.options.pluginVersion).toBe(
+				fixture.descriptor.version,
+			);
+			const installed = await installation;
+			expect(installed.current?.version).toBe("2.0.0");
+			expect(installed.desiredState).toBe("disabled");
+			expect(supervisor.get(fixture.descriptor.pluginId)?.state).toBe("stopped");
+			expect((await manager.getStatus(fixture.descriptor.pluginId))?.current).toEqual(
+				installed.current,
+			);
+			expect(
+				(await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId))?.status,
+			).toBe("seeded");
+		} finally {
+			release.resolve();
+			spy.mockRestore();
+		}
+	}, 15_000);
+
+	test("File trust failures and directory identity hints cannot publish current", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.upload-validation");
+		const untrusted = makeManager({
+			root: join(root, "untrusted-store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			trustPolicy: { enabled: true, requireSignature: true },
+		});
+		await expect(
+			untrusted.install(new File([fixture.bytes], "unsigned.nfplugin")),
+		).rejects.toThrow();
+		expect((await untrusted.packageStore.readCurrent()).plugins).toEqual({});
+		expect(await untrusted.stateStore.getState(fixture.descriptor.pluginId)).toBeUndefined();
+		const hinted = makeManager({
+			root: join(root, "hinted-store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await expect(
+			hinted.install(fixture.source, { pluginId: "com.example.wrong-hint" }),
+		).rejects.toMatchObject({ code: "PLUGIN_IDENTITY_MISMATCH" });
+		expect((await hinted.packageStore.readCurrent()).plugins).toEqual({});
+		expect(await hinted.stateStore.getState(fixture.descriptor.pluginId)).toBeUndefined();
+	}, 15_000);
+
+	test("a File upload after default commit cannot replace the command before enable/activate", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-post-commit");
+		const uploadFixture = await makeBundledFixture(
+			await makeTempRoot(),
+			fixture.descriptor.pluginId,
+			"2.0.0",
+		);
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				command: ["fixture-runtime", context.manifest.version, context.packagePath],
+				cwd: context.packagePath,
+			}),
+		});
+		const entered = deferred();
+		const release = deferred();
+		const staged = deferred();
+		const upload = new File([uploadFixture.bytes], "replacement.nfplugin");
+		let uploadedPointerPublished: boolean | undefined;
+		const originalSetId = manager.stateStore.setInstallationId.bind(manager.stateStore);
+		const committing = spyOn(manager.stateStore, "setInstallationId").mockImplementation(
+			async (pluginId, installationId) => {
+				const result = await originalSetId(pluginId, installationId);
+				entered.resolve();
+				await release.promise;
+				return result;
+			},
+		);
+		const originalInstall = packageStaging(manager).stagePackage.bind(manager);
+		const staging = spyOn(packageStaging(manager), "stagePackage").mockImplementation(
+			async (source, ...args) => {
+				const result = await originalInstall(source, ...args);
+				if (source === upload) {
+					uploadedPointerPublished = result.currentUpdated;
+					staged.resolve();
+				}
+				return result;
+			},
+		);
+		const starts = spyOn(supervisor, "start");
+		try {
+			const bootstrap = manager.bootstrapBundledPlugin(fixture.descriptor);
+			await entered.promise;
+			const defaultPointer = (await manager.packageStore.readCurrent()).plugins[
+				fixture.descriptor.pluginId
+			];
+			expect(defaultPointer?.version).toBe(fixture.descriptor.version);
+			expect((await manager.stateStore.getState(fixture.descriptor.pluginId))?.desiredState).toBe(
+				"disabled",
+			);
+			const installation = manager.install(upload);
+			await staged.promise;
+			expect(uploadedPointerPublished).toBe(false);
+			expect(
+				(await manager.packageStore.readCurrent()).plugins[fixture.descriptor.pluginId],
+			).toEqual(defaultPointer);
+			release.resolve();
+			const bootstrapped = await bootstrap;
+			const installed = await installation;
+			expect(bootstrapped?.current).toEqual(defaultPointer);
+			expect(starts).toHaveBeenCalledTimes(1);
+			const defaultPath = join(
+				manager.root,
+				"packages",
+				fixture.descriptor.pluginId,
+				fixture.descriptor.version,
+				defaultPointer?.hash ?? "missing default pointer",
+			);
+			expect(starts).toHaveBeenCalledWith(
+				expect.objectContaining({
+					pluginVersion: fixture.descriptor.version,
+					command: ["fixture-runtime", fixture.descriptor.version, defaultPath],
+					cwd: defaultPath,
+				}),
+				expect.any(AbortSignal),
+			);
+			expect(installed.current?.version).toBe("2.0.0");
+			expect(installed.desiredState).toBe("disabled");
+			expect(supervisor.get(fixture.descriptor.pluginId)?.state).toBe("stopped");
+		} finally {
+			release.resolve();
+			committing.mockRestore();
+			staging.mockRestore();
+			starts.mockRestore();
+		}
+	}, 15_000);
+
+	test("shutdown drains delayed runtime options and never starts a late process", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.runtime", "1.0.0");
+		const entered = deferred();
+		const release = deferred();
+		const supervisor = new RuntimeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => {
+				entered.resolve();
+				await release.promise;
+				return {
+					pluginId: context.pluginId,
+					pluginVersion: context.manifest.version,
+					command: [
+						process.execPath,
+						join(import.meta.dir, "../../fixtures/plugins/runtime/fixture.ts"),
+					],
+					cwd: context.packagePath,
+					runner: new LocalProcessRunner({
+						allowedCwds: [context.packagePath],
+						allowUnboundedResourceUsage: process.platform === "win32",
+					}),
+				};
+			},
+		});
+		const starts = spyOn(supervisor, "start");
+		const bootstrap = manager.bootstrapBundledPlugin(fixture.descriptor);
+		const rejected = bootstrap.then(
+			() => new Error("bootstrap unexpectedly completed after shutdown"),
+			(error: unknown) => error,
+		);
+		try {
+			await entered.promise;
+			const shutdown = manager.shutdown();
+			expect(manager.isShuttingDown()).toBe(true);
+			await expectPending(shutdown);
+			release.resolve();
+			await shutdown;
+			expect(await rejected).toMatchObject({ message: "Plugin manager is shutting down" });
+			expect(starts).not.toHaveBeenCalled();
+			expect(supervisor.get(fixture.descriptor.pluginId)).toBeUndefined();
+			expect(supervisor.getDiagnostics()).toEqual([]);
+		} finally {
+			release.resolve();
+			await rejected;
+			await manager.shutdown();
+			starts.mockRestore();
+		}
+	}, 15_000);
+
+	test("shutdown drains delayed staging without publishing current or starting a process", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-stage-cancel");
+		const entered = deferred();
+		const release = deferred();
+		const supervisor = new RuntimeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const originalInstall = packageStaging(manager).stagePackage.bind(manager);
+		const staging = spyOn(packageStaging(manager), "stagePackage").mockImplementation(
+			async (source, ...args) => {
+				entered.resolve();
+				await release.promise;
+				return originalInstall(source, ...args);
+			},
+		);
+		const starts = spyOn(supervisor, "start");
+		const bootstrap = manager.bootstrapBundledPlugin(fixture.descriptor);
+		const rejected = bootstrap.then(
+			() => new Error("bootstrap unexpectedly completed after shutdown"),
+			(error: unknown) => error,
+		);
+		try {
+			await entered.promise;
+			const shutdown = manager.shutdown();
+			await expectPending(shutdown);
+			release.resolve();
+			await shutdown;
+			expect(await rejected).toMatchObject({ message: "Plugin manager is shutting down" });
+			expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+			expect(await manager.stateStore.getState(fixture.descriptor.pluginId)).toBeUndefined();
+			expect(starts).not.toHaveBeenCalled();
+			expect(supervisor.getDiagnostics()).toEqual([]);
+		} finally {
+			release.resolve();
+			await rejected;
+			await manager.shutdown();
+			staging.mockRestore();
+			starts.mockRestore();
+		}
+	}, 15_000);
+
+	test("startup isolates a bundled failure and starts quota only after contributions are ready", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-startup-order");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const events: string[] = [];
+		expect(
+			await initializePluginServices(
+				manager,
+				[
+					{
+						...fixture.descriptor,
+						load: async () => ({ bytes: fixture.bytes, sha256: "0".repeat(64) }),
+					},
+					fixture.descriptor,
+				],
+				{
+					startQuota: () => {
+						expect(supervisor.get(fixture.descriptor.pluginId)?.state).toBe("active");
+						events.push("quota.start");
+					},
+					onBootstrapError: () => events.push("bootstrap.error"),
+				},
+			),
+		).toBe(true);
+		expect(events).toEqual(["bootstrap.error", "quota.start"]);
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("late startup cannot call quota.start after beginShutdown and quota.stop", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-startup-cancel");
+		const entered = deferred();
+		const release = deferred();
+		const events: string[] = [];
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const startup = initializePluginServices(
+			manager,
+			[
+				{
+					...fixture.descriptor,
+					load: async () => {
+						entered.resolve();
+						await release.promise;
+						return { bytes: fixture.bytes, sha256: fixture.sha256 };
+					},
+				},
+				fixture.descriptor,
+			],
+			{
+				startQuota: () => {
+					events.push("quota.start");
+				},
+				onBootstrapError: () => events.push("bootstrap.error"),
+			},
+		);
+		try {
+			await entered.promise;
+			manager.beginShutdown();
+			events.push("quota.stop");
+			const shutdown = manager.shutdown();
+			await expectPending(shutdown);
+			release.resolve();
+			expect(await startup).toBe(false);
+			await shutdown;
+			expect(events).toEqual(["quota.stop"]);
+			expect(fixture.loadCount()).toBe(0);
+			expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		} finally {
+			release.resolve();
+			await startup;
+			await manager.shutdown();
+		}
+	}, 15_000);
+
+	test("shutdown before initialization completes drains it and skips defaults and quota", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-initialize-cancel");
+		const entered = deferred();
+		const release = deferred();
+		const events: string[] = [];
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const originalInitialize = manager.stateStore.initialize.bind(manager.stateStore);
+		const initializing = spyOn(manager.stateStore, "initialize").mockImplementation(async () => {
+			const snapshot = await originalInitialize();
+			entered.resolve();
+			await release.promise;
+			return snapshot;
+		});
+		const startup = initializePluginServices(manager, [fixture.descriptor], {
+			startQuota: () => {
+				events.push("quota.start");
+			},
+			onBootstrapError: () => events.push("bootstrap.error"),
+		});
+		try {
+			await entered.promise;
+			const shutdown = manager.shutdown();
+			await expectPending(shutdown);
+			release.resolve();
+			expect(await startup).toBe(false);
+			await shutdown;
+			expect(events).toEqual([]);
+			expect(fixture.loadCount()).toBe(0);
+		} finally {
+			release.resolve();
+			await startup;
+			await manager.shutdown();
+			initializing.mockRestore();
+		}
+	}, 15_000);
+
+	test("late runtime events cannot write or restore host access after shutdown", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-late-events");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		await manager.bootstrapBundledPlugin(fixture.descriptor);
+		await manager.shutdown();
+		const runtime = supervisor.get(fixture.descriptor.pluginId);
+		if (!runtime) throw new Error("expected the retired test runtime");
+		const persisted = await readFile(manager.stateStore.statePath, "utf8");
+		const writes = spyOn(manager.stateStore, "updateState");
+		const binds = spyOn(manager.hostServices, "bindRuntime");
+		try {
+			runtime.options.onStateChange?.("active", "stopped");
+			runtime.options.onStateChange?.("starting", "stopped");
+			await settle();
+			expect(writes).not.toHaveBeenCalled();
+			expect(binds).not.toHaveBeenCalled();
+			expect(await readFile(manager.stateStore.statePath, "utf8")).toBe(persisted);
+			expect(runtime.state).toBe("stopped");
+		} finally {
+			writes.mockRestore();
+			binds.mockRestore();
+		}
+	}, 15_000);
+
+	test("a shutdown drain timeout is a failure and late staging still cannot publish", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-drain-timeout");
+		const entered = deferred();
+		const release = deferred();
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const originalInstall = packageStaging(manager).stagePackage.bind(manager);
+		const staging = spyOn(packageStaging(manager), "stagePackage").mockImplementation(
+			async (source, ...args) => {
+				entered.resolve();
+				await release.promise;
+				return originalInstall(source, ...args);
+			},
+		);
+		const rejected = manager.bootstrapBundledPlugin(fixture.descriptor).then(
+			() => new Error("bootstrap unexpectedly completed after shutdown"),
+			(error: unknown) => error,
+		);
+		try {
+			await entered.promise;
+			const error = await manager.shutdown({ timeoutMs: 30 }).then(
+				() => new Error("shutdown unexpectedly completed before its drain"),
+				(failure: unknown) => failure,
+			);
+			expect(error).toMatchObject({ code: "PLUGIN_SHUTDOWN_TIMEOUT" });
+			release.resolve();
+			expect(await rejected).toMatchObject({ message: "Plugin manager is shutting down" });
+			await manager.shutdown();
+			expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+			expect(supervisor.getDiagnostics()).toEqual([]);
+		} finally {
+			release.resolve();
+			await rejected;
+			await manager.shutdown();
+			staging.mockRestore();
+		}
+	}, 15_000);
+
+	test("manager shutdown cancels a still-loading default without installing it", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.bundled-cancel");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.initialize();
+		const entered = deferred();
+		const bootstrap = manager.bootstrapBundledPlugin({
+			...fixture.descriptor,
+			load: (signal) =>
+				new Promise((_resolve, reject) => {
+					if (!signal) throw new Error("missing bootstrap cancellation signal");
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					entered.resolve();
+				}),
+		});
+		const rejected = bootstrap.then(
+			() => {
+				throw new Error("bootstrap unexpectedly completed after shutdown");
+			},
+			(error: unknown) => error,
+		);
+		await entered.promise;
+		await manager.shutdown();
+		expect(await rejected).toMatchObject({ message: "Plugin manager is shutting down" });
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		expect(
+			await manager.stateStore.getBundledBootstrap(fixture.descriptor.pluginId),
+		).toBeUndefined();
+	}, 15_000);
+});
+
+test("reinstalling a live bundled archive stops it and explicit activation restores active state", async () => {
+	const root = await makeTempRoot();
+	const fixture = await makeBundledFixture(root, "com.example.bundled-live-reinstall");
+	const supervisor = new FakeSupervisor();
+	const manager = makeManager({
+		root: join(root, "store"),
+		disabled: false,
+		runtimeSupervisor: supervisor,
+	});
+	const initialized = await manager.bootstrapBundledPlugin(fixture.descriptor);
+	if (!initialized) throw new Error("expected a freshly initialized bundled plugin");
+	const before = await manager.getPermissions(fixture.descriptor.pluginId);
+	expect(initialized.runtimeState).toBe("active");
+	const installed = await manager.install(new File([fixture.bytes], "provider-quota.nfplugin"));
+	expect(installed.current).toEqual(initialized.current);
+	expect(installed).toMatchObject({ desiredState: "disabled", runtimeState: "inactive" });
+	expect(supervisor.get(fixture.descriptor.pluginId)?.state).toBe("stopped");
+	expect((await manager.getPermissions(fixture.descriptor.pluginId)).grants).toEqual(before.grants);
+	await manager.enable(fixture.descriptor.pluginId);
+	const activated = await manager.activate(fixture.descriptor.pluginId);
+	expect(activated).toMatchObject({ desiredState: "enabled", runtimeState: "active" });
+	expect(supervisor.startCount.get(fixture.descriptor.pluginId)).toBe(2);
+}, 15_000);
+
+test("activation repairs persisted inactive state when the same runtime is already active", async () => {
+	const root = await makeTempRoot();
+	const fixture = await makeBundledFixture(root, "com.example.bundled-active-state");
+	const supervisor = new FakeSupervisor();
+	const manager = makeManager({
+		root: join(root, "store"),
+		disabled: false,
+		runtimeSupervisor: supervisor,
+	});
+	await manager.bootstrapBundledPlugin(fixture.descriptor);
+	await manager.stateStore.updateState(fixture.descriptor.pluginId, { runtimeState: "inactive" });
+	const activated = await manager.activate(fixture.descriptor.pluginId);
+	expect(activated.runtimeState).toBe("active");
+	expect((await manager.stateStore.getState(fixture.descriptor.pluginId))?.runtimeState).toBe(
+		"active",
+	);
+	expect(supervisor.startCount.get(fixture.descriptor.pluginId)).toBe(1);
+}, 15_000);
+
+// The shared authority service uses preload's isolated file database. Restrict cleanup
+// to these test-owned migration IDs; every package, permission mirror and ledger is real.
+describe("retired builtin quota default choice migration", () => {
+	const legacyId = "com.narrafork.apikey-quota";
+	const quotaId = "io.narrafork.provider-quota";
+	const managers: PluginManager[] = [];
+	const clearFixtureAuthorities = () => {
+		if (process.env.NARRAFORK_TEST !== "1")
+			throw new Error("migration fixtures require isolated preload");
+		db.delete(integrationAuthorities)
+			.where(
+				and(
+					eq(integrationAuthorities.kind, "plugin_installation"),
+					inArray(integrationAuthorities.integrationId, [legacyId, quotaId]),
+				),
+			)
+			.run();
+	};
+	beforeEach(clearFixtureAuthorities);
+	afterEach(async () => {
+		for (const manager of managers.splice(0)) await manager.shutdown();
+		clearFixtureAuthorities();
+	});
+
+	function managerFor(root: string, options: ConstructorParameters<typeof PluginManager>[0] = {}) {
+		const manager = makeManager({
+			root,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+			...options,
+		});
+		managers.push(manager);
+		return manager;
+	}
+
+	async function oldBuiltin(root: string) {
+		const source = await makePackage(root, legacyId, (manifest) => {
+			manifest.activationEvents = ["onCommand:hello"];
+			(manifest.permissions as Record<string, unknown>).host = ["provider.use"];
+		});
+		const storeRoot = join(root, "store");
+		const manager = managerFor(storeRoot, {
+			catalog: new PluginCatalog({ root: storeRoot, builtinRoots: [source] }),
+		});
+		await manager.initialize();
+		expect((await manager.getStatus(legacyId))?.desiredState).toBe("enabled");
+		expect(
+			(await manager.getPermissions(legacyId)).grants.map((grant) => grant.capability),
+		).toEqual(["provider.use"]);
+		return { manager, storeRoot };
+	}
+
+	test("without old or replacement history the quota archive is installed and enabled normally", async () => {
+		const root = await makeTempRoot();
+		const manager = managerFor(join(root, "store"));
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+			builtin: false,
+			current: { version: "1.0.2" },
+		});
+		expect(await manager.stateStore.getBundledBootstrap(legacyId)).toBeUndefined();
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("an explicit old builtin disable suppresses the replacement across restart and old-state removal", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.disable(legacyId);
+		const grants = (await old.getPermissions(legacyId)).grants;
+		await old.shutdown();
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		const manager = managerFor(storeRoot);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(fixture.loadCount()).toBe(0);
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		expect(await manager.stateStore.getState(quotaId)).toBeUndefined();
+		expect(await manager.integrationAuthorityService.listAuthorities(quotaId)).toEqual([]);
+		expect((await manager.getPermissions(legacyId)).grants).toEqual(grants);
+		const refusal = await manager.stateStore.getBundledBootstrap(quotaId);
+		expect(refusal).toMatchObject({
+			status: "removed",
+			defaultChoice: "disabled",
+			inheritedFrom: legacyId,
+			version: "1.0.2",
+		});
+		await manager.stateStore.removeState(legacyId);
+		await manager.shutdown();
+		const reloaded = managerFor(storeRoot);
+		expect(await reloaded.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(await reloaded.stateStore.getBundledBootstrap(quotaId)).toEqual(refusal);
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("a pre-ledger disabled state is captured before missing-package reconciliation", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		// Existing hosts persisted desiredState without a bundled ledger.
+		await old.stateStore.updateState(legacyId, {
+			desiredState: "disabled",
+			runtimeState: "inactive",
+		});
+		expect(await old.stateStore.getBundledBootstrap(legacyId)).toBeUndefined();
+		await old.shutdown();
+		const manager = managerFor(storeRoot);
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect((await manager.stateStore.getBundledBootstrap(legacyId))?.defaultChoice).toBe(
+			"disabled",
+		);
+		expect((await manager.stateStore.getBundledBootstrap(quotaId))?.inheritedFrom).toBe(legacyId);
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("an enabled old builtin still permits first defaults after shutdown before bootstrap, without grant copying", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		const oldState = await old.getStatus(legacyId);
+		const grants = (await old.getPermissions(legacyId)).grants;
+		await old.shutdown();
+		const first = managerFor(storeRoot);
+		await first.initialize();
+		expect((await first.stateStore.getState(legacyId))?.desiredState).toBe("disabled");
+		expect((await first.stateStore.getBundledBootstrap(legacyId))?.defaultChoice).toBe("enabled");
+		await first.shutdown();
+		const manager = managerFor(storeRoot);
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+			current: { version: "1.0.2" },
+		});
+		const newState = await manager.stateStore.getState(quotaId);
+		expect(newState?.installationId).not.toBe(oldState?.installationId);
+		const newGrants = (await manager.getPermissions(quotaId)).grants;
+		expect(newGrants.map((grant) => grant.capability).sort()).toEqual([
+			"provider.connection.request",
+			"quota.provide",
+		]);
+		expect(newGrants.every((grant) => grant.grantedBy === "system")).toBe(true);
+		expect(
+			newGrants.some((grant) => grants.some((oldGrant) => oldGrant.grantId === grant.grantId)),
+		).toBe(false);
+		expect((await manager.getPermissions(legacyId)).grants).toEqual(grants);
+		expect((await manager.stateStore.getBundledBootstrap(quotaId))?.status).toBe("seeded");
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("a retired hash authority does not override the enabled canonical installation", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		const legacyHash = "a".repeat(64);
+		await old.integrationAuthorityService.ensureInstallation(legacyId, legacyHash, {
+			count: 1,
+			capabilities: ["provider.use"],
+			revision: 1,
+			updatedAt: new Date().toISOString(),
+		});
+		await integrationAuthorityService.revoke({
+			authorityId: pluginInstallationAuthorityId(legacyId, legacyHash),
+			reason: "test legacy hash authority retired",
+		});
+		await old.shutdown();
+		const manager = managerFor(storeRoot);
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+		});
+		expect(fixture.loadCount()).toBe(1);
+	}, 15_000);
+
+	test("ambiguous active legacy authorities fail closed before any archive is loaded", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.integrationAuthorityService.ensureInstallation(legacyId, randomUUID(), {
+			count: 1,
+			capabilities: ["provider.use"],
+			revision: 1,
+			updatedAt: new Date().toISOString(),
+		});
+		await old.shutdown();
+		const manager = managerFor(storeRoot);
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		await expect(manager.bootstrapBundledPlugin(fixture.descriptor)).rejects.toMatchObject({
+			code: "PLUGIN_LEGACY_QUOTA_AUTHORIZATION_AMBIGUOUS",
+		});
+		expect(fixture.loadCount()).toBe(0);
+		expect(await manager.stateStore.getBundledBootstrap(quotaId)).toBeUndefined();
+		expect(await manager.integrationAuthorityService.listAuthorities(quotaId)).toEqual([]);
+	}, 15_000);
+
+	test("a refusal commit failure cannot fall through to install and does not leak cached metadata", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.disable(legacyId);
+		await old.shutdown();
+		let failRefusal = true;
+		const store = new PluginStateStore({
+			root: storeRoot,
+			renameFile: async (from, to) => {
+				const value = JSON.parse(await readFile(from, "utf8"));
+				if (failRefusal && value.bundledBootstrap?.[quotaId]?.inheritedFrom) {
+					throw new Error("injected refusal commit failure");
+				}
+				await rename(from, to);
+			},
+		});
+		const manager = managerFor(storeRoot, { stateStore: store });
+		await manager.initialize();
+		const before = await readFile(store.statePath, "utf8");
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		await expect(manager.bootstrapBundledPlugin(fixture.descriptor)).rejects.toThrow(
+			"refusal commit failure",
+		);
+		expect(await readFile(store.statePath, "utf8")).toBe(before);
+		expect(await store.getBundledBootstrap(quotaId)).toBeUndefined();
+		expect((await manager.packageStore.readCurrent()).plugins).toEqual({});
+		expect(fixture.loadCount()).toBe(0);
+		failRefusal = false;
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect(
+			(await new PluginStateStore(storeRoot).getBundledBootstrap(quotaId))?.defaultChoice,
+		).toBe("disabled");
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("an old uninstall stays removed under the replacement ID", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.uninstall(legacyId);
+		await old.shutdown();
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		const manager = managerFor(storeRoot);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect((await manager.stateStore.getBundledBootstrap(quotaId))?.defaultChoice).toBe("removed");
+		expect(await manager.stateStore.getState(quotaId)).toBeUndefined();
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test.each([
+		"authority",
+		"provider-use-grant",
+	] as const)("an old %s revocation is not repaired by an automatic ID replacement", async (revocation) => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		if (revocation === "authority") {
+			await old.integrationAuthorityService.revokePlugin(
+				legacyId,
+				"test operator revoked quota authorization",
+			);
+			await old.stateStore.removeState(legacyId);
+		} else {
+			const permissions = await old.getPermissions(legacyId);
+			await old.revokePermissions(legacyId, {
+				grantIds: permissions.grants.map((grant) => grant.grantId),
+				expectedRevision: permissions.revision,
+				grantedBy: "test-admin",
+			});
+			expect((await old.stateStore.getState(legacyId))?.desiredState).toBe("enabled");
+		}
+		await old.shutdown();
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		const manager = managerFor(storeRoot);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		expect((await manager.stateStore.getBundledBootstrap(quotaId))?.defaultChoice).toBe("revoked");
+		expect(await manager.integrationAuthorityService.listAuthorities(quotaId)).toEqual([]);
+		expect(await manager.permissionStore.listSets(quotaId)).toEqual([]);
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test.each([
+		"disabled",
+		"enabled",
+		"removed",
+		"revoked",
+		"disposition",
+	] as const)("the replacement's own %s history wins over an old disable", async (history) => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.disable(legacyId);
+		await old.shutdown();
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		const manager = managerFor(storeRoot);
+		let before = await manager.stateStore.getBundledBootstrap(quotaId);
+		if (history === "removed" || history === "disposition") {
+			before = await manager.stateStore.setBundledBootstrap(quotaId, {
+				status: history === "removed" ? "removed" : "seeded",
+				version: "1.0.1",
+				archiveSha256: null,
+			});
+		} else {
+			await manager.install(new File([fixture.bytes], "explicit-quota.nfplugin"));
+			if (history === "enabled") {
+				await manager.enable(quotaId);
+				await manager.activate(quotaId);
+			}
+			if (history === "revoked")
+				await manager.integrationAuthorityService.revokePlugin(
+					quotaId,
+					"test explicit replacement revocation",
+				);
+		}
+		const state = await manager.stateStore.getState(quotaId);
+		const permissions = await manager.permissionStore.listSets(quotaId);
+		const result = await manager.bootstrapBundledPlugin(fixture.descriptor);
+		if (state) {
+			expect(result?.current).toEqual(state.current);
+			expect(result?.desiredState).toBe(state.desiredState);
+			expect(result?.installationId).toBe(state.installationId);
+			expect(await manager.permissionStore.listSets(quotaId)).toEqual(permissions);
+			expect((await manager.stateStore.getBundledBootstrap(quotaId))?.status).toBe("adopted");
+		} else {
+			expect(result).toBeNull();
+			expect(await manager.stateStore.getBundledBootstrap(quotaId)).toEqual(before);
+		}
+		expect((await manager.stateStore.getBundledBootstrap(quotaId))?.inheritedFrom).toBeUndefined();
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+
+	test("an explicit replacement reinstall can override inherited refusal without restoring provider.use", async () => {
+		const root = await makeTempRoot();
+		const { manager: old, storeRoot } = await oldBuiltin(root);
+		await old.disable(legacyId);
+		await old.shutdown();
+		const fixture = await makeBundledFixture(await makeTempRoot(), quotaId, "1.0.2");
+		const manager = managerFor(storeRoot);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		await manager.install(new File([fixture.bytes], "explicit-reinstall.nfplugin"));
+		await manager.enable(quotaId);
+		await manager.activate(quotaId);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+		});
+		expect(
+			(await manager.getPermissions(quotaId)).grants.map((grant) => grant.capability).sort(),
+		).toEqual(["provider.connection.request", "quota.provide"]);
+		await manager.shutdown();
+		const reloaded = managerFor(storeRoot);
+		expect(await reloaded.bootstrapBundledPlugin(fixture.descriptor)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+		});
+		expect(fixture.loadCount()).toBe(0);
+	}, 15_000);
+});
+
+describe("plugin sources and controlled updates", () => {
+	const sourceHint = {
+		type: "github" as const,
+		owner: "example",
+		repo: "plugin",
+		assetName: "plugin-{version}.nfplugin",
+	};
+	async function sourcePackage(
+		root: string,
+		pluginId: string,
+		version: string,
+		hint: typeof sourceHint | null = sourceHint,
+		change?: (manifest: Record<string, unknown>) => void,
+	) {
+		const source = await makePackage(root, pluginId, (manifest) => {
+			manifest.version = version;
+			manifest.activationEvents = ["onStartup"];
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			(manifest.contributes as Record<string, unknown>).providers = [
+				{ id: "relay", title: "Relay" },
+			];
+			change?.(manifest);
+		});
+		if (hint)
+			await writeFile(
+				join(source, "plugin-source.json"),
+				JSON.stringify({ schemaVersion: 1, pluginId, source: hint }),
+			);
+		else await rm(join(source, "plugin-source.json"), { force: true });
+		return source;
+	}
+	async function fixture(
+		pluginId: string,
+		enabled = true,
+		change?: (manifest: Record<string, unknown>) => void,
+	) {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				command: ["fixture-runtime", context.package.hash],
+				cwd: context.packagePath,
+			}),
+		});
+		await manager.install(await sourcePackage(root, pluginId, "1.0.0", sourceHint, change));
+		await manager.stateStore.updateState(pluginId, {
+			providerConfigs: { relay: { note: "saved" } },
+			providerPrefixes: { relay: "saved_prefix" },
+			providerProxies: { relay: { mode: "system" } },
+		});
+		if (enabled) {
+			await manager.enable(pluginId);
+			await manager.activate(pluginId);
+		}
+		const state = await manager.stateStore.getState(pluginId);
+		if (!state?.current || !state.installationId)
+			throw new Error("missing actual fixture installation");
+		return {
+			root,
+			supervisor,
+			manager,
+			state: { ...state, current: state.current, installationId: state.installationId },
+			options: {
+				pluginId,
+				expectedCurrent: state.current,
+				expectedInstallationId: state.installationId,
+				expectedSourceRevision: state.sourceBinding?.revision ?? 0,
+				expectedVersion: "2.0.0",
+				automatic: false,
+			},
+		};
+	}
+
+	test("old packages without source retain ordinary runtime operations and cannot auto-update", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.old-source-optional";
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(await makePackage(root, pluginId));
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		expect(await manager.getSource(pluginId)).toMatchObject({
+			binding: { revision: 0, mode: "inherit", source: null, autoUpdate: false },
+			declaredSource: null,
+			origin: "none",
+		});
+		await expect(
+			manager.setAutoUpdate(pluginId, true, { expectedRevision: 0 }),
+		).rejects.toMatchObject({ code: "PLUGIN_SOURCE_REQUIRED" });
+		expect((await manager.getStatus(pluginId))?.runtimeState).toBe("active");
+		expect(manager.getHostApiVersion()).toBeString();
+		expect(manager.getHostApiVersion().length).toBeGreaterThan(0);
+	});
+
+	test("invalid source metadata is isolated from a valid installed runtime", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.invalid-source-optional";
+		const source = await makePackage(root, pluginId);
+		await writeFile(join(source, "plugin-source.json"), "{broken");
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		const view = await manager.getSource(pluginId);
+		expect(view.binding.source).toBeNull();
+		expect(view.diagnostics[0]?.code).toBe("SOURCE_INVALID");
+		expect((await manager.getStatus(pluginId))?.runtimeState).toBe("active");
+	});
+
+	test("source selection and auto preference use durable revisions and notify invalidation", async () => {
+		const f = await fixture("com.example.source-revisions");
+		const events: string[] = [];
+		const unsubscribe = f.manager.onSourceChanged((id) => events.push(id));
+		const configured = {
+			...sourceHint,
+			repo: "configured",
+			homepage: "https://example.test/plugin",
+		};
+		await f.manager.setSource(f.state.pluginId, configured, { expectedRevision: 0 });
+		await expect(
+			f.manager.setAutoUpdate(f.state.pluginId, true, { expectedRevision: 0 }),
+		).rejects.toMatchObject({ code: "PLUGIN_SOURCE_REVISION_CONFLICT" });
+		const auto = await f.manager.setAutoUpdate(f.state.pluginId, true, { expectedRevision: 1 });
+		expect(auto.binding).toMatchObject({
+			revision: 2,
+			mode: "configured",
+			source: configured,
+			autoUpdate: true,
+		});
+		expect(
+			(await new PluginStateStore(f.manager.root).getState(f.state.pluginId))?.sourceBinding,
+		).toEqual(auto.binding);
+		await f.manager.setSource(f.state.pluginId, null, { expectedRevision: 2 });
+		expect(await f.manager.getSource(f.state.pluginId)).toMatchObject({
+			binding: { revision: 3, mode: "none", source: null, autoUpdate: false },
+			declaredSource: sourceHint,
+			origin: "none",
+		});
+		expect(events).toEqual([f.state.pluginId, f.state.pluginId, f.state.pluginId]);
+		unsubscribe();
+	});
+
+	test.each([
+		true,
+		false,
+	])("source update preserves enabled=%s, UUID, config and grants without adopting new source hints", async (enabled) => {
+		const f = await fixture(`com.example.source-state-${enabled}`, enabled);
+		const permissions = await f.manager.getPermissions(f.state.pluginId);
+		const auto = await f.manager.setAutoUpdate(f.state.pluginId, true, { expectedRevision: 0 });
+		const nextHint = { ...sourceHint, repo: "unapproved-new-source" };
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0", nextHint);
+		const updated = await f.manager.updateFromSource(next, {
+			...f.options,
+			expectedSourceRevision: auto.binding.revision,
+			automatic: true,
+		});
+		expect(updated.current?.version).toBe("2.0.0");
+		expect(updated.desiredState).toBe(enabled ? "enabled" : "disabled");
+		expect(updated.runtimeState).toBe(enabled ? "active" : "inactive");
+		expect(updated.installationId).toBe(f.state.installationId);
+		expect(updated.providerConfigs).toEqual(f.state.providerConfigs);
+		expect(updated.providerPrefixes).toEqual(f.state.providerPrefixes);
+		expect(updated.providerProxies).toEqual(f.state.providerProxies);
+		expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+		expect(await f.manager.getSource(f.state.pluginId)).toMatchObject({
+			binding: auto.binding,
+			declaredSource: nextHint,
+		});
+		expect(f.supervisor.startCount.get(f.state.pluginId) ?? 0).toBe(enabled ? 2 : 0);
+	});
+
+	test.each([
+		"current",
+		"revision",
+		"installation",
+		"version",
+	] as const)("stale %s source candidates never publish or stop the current runtime", async (conflict) => {
+		const f = await fixture(`com.example.source-conflict-${conflict}`);
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0");
+		const options = { ...f.options };
+		if (conflict === "current")
+			options.expectedCurrent = { version: "0.9.0", hash: "a".repeat(64) };
+		if (conflict === "revision") options.expectedSourceRevision = 9;
+		if (conflict === "installation") options.expectedInstallationId = randomUUID();
+		if (conflict === "version") options.expectedVersion = "3.0.0";
+		await expect(f.manager.updateFromSource(next, options)).rejects.toThrow();
+		expect((await f.manager.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+			f.state.current,
+		);
+		expect(f.supervisor.get(f.state.pluginId)?.state).toBe("active");
+		expect(f.supervisor.startCount.get(f.state.pluginId)).toBe(1);
+	});
+
+	test.each([
+		"host",
+		"runner",
+		"network",
+		"filesystem",
+		"process",
+		"secrets",
+		"dependencies",
+		"signature",
+	] as const)("automatic %s trust changes require manual confirmation before current changes", async (change) => {
+		const f = await fixture(`com.example.source-growth-${change}`);
+		const auto = await f.manager.setAutoUpdate(f.state.pluginId, true, { expectedRevision: 0 });
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0", sourceHint, (manifest) => {
+			const permissions = manifest.permissions as Record<string, unknown>;
+			if (change === "host") permissions.host = ["diagnostics.readOwnLogs", "provider.use"];
+			if (change === "runner") (manifest.engine as Record<string, unknown>).runner = "podman";
+			if (change === "network")
+				permissions.network = { mode: "allowlist", allow: ["api.example.test"] };
+			if (change === "filesystem") permissions.filesystem = { workspace: "readWrite" };
+			if (change === "process") permissions.process = { spawn: "declared" };
+			if (change === "secrets")
+				manifest.secrets = [
+					{
+						id: "api-key",
+						label: "API key",
+						required: false,
+						scope: ["user"],
+						usage: "outbound-network",
+						inject: "ephemeral-reference",
+					},
+				];
+			if (change === "dependencies")
+				(manifest.dependencies as Record<string, unknown>).runtime = { dependency: "^2.0.0" };
+		});
+		if (change === "signature")
+			await writeFile(
+				join(next, "signature.json"),
+				JSON.stringify({
+					algorithm: "ed25519",
+					keyId: "new-key",
+					signature: "unused-test-value",
+					pluginId: f.state.pluginId,
+					version: "2.0.0",
+					packageDigest: "a".repeat(64),
+				}),
+			);
+		const permissions = await f.manager.getPermissions(f.state.pluginId);
+		await expect(
+			f.manager.updateFromSource(next, {
+				...f.options,
+				expectedSourceRevision: auto.binding.revision,
+				automatic: true,
+				allowTrustChange: true,
+			}),
+		).rejects.toMatchObject({ code: "PLUGIN_UPDATE_MANUAL_REQUIRED" });
+		expect((await f.manager.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+			f.state.current,
+		);
+		expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+		expect(f.supervisor.get(f.state.pluginId)?.state).toBe("active");
+	});
+
+	test.each([
+		"add",
+		"match",
+		"path",
+		"auth",
+		"headers",
+	] as const)("quota %s declarations cannot expand an already granted connection through automatic update", async (change) => {
+		const declaration = {
+			id: "quota",
+			title: "Quota",
+			match: { hosts: ["quota.example.test"] },
+			requests: [{ path: "/usage", auth: "bearer", headers: ["accept"] }],
+		};
+		const baseline = (manifest: Record<string, unknown>) => {
+			(manifest.permissions as Record<string, unknown>).host = [
+				"quota.provide",
+				"provider.connection.request",
+			];
+			(manifest.contributes as Record<string, unknown>).quotaSources = [declaration];
+		};
+		const f = await fixture(`com.example.source-quota-${change}`, true, baseline);
+		const auto = await f.manager.setAutoUpdate(f.state.pluginId, true, { expectedRevision: 0 });
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0", sourceHint, (manifest) => {
+			baseline(manifest);
+			const changed = structuredClone(declaration);
+			if (change === "match") changed.match.hosts = ["another.example.test"];
+			if (change === "path") changed.requests[0].path = "/api/user/self";
+			if (change === "auth") changed.requests[0].auth = "site-token";
+			if (change === "headers") changed.requests[0].headers.push("user-agent");
+			(manifest.contributes as Record<string, unknown>).quotaSources =
+				change === "add" ? [declaration, { ...changed, id: "second-quota" }] : [changed];
+		});
+		const permissions = await f.manager.getPermissions(f.state.pluginId);
+		const options = { ...f.options, expectedSourceRevision: auto.binding.revision };
+		await expect(
+			f.manager.updateFromSource(next, { ...options, automatic: true, allowTrustChange: true }),
+		).rejects.toMatchObject({ code: "PLUGIN_UPDATE_MANUAL_REQUIRED" });
+		await expect(f.manager.updateFromSource(next, options)).rejects.toMatchObject({
+			code: "PLUGIN_UPDATE_MANUAL_REQUIRED",
+		});
+		expect((await f.manager.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+			f.state.current,
+		);
+		expect(f.supervisor.get(f.state.pluginId)?.state).toBe("active");
+		expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+		const accepted = await f.manager.updateFromSource(next, { ...options, allowTrustChange: true });
+		expect(accepted.current?.version).toBe("2.0.0");
+		expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+	}, 20000);
+
+	test("manual trust-change confirmation still withholds new capabilities instead of granting them", async () => {
+		const f = await fixture("com.example.source-manual-growth");
+		const permissions = await f.manager.getPermissions(f.state.pluginId);
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0", sourceHint, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = [
+				"diagnostics.readOwnLogs",
+				"provider.use",
+			];
+		});
+		await expect(f.manager.updateFromSource(next, f.options)).rejects.toMatchObject({
+			code: "PLUGIN_UPDATE_MANUAL_REQUIRED",
+		});
+		expect(
+			await f.manager.updateFromSource(next, { ...f.options, allowTrustChange: true }),
+		).toMatchObject({ desiredState: "enabled", runtimeState: "active" });
+		expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+		expect(
+			(await f.manager.listPendingPermissionRequests(f.state.pluginId)).some(
+				(request) => request.capability === "provider.use",
+			),
+		).toBe(true);
+	});
+
+	test("cancellation during real package staging keeps old current and never enters commit", async () => {
+		const f = await fixture("com.example.source-precommit-cancel");
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0");
+		const entered = deferred();
+		const release = deferred();
+		const controller = new AbortController();
+		const original = f.manager.catalog.scan.bind(f.manager.catalog);
+		const staging = spyOn(f.manager.catalog, "scan").mockImplementation(async () => {
+			const scanned = await original();
+			entered.resolve();
+			await release.promise;
+			return scanned;
+		});
+		let commits = 0;
+		const result = f.manager
+			.updateFromSource(next, {
+				...f.options,
+				signal: controller.signal,
+				onCommit: () => commits++,
+			})
+			.then(
+				() => ({ ok: true }),
+				(error: unknown) => ({ ok: false, error }),
+			);
+		try {
+			await entered.promise;
+			controller.abort(new Error("test source cancellation"));
+			release.resolve();
+			expect(await result).toMatchObject({ ok: false, error: expect.any(Error) });
+			expect(commits).toBe(0);
+			expect((await f.manager.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+				f.state.current,
+			);
+			expect(f.supervisor.get(f.state.pluginId)?.state).toBe("active");
+		} finally {
+			release.resolve();
+			await result;
+			staging.mockRestore();
+		}
+	});
+
+	test("request cancellation at the commit hook does not misreport a successful source update as cancelled", async () => {
+		const f = await fixture("com.example.source-postcommit-cancel");
+		const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0");
+		const controller = new AbortController();
+		let commits = 0;
+		const result = await f.manager.updateFromSource(next, {
+			...f.options,
+			signal: controller.signal,
+			onCommit: () => {
+				commits++;
+				controller.abort(new Error("too late to cancel publication"));
+			},
+		});
+		expect(commits).toBe(1);
+		expect(result).toMatchObject({ current: { version: "2.0.0" }, runtimeState: "active" });
+	});
+
+	test("activation failure rolls back pointer, desired state, config, UUID and grants", async () => {
+		const f = await fixture("com.example.source-activation-rollback");
+		const permissions = await f.manager.getPermissions(f.state.pluginId);
+		const original = f.supervisor.start.bind(f.supervisor);
+		const start = spyOn(f.supervisor, "start").mockImplementation(
+			async (options: PluginRuntimeOptions | string, signal?: AbortSignal) => {
+				if (typeof options !== "string" && options.pluginVersion === "2.0.0") {
+					f.supervisor.register(options);
+					throw new PluginRuntimeError("test new-version handshake failure", {
+						code: "HELLO_PLUGIN_ID_MISMATCH",
+						phase: "hello",
+						kind: "handshake",
+					});
+				}
+				return typeof options === "string" ? original(options, signal) : original(options, signal);
+			},
+		);
+		try {
+			const next = await sourcePackage(f.root, f.state.pluginId, "2.0.0");
+			await expect(f.manager.updateFromSource(next, f.options)).rejects.toThrow(
+				"test new-version handshake failure",
+			);
+			const restored = await f.manager.stateStore.getState(f.state.pluginId);
+			expect((await f.manager.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+				f.state.current,
+			);
+			expect(restored).toMatchObject({
+				current: f.state.current,
+				desiredState: "enabled",
+				runtimeState: "active",
+				installationId: f.state.installationId,
+				providerConfigs: f.state.providerConfigs,
+				sourceBinding: f.state.sourceBinding,
+			});
+			expect((await f.manager.getPermissions(f.state.pluginId)).grants).toEqual(permissions.grants);
+			expect(f.supervisor.get(f.state.pluginId)?.options.pluginVersion).toBe("1.0.0");
+			expect(
+				(await f.manager.stateStore.listOperations(f.state.pluginId)).some(
+					(operation) => operation.operation === "upgrade" && operation.status === "rolled_back",
+				),
+			).toBe(true);
+		} finally {
+			start.mockRestore();
+		}
+	});
+
+	test("an interrupted source switch restores the journal's approved old state on restart", async () => {
+		const f = await fixture("com.example.source-restart-rollback");
+		await f.manager.shutdown();
+		const checkpoint = await f.manager.stateStore.getState(f.state.pluginId);
+		if (!checkpoint?.current) throw new Error("missing durable checkpoint");
+		const staged = await f.manager.packageStore.install(
+			await sourcePackage(f.root, f.state.pluginId, "2.0.0"),
+			{ updateCurrent: false },
+		);
+		const next = { version: staged.version, hash: staged.hash };
+		const operation = await f.manager.stateStore.beginOperation({
+			pluginId: f.state.pluginId,
+			operation: "upgrade",
+			status: "running",
+			context: {
+				from: checkpoint.current,
+				to: next,
+				sourceUpdate: true,
+				rollbackState: JSON.parse(JSON.stringify(checkpoint)),
+			},
+		});
+		await f.manager.packageStore.setCurrent(f.state.pluginId, next, {
+			expectedCurrent: checkpoint.current,
+		});
+		await f.manager.stateStore.updateState(f.state.pluginId, {
+			current: next,
+			desiredState: "disabled",
+			providerConfigs: {},
+			sourceBinding: { revision: 9, mode: "none", source: null, autoUpdate: false },
+		});
+		const supervisor = new FakeSupervisor();
+		const reloaded = makeManager({
+			root: f.manager.root,
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		await reloaded.initialize();
+		expect((await reloaded.packageStore.readCurrent()).plugins[f.state.pluginId]).toEqual(
+			checkpoint.current,
+		);
+		expect(await reloaded.stateStore.getState(f.state.pluginId)).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+			installationId: checkpoint.installationId,
+			providerConfigs: checkpoint.providerConfigs,
+			sourceBinding: checkpoint.sourceBinding,
+		});
+		expect((await reloaded.stateStore.getOperation(operation.id))?.status).toBe("rolled_back");
+		expect(supervisor.get(f.state.pluginId)?.options.pluginVersion).toBe("1.0.0");
+	});
+
+	test("builtin installation is an explicit ordinary reinstallation after uninstall, not bootstrap resurrection", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.explicit-builtin", "1.0.3");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		await manager.bootstrapBundledPlugin(fixture.descriptor);
+		const oldId = (await manager.stateStore.getState(fixture.descriptor.pluginId))?.installationId;
+		await manager.uninstall(fixture.descriptor.pluginId);
+		expect(await manager.bootstrapBundledPlugin(fixture.descriptor)).toBeNull();
+		let commits = 0;
+		const result = await manager.installBuiltin(fixture.descriptor, { onCommit: () => commits++ });
+		expect(result).toMatchObject({
+			desiredState: "enabled",
+			runtimeState: "active",
+			current: { version: "1.0.3" },
+		});
+		expect(result.installationId).not.toBe(oldId);
+		expect(commits).toBe(1);
+		expect(
+			(await manager.getPermissions(fixture.descriptor.pluginId)).grants.some(
+				(grant) => grant.capability === "provider.use",
+			),
+		).toBe(false);
+	});
+
+	test("invalid builtin payloads and downgrades do not stop an already active plugin", async () => {
+		const root = await makeTempRoot();
+		const fixture = await makeBundledFixture(root, "com.example.builtin-guard", "2.0.0");
+		const supervisor = new FakeSupervisor();
+		const manager = makeManager({
+			root: join(root, "store"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		await manager.bootstrapBundledPlugin(fixture.descriptor);
+		await expect(
+			manager.installBuiltin({
+				...fixture.descriptor,
+				load: async () => ({ bytes: fixture.bytes, sha256: "0".repeat(64) }),
+			}),
+		).rejects.toMatchObject({ code: "PLUGIN_BUNDLED_INTEGRITY_FAILED" });
+		await expect(
+			manager.installBuiltin({ ...fixture.descriptor, version: "1.0.3" }),
+		).rejects.toMatchObject({ code: "PLUGIN_UPDATE_NOT_NEWER" });
+		expect(supervisor.get(fixture.descriptor.pluginId)?.state).toBe("active");
+		expect(supervisor.startCount.get(fixture.descriptor.pluginId)).toBe(1);
 	});
 });

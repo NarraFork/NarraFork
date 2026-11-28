@@ -3,6 +3,7 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { RateLimitError } from "../lib/errors";
+import { ProviderQuotaError } from "../lib/provider-quota-async";
 import { getSettingsRevision, settings } from "../lib/settings";
 import {
 	currentCommandCodeCliIdentity,
@@ -102,7 +103,14 @@ quotaSnapshotRoutes.post(
 				"Balance probe requested too frequently",
 			);
 		}
-		const refresh = refreshQuotaSnapshots(filter);
+		let refresh: ReturnType<typeof refreshQuotaSnapshots>;
+		try {
+			refresh = refreshQuotaSnapshots(filter);
+		} catch (error) {
+			if (!(error instanceof ProviderQuotaError) || error.code !== "queue_full") throw error;
+			c.header("Retry-After", "1");
+			throw new RateLimitError("PROVIDER_QUOTA_BUSY", 1_000, "Quota refresh queue is full");
+		}
 		if (filter.groupId === "tokendance")
 			await waitForTokenDanceQuotaRefresh(refresh, c.req.raw.signal);
 		else void refresh.catch(() => {});

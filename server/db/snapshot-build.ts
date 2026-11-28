@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { hotSafe } from "../lib/hot-safe";
 import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
 import { TaskQueue } from "../lib/worker-runtime/queue";
+import type { ProviderSettingsImportStageInput } from "./provider-settings-import-stage";
 import {
 	DB_SNAPSHOT_KINDS_ENV,
 	DB_SNAPSHOT_OUTPUT_ENV,
@@ -13,10 +14,10 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
-const MAX_INPUT_BYTES = 16 * 1024;
+const MAX_INPUT_BYTES = 256 * 1024;
 const owner = hotSafe("narrafork.snapshotBuild.owner", () => ({
 	queue: new TaskQueue({ concurrency: 2, maxQueued: 8, maxQueuedBytes: 8 * MAX_INPUT_BYTES }),
-	handles: new Set<WorkerHandle<Bun.Subprocess<"ignore", "pipe", "ignore">>>(),
+	handles: new Set<WorkerHandle<Bun.Subprocess<"ignore" | Blob, "pipe", "ignore">>>(),
 	closing: undefined as Promise<void> | undefined,
 }));
 
@@ -70,18 +71,53 @@ export async function buildSnapshotInSubprocess(input: {
 	outputPath: string;
 	requests: boolean;
 	sessions: boolean;
+	/** Export every persisted extension, including targets absent from core settings. */
+	providers?: { passphrase?: string };
+	providerImport?: ProviderSettingsImportStageInput;
+	providerClear?: boolean;
 	timeoutMs?: number;
 	signal?: AbortSignal;
-}): Promise<void> {
-	const kinds = [input.requests ? "requests" : "", input.sessions ? "sessions" : ""]
-		.filter(Boolean)
-		.join(",");
+}): Promise<SnapshotBuildResult> {
+	if (input.providerImport && (input.providers || input.requests || input.sessions))
+		throw new Error("Invalid snapshot transfer mode");
+	if (
+		input.providerClear &&
+		(input.providerImport || input.providers || input.requests || input.sessions)
+	)
+		throw new Error("Invalid snapshot clear mode");
+	const kinds = input.providerClear
+		? "provider-clear"
+		: input.providerImport
+			? "provider-import"
+			: [
+					input.requests ? "requests" : "",
+					input.sessions ? "sessions" : "",
+					input.providers ? "providers" : "",
+				]
+					.filter(Boolean)
+					.join(",");
 	if (!kinds) throw new Error("snapshot requested with nothing selected");
-	const bytes = Buffer.byteLength(input.sourcePath) + Buffer.byteLength(input.outputPath);
+	if ((input.providers?.passphrase?.length ?? 0) > 4096)
+		throw new Error("snapshot provider input limit exceeded");
+	if (
+		input.providerImport &&
+		(input.providerImport.mappings.length > 4096 ||
+			(input.providerImport.passphrase?.length ?? 0) > 4096)
+	)
+		throw new Error("snapshot import input limit exceeded");
+	const payload = input.providers
+		? JSON.stringify(input.providers)
+		: input.providerImport
+			? JSON.stringify(input.providerImport)
+			: "";
+	const bytes =
+		Buffer.byteLength(input.sourcePath) +
+		Buffer.byteLength(input.outputPath) +
+		Buffer.byteLength(payload);
 	if (bytes > MAX_INPUT_BYTES) throw new Error("snapshot input limit exceeded");
 	// No prior total deadline: execution still receives its original complete phase budget.
 	const permit = await owner.queue.acquire({ deadlineAt: Infinity, bytes, signal: input.signal });
-	let handle: WorkerHandle<Bun.Subprocess<"ignore", "pipe", "ignore">> | undefined;
+	let handle: WorkerHandle<Bun.Subprocess<"ignore" | Blob, "pipe", "ignore">> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let stopped = false;
 	const stop = () => {
@@ -98,7 +134,7 @@ export async function buildSnapshotInSubprocess(input: {
 				[DB_SNAPSHOT_OUTPUT_ENV]: input.outputPath,
 				[DB_SNAPSHOT_KINDS_ENV]: kinds,
 			},
-			stdin: "ignore",
+			stdin: input.providers || input.providerImport ? new Blob([payload]) : "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
 			windowsHide: true,
@@ -121,6 +157,21 @@ export async function buildSnapshotInSubprocess(input: {
 			throw new Error(
 				`snapshot builder failed (exit ${exitCode}): ${report?.error ?? "no report"}`,
 			);
+		if (input.providers || input.providerImport || input.providerClear) {
+			if (
+				!Number.isSafeInteger(report.providerSettingsCount) ||
+				(report.providerSettingsCount as number) < 0 ||
+				(input.providers && typeof report.providerSettingsSealed !== "boolean") ||
+				(input.providerImport &&
+					(!Number.isSafeInteger(report.providerSettingsSkipped) ||
+						(report.providerSettingsSkipped as number) < 0 ||
+						(report.providerSettingsCount as number) +
+							(report.providerSettingsSkipped as number) !==
+							input.providerImport.expectedCount))
+			)
+				throw new Error("snapshot builder returned an incomplete provider transfer report");
+		}
+		return report;
 	} finally {
 		clearTimeout(timer);
 		permit.signal.removeEventListener("abort", stop);

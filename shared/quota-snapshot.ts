@@ -13,6 +13,7 @@ export interface QuotaWindow {
 	label?: string;
 	/** Share of the window already used, 0..1 (1 = used up); null when unknown. */
 	usedRatio: number | null;
+	status?: "ok" | "rate-limited";
 	/** Epoch ms when the window refills, if known. */
 	resetsAt: number | null;
 	/** Absolute period allowance, when upstream reports it; omitted rather than invented. */
@@ -23,8 +24,18 @@ export interface QuotaWindow {
 }
 
 export interface QuotaBalance {
+	id?: string;
+	label?: string;
+	display?: "summary" | "detail";
 	unit: string;
 	remaining: number | null;
+	/** Validated exact decimal spelling, when upstream precision matters. */
+	remainingText?: string;
+	/** Explicit source constraint; omitted preserves legacy alternative-balance semantics. */
+	quota?: "required" | "alternative" | "none";
+	used?: number;
+	window?: string;
+	windowStart?: number;
 	total?: number;
 	unlimited?: boolean;
 	/**
@@ -42,6 +53,10 @@ export interface QuotaSnapshot {
 	/** Last fetch error; the previous numbers may still be shown alongside it. */
 	error?: string;
 	scope: QuotaScope;
+	/** Explicit account availability; unknown is omitted rather than treated as usable credit. */
+	available?: boolean;
+	/** Normalized plain text supplied by the quota source, never a raw upstream payload. */
+	details?: string;
 	windows: QuotaWindow[];
 	balances: QuotaBalance[];
 	/** Plan tier, when the upstream names one. */

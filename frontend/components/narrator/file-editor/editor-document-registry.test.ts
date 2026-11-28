@@ -629,7 +629,8 @@ test("source failure retry reuses its existing model without leaking another can
 
 test("clean hidden tab leases do not keep a model, baseline or server doc alive under pressure", async () => {
 	registry = new EditorDocumentRegistry({ count: 0, bytes: 0, idleMs: 300_000 });
-	const onEvicted = spyOn({ run() {} }, "run");
+	const eviction = { run: () => undefined };
+	const onEvicted = spyOn(eviction, "run");
 	const lease = await registry.acquire(options, new AbortController().signal, onEvicted);
 	leases.push(lease);
 	await lease.copy.ensureLoaded();

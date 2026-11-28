@@ -25,24 +25,33 @@ export const STREAM_BALANCE_MAX_AGE_MS = 60_000;
 /** Unknown/error/unlimited balances are not zero; different currencies may fund a request. */
 function quotaBlock(snapshot: QuotaSnapshot | undefined, now: number, checkBalances = true): Block {
 	if (!snapshot || snapshot.error) return { blocked: false };
-	const balances = snapshot.balances;
+	if (
+		snapshot.available === false ||
+		(snapshot.expiresAt !== undefined && snapshot.expiresAt <= now)
+	)
+		return { blocked: true };
+	const balances = snapshot.balances.filter(
+		(balance) => balance.quota !== "none" && (!balance.window || balance.quota === "alternative"),
+	);
+	const balanceExhausted = (balance: (typeof balances)[number]) =>
+		!balance.unlimited &&
+		typeof balance.remaining === "number" &&
+		Number.isFinite(balance.remaining) &&
+		balance.remaining <= 0;
+	const alternatives = balances.filter((balance) => balance.quota !== "required");
 	if (
 		checkBalances &&
-		balances.length > 0 &&
-		balances.every(
-			(balance) =>
-				!balance.unlimited &&
-				typeof balance.remaining === "number" &&
-				Number.isFinite(balance.remaining) &&
-				balance.remaining <= 0,
-		)
-	) {
+		(balances.some((balance) => balance.quota === "required" && balanceExhausted(balance)) ||
+			(alternatives.length > 0 && alternatives.every(balanceExhausted)))
+	)
 		return { blocked: true };
-	}
 	const exhausted = snapshot.windows.filter(
 		(window) =>
-			typeof window.usedRatio === "number" &&
-			window.usedRatio >= 1 &&
+			(window.status === "rate-limited" ||
+				window.remaining === 0 ||
+				(typeof window.usedRatio === "number" &&
+					window.usedRatio >= 1 &&
+					!(typeof window.remaining === "number" && window.remaining > 0))) &&
 			(window.resetsAt === null || window.resetsAt > now),
 	);
 	if (!exhausted.length) return { blocked: false };
@@ -75,6 +84,9 @@ export function keyRouting<T extends KeyConfig>(
 		/** OpenCode's optional wallet is a fallback, not a prerequisite for its plan. */
 		probeBalanceIsFallback?: boolean;
 		streamIdentity?: (config: T) => string;
+		/** Pure identity-checked projection from an external canonical quota owner. */
+		probeSnapshot?: (credentialId: string) => QuotaSnapshot | undefined;
+		streamCurrent?: (credentialId: string, snapshot: QuotaSnapshot) => boolean;
 		/** Model-specific transport constraints are checked on the same credential as quota. */
 		isEligible?: (config: T, model?: string) => boolean;
 		/** Source owner decides comparable balance authority; generic windows/errors stay separate. */
@@ -97,11 +109,22 @@ export function keyRouting<T extends KeyConfig>(
 		const candidates = keys.map((key) => {
 			const current = config && withProviderKey(config, key);
 			const failure = keyCooldown(key.id, now, false);
-			const stream =
+			const cachedStream =
 				current && options.streamIdentity
 					? quotaStore.peekForIdentity(key.id, options.streamIdentity(current), STREAM_QUOTA_SOURCE)
 					: undefined;
-			const probe = current && quotaStore.peekForIdentity(key.id, identity(current));
+			// Stream expiry bounds cache validity; probe expiry can denote an expired subscription.
+			const stream =
+				cachedStream &&
+				(cachedStream.expiresAt === undefined || cachedStream.expiresAt > now) &&
+				options.streamCurrent?.(key.id, cachedStream) !== false
+					? cachedStream
+					: undefined;
+			const probe =
+				current &&
+				(options.probeSnapshot
+					? options.probeSnapshot(key.id)
+					: quotaStore.peekForIdentity(key.id, identity(current)));
 			const balances = options.balanceSources?.(probe, stream, now, STREAM_BALANCE_MAX_AGE_MS);
 			const block = combine([
 				{ blocked: !!current && options.isEligible?.(current, model) === false },

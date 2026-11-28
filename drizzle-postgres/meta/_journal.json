@@ -610,6 +610,13 @@
 			"when": 1795748780390,
 			"tag": "0086_team_event_kind_index",
 			"breakpoints": true
+		},
+		{
+			"idx": 87,
+			"version": "7",
+			"when": 1795849192101,
+			"tag": "0087_plugin_provider_settings",
+			"breakpoints": true
 		}
   ]
 }

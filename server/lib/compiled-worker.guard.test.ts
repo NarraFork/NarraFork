@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { COMPILED_WORKER_ENTRIES, compiledWorkerBuildEntrypoints } from "./compiled-worker";
 
@@ -8,9 +9,9 @@ import { COMPILED_WORKER_ENTRIES, compiledWorkerBuildEntrypoints } from "./compi
 const root = join(import.meta.dir, "../..");
 
 function serverSources(): string[] {
-	return [
-		...new Bun.Glob("**/*.{ts,tsx,js,mjs,cjs}").scanSync({ cwd: join(root, "server") }),
-	].filter((path) => !path.includes(".test.") && !path.includes("__tests__/"));
+	return [...new Bun.Glob("**/*.{ts,tsx,js,mjs,cjs}").scanSync({ cwd: join(root, "server") })]
+		.map((path) => path.replaceAll("\\", "/"))
+		.filter((path) => !path.includes(".test.") && !path.includes("__tests__/"));
 }
 
 test("production compile spreads the worker registry instead of listing worker paths", () => {
@@ -25,8 +26,7 @@ test("production compile spreads the worker registry instead of listing worker p
 });
 
 test("local and release builds share the same unique, explicitly covered worker entries", () => {
-	// Concurrent additions must each have a named owner, rather than accidentally
-	// agreeing on a stale numeric total after their branches merge.
+	// Every entry has an explicit owner, including concurrent additions.
 	const registeredEntries: string[] = [...COMPILED_WORKER_ENTRIES];
 	expect(registeredEntries.sort()).toEqual(Object.keys(entryOwners).sort());
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
@@ -62,6 +62,9 @@ function executableText(source: string, path = "worker.ts"): string {
 
 /** Lexical regression guard for known constructor forms; not an arbitrary-code/dataflow proof. */
 function workerConstructors(source: string, path = "worker.ts"): string[] {
+	// Avoid transpiling the many ordinary server modules; only files that can contain a native
+	// worker construction need the syntax-aware scan below.
+	if (!/Worker|Reflect|\\u/.test(source)) return [];
 	const code = executableText(source, path).replace(
 		/\[(["'])(Worker|NodeWorker|construct)\1\]/g,
 		".$2",
@@ -109,21 +112,28 @@ function workerConstructors(source: string, path = "worker.ts"): string[] {
 	});
 }
 
-test("worker spawns go through the shared resolver and only Handle owns native constructors", () => {
+test("worker spawns go through the shared resolver and only Handle owns native constructors", async () => {
 	const offenders: string[] = [];
-	for (const path of serverSources()) {
-		if (path === "lib/worker-runtime/lifecycle.ts") continue;
-		const source = readFileSync(join(root, "server", path), "utf8");
-		for (const name of workerConstructors(source, path)) offenders.push(`${path}: ${name}`);
+	const sources = serverSources().filter((path) => path !== "lib/worker-runtime/lifecycle.ts");
+	// Scan every source, but bound concurrent IO instead of serially blocking on cold disk reads.
+	for (let offset = 0; offset < sources.length; offset += 16) {
+		const batch = await Promise.all(
+			sources.slice(offset, offset + 16).map(async (path) => {
+				const source = await readFile(join(root, "server", path), "utf8");
+				return workerConstructors(source, path).map((name) => `${path}: ${name}`);
+			}),
+		);
+		for (const result of batch) offenders.push(...result);
 	}
 	expect(offenders).toEqual([]);
-	const core = readFileSync(join(root, "server/lib/worker-runtime/lifecycle.ts"), "utf8");
+	const core = await readFile(join(root, "server/lib/worker-runtime/lifecycle.ts"), "utf8");
 	expect(workerConstructors(core)).toEqual(["NodeWorker", "globalThis.Worker"]);
-});
+}, 15_000);
 
 test("eval/Blob text, namespace aliases and Reflect cannot grant a file-wide constructor exemption", () => {
 	for (const source of [
 		'new Worker("x")',
+		'new NodeWorker("x")',
 		'new Worker("x", {eval:true}); const url=URL.createObjectURL(new Blob([]));',
 		'const source = "new Worker(\\"x\\")"; export {source};',
 		'import {Worker as Native} from "node:worker_threads"; new Native("x");',
@@ -179,8 +189,17 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"services/narrator-prefix-snapshots-worker.ts": ["services/narrator-prefix-snapshots.ts"],
 	"services/revert-transaction-manifest-worker.ts": ["services/revert-transaction-worker.ts"],
 	"services/token-recalculation-worker.ts": ["services/token-recalculation-worker-client.ts"],
+	"services/plugin-package-stage-worker.ts": ["services/plugin-runtime.ts"],
+	"services/provider-settings-migration-worker.ts": [
+		"services/provider-settings-migration-client.ts",
+	],
 };
 const evalOwners = [
+	{
+		kind: "legacy-quota-cache",
+		owners: ["services/provider-quota-legacy-cache.ts"],
+		marker: "WorkerHandle.thread",
+	},
 	{
 		kind: "Body",
 		owners: ["services/revert-selection-service.ts"],
@@ -236,7 +255,7 @@ const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
 test("all registered entry, trusted-eval and process families have explicit common-runtime coverage", () => {
 	expect(Object.keys(entryOwners).sort()).toEqual([...COMPILED_WORKER_ENTRIES].sort());
-	expect(evalOwners).toHaveLength(6);
+	expect(evalOwners).toHaveLength(7);
 	expect(processOwners).toHaveLength(5);
 	const families = [
 		...COMPILED_WORKER_ENTRIES.map((entry) => `entry:${entry}`),
@@ -257,7 +276,12 @@ test("all registered entry, trusted-eval and process families have explicit comm
 		expect(text.includes(marker), `${kind}: ${marker}`).toBe(true);
 		expect(admission.test(text), `${kind}: admission`).toBe(true);
 		expect(text.includes("inlineFallback"), kind).toBe(false);
-		if (kind === "Body" || kind === "Rewrite" || kind === "historical-input")
+		if (
+			kind === "Body" ||
+			kind === "Rewrite" ||
+			kind === "historical-input" ||
+			kind === "legacy-quota-cache"
+		)
 			expect(/\beval:\s*true/.test(text), `${kind}: trusted eval`).toBe(true);
 		else expect(text.includes("URL.createObjectURL"), `${kind}: trusted Blob`).toBe(true);
 	}
@@ -320,4 +344,21 @@ test("the common runtime owns mechanics only, never business persistence or resu
 		expect(source).not.toContain("node:fs");
 		expect(source).not.toMatch(/resultCache|cachedResults|inlineFallback/);
 	}
+});
+
+test("database readers retain Windows entry normalization through the shared connector", () => {
+	const pool = ownerText(["lib/db-worker/pool.ts"]);
+	const connector = ownerText(["lib/compiled-worker.ts"]);
+	expect(pool).toContain("connectCompiledWorker(workerSpecifierCandidates()");
+	expect(connector).toContain("WorkerHandle.thread(workerEntryFromSpecifier(specifier)");
+	expect(pool).not.toMatch(/new\s+Worker\s*\(/);
+});
+
+test("package staging has its own compiled Worker entry, not state-store import side effects", () => {
+	const stateStore = ownerText(["services/plugin-state-store.ts"]);
+	const staging = ownerText(["services/plugin-package-stage-worker.ts"]);
+	expect(stateStore).not.toContain("parentPort.on(");
+	expect(staging).toContain('port.on("message"');
+	expect(COMPILED_WORKER_ENTRIES).toContain("services/plugin-package-stage-worker.ts");
+	expect(COMPILED_WORKER_ENTRIES).not.toContain("services/plugin-state-store.ts");
 });

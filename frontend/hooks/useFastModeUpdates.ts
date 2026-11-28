@@ -32,7 +32,12 @@ export function useFastModeUpdates(enabled = true) {
 				timer = undefined;
 				void invalidateFastModeDetails(client);
 				if (refreshPreferences) {
-					void client.invalidateQueries({ queryKey: ["user-preferences"] });
+					// Recent-tab pages share this prefix but own their revision/WS synchronization.
+					void client.invalidateQueries({
+						queryKey: ["user-preferences"],
+						predicate: ({ queryKey }) =>
+							queryKey.length === 4 && (queryKey[1] === "ui" || queryKey[1] === "detail"),
+					});
 				}
 				refreshPreferences = false;
 			}, 100);

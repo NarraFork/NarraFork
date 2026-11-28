@@ -2,26 +2,25 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { quotaSnapshotText } from "@frontend/components/narrator/model/quota-snapshot-view";
 import { buildModelMenuProviderBadges } from "@frontend/components/narrator/model/use-model-menu-provider-badges";
 import { selectQuotaEntries } from "@frontend/hooks/useQuotaSnapshots";
+import type { ProviderQuotaData, QuotaQueryResult } from "@shared/provider-quota";
 import type {
 	QuotaSnapshot,
 	QuotaSnapshotEntry,
 	QuotaSnapshotsResponse,
 } from "@shared/quota-snapshot";
 import { Hono } from "hono";
+import {
+	deferred,
+	legacyQuotaFixture,
+	required,
+} from "../../lib/__tests__/provider-quota-legacy-fixture";
 import { getCodexManager } from "../../lib/codex-manager";
 import * as commandAuth from "../../lib/commandcode-manager";
 import * as customQuota from "../../lib/custom-api-quota-cache";
 import { updateCustomApiQuotaByPrefix } from "../../lib/custom-api-quota-cache";
 import { AppError } from "../../lib/errors";
-import { kimiQuotaIdentity } from "../../lib/kimi-usage-cache";
-import * as outbound from "../../lib/net/outbound-fetch";
-import { providerBalanceCache } from "../../lib/provider-balance-cache";
 import { streamQuotaIdentity } from "../../lib/provider-key-subjects";
-import {
-	getProviderKeyStore,
-	TOKENDANCE_KEY_OWNER,
-	withProviderKey,
-} from "../../lib/provider-keys";
+import { getProviderKeyStore, TOKENDANCE_KEY_OWNER } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
 import {
 	publicQuotaSnapshot,
@@ -39,6 +38,21 @@ import { quotaSnapshotRoutes } from "../quota-snapshots";
 
 const saved = structuredClone(settings);
 const pluginId = "com.example.quota-test";
+let quotaFixture: ReturnType<typeof legacyQuotaFixture>;
+const pluginData = (usedRatio = 0.25): ProviderQuotaData => ({
+	scope: "subscription",
+	amounts: [],
+	windows: [
+		{
+			id: "fiveHour",
+			used: null,
+			limit: null,
+			remaining: null,
+			usedPercent: usedRatio * 100,
+			resetAt: null,
+		},
+	],
+});
 const config = (id = "quota-kimi", apiKey = "quota-secret"): CustomApiProviderConfig => ({
 	id,
 	name: id,
@@ -93,16 +107,16 @@ beforeEach(() => {
 		commandCode: { apiKey: "", disabled: true },
 		tokendance: { apiKey: "", generation: 0, disabled: true },
 	});
-	providerBalanceCache.sync();
+	quotaFixture = legacyQuotaFixture([], pluginData());
 });
 afterEach(() => {
+	quotaFixture.dispose();
 	mock.restore();
 	pluginProviderRegistry.removePlugin(pluginId);
 	const manager = getCodexManager();
 	if (Object.hasOwn(manager, "quotaCredentialIds"))
 		Reflect.deleteProperty(manager, "quotaCredentialIds");
 	saveSettings(structuredClone(saved));
-	providerBalanceCache.sync();
 	setAuthStores(undefined);
 });
 
@@ -256,7 +270,7 @@ describe("unified quota API", () => {
 			(await app().request("/api/quota-snapshots/refresh", { method: "POST", body: "{}" })).status,
 		).toBe(401);
 	});
-	test("admin enumerates every credential but ordinary users retain one anonymous allowance per group", () => {
+	test("admin enumerates every credential but ordinary users retain one anonymous allowance per group", async () => {
 		saveSettings({ ...settings, customApiProviders: [config()] });
 		const keys = getProviderKeyStore();
 		const first = keys.list("quota-kimi")[0];
@@ -264,21 +278,24 @@ describe("unified quota API", () => {
 		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-kimi");
 		if (!provider) throw new Error("missing fixture");
 		try {
-			quotaStore.set(
-				first.id,
-				kimiQuotaIdentity(withProviderKey(provider, first)),
-				snap(0.25),
-				false,
-			);
-			quotaStore.set(
-				second.id,
-				kimiQuotaIdentity(withProviderKey(provider, second)),
-				snap(0.9),
-				false,
-			);
+			quotaFixture.query.mockImplementation(async (_source, target) => ({
+				status: "supported",
+				error: null,
+				data: pluginData("keyId" in target && target.keyId === second.id ? 0.9 : 0.25),
+			}));
+			await Promise.all([
+				quotaFixture.service.refreshKey(first.id),
+				quotaFixture.service.refreshKey(second.id),
+			]);
 			const admin = byGroup(readQuotaSnapshots(true, false), "quota-kimi");
 			expect(admin.map((entry) => entry.credentialId)).toEqual([first.id, second.id]);
 			expect(admin.map((entry) => entry.snapshot?.windows[0]?.usedRatio)).toEqual([0.25, 0.9]);
+			expect(admin.map((entry) => entry.primary)).toEqual([true, false]);
+			expect(admin.map((entry) => entry.generation)).toEqual([
+				quotaFixture.service.peekKey(first.id)?.generation,
+				quotaFixture.service.peekKey(second.id)?.generation,
+			]);
+			expect(admin.every((entry) => entry.snapshot?.scope === "subscription")).toBe(true);
 			const user = byGroup(readQuotaSnapshots(false, false), "quota-kimi");
 			expect(user).toHaveLength(1);
 			expect(user[0]).toMatchObject({
@@ -290,11 +307,9 @@ describe("unified quota API", () => {
 			);
 		} finally {
 			keys.remove(second.id);
-			quotaStore.remove(first.id);
-			quotaStore.remove(second.id);
 		}
 	});
-	test("probe and stream slots coexist and replaced secrets invalidate both", () => {
+	test("probe and stream slots coexist and replaced secrets invalidate both", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-stream")] });
 		const provider = settings.customApiProviders?.find(
 			(provider) => provider.id === "quota-stream",
@@ -302,12 +317,13 @@ describe("unified quota API", () => {
 		if (!provider) throw new Error("missing fixture");
 		const key = getProviderKeyStore().list(provider.id)[0];
 		const id = key.id;
-		quotaStore.set(id, kimiQuotaIdentity(withProviderKey(provider, key)), snap(), false);
+		const probe = required(await quotaFixture.service.refreshKey(id));
 		updateCustomApiQuotaByPrefix(
 			provider.prefix,
 			"12.5",
 			"private-detail",
-			streamQuotaIdentity(provider),
+			streamQuotaIdentity(provider, key.id),
+			probe.generation,
 		);
 		const entries = byGroup(readQuotaSnapshots(true, false), provider.id);
 		expect(entries.map((entry) => entry.source)).toEqual(["probe", "quota_balance"]);
@@ -318,13 +334,11 @@ describe("unified quota API", () => {
 		expect(byGroup(readQuotaSnapshots(true, false), provider.id)).toMatchObject([
 			{ snapshot: null },
 		]);
-		quotaStore.remove(id);
+		expect(quotaFixture.service.peekKey(id)?.generation).not.toBe(probe.generation);
 		quotaStore.remove(id, STREAM_QUOTA_SOURCE);
 	});
 	test("unsupported gateway probing preserves streamed balances through the public API and both displays", async () => {
-		const fetch = spyOn(outbound, "outboundFetch").mockImplementation(
-			async () => new Response("not found", { status: 404 }),
-		);
+		quotaFixture.query.mockResolvedValue({ status: "unsupported", data: null, error: null });
 		saveSettings({
 			...settings,
 			customApiProviders: [
@@ -334,18 +348,18 @@ describe("unified quota API", () => {
 		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-stream-only");
 		if (!provider) throw new Error("missing live provider fixture");
 		const key = getProviderKeyStore().list(provider.id)[0];
-		providerBalanceCache.sync();
-		await providerBalanceCache.request(provider.id);
-		expect(providerBalanceCache.peek(provider.id)?.status).toBe("unsupported");
-		const discoveryCalls = fetch.mock.calls.length;
-		const probeBefore = structuredClone(quotaStore.peek(key.id));
+		await quotaFixture.service.refreshKey(key.id);
+		expect(quotaFixture.service.peek(provider.id)?.status).toBe("unsupported");
+		const discoveryCalls = quotaFixture.query.mock.calls.length;
+		const probeBefore = required(quotaFixture.service.peekKey(key.id));
 		try {
 			for (const amount of [3, 4]) {
 				updateCustomApiQuotaByPrefix(
 					provider.prefix,
 					String(amount),
 					"private-detail",
-					streamQuotaIdentity(provider),
+					streamQuotaIdentity(provider, key.id),
+					probeBefore.generation,
 				);
 				for (const role of ["admin", "user"] as const) {
 					const response = await app(role).request(
@@ -378,11 +392,10 @@ describe("unified quota API", () => {
 					}
 				}
 			}
-			expect(providerBalanceCache.peek(provider.id)?.status).toBe("unsupported");
-			expect(fetch).toHaveBeenCalledTimes(discoveryCalls);
-			expect(quotaStore.peek(key.id)).toEqual(probeBefore);
+			expect(quotaFixture.service.peek(provider.id)?.status).toBe("unsupported");
+			expect(quotaFixture.query).toHaveBeenCalledTimes(discoveryCalls);
+			expect(quotaFixture.service.peekKey(key.id)).toEqual(probeBefore);
 		} finally {
-			quotaStore.remove(key.id);
 			quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
 		}
 	});
@@ -409,16 +422,12 @@ describe("unified quota API", () => {
 		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-error");
 		if (!provider) throw new Error("missing fixture");
 		const id = key.id;
-		quotaStore.set(
-			id,
-			kimiQuotaIdentity(withProviderKey(provider, key)),
-			{
-				...snap(),
-				error:
-					"key quota-secret rejected for private-account@example.com at https://internal/usage",
-			},
-			false,
+		quotaFixture.query.mockRejectedValue(
+			new Error(
+				"key quota-secret rejected for private-account@example.com at https://internal/usage",
+			),
 		);
+		await quotaFixture.service.refreshKey(id);
 		for (const role of ["admin", "user"] as const) {
 			const response = await app(role).request("/api/quota-snapshots");
 			expect(response.status).toBe(200);
@@ -430,20 +439,24 @@ describe("unified quota API", () => {
 				error: "quota_unavailable",
 			});
 		}
-		quotaStore.remove(id);
+		expect(quotaFixture.query).toHaveBeenCalledTimes(1);
 	});
-	test("both roles receive the fixed plugin-disabled code without private quota detail", async () => {
+	test("both roles withdraw plugin-disabled quota and its stream without private detail", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-plugin-code")] });
 		const key = getProviderKeyStore().list("quota-plugin-code")[0];
 		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-plugin-code");
 		if (!provider) throw new Error("missing fixture");
 		const id = key.id;
-		quotaStore.set(
-			id,
-			kimiQuotaIdentity(withProviderKey(provider, key)),
-			{ ...snap(), error: "plugin_not_enabled" },
-			false,
+		const probe = required(await quotaFixture.service.refreshKey(id));
+		updateCustomApiQuotaByPrefix(
+			provider.prefix,
+			"12",
+			"private-detail",
+			streamQuotaIdentity(provider, key.id),
+			probe.generation,
 		);
+		expect(byGroup(readQuotaSnapshots(true, false), provider.id)).toHaveLength(2);
+		quotaFixture.revoke();
 		try {
 			for (const role of ["admin", "user"] as const) {
 				const response = await app(role).request(
@@ -451,35 +464,81 @@ describe("unified quota API", () => {
 				);
 				expect(response.status).toBe(200);
 				const text = await response.text();
-				expect(byGroup(JSON.parse(text), "quota-plugin-code")[0].snapshot).toMatchObject({
-					hasError: true,
-					error: "plugin_not_enabled",
-				});
+				const entries = byGroup(JSON.parse(text), "quota-plugin-code");
+				expect(entries).toHaveLength(1);
+				expect(entries[0]).toMatchObject({ source: "probe", supported: false, snapshot: null });
 				expect(text).not.toMatch(/quota-secret|private-account|headers|detail/);
 			}
 		} finally {
-			quotaStore.remove(id);
+			quotaStore.remove(id, STREAM_QUOTA_SOURCE);
 		}
 	});
 
 	test("cold GET returns immediately and repeated reads share the original source refresh", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-hanging")] });
-		let finish!: (response: Response) => void;
-		const upstream = new Promise<Response>((resolve) => {
-			finish = resolve;
-		});
-		const transport = spyOn(outbound, "outboundFetch").mockImplementation(() => upstream);
+		const key = required(getProviderKeyStore().list("quota-hanging")[0]);
+		const upstream = deferred<QuotaQueryResult>();
+		quotaFixture.query.mockImplementation(() => upstream.promise);
 		try {
+			const cached = await app("user").request(
+				"/api/quota-snapshots?cachedOnly=true&groupId=quota-hanging",
+			);
+			expect(cached.status).toBe(200);
+			expect(quotaFixture.query).not.toHaveBeenCalled();
 			const first = await app("user").request("/api/quota-snapshots");
 			expect(first.status).toBe(200);
-			expect(byGroup(await first.json(), "quota-hanging")[0].snapshot).toBeNull();
+			expect(byGroup(await first.json(), "quota-hanging")[0]).toMatchObject({
+				snapshot: null,
+				refreshing: true,
+				credentialId: null,
+			});
 			expect((await app("user").request("/api/quota-snapshots")).status).toBe(200);
-			expect(transport).toHaveBeenCalledTimes(1);
+			expect(quotaFixture.query).toHaveBeenCalledTimes(1);
 		} finally {
-			finish(Response.json({ fiveHour: { used: 1, limit: 4, remaining: 3, resetTime: null } }));
-			const { refreshAllKimiUsages } = await import("../../lib/kimi-usage-cache");
-			await refreshAllKimiUsages();
+			upstream.resolve({ status: "supported", data: pluginData(), error: null });
+			await quotaFixture.service.refreshKey(key.id);
 		}
+		expect(
+			byGroup(readQuotaSnapshots(true, false), "quota-hanging")[0].snapshot?.windows[0]?.usedRatio,
+		).toBe(0.25);
+		expect(quotaFixture.query).toHaveBeenCalledTimes(1);
+	});
+	test("admin refresh acknowledges the plugin task before completion and request cancellation leaves its owner running", async () => {
+		saveSettings({ ...settings, customApiProviders: [config("quota-manual")] });
+		const key = required(getProviderKeyStore().list("quota-manual")[0]);
+		const upstream = deferred<QuotaQueryResult>();
+		quotaFixture.query.mockImplementation(() => upstream.promise);
+		expect((await refresh("user", { groupId: "quota-manual", credentialId: key.id })).status).toBe(
+			403,
+		);
+		expect(quotaFixture.query).not.toHaveBeenCalled();
+		const controller = new AbortController();
+		try {
+			const response = await app("admin").request("/api/quota-snapshots/refresh", {
+				method: "POST",
+				signal: controller.signal,
+				body: JSON.stringify({ groupId: "quota-manual", credentialId: key.id }),
+			});
+			expect(response.status).toBe(200);
+			const entries = byGroup(await response.json(), "quota-manual");
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).toMatchObject({
+				credentialId: key.id,
+				refreshing: true,
+				snapshot: null,
+				generation: required(quotaFixture.service.peekKey(key.id)).generation,
+			});
+			controller.abort();
+			expect(quotaFixture.query).toHaveBeenCalledTimes(1);
+			expect(quotaFixture.query.mock.calls[0]?.[2].signal.aborted).toBe(false);
+		} finally {
+			upstream.resolve({ status: "supported", data: pluginData(0.7), error: null });
+			await quotaFixture.service.refreshKey(key.id);
+		}
+		expect(
+			byGroup(readQuotaSnapshots(true, false), "quota-manual")[0].snapshot?.windows[0]?.usedRatio,
+		).toBe(0.7);
+		expect(quotaFixture.query).toHaveBeenCalledTimes(1);
 	});
 	test("normal refresh is administrator-only; filters are validated and cannot become URLs", async () => {
 		expect((await refresh("user", {})).status).toBe(403);

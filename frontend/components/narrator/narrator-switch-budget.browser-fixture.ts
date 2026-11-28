@@ -1,5 +1,5 @@
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { app } from "../../../server/app";
 import { db, sqlite } from "../../../server/db";
@@ -33,13 +33,14 @@ export interface RestArrival {
 	endedAt: number;
 	status: number;
 	bytes: number;
+	aborted?: boolean;
 	body?: string;
 }
 
 export async function createSwitchBudgetFixture() {
 	if (process.env.NARRAFORK_TEST !== "1") throw new Error("Requires test preload isolation");
 	const home = realpathSync(testEnvironment.narraforkHome);
-	if (!resolve(getDbPath()).startsWith(`${home}/`)) throw new Error("DB is not in test HOME");
+	if (!resolve(getDbPath()).startsWith(`${home}${sep}`)) throw new Error("DB is not in test HOME");
 	if (resolve(frontendDist) !== resolve(import.meta.dir, "../../../dist/frontend"))
 		throw new Error("Only this worktree's frontend build is allowed");
 	const repo = mkdtempSync(join(testEnvironment.isolatedHome, "switch-budget-repo-"));
@@ -198,7 +199,7 @@ export async function createSwitchBudgetFixture() {
 			const url = new URL(request.url);
 			if (!url.pathname.startsWith("/api/") && !url.pathname.startsWith("/ws/")) {
 				const path = resolve(frontendDist, `.${url.pathname}`);
-				if (!path.startsWith(`${resolve(frontendDist)}/`))
+				if (!path.startsWith(`${resolve(frontendDist)}${sep}`))
 					return new Response(null, { status: 404 });
 				const file = Bun.file(path);
 				if (await file.exists()) return new Response(file);
@@ -234,6 +235,7 @@ export async function createSwitchBudgetFixture() {
 			const body = await response.clone().text();
 			record.endedAt = performance.now();
 			record.status = response.status;
+			record.aborted = request.signal.aborted;
 			record.bytes = new TextEncoder().encode(body).byteLength;
 			if (
 				/settings\/runtime|user-preferences\/ui|model-catalog\/(runtime|options)|\/ui-summary|\/api\/narrators\/[^/]+$/.test(

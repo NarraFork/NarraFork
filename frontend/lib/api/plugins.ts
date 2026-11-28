@@ -1,3 +1,12 @@
+import type {
+	BuiltinPluginSummary,
+	PluginSource,
+	PluginSourceDiagnostic,
+	PluginSourceView,
+	PluginUpdateJob,
+	PluginUpdateView,
+} from "@shared/plugin-source";
+import type { ProviderSettingsContribution } from "@shared/provider-settings";
 import type { PluginViewSurface } from "../../components/plugins/types";
 import {
 	ApiError,
@@ -46,6 +55,8 @@ export interface PluginContributionSummary {
 	id?: string;
 	fullId?: string;
 	kind?: string;
+	/** Static form metadata only; never saved provider values or credential references. */
+	providerSettings?: ProviderSettingsContribution;
 	title?: string;
 	/** Surfaces a view contribution may mount on; absent for other kinds. */
 	surfaces?: PluginViewSurface[];
@@ -169,6 +180,15 @@ export interface PluginSummary {
 	status?: string;
 	/** Shipped with the application: no install step, no package-store record, no grant. */
 	builtin?: boolean;
+	/** Explicit host capabilities override historical builtin presentation labels. */
+	canUninstall?: boolean;
+	canUpdate?: boolean;
+	packageKind?: "builtin-directory" | "installed";
+	origin?: "builtin" | "installed";
+	sourceHint?: PluginSource | null;
+	sourceDiagnostics?: PluginSourceDiagnostic[];
+	sourceView?: PluginSourceView;
+	updateView?: PluginUpdateView;
 	desiredState?: PluginDesiredState;
 	runtimeState?: PluginRuntimeState;
 	compatibility?: PluginCompatibilityState;
@@ -303,6 +323,71 @@ export interface PluginProviderCatalogRefreshResponse {
 export const pluginsApi = {
 	list: () => request<PluginListResponse | PluginSummary[]>("/plugins"),
 	get: (pluginId: string) => request<PluginDetail>(pluginPath(pluginId)),
+	pluginGetSource: (pluginId: string, options?: { signal?: AbortSignal }) =>
+		request<PluginSourceView>(`${pluginPath(pluginId)}/source`, {
+			signal: options?.signal,
+			maxResponseBytes: 32 * 1024,
+		}),
+	pluginSetSource: (
+		pluginId: string,
+		input: { source: PluginSource | null; expectedRevision: number },
+	) =>
+		request<PluginSourceView>(`${pluginPath(pluginId)}/source`, {
+			method: "PUT",
+			body: JSON.stringify(input),
+			maxResponseBytes: 32 * 1024,
+		}),
+	pluginGetUpdates: (pluginId: string, options?: { signal?: AbortSignal }) =>
+		request<PluginUpdateView>(`${pluginPath(pluginId)}/updates`, {
+			signal: options?.signal,
+			maxResponseBytes: 16 * 1024,
+		}),
+	pluginCheckUpdates: (pluginId: string) =>
+		request<{ jobId: string }>(`${pluginPath(pluginId)}/updates/check`, {
+			method: "POST",
+			body: "{}",
+			maxResponseBytes: 1024,
+		}),
+	pluginApplyUpdate: (
+		pluginId: string,
+		input: { candidateId: string; expectedRevision: number; allowTrustChange?: boolean },
+	) =>
+		request<{ jobId: string }>(`${pluginPath(pluginId)}/updates/apply`, {
+			method: "POST",
+			body: JSON.stringify(input),
+			maxResponseBytes: 1024,
+		}),
+	pluginSetUpdatePreferences: (
+		pluginId: string,
+		input: { autoUpdate: boolean; expectedRevision: number },
+	) =>
+		request<PluginSourceView>(`${pluginPath(pluginId)}/updates/preferences`, {
+			method: "PUT",
+			body: JSON.stringify(input),
+			maxResponseBytes: 32 * 1024,
+		}),
+	pluginGetUpdateJob: (jobId: string, options?: { signal?: AbortSignal }) =>
+		request<PluginUpdateJob>(`/plugins/update-jobs/${encodeURIComponent(jobId)}`, {
+			signal: options?.signal,
+			maxResponseBytes: 16 * 1024,
+		}),
+	pluginCancelUpdateJob: (jobId: string) =>
+		request<PluginUpdateJob>(`/plugins/update-jobs/${encodeURIComponent(jobId)}/cancel`, {
+			method: "POST",
+			body: "{}",
+			maxResponseBytes: 16 * 1024,
+		}),
+	pluginListBuiltins: (options?: { signal?: AbortSignal }) =>
+		request<{ builtins: BuiltinPluginSummary[] }>("/plugins/builtins", {
+			signal: options?.signal,
+			maxResponseBytes: 64 * 1024,
+		}),
+	pluginInstallBuiltin: (pluginId: string) =>
+		request<{ jobId: string }>(`/plugins/builtins/${encodeURIComponent(pluginId)}/install`, {
+			method: "POST",
+			body: "{}",
+			maxResponseBytes: 1024,
+		}),
 	getDiagnostics: (pluginId: string) =>
 		request<PluginDetail>(`${pluginPath(pluginId)}/diagnostics`),
 	install: (path: string) =>

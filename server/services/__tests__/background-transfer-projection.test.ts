@@ -72,6 +72,9 @@ beforeEach(() => {
 afterEach(async () => {
 	if (backgroundOccupancyStore.isReady) await flush();
 	await runtimePublication.flushRecipient(PARENT);
+	// Task list frames finish asynchronous Worker reads after the row is written.
+	// Drain their tracked work before clearing a fixture or the next test's frame sink.
+	await backgroundTaskService.drainBashCollectors();
 	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
@@ -144,6 +147,10 @@ async function flush(): Promise<void> {
  * it looks like the progress broadcast bumped the list version.
  */
 async function waitForListDelta(): Promise<void> {
+	// Occupancy publishes a second list frame via setImmediate after its Worker settles.
+	// Let that subscriber enqueue its tracked broadcast before draining both frames.
+	await flush();
+	await backgroundTaskService.drainBashCollectors();
 	for (let i = 0; i < 50; i++) {
 		if (broadcasts.some((entry) => entry.message.type === "background_task_list_delta")) return;
 		await flush();

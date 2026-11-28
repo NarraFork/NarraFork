@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it, spyOn } from "bun:test";
 import {
 	type JsonRpcEnvelope,
@@ -77,6 +78,150 @@ function notification(method: string, params?: unknown): JsonRpcNotification {
 }
 
 describe("PluginRpcConnection", () => {
+	for (const finish of ["timeout", "cancel", "close"] as const) {
+		it.each([
+			false,
+			true,
+		])(`owns the real dispatcher write and late audit after ${finish}, reject=%s`, async (rejectLate) => {
+			const database = new Database(":memory:");
+			database.run("CREATE TABLE late_writes (kind TEXT)");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const auditEntered = Promise.withResolvers<void>();
+			const auditRelease = Promise.withResolvers<void>();
+			const lateEntered = Promise.withResolvers<void>();
+			const lateRelease = Promise.withResolvers<void>();
+			const response = Promise.withResolvers<void>();
+			let calls = 0;
+			const transport = new MemoryTransport();
+			transport.onSend = (message) => {
+				if ("id" in message && message.id === "owned" && !("method" in message)) response.resolve();
+			};
+			const dispatcher = new PluginHostDispatcher({
+				maxConcurrency: 1,
+				methods: {
+					write: {
+						method: "write",
+						sideEffect: "unknown",
+						handler: async () => {
+							calls++;
+							entered.resolve();
+							await release.promise; // Deliberately ignores AbortSignal.
+							database.run("INSERT INTO late_writes VALUES ('handler')");
+							if (rejectLate) throw new Error("late handler failure");
+							return true;
+						},
+					},
+				},
+				audit: async (entry) => {
+					if (entry.code !== "LATE_RESULT") return;
+					auditEntered.resolve();
+					await auditRelease.promise;
+					database.run("INSERT INTO late_writes VALUES ('audit')");
+					if (rejectLate) throw new Error("late audit failure");
+				},
+				onLateResult: async () => {
+					lateEntered.resolve();
+					await lateRelease.promise;
+					database.run("INSERT INTO late_writes VALUES ('late-result')");
+				},
+			});
+			const dispatch = spyOn(dispatcher, "dispatch");
+			const timers = spyOn(globalThis, "setTimeout");
+			const connection = new PluginRpcConnection({
+				transport,
+				dispatcher,
+				maxInFlight: 1,
+				inboundTimeoutMs: 54_321,
+			});
+			try {
+				transport.emit({ jsonrpc: "2.0", id: "owned", method: "write" });
+				await entered.promise;
+				if (finish === "timeout") {
+					const index = timers.mock.calls.findIndex(([, delay]) => delay === 54_321);
+					expect(index).toBeGreaterThanOrEqual(0);
+					const timer = timers.mock.results[index];
+					if (timer.type !== "return") throw new Error("missing inbound deadline timer");
+					clearTimeout(timer.value);
+					timers.mock.calls[index][0]();
+				} else if (finish === "cancel") await connection.cancelInbound("owned");
+				else await connection.close();
+				if (finish !== "close") await response.promise;
+				const outer = dispatch.mock.results[0];
+				if (outer.type !== "return") throw new Error("missing real dispatcher operation");
+				await outer.value; // The real dispatcher wrapper has already answered/cancelled.
+				await new Promise<void>((resolve) => setImmediate(resolve)); // Finish the response send/finally.
+				expect(connection.inboundActiveCount).toBe(0);
+				expect(connection.pendingInboundCount).toBe(1);
+				expect(connection.hasPendingShutdownWork()).toBe(true);
+				const idle = connection.waitForPendingShutdownWork();
+				expect(Bun.peek.status(idle)).toBe("pending");
+				if (finish !== "close") {
+					const full = Promise.withResolvers<void>();
+					transport.onSend = (message) => {
+						if ("id" in message && message.id === "flood-7") full.resolve();
+					};
+					for (let i = 0; i < 8; i++)
+						transport.emit({ jsonrpc: "2.0", id: `flood-${i}`, method: "write" });
+					await full.promise;
+					expect(calls).toBe(1);
+					expect(
+						transport.writes.filter(
+							(item) =>
+								"error" in item && (item.error.data as { code?: string })?.code === "PLUGIN_BUSY",
+						),
+					).toHaveLength(8);
+				}
+				await connection.close(); // Never waits unboundedly on an abort-ignoring handler.
+				expect(connection.hasPendingShutdownWork()).toBe(true);
+				release.resolve();
+				await auditEntered.promise;
+				await lateEntered.promise;
+				expect(connection.hasPendingShutdownWork()).toBe(true);
+				lateRelease.resolve();
+				auditRelease.resolve();
+				await idle;
+				expect(connection.hasPendingShutdownWork()).toBe(false);
+				expect(database.query("SELECT kind FROM late_writes ORDER BY kind").all()).toEqual([
+					{ kind: "audit" },
+					{ kind: "handler" },
+					{ kind: "late-result" },
+				]);
+				expect(transport.writes.filter((item) => "id" in item && item.id === "owned")).toHaveLength(
+					finish === "close" ? 0 : 1,
+				);
+			} finally {
+				release.resolve();
+				auditRelease.resolve();
+				lateRelease.resolve();
+				await connection.close();
+				await connection.waitForPendingShutdownWork();
+				timers.mockRestore();
+				dispatch.mockRestore();
+				database.close();
+			}
+		});
+	}
+
+	it("bounds quota replies per pending request without enlarging the connection inbound budget", async () => {
+		const transport = new MemoryTransport();
+		const connection = new PluginRpcConnection({ transport });
+		const frameLimit = connection.getLimits().maxInboundFrameBytes;
+		transport.onSend = (message) => {
+			if (!("id" in message) || !("method" in message)) return;
+			transport.emit(responseFor(message.id, "x".repeat(20 * 1024)));
+		};
+		await expect(
+			connection.request("quota.query", {}, { maxResponseBytes: 16 * 1024 + 1024 }),
+		).rejects.toMatchObject({ code: "RESPONSE_FRAME_LIMIT" });
+		expect(connection.getLimits().maxInboundFrameBytes).toBe(frameLimit);
+		const ordinary = await connection.request("ordinary.query", {});
+		expect(
+			"result" in ordinary && typeof ordinary.result === "string" && ordinary.result.length,
+		).toBe(20 * 1024);
+		expect(connection.outboundPendingCount).toBe(0);
+		connection.close();
+	});
 	it("serializes outbound bodies once and accounts for UTF-8 framing and control reserve", async () => {
 		const transport = new MemoryTransport();
 		const message = notification("bytes", { text: "中文" });

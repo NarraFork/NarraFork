@@ -6,6 +6,7 @@ import type { ResolvedBranding } from "@shared/branding";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import { isNugPaymentContext, type NugPaymentIntent } from "@shared/nug-payment";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type { ProviderQuotaPage, ProviderQuotaSnapshot } from "@shared/provider-quota";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
@@ -908,6 +909,29 @@ export const miscApi = {
 				{ status: "disabled" | "offline" | "connecting" | "online"; egressMode: string }
 			>
 		>("/nug/relay-status"),
+
+	providerGetQuotas: (options?: {
+		providerId?: string;
+		cursor?: string;
+		limit?: number;
+		signal?: AbortSignal;
+	}) => {
+		const params = new URLSearchParams();
+		if (options?.providerId) params.set("providerId", options.providerId);
+		if (options?.cursor) params.set("cursor", options.cursor);
+		params.set("limit", String(options?.limit ?? 100));
+		return request<ProviderQuotaPage>(`/provider-quotas?${params}`, {
+			signal: options?.signal,
+			maxResponseBytes: 256 * 1024,
+		});
+	},
+	providerRefreshQuota: (providerId: string, mode: "probe" | "refresh", signal?: AbortSignal) =>
+		request<ProviderQuotaSnapshot>(`/provider-quotas/${encodeURIComponent(providerId)}/refresh`, {
+			method: "POST",
+			body: JSON.stringify({ mode }),
+			signal,
+			maxResponseBytes: 16 * 1024,
+		}),
 
 	providerProbeBalance: (providerId: string) =>
 		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {

@@ -1,6 +1,6 @@
 {
-  "id": "8b958c5e-584f-4329-9345-37753e276342",
-  "prevId": "4c8df1ee-e212-497f-b798-8e4df0878f06",
+  "id": "a61f112b-2e38-4e5f-9fea-f0d9023a8ec4",
+  "prevId": "8b958c5e-584f-4329-9345-37753e276342",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -20859,6 +20859,470 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.plugin_provider_settings": {
+      "name": "plugin_provider_settings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "plugin_id": {
+          "name": "plugin_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contribution_id": {
+          "name": "contribution_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_kind": {
+          "name": "target_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_id": {
+          "name": "target_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'active'"
+        },
+        "schema_version": {
+          "name": "schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_fingerprint": {
+          "name": "schema_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "binding_fingerprint": {
+          "name": "binding_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "config_text": {
+          "name": "config_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "secrets_envelope": {
+          "name": "secrets_envelope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "key_id": {
+          "name": "key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_plugin_provider_settings_target": {
+          "name": "idx_plugin_provider_settings_target",
+          "columns": [
+            {
+              "expression": "plugin_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "contribution_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "target_kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "target_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_plugin_provider_settings_list": {
+          "name": "idx_plugin_provider_settings_list",
+          "columns": [
+            {
+              "expression": "plugin_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_plugin_provider_settings_provider": {
+          "name": "idx_plugin_provider_settings_provider",
+          "columns": [
+            {
+              "expression": "target_kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "target_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_plugin_provider_settings_revision": {
+          "name": "ck_plugin_provider_settings_revision",
+          "value": "\"revision\" >= 1 and \"revision\" <= 9007199254740990"
+        },
+        "ck_plugin_provider_settings_version": {
+          "name": "ck_plugin_provider_settings_version",
+          "value": "\"schema_version\" >= 1"
+        },
+        "ck_plugin_provider_settings_state": {
+          "name": "ck_plugin_provider_settings_state",
+          "value": "\"state\" in ('active','dormant','deleted','blocked')"
+        },
+        "ck_plugin_provider_settings_bytes": {
+          "name": "ck_plugin_provider_settings_bytes",
+          "value": "octet_length(\"config_text\") + coalesce(octet_length(\"secrets_envelope\"), 0) <= 65536"
+        },
+        "ck_plugin_provider_settings_secret_key": {
+          "name": "ck_plugin_provider_settings_secret_key",
+          "value": "(\"secrets_envelope\" is null and \"key_id\" is null) or (\"secrets_envelope\" is not null and \"key_id\" is not null)"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.plugin_resource_budgets": {
+      "name": "plugin_resource_budgets",
+      "schema": "",
+      "columns": {
+        "plugin_id": {
+          "name": "plugin_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "resource_bytes": {
+          "name": "resource_bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "resource_count": {
+          "name": "resource_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "settings_count": {
+          "name": "settings_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_plugin_budget_bytes": {
+          "name": "ck_plugin_budget_bytes",
+          "value": "\"resource_bytes\" >= 0 and \"resource_bytes\" <= 8388608"
+        },
+        "ck_plugin_budget_resources": {
+          "name": "ck_plugin_budget_resources",
+          "value": "\"resource_count\" >= 0 and \"resource_count\" <= 4096"
+        },
+        "ck_plugin_budget_settings": {
+          "name": "ck_plugin_budget_settings",
+          "value": "\"settings_count\" >= 0 and \"settings_count\" <= 4096"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.plugin_resource_entries": {
+      "name": "plugin_resource_entries",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "plugin_id": {
+          "name": "plugin_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "owner_kind": {
+          "name": "owner_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scope_type": {
+          "name": "scope_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scope_id": {
+          "name": "scope_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key": {
+          "name": "key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "binding_fingerprint": {
+          "name": "binding_fingerprint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'active'"
+        },
+        "value_text": {
+          "name": "value_text",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bytes": {
+          "name": "bytes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_plugin_resource_identity": {
+          "name": "idx_plugin_resource_identity",
+          "columns": [
+            {
+              "expression": "plugin_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "owner_kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scope_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scope_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_plugin_resource_list": {
+          "name": "idx_plugin_resource_list",
+          "columns": [
+            {
+              "expression": "plugin_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "owner_kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scope_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "scope_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_plugin_resource_revision": {
+          "name": "ck_plugin_resource_revision",
+          "value": "\"revision\" >= 1 and \"revision\" <= 9007199254740990"
+        },
+        "ck_plugin_resource_state": {
+          "name": "ck_plugin_resource_state",
+          "value": "\"state\" in ('active','deleted')"
+        },
+        "ck_plugin_resource_bytes": {
+          "name": "ck_plugin_resource_bytes",
+          "value": "\"bytes\" >= 0 and \"bytes\" <= 65536 and octet_length(\"value_text\") = \"bytes\""
+        }
+      },
       "isRLSEnabled": false
     },
     "public.port_allocations": {

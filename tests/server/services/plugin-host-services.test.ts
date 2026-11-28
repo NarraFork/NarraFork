@@ -7,7 +7,10 @@ import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginEventGateway } from "@server/services/plugin-event-gateway";
 import { PluginHostServices } from "@server/services/plugin-host-services";
 import { PluginLifecycleRevokeCoordinator } from "@server/services/plugin-lifecycle-revoke-coordinator";
-import type { StoredPermissionGrant } from "@server/services/plugin-permission-store";
+import {
+	PluginPermissionStore,
+	type StoredPermissionGrant,
+} from "@server/services/plugin-permission-store";
 import {
 	createPluginLifecycleRevokeAdapters,
 	createPluginPlatformServices,
@@ -76,6 +79,78 @@ function bind(
 }
 
 describe("PluginHostServices", () => {
+	test.each([
+		false,
+		true,
+	])("backend connection requests use bound principal, live grants and response budget (authority projection=%s)", async (projected) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-quota-host-services-"));
+		tempRoots.push(root);
+		const permissionStore = new PluginPermissionStore({ root });
+		const mutation = await permissionStore.replace(pluginId, installationId, [
+			{ capability: "quota.provide", scope: { type: "global" } },
+			{ capability: "provider.connection.request", scope: { type: "global" } },
+		]);
+		if (projected) {
+			await permissionStore.mirrorAuthorityGrants(
+				pluginId,
+				installationId,
+				async () => mutation.set,
+			);
+			const mirror = await permissionStore.getSet(pluginId, installationId);
+			expect(mirror.revision).toBeGreaterThan(mutation.set.revision);
+			expect(mirror.authorityRevision).toBe(mutation.set.revision);
+		}
+		const principals: unknown[] = [];
+		const calls: unknown[] = [];
+		const host = new PluginHostServices({
+			capabilityBroker: new CapabilityBroker(),
+			permissionStore,
+			providerConnectionService: {
+				request: async (params, principal) => {
+					calls.push(params);
+					principals.push(principal);
+					return {
+						status: 200,
+						contentType: "application/json",
+						body: "\u0001".repeat(256 * 1024),
+						bytes: 256 * 1024,
+					};
+				},
+				revokePlugin: () => undefined,
+			},
+		});
+		const runtime = bind(host, {
+			grantRevision: mutation.set.revision,
+			grants: mutation.set.grants,
+			manifestRequested: ["quota.provide", "provider.connection.request"],
+		});
+		const request = {
+			jsonrpc: "2.0" as const,
+			id: "provider-connection",
+			method: "provider.connection.request",
+			params: { reference: "host-ref", path: "/quota" },
+		};
+		const response = await runtime.dispatcher.dispatch(request);
+		expect(response).toMatchObject({ result: { status: 200, bytes: 256 * 1024 } });
+		expect(principals).toEqual([runtime.plugin]);
+		expect(calls).toEqual([{ ...request.params, method: "GET" }]);
+		const forged = await runtime.dispatcher.dispatch({
+			...request,
+			id: "forged",
+			params: { ...request.params, principal: { pluginId: "com.other.plugin" } },
+		});
+		expect(forged).toMatchObject({ error: { data: { code: "INVALID_PARAMS" } } });
+		await permissionStore.revoke(
+			pluginId,
+			installationId,
+			mutation.set.grants
+				.filter((grant) => grant.capability === "quota.provide")
+				.map((grant) => grant.grantId),
+		);
+		const stale = await runtime.dispatcher.dispatch({ ...request, id: "stale" });
+		expect(stale).toMatchObject({ error: { data: { code: "PERMISSION_DENIED" } } });
+		expect(calls).toHaveLength(1);
+	});
 	test("composes one public API, registry pair, event gateway, and storage factory", async () => {
 		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-platform-services-"));
 		tempRoots.push(root);
@@ -383,6 +458,13 @@ describe("PluginHostServices", () => {
 				toolRegistry: { runtimeCrashed: () => record("tool_registry") },
 				mcpAdapter: { markUnavailable: () => record("mcp_adapter") },
 				providerRegistry: { list: () => [] },
+				quotaRegistry: {
+					invalidatePlugin: (_plugin: string, options: unknown) => {
+						expect(_plugin).toBe(pluginId);
+						expect(options).toEqual({ runtimeOnly: true });
+						record("quota_registry");
+					},
+				},
 			} as never),
 		});
 
@@ -403,6 +485,7 @@ describe("PluginHostServices", () => {
 			"tool_registry",
 			"mcp_adapter",
 			"provider_registry",
+			"quota_registry",
 		]);
 		expect(hostServices.hasRuntimeBinding(pluginId, runtimeId)).toBe(false);
 		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(false);
@@ -416,6 +499,7 @@ describe("PluginHostServices", () => {
 			{ layer: "secret_broker", bindingPresent: false },
 			{ layer: "tool_registry", bindingPresent: false },
 			{ layer: "mcp_adapter", bindingPresent: false },
+			{ layer: "quota_registry", bindingPresent: false },
 		]);
 
 		const secondGeneration = bind(hostServices, {

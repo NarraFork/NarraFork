@@ -1,0 +1,98 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.example.provider-settings.reference",
+	"version": "1.0.0",
+	"displayName": "Provider Settings Reference",
+	"description": "A provider-settings action example that reads only its host-bound saved values.",
+	"publisher": {
+		"id": "com.example",
+		"name": "Example Team"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": ["host_api.requests", "host_api.provider_settings"],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": [],
+	"contributes": {
+		"providerSettings": [
+			{
+				"id": "settings",
+				"schemaVersion": 1,
+				"title": "Reference provider settings",
+				"description": "Public values used by the reference action.",
+				"targetKinds": ["custom-api", "nug", "platform", "executable-plugin"],
+				"configSchema": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"text": {
+							"type": "string",
+							"title": "Text label",
+							"default": "reference"
+						},
+						"enabled": {
+							"type": "boolean",
+							"title": "Enabled",
+							"default": false
+						},
+						"attempts": {
+							"type": "integer",
+							"title": "Attempts",
+							"minimum": 0,
+							"maximum": 99,
+							"default": 3
+						}
+					}
+				},
+				"action": {
+					"title": "Read saved settings",
+					"description": "Reads this contribution's host-bound public settings and returns a deterministic summary."
+				}
+			}
+		],
+		"providers": [],
+		"searchProviders": [],
+		"quotaSources": [],
+		"tools": [],
+		"commands": [],
+		"events": [],
+		"views": [],
+		"themes": []
+	},
+	"permissions": {
+		"host": ["provider.settings.read_self"],
+		"network": {
+			"mode": "none",
+			"allow": []
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	},
+	"secrets": [],
+	"dependencies": {
+		"plugins": {},
+		"runtime": {}
+	}
+}

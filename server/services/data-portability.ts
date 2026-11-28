@@ -33,7 +33,7 @@ import { randomBytes } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, type FileHandle, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
@@ -46,7 +46,7 @@ import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
 import { getProviderKeyStore } from "@server/lib/provider-keys";
-import { saveSettings, settings } from "@server/lib/settings";
+import { getSettingsRevision, saveSettings, settings } from "@server/lib/settings";
 import type { NarraForkSettings } from "@server/lib/settings/types";
 import { createGroupAllocator } from "@server/lib/sourcing/allocate-group";
 import type { ServiceTemplateId } from "@server/lib/sourcing/templates";
@@ -82,15 +82,23 @@ import {
 } from "../db/alias-selector-backfill";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
-import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
+import {
+	PROVIDER_SETTINGS_SEALED_ENTRY,
+	PROVIDER_SETTINGS_TRANSFER_LIMITS,
+	type ProviderSettingsTransferTarget,
+	SNAPSHOT_TABLES,
+} from "../db/snapshot-protocol";
 import { eventBus } from "../lib/event-bus";
+import { parseSettingAddress } from "./plugin-settings-store";
+import { PROVIDER_SETTINGS_SINGLETON_IDS } from "./provider-settings-targets";
 
 /** Archives without sealed provider keys; every version of this importer reads them. */
 const PLAIN_EXPORT_VERSION = 1;
 /** Archives whose unified credentials are sealed in `provider-keys.sealed.json`. */
 const SEALED_KEYS_EXPORT_VERSION = 3;
 /** The newest version this importer reads. */
-const EXPORT_VERSION = SEALED_KEYS_EXPORT_VERSION;
+const PROVIDER_SETTINGS_EXPORT_VERSION = 3;
+const EXPORT_VERSION = PROVIDER_SETTINGS_EXPORT_VERSION;
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
 
 /** 供应商配置里参与导出/导入的顶层字段。 */
@@ -141,6 +149,9 @@ interface ImportPreview {
 	sealedKeys?: string;
 	/** Owners in the sealed file, from its plaintext header; for the preview only. */
 	sealedKeyCount?: number;
+	providerSettingsCount?: number;
+	providerSettingsTargets?: ProviderSettingsTransferTarget[];
+	providerSettingsSealedPath?: string;
 }
 
 const previews = new Map<string, ImportPreview>();
@@ -264,6 +275,7 @@ async function extractEntryToFile(
 	zipPath: string,
 	entry: ZipEntryIndex,
 	destination: string,
+	maxBytes = MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
 ): Promise<void> {
 	const source = createReadStream(zipPath, {
 		start: entry.dataStart,
@@ -276,7 +288,7 @@ async function extractEntryToFile(
 		transform(chunk, _encoding, callback) {
 			const bytes = Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
 			seen += bytes;
-			if (seen > MAX_SNAPSHOT_UNCOMPRESSED_BYTES) {
+			if (seen > maxBytes) {
 				callback(catalogError("IMPORT_FILE_TOO_LARGE", { limit: MAX_SNAPSHOT_LABEL }));
 				return;
 			}
@@ -400,6 +412,39 @@ export function redeemExportTicket(
 	};
 }
 
+/** Read only bounded identity columns from the snapshot, including dormant/orphan targets. */
+function extensionExportTargets(snapshotPath: string): ProviderSettingsTransferTarget[] {
+	const snapshot = new Database(snapshotPath, { readonly: true });
+	try {
+		const rows = snapshot
+			.query(
+				"SELECT substr(target_kind,1,32) AS kind,substr(target_id,1,257) AS id FROM plugin_provider_settings LIMIT ?",
+			)
+			.all(PROVIDER_SETTINGS_TRANSFER_LIMITS.records + 1) as ProviderSettingsTransferTarget[];
+		if (rows.length > PROVIDER_SETTINGS_TRANSFER_LIMITS.records)
+			throw new AppError(
+				"Provider settings target limit exceeded",
+				400,
+				"PROVIDER_SETTINGS_IMPORT_INVALID",
+			);
+		const targets = new Map<string, ProviderSettingsTransferTarget>();
+		for (const target of rows) {
+			const address = parseSettingAddress({
+				pluginId: "transfer.validation",
+				contributionId: "targets",
+				targetKind: target.kind,
+				targetId: target.id,
+			});
+			const value = { kind: address.targetKind, id: address.targetId };
+			targets.set(JSON.stringify([value.kind, value.id]), value);
+		}
+		return [...targets.values()].sort((a, b) =>
+			JSON.stringify(a).localeCompare(JSON.stringify(b), "en"),
+		);
+	} finally {
+		snapshot.close();
+	}
+}
 /**
  * 导出一份 ZIP：先在子进程里把导入需要的表复制成原生 SQLite 快照，再压缩进 ZIP。
  * 供应商配置与清单是小的 JSON 文件。
@@ -418,24 +463,31 @@ export async function exportData(
 	const zipPath = join(dir, "narrafork-export.zip");
 	const output = createWriteStream(zipPath);
 	const archive = archiver("zip", { zlib: { level: 1 } });
-	// 只导出供应商时不建快照：供应商配置在 settings.json 里。快照会把
-	// 与选择无关的会话和请求历史一起带走。
-	const needsSnapshot = selection.requests || selection.sessions;
+	// Provider selection also needs the extension table; unrelated kinds remain empty tables.
+	const hasExtensionData =
+		selection.providers &&
+		sqlite.query("SELECT 1 FROM plugin_provider_settings LIMIT 1").get() !== null;
+	const needsSnapshot = selection.requests || selection.sessions || hasExtensionData;
+	const collected = selection.providers
+		? collectProviders(settings)
+		: ({} as Partial<Record<ProviderKey, unknown>>);
+	let extensionCount = 0,
+		extensionSealed = false;
 	try {
 		if (needsSnapshot) {
 			// 只把导入需要的表复制进快照，且整段 O(数据量) 的工作放在子进程里，
 			// 不让 INSERT…SELECT / VACUUM 占住服务器的单一线程。
-			await buildSnapshotInSubprocess({
+			const built = await buildSnapshotInSubprocess({
 				sourcePath: getDbPath(),
 				outputPath: snapshotPath,
 				requests: selection.requests,
 				sessions: selection.sessions,
+				...(hasExtensionData ? { providers: { passphrase: options.passphrase } } : {}),
 			});
+			extensionCount = built.providerSettingsCount ?? 0;
+			extensionSealed = built.providerSettingsSealed ?? false;
 		}
 
-		const collected = selection.providers
-			? collectProviders(settings)
-			: ({} as Partial<Record<ProviderKey, unknown>>);
 		// Keys leave providers.json and travel sealed. Sealing (async scrypt) is done before
 		// archiving starts, so a failure leaves no half-written ZIP.
 		const sealedKeys =
@@ -461,17 +513,35 @@ export async function exportData(
 			archive.on("error", reject);
 		});
 		archive.pipe(output);
-		if (needsSnapshot) archive.file(snapshotPath, { name: "snapshot.db" });
+		if (selection.requests || selection.sessions || extensionCount)
+			archive.file(snapshotPath, { name: "snapshot.db" });
 		archive.append(JSON.stringify(providers, null, 2), {
 			name: "providers.json",
 		});
 		if (sealedKeys) archive.append(sealedKeys, { name: SEALED_KEYS_ENTRY });
-		// Only an archive with sealed keys is version 2: an older instance cannot read them and
-		// must refuse it, while archives without providers stay importable there.
+		if (extensionSealed)
+			archive.file(join(dir, PROVIDER_SETTINGS_SEALED_ENTRY), {
+				name: PROVIDER_SETTINGS_SEALED_ENTRY,
+			});
+		// Unified credentials and provider extension settings both require v3. Plain archives
+		// without either remain readable by older instances.
 		archive.append(
 			JSON.stringify(
 				{
-					version: sealedKeys ? SEALED_KEYS_EXPORT_VERSION : PLAIN_EXPORT_VERSION,
+					version: extensionCount
+						? PROVIDER_SETTINGS_EXPORT_VERSION
+						: sealedKeys
+							? SEALED_KEYS_EXPORT_VERSION
+							: PLAIN_EXPORT_VERSION,
+					...(extensionCount
+						? {
+								providerSettings: {
+									count: extensionCount,
+									sealed: extensionSealed,
+									targets: extensionExportTargets(snapshotPath),
+								},
+							}
+						: {}),
 					exportedAt: new Date().toISOString(),
 					counts,
 				},
@@ -678,6 +748,27 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 		? (await readSmallEntry(zipPath, sealedEntry)).toString("utf8")
 		: undefined;
 
+	const extensionSealedEntry = index.get(PROVIDER_SETTINGS_SEALED_ENTRY);
+	let providerSettingsSealedPath: string | undefined;
+	if (extensionSealedEntry) {
+		if (
+			Number(manifest?.version) !== PROVIDER_SETTINGS_EXPORT_VERSION ||
+			extensionSealedEntry.compressedSize > 8 * 1024 * 1024
+		)
+			throw new AppError(
+				"Invalid provider settings archive",
+				400,
+				"PROVIDER_SETTINGS_IMPORT_INVALID",
+			);
+		providerSettingsSealedPath = join(dir, PROVIDER_SETTINGS_SEALED_ENTRY);
+		await extractEntryToFile(
+			zipPath,
+			extensionSealedEntry,
+			providerSettingsSealedPath,
+			8 * 1024 * 1024,
+		);
+	}
+
 	// ATTACH 快照到主库连接，联查冲突（单条 SQL，不把 id 集合搬进 JS）
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;
 	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [snapshotPath]);
@@ -706,6 +797,73 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 			sessions: countRowsIn(snapshotPath, "narrators"),
 			providers: countProviders(providers),
 		};
+		let providerSettingsCount = 0;
+		const hasExtensionTable = sqlite
+			.query(
+				`SELECT 1 FROM ${attachName}.sqlite_master WHERE type='table' AND name='plugin_provider_settings' LIMIT 1`,
+			)
+			.get();
+		if (hasExtensionTable) {
+			providerSettingsCount = sqlite
+				.query(`SELECT 1 FROM ${attachName}.plugin_provider_settings LIMIT 513`)
+				.all().length;
+			if (
+				providerSettingsCount > 512 ||
+				(providerSettingsCount > 0 &&
+					Number(manifest?.version) !== PROVIDER_SETTINGS_EXPORT_VERSION)
+			)
+				throw new AppError(
+					"Invalid provider settings archive version or size",
+					400,
+					"PROVIDER_SETTINGS_IMPORT_INVALID",
+				);
+		}
+		const providerSettingsTargets = hasExtensionTable ? extensionExportTargets(snapshotPath) : [];
+		const extensionHeader = manifest?.providerSettings as
+			| { count?: unknown; sealed?: unknown; targets?: unknown }
+			| undefined;
+		// Early v3 archives did not include a target inventory; their snapshot remains authoritative.
+		if (extensionHeader?.targets !== undefined) {
+			const targets = extensionHeader.targets;
+			if (
+				!Array.isArray(targets) ||
+				targets.length !== providerSettingsTargets.length ||
+				targets.length > PROVIDER_SETTINGS_TRANSFER_LIMITS.records
+			)
+				throw new AppError(
+					"Invalid provider settings targets",
+					400,
+					"PROVIDER_SETTINGS_IMPORT_INVALID",
+				);
+			const targetKeys = new Set(
+				targets.map((target) => JSON.stringify([target?.kind, target?.id])),
+			);
+			if (
+				targetKeys.size !== targets.length ||
+				providerSettingsTargets.some(
+					(target) => !targetKeys.has(JSON.stringify([target.kind, target.id])),
+				)
+			)
+				throw new AppError(
+					"Incomplete provider settings targets",
+					400,
+					"PROVIDER_SETTINGS_IMPORT_INVALID",
+				);
+		}
+		// v3 also carries unified credentials alone. Require the extension inventory only
+		// when extension data or metadata is present; a credential-only v3 has neither.
+		if (
+			(extensionHeader !== undefined || providerSettingsCount > 0 || providerSettingsSealedPath) &&
+			(Number(manifest?.version) !== PROVIDER_SETTINGS_EXPORT_VERSION ||
+				!hasExtensionTable ||
+				extensionHeader?.count !== providerSettingsCount ||
+				extensionHeader?.sealed !== !!providerSettingsSealedPath)
+		)
+			throw new AppError(
+				"Incomplete provider settings archive",
+				400,
+				"PROVIDER_SETTINGS_IMPORT_INVALID",
+			);
 		const token = randomBytes(18).toString("base64url");
 		const preview: ImportPreview = {
 			token,
@@ -721,6 +879,9 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 			exportedAt: typeof manifest?.exportedAt === "string" ? manifest.exportedAt : undefined,
 			version: manifest ? Number(manifest.version ?? PLAIN_EXPORT_VERSION) : undefined,
 			...(sealedKeys ? { sealedKeys, sealedKeyCount: sealedHeaderCount(sealedKeys) } : {}),
+			...(providerSettingsCount
+				? { providerSettingsCount, providerSettingsTargets, providerSettingsSealedPath }
+				: {}),
 		};
 		previews.set(token, preview);
 		prunePreviews();
@@ -795,6 +956,11 @@ export interface ImportResult {
 	keysImported: number;
 	/** Sealed keys that could not be written to the key store; see the server log. */
 	keysFailed: number;
+	/** Present only when the archive carries provider extension settings. */
+	providerSettingsImported?: number;
+	/** Existing local settings/tombstones or earlier records for the same mapped address win. */
+	providerSettingsSkipped?: number;
+	providerSettingsConflicts?: number;
 	/** Explicit link restoration/skipping report; archive relations are not portable ACL grants. */
 	communication: CommunicationImportResult;
 }
@@ -1341,9 +1507,41 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 	/** Exporting template/id → the local group created by this import. */
 	let addedGroups: ReadonlyMap<string, { id: string }> = new Map();
 
+	const preparedRevision = getSettingsRevision();
+	const preparedMerge =
+		importProviders && preview.providerSettingsCount
+			? mergeProviders(incomingProviders, transferItems)
+			: undefined;
+	let extensionStage: string | undefined;
+	let extensionStageCount = 0,
+		extensionStageSkipped = 0;
+	const extensionAttach = `ext_${randomBytes(4).toString("hex")}`;
+	if (preparedMerge) {
+		if (preview.providerSettingsSealedPath && !options.passphrase)
+			throw catalogError("IMPORT_PASSPHRASE_REQUIRED");
+		extensionStage = join(
+			dirname(preview.snapshotPath),
+			`provider-settings-stage-${randomBytes(4).toString("hex")}.db`,
+		);
+		const staged = await buildSnapshotInSubprocess({
+			sourcePath: preview.snapshotPath,
+			outputPath: extensionStage,
+			requests: false,
+			sessions: false,
+			providerImport: {
+				mappings: preparedMerge.providerSettingsMappings,
+				expectedCount: preview.providerSettingsCount ?? 0,
+				passphrase: options.passphrase,
+				sealedPath: preview.providerSettingsSealedPath,
+			},
+		});
+		extensionStageCount = staged.providerSettingsCount ?? 0;
+		extensionStageSkipped = staged.providerSettingsSkipped ?? 0;
+	}
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;
 	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [preview.snapshotPath]);
 	try {
+		if (extensionStage) sqlite.run(`ATTACH DATABASE ? AS ${extensionAttach}`, [extensionStage]);
 		// 覆盖列同样取交集（快照与主库可能列数不同）
 		const incomingNarratorColumns = tableColumns(attachName, "narrators");
 		const narratorColumns = tableColumns("main", "narrators").filter(
@@ -1358,6 +1556,12 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			.join(", ");
 
 		const transaction = sqlite.transaction(() => {
+			if (preparedMerge && getSettingsRevision() !== preparedRevision)
+				throw new AppError(
+					"Providers changed during import preparation",
+					409,
+					"PROVIDER_SETTINGS_REVISION_CONFLICT",
+				);
 			const counts: ImportResult = {
 				requestsInserted: 0,
 				sessionsInserted: 0,
@@ -1561,7 +1765,43 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			// 5) 供应商合并：`saveSettings` 是原子写（临时文件 + rename），放在事务末尾，
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
 			if (include.providers) {
-				const merge = mergeProviders(incomingProviders, transferItems);
+				const merge = preparedMerge ?? mergeProviders(incomingProviders, transferItems);
+				if (extensionStage) {
+					// The source contains at most 512 verified, re-encrypted rows. No local row
+					// or tombstone is overwritten; grants and resource receipts are not imported.
+					const conflicts = sqlite
+						.query(
+							`SELECT COUNT(*) AS n FROM ${extensionAttach}.plugin_provider_settings i WHERE EXISTS (SELECT 1 FROM main.plugin_provider_settings m WHERE i.id=m.id)`,
+						)
+						.get() as { n: number };
+					// Compute the delta before insertion, while the same transaction owns the snapshot.
+					const groups = sqlite
+						.query(
+							`SELECT i.plugin_id AS pluginId,COUNT(*) AS n FROM ${extensionAttach}.plugin_provider_settings i WHERE NOT EXISTS (SELECT 1 FROM main.plugin_provider_settings m WHERE i.id=m.id) GROUP BY i.plugin_id LIMIT 513`,
+						)
+						.all() as Array<{ pluginId: string; n: number }>;
+					if (groups.length > PROVIDER_SETTINGS_TRANSFER_LIMITS.records)
+						throw new AppError(
+							"Provider extension import limit exceeded",
+							400,
+							"PROVIDER_SETTINGS_IMPORT_INVALID",
+						);
+					const inserted = copyTable(extensionAttach, "plugin_provider_settings");
+					if (inserted + conflicts.n !== extensionStageCount)
+						throw new AppError(
+							"Incomplete provider extension import",
+							409,
+							"PROVIDER_SETTINGS_IMPORT_INVALID",
+						);
+					for (const group of groups)
+						sqlite.run(
+							`INSERT INTO plugin_resource_budgets(plugin_id,resource_bytes,resource_count,settings_count,updated_at) VALUES (?,0,0,?,?) ON CONFLICT(plugin_id) DO UPDATE SET settings_count=plugin_resource_budgets.settings_count+excluded.settings_count,updated_at=excluded.updated_at`,
+							[group.pluginId, group.n, new Date().toISOString()],
+						);
+					counts.providerSettingsImported = inserted;
+					counts.providerSettingsSkipped = conflicts.n + extensionStageSkipped;
+					counts.providerSettingsConflicts = counts.providerSettingsSkipped;
+				}
 				// Read after the transaction commits; a retried transaction recomputes them.
 				addedGroups = merge.addedGroups;
 				// 改名的供应商：本次写入的会话跟着指向新前缀，不留在本地同名的另一个服务上。
@@ -1572,6 +1812,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					);
 				}
 				if (merge.changed) {
+					// The catalog owns its separate file; apply only after the staged extension
+					// payload has passed validation and the import revision still matches.
+					if (merge.merged.modelCatalog) importModelCatalogSettings(merge.merged.modelCatalog);
 					const next = structuredClone(settings) as NarraForkSettings;
 					for (const key of PROVIDER_KEYS) {
 						if (merge.merged[key] !== undefined) {
@@ -1580,7 +1823,8 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					const agentPatch: Record<string, unknown> = {};
 					for (const key of AGENT_PROVIDER_KEYS) {
-						if (merge.merged[key] !== undefined) agentPatch[key] = merge.merged[key];
+						if (key !== "modelCatalog" && merge.merged[key] !== undefined)
+							agentPatch[key] = merge.merged[key];
 					}
 					if (Object.keys(agentPatch).length > 0) {
 						next.agent = { ...next.agent, ...agentPatch } as NarraForkSettings["agent"];
@@ -1621,6 +1865,12 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		} catch {
 			// 忽略
 		}
+		if (extensionStage)
+			try {
+				sqlite.run(`DETACH DATABASE ${extensionAttach}`);
+			} catch {
+				/* Keep staging evidence when a handle is still open. */
+			}
 	}
 
 	if (options.include?.sessions ?? true) {
@@ -1646,6 +1896,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 	}
 
 	previews.delete(token);
+	if (extensionStage) void rm(extensionStage, { force: true }).catch(() => {});
+	if (preview.providerSettingsSealedPath)
+		void rm(preview.providerSettingsSealedPath, { force: true }).catch(() => {});
 	void rm(preview.snapshotPath, { force: true }).catch(() => {});
 	return result;
 }
@@ -1804,10 +2057,10 @@ function mergeAgentModelSettings(
 		changed = true;
 	}
 
-	// Overrides are merged into the catalog's own file (incoming wins per entry); the
-	// catalog keeps owning `agent.modelCatalog`, so nothing goes into the settings patch.
+	// Stage overrides with the merge plan. Extension decryption/validation may still fail,
+	// so the catalog's own file must not be touched during import preparation.
 	if (incoming.modelCatalog && typeof incoming.modelCatalog === "object") {
-		importModelCatalogSettings(incoming.modelCatalog);
+		out.modelCatalog = incoming.modelCatalog;
 		changed = true;
 	}
 
@@ -1827,6 +2080,8 @@ function mergeProviders(
 	prefixRemaps: Map<string, string>;
 	/** Only newly added groups receive credentials; merged local groups keep their own. */
 	addedGroups: Map<string, { id: string }>;
+	/** Extension rows also follow reused local endpoints; existing local rows always win. */
+	providerSettingsMappings: Array<{ kind: string; from: string; to: string }>;
 } {
 	const current = structuredClone(settings) as NarraForkSettings;
 	const merged: Partial<Record<ProviderKey, unknown>> = {};
@@ -1835,6 +2090,7 @@ function mergeProviders(
 	let renamed = 0;
 	let skipped = 0;
 	const prefixRemaps = new Map<string, string>();
+	const providerSettingsMappings: Array<{ kind: string; from: string; to: string }> = [];
 	const addedGroups = new Map<string, { id: string }>();
 	const allocator = createGroupAllocator();
 	const store = getProviderKeyStore();
@@ -1857,6 +2113,7 @@ function mergeProviders(
 		const existingNames = new Set(currentList.map((item) => String(item.name ?? "")));
 		for (const item of incomingList as Array<Record<string, unknown>>) {
 			const copy = { ...item };
+			const incomingId = typeof item.id === "string" ? item.id : "";
 			const templateId: ServiceTemplateId =
 				key === "nugProviders" ? "nug" : identifyService(copy as never).templateId;
 			const sourceKey = transferGroupKey(templateId, String(copy.id ?? ""));
@@ -1873,6 +2130,12 @@ function mergeProviders(
 					String(copy.prefix ?? ""),
 					String(sameEndpoint.prefix ?? ""),
 				);
+				if (incomingId && typeof sameEndpoint.id === "string" && sameEndpoint.id)
+					providerSettingsMappings.push({
+						kind: key === "customApiProviders" ? "custom-api" : "nug",
+						from: incomingId,
+						to: sameEndpoint.id,
+					});
 				skipped += 1;
 				continue;
 			}
@@ -1885,6 +2148,12 @@ function mergeProviders(
 			copy.prefix = allocated.prefix;
 			addedGroups.set(sourceKey, { id: allocated.id });
 			rememberPrefixRemap(prefixRemaps, incomingPrefix, allocated.prefix);
+			if (incomingId)
+				providerSettingsMappings.push({
+					kind: key === "customApiProviders" ? "custom-api" : "nug",
+					from: incomingId,
+					to: allocated.id,
+				});
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1951,6 +2220,9 @@ function mergeProviders(
 	for (const key of ["codex", "tokendance", "commandCode"] as const) {
 		const value = incoming[key];
 		if (value === undefined) continue;
+		const id = PROVIDER_SETTINGS_SINGLETON_IDS[key === "commandCode" ? "commandcode" : key];
+		// Reused singleton slots can still receive a missing extension; local rows win below.
+		providerSettingsMappings.push({ kind: "platform", from: id, to: id });
 		const configured =
 			key === "tokendance"
 				? !!store.firstGroupKey("tokendance")
@@ -1978,6 +2250,7 @@ function mergeProviders(
 		skipped,
 		prefixRemaps,
 		addedGroups,
+		providerSettingsMappings,
 	};
 }
 
@@ -2141,5 +2414,13 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 		}
 	}
 
+	if (clearProviders)
+		await buildSnapshotInSubprocess({
+			sourcePath: getDbPath(),
+			outputPath: getDbPath(),
+			requests: false,
+			sessions: false,
+			providerClear: true,
+		});
 	return { target, deleted };
 }

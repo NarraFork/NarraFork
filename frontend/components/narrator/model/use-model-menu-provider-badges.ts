@@ -79,7 +79,7 @@ export function buildModelMenuProviderBadges(
 		);
 		const failed = views.some((view) => view.failed);
 		if (windows.length) {
-			const level = worstQuotaLevel(windows.map((window) => window.level));
+			const level = worstQuotaLevel(views.map((view) => view.level));
 			const combined = {
 				...views[0],
 				windows,
@@ -95,14 +95,19 @@ export function buildModelMenuProviderBadges(
 				stale: failed,
 			};
 		}
-		const balances = group.flatMap((entry) =>
-			entry.snapshot?.balances.length &&
-			(entry.snapshot.expiresAt == null ||
-				!Number.isFinite(entry.snapshot.expiresAt) ||
-				entry.snapshot.expiresAt > now)
-				? [quotaSnapshotText({ ...entry.snapshot, windows: [] }, t, now)]
-				: [],
-		);
+		const balances = group.flatMap((entry) => {
+			const snapshot = entry.snapshot;
+			if (
+				!snapshot ||
+				(!snapshot.balances.some((balance) => balance.display !== "detail") &&
+					snapshot.available !== false) ||
+				(snapshot.expiresAt != null &&
+					Number.isFinite(snapshot.expiresAt) &&
+					snapshot.expiresAt <= now)
+			)
+				return [];
+			return [quotaSnapshotText({ ...snapshot, windows: [] }, t, now)];
+		});
 		if (balances.length) {
 			// Do not sum balances: separate credentials can share an upstream wallet.
 			providerBalances[prefix] = {
@@ -112,8 +117,8 @@ export function buildModelMenuProviderBadges(
 			};
 		} else if (!windows.length && group.some((entry) => entry.supported !== false)) {
 			providerBadges[prefix] = {
-				text: views[0].unavailableText,
-				color: "gray",
+				text: formatQuotaBadgeText(views[0], t),
+				color: QUOTA_LEVEL_COLORS[views[0].level],
 				tooltip: failed ? t("quotaPanel.staleHint") : undefined,
 				stale: failed,
 			};

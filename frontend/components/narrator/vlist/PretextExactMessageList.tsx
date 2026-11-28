@@ -2622,7 +2622,7 @@ export const PretextExactMessageList = memo(
 					});
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
-				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
+				onCatchUp: (orphanChildren, topLevel, subagentActivities): undefined => {
 					translationVisibility?.resume();
 					const initialSync = initialRevisionSyncRef.current;
 					initialRevisionSyncRef.current = false;

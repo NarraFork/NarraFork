@@ -1379,8 +1379,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					connectionIdentity !== narratorWSManager.getCredentialIdentity()
 				)
 					return;
-				// WS has no credential identity: re-read the server projection, never inject
-				// a request's stream text into another credential or overwrite a quota probe.
+				// Re-read the server projection; stream payloads cannot replace another
+				// credential's balance or overwrite an authoritative quota probe.
 				void invalidateQuotaSnapshotRead(qc, quotaReadScope, authGeneration);
 			},
 			onPaymentRequired: (info) => {

@@ -1156,3 +1156,38 @@ describe("plan reflection handover with the real WS hook", () => {
 		expect(current.pendingPermissions).toEqual([permission]);
 	});
 });
+
+test("late Custom API quota cannot enter a NUG view or its independent cache", async () => {
+	quotaProviderId = "p1";
+	qc.setQueryData(["settings"], { customApiQuotas: {}, providerQuotaGenerations: { p1: "g1" } });
+	qc.setQueryData(["nug", "quotas"], { "nug-fixture": { balance: 8 } });
+	await render();
+	function NugHarness() {
+		current = useNarratorPanelWS({
+			narratorId,
+			narratorStatus,
+			isAtBottomRef: { current: true },
+			quotaReadScope: { groupId: "nug-fixture", cachedOnly: true, expectedGeneration: 1 },
+			quotaProviderKey: "nug-fixture",
+		});
+		return null;
+	}
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={qc}>
+				<I18nextProvider i18n={instance}>
+					<NugHarness />
+				</I18nextProvider>
+			</QueryClientProvider>,
+		),
+	);
+	await event({
+		type: "quota_balance",
+		quotaBalance: "999",
+		detailedQuotaBalance: "old custom account",
+		customApiQuotaTarget: { providerId: "p1", generation: "g1" },
+	});
+	expect(qc.getQueryData(["nug", "quotas"])).toEqual({ "nug-fixture": { balance: 8 } });
+	await event({ type: "quota_balance", quotaBalance: "7", customApiQuotaTarget: null });
+	expect(qc.getQueryData(["nug", "quotas"])).toEqual({ "nug-fixture": { balance: 8 } });
+});

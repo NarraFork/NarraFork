@@ -1,7 +1,8 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ApiRequestDiagnostics } from "@shared/agent-protocol/types";
-import * as outbound from "../net/outbound-fetch";
+import type { ProviderQuotaData, QuotaQueryResult } from "@shared/provider-quota";
 import { type CustomApiProviderConfig, settings } from "../settings";
+import { deferred, legacyQuotaFixture } from "./provider-quota-legacy-fixture";
 
 const {
 	classifyOpencodeRefusal,
@@ -16,7 +17,8 @@ const {
 	selectOpencodeUsageResetTarget,
 } = await import("../opencode-quota-wait");
 const { resolveProviderQuotaWait } = await import("../provider-quota-wait");
-const { syncOpencodeUsageCache, refreshOpencodeUsage } = await import("../opencode-usage-cache");
+
+const { refreshOpencodeUsage } = await import("../opencode-usage-cache");
 
 // Monday 2026-10-19 12:00 UTC.
 const NOW = Date.parse("2026-10-19T12:00:00.000Z");
@@ -216,12 +218,11 @@ describe("rate limit waits", () => {
 	});
 });
 
-// --- Resolver against configured providers and a mocked usage endpoint ---
+// --- Existing resolver, now driven through the generic quota service ---
 
-const originalProviders = settings.customApiProviders;
-const originalProxy = settings.proxy;
+let fixture: ReturnType<typeof legacyQuotaFixture>;
 let usageCalls = 0;
-let usageBody: unknown = { usage: { rolling: null, weekly: null, monthly: null } };
+let usageBody: ProviderQuotaData = { amounts: [], windows: [] };
 
 function provider(overrides: Partial<CustomApiProviderConfig> = {}): CustomApiProviderConfig {
 	return {
@@ -238,23 +239,17 @@ function provider(overrides: Partial<CustomApiProviderConfig> = {}): CustomApiPr
 
 describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 	beforeEach(() => {
-		settings.customApiProviders = [];
-		syncOpencodeUsageCache();
-		settings.customApiProviders = [provider()];
-		settings.proxy = { mode: "direct" };
+		fixture = legacyQuotaFixture([provider()]);
 		usageCalls = 0;
-		spyOn(outbound, "outboundFetch").mockImplementation(async (input) => {
+		usageBody = { amounts: [], windows: [] };
+		fixture.query.mockImplementation(async () => {
 			usageCalls++;
-			// The per-family root has no /usage; it must be read from the Go root.
-			expect(String(input)).toBe("https://opencode.ai/inference/go/v1/usage");
-			return Response.json(usageBody);
+			return { status: "supported", data: usageBody, error: null };
 		});
 	});
-	afterEach(() => mock.restore());
-	afterAll(() => {
-		settings.customApiProviders = originalProviders;
-		settings.proxy = originalProxy;
-		syncOpencodeUsageCache();
+	afterEach(() => {
+		fixture.dispose();
+		mock.restore();
 	});
 
 	test("retry-after resolves the wait without a usage request", async () => {
@@ -273,11 +268,17 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 		["rate_limit", "Too many requests", "rateLimit"],
 	] as const)("%s honors the 30-second Retry-After without fetching usage", async (waitKind, message, bucket) => {
 		usageBody = {
-			usage: {
-				rolling: { status: "ok", percent: 2 },
-				weekly: { status: "ok", percent: 3 },
-				monthly: { status: "ok", percent: 4 },
-			},
+			amounts: [],
+			windows: ["rolling", "weekly", "monthly"].map((id, index) => ({
+				id,
+				label: id,
+				used: null,
+				limit: null,
+				remaining: null,
+				resetAt: null,
+				status: "ok" as const,
+				usedPercent: index + 2,
+			})),
 		};
 		const healthy = await refreshOpencodeUsage("ocg");
 		expect([healthy?.rolling?.status, healthy?.weekly?.status, healthy?.monthly?.status]).toEqual([
@@ -336,11 +337,27 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 
 	test("falls back to one usage refresh when the free sources are silent", async () => {
 		usageBody = {
-			usage: {
-				rolling: { status: "rate-limited", percent: 100, resetsAt: "2026-10-19T15:00:00.000Z" },
-				weekly: { status: "ok", percent: 30, resetsAt: "2026-10-26T00:00:00.000Z" },
-				monthly: null,
-			},
+			amounts: [],
+			windows: [
+				{
+					id: "rolling",
+					status: "rate-limited",
+					usedPercent: 100,
+					resetAt: "2026-10-19T15:00:00.000Z",
+					used: null,
+					limit: null,
+					remaining: null,
+				},
+				{
+					id: "weekly",
+					status: "ok",
+					usedPercent: 30,
+					resetAt: "2026-10-26T00:00:00.000Z",
+					used: null,
+					limit: null,
+					remaining: null,
+				},
+			],
 		};
 		const target = await resolveOpencodeQuotaTarget(
 			"ocg",
@@ -354,6 +371,152 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 			source: "usage",
 		});
 		expect(usageCalls).toBe(1);
+	});
+
+	test("an in-flight refresh does not erase the known reset used by the unchanged wait policy", async () => {
+		const resetAt = NOW + 3_600_000;
+		usageBody = {
+			amounts: [],
+			windows: [
+				{
+					id: "rolling",
+					status: "rate-limited",
+					usedPercent: 100,
+					used: null,
+					limit: null,
+					remaining: null,
+					resetAt: new Date(resetAt).toISOString(),
+				},
+			],
+		};
+		fixture.advance(NOW - 1_000_000);
+		await fixture.service.refresh("ocg");
+		fixture.advance(10_000);
+		const pending = deferred<QuotaQueryResult>();
+		fixture.query.mockImplementation(() => pending.promise);
+		const refresh = fixture.service.refresh("ocg");
+		expect(fixture.service.peek("ocg")?.status).toBe("probing");
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toMatchObject({
+			bucket: "fiveHour",
+			resetAt,
+			resumeAt: resetAt + OPENCODE_QUOTA_RESET_SKEW_MS,
+			source: "usage",
+		});
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+		pending.resolve({ status: "supported", data: usageBody, error: null });
+		await refresh;
+	});
+
+	test("legacy display windows cannot park a turn; only a live supported refresh restores their authority", async () => {
+		fixture.dispose();
+		mock.restore();
+		const data: ProviderQuotaData = {
+			amounts: [],
+			windows: [
+				{
+					id: "rolling",
+					used: null,
+					limit: null,
+					remaining: null,
+					usedPercent: 100,
+					resetAt: new Date(NOW + 3_600_000).toISOString(),
+					status: "rate-limited",
+				},
+			],
+		};
+		fixture = legacyQuotaFixture([provider()], data, {
+			persistence: {
+				restore: () => ({
+					sourceId: "test-quota/legacy",
+					sourceRevision: "revision-1",
+					status: "supported",
+					data,
+					fetchedAt: NOW,
+					attemptedAt: NOW,
+					legacyDisplayOnly: true,
+				}),
+				save() {},
+				remove() {},
+				async flush() {},
+			},
+		});
+		fixture.advance(NOW - 1_000_000);
+		fixture.query.mockResolvedValue({ status: "error", data: null, error: "request_failed" });
+		expect(fixture.service.peek("ocg")).toMatchObject({ stale: true, fetchedAt: NOW, data });
+		expect(fixture.service.peek("ocg")).not.toHaveProperty("legacyDisplayOnly");
+		expect(fixture.service.peekKeyForSelection("ocg")).toBeNull();
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toEqual({ bucket: "other" });
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(fixture.service.peek("ocg")?.data).toEqual(data);
+		fixture.advance(10_000);
+		fixture.query.mockResolvedValue({ status: "supported", data, error: null });
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toMatchObject({ bucket: "fiveHour", source: "usage", resetAt: NOW + 3_600_000 });
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+		expect(fixture.service.peekKeyForSelection("ocg")?.data).toEqual(data);
+	});
+
+	test("revoked sources cannot supply an old reset or reactivate an upstream reader", async () => {
+		usageBody = {
+			amounts: [],
+			windows: [
+				{
+					id: "rolling",
+					status: "rate-limited",
+					usedPercent: 100,
+					used: null,
+					limit: null,
+					remaining: null,
+					resetAt: new Date(NOW + 3_600_000).toISOString(),
+				},
+			],
+		};
+		await fixture.service.refresh("ocg");
+		fixture.revoke();
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toEqual({ bucket: "other" });
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+	});
+
+	test("platform provider refs remain outside Custom API quota waiting and discovery", async () => {
+		for (const providerRef of ["codex", "commandcode", "tokendance", "nug", "nug:provider-id"]) {
+			expect(await resolveProviderQuotaWait(providerRef, WEEKLY_MESSAGE, diag(), NOW)).toEqual({
+				kind: "none",
+			});
+		}
+		expect(fixture.query).not.toHaveBeenCalled();
+		expect(Object.keys(fixture.service.generations())).toEqual(["ocg"]);
+	});
+
+	test("without a source and reset evidence an unknown wall is refused, not treated as recovered", async () => {
+		fixture.revoke();
+		const target = await resolveOpencodeQuotaTarget(
+			"ocg",
+			"Go usage limit exceeded",
+			diag({ message: "Go usage limit exceeded", responseSnippet: "Go usage limit exceeded" }),
+			NOW,
+		);
+		expect(target).toEqual({ bucket: "other" });
+		expect(target).not.toHaveProperty("resumeAt");
+		expect(usageCalls).toBe(0);
+	});
+
+	test("free retry-after evidence still works without an installed source", async () => {
+		fixture.revoke();
+		const target = await resolveOpencodeQuotaTarget(
+			"ocg",
+			WEEKLY_MESSAGE,
+			diag({ responseHeaders: { "retry-after": "3600" } }),
+			NOW,
+		);
+		expect(target).toMatchObject({ bucket: "weekly", resetAt: NOW + 3_600_000 });
+		expect(usageCalls).toBe(0);
 	});
 
 	test("a monthly reset beyond the budget is refused with its instant", async () => {

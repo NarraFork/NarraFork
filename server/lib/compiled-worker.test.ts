@@ -495,14 +495,18 @@ await compileRuntimeBundle({ ...JSON.parse(process.argv[2]), modules: new Map() 
 					value: { complete: true, files: [], readFiles: 0, readBytes: 0 },
 				});
 				expect(result.posts.filter((post) => post.action !== "ping")).toEqual([
-					{ entry: result.specifier, action: "read" },
+					{ entry: expect.any(String), action: "read" },
 				]);
-				expect(result.attempts.slice(result.attemptsBeforeCache)).toEqual([result.specifier]);
+				expect(result.attempts.slice(result.attemptsBeforeCache)).toEqual([
+					String(workerEntryFromSpecifier(result.specifier)),
+				]);
 			} else {
 				expect(result.ok).toBe(false);
 				expect(result.error).toContain("No worker entry loaded");
 				expect(result.elapsedMs).toBeLessThan(3_000);
-				expect(result.attempts).toEqual(result.specifiers);
+				expect(result.attempts).toEqual(
+					result.specifiers.map((specifier) => String(workerEntryFromSpecifier(specifier))),
+				);
 				expect(result.posts.every((post) => post.action === "ping")).toBe(true);
 			}
 		}

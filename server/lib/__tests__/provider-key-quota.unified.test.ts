@@ -1,7 +1,12 @@
-import { afterAll, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, expect, mock, test } from "bun:test";
 import { seedUnifiedCredentials } from "../../../tests/unified-credentials";
 import { getProviderKeyStore, resetProviderKeyStoreForTests } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
+import {
+	archivedQuotaFixture,
+	bindLegacyQuotaService,
+	closeQuotaTestPackage,
+} from "./provider-quota-legacy-fixture";
 
 const credentials = seedUnifiedCredentials();
 const saved = structuredClone(settings);
@@ -25,7 +30,14 @@ mock.module("../net/outbound-fetch", () => ({
 const { getKimiKeyUsages, refreshAllKimiUsages, purgeKimiUsageCache } = await import(
 	"../kimi-usage-cache"
 );
-afterAll(() => {
+let fixture: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+beforeAll(async () => {
+	fixture = await archivedQuotaFixture();
+	bindLegacyQuotaService(fixture.service);
+});
+afterAll(async () => {
+	await fixture?.close();
+	await closeQuotaTestPackage();
 	purgeKimiUsageCache([owner]);
 	getProviderKeyStore().removeProvider(owner);
 	saveSettings(saved);
@@ -51,6 +63,7 @@ test("quota refresh reads both persisted unified credentials after store rebuild
 	const first = getProviderKeyStore().list(owner)[0];
 	const second = getProviderKeyStore().add(owner, { apiKey: "second-quota-key" });
 	resetProviderKeyStoreForTests();
+	await fixture.prepareProviders(settings.customApiProviders ?? []);
 	await refreshAllKimiUsages();
 	expect(seen.sort()).toEqual(["Bearer first-quota-key", "Bearer second-quota-key"]);
 	for (const id of [first.id, second.id]) expect(getKimiKeyUsages()[id]?.fiveHour?.used).toBe(20);

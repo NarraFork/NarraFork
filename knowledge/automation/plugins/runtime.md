@@ -48,7 +48,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 关键规则
 - 包存储（`PluginPackageStore`）：根目录 `<narrafork-home>/plugins`，含 `staging/`、`packages/`、`current.json`（指针 `{version, hash}`）。只收 `.zip`/`.nfplugin`；上限为压缩包 100MiB、解压 500MiB、单文件 50MiB、清单 1MiB、1 万个文件，整体操作 60s；含符号链接或特殊条目即拒绝。路由上传另限 100MiB。
 - 安装只落盘并登记，不启动：`finishInstalledPackage` 把 `desiredState` 置为 `disabled`，之后需 enable/activate。同一 `pluginId` 装入不同哈希即视为升级：先撤销旧授权、停旧运行时，再校验信任策略（`plugin-manager.ts`）。
-- 内置插件同走清单校验与生命周期，只是没有安装步骤，首次初始化时默认 `enabled`，之后显式 disable 保持有效；编译版先把内置包写回磁盘再读（`builtin-plugins/registry.ts`、`materialize.ts`）。
+- 随宿主分发的额度包走普通 `.nfplugin` 安装与生命周期，显式停用、撤权和卸载决定保持有效；编译版嵌入独立归档并按内容摘要物化。旧 catalog-only 额度目录已退役，兼容升级选择由 `plugin-manager.ts` 与 `bundled-plugin-assets.ts` 处理。
 - 清单：`engine.runtime` 为 bun/node/python/binary，`engine.runner` 为 `local-process`（默认）或 `podman`；`server` 声明入口、stdio 传输、`narrafork.rpc/1`，`startupTimeoutMs`（默认 15s）与 `activationTimeoutMs`（默认 30s）被映射为运行时的握手与激活超时（`manifest.ts`、`plugin-manager.ts:defaultRuntimeOptions`）。
 - 本地运行器：子进程只继承白名单环境变量（PATH、LANG 与若干 `NF_PLUGIN_*`）；POSIX 上用 `/bin/sh ulimit` 套 CPU 300s、虚拟内存 1GiB，Windows 无此限制（manager 对 win32 显式放行无限制运行）。进程启动超时 15s，空闲超时 5 分钟（`LocalProcessRunner`），RPC 15s、排空 5s、关停 5s（`PluginRuntime` 默认）。空闲超时到期后的链路（`PluginRuntime.timeout("idle")`、`RuntimeSupervisor.handleFailure`）：
   - 先 `emitError`（错误码 `IDLE_TIMEOUT`，`phase: "idle"`，`retryable`），再 `kill`。
@@ -57,6 +57,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - 这次重启计入重启预算（窗口内次数与总次数上限）；预算耗尽才隔离（`restart budget exhausted`）。
 - `local-process` 不提供网络或文件系统隔离；清单里的 `permissions.network/filesystem/process` 在宿主代码里没有任何读取方，只是声明，不是沙箱（`manifest.ts` 注释，全仓搜索确认）。需要隔离用下面的 Podman 运行器。
 - 编译版没有系统 Bun：用自身可执行文件加 `--plugin-runtime-worker <入口>` 启动插件，该模式在加载 main 之前分支，不开数据库、不抢实例锁（`plugin-runtime-worker.ts`）；源码运行直接 `bun <入口>`。
+- `PluginRuntime.start` 的调用方取消信号只约束进程启动、hello、initialize、activate 和首个 health；成功后解除该调用方监听，进程生命周期交给 runtime/supervisor。设置或额度请求结束不能杀掉共享插件。直接使用 runner 时，其取消信号仍拥有该进程生命周期；启动中取消仍终止真实子进程并清理监听。
 - 监督（`RuntimeSupervisor`）：崩溃/失败后指数退避重启（100ms 起，上限 30s，±10% 抖动）；60s 窗口内超过 3 次或 15 分钟内超过 10 次进入 `quarantine`；stdout 协议错误（`INVALID_JSON_RPC`、`STDOUT_LIMIT`、握手类错误、`PROCESS_EXIT`）直接隔离。隔离后的调用见[授权与密钥](permissions-secrets.md)。
 - Podman 运行器只在清单声明 `podman` 时用，且需要环境变量 `NF_PLUGIN_PODMAN_IMAGE` 与 `NF_PLUGIN_PODMAN_IMAGE_DIGEST`，缺失则 503 `PLUGIN_PODMAN_CONFIGURATION_MISSING`。命令带 `--read-only`、`--network none`、`--cap-drop ALL`、`no-new-privileges`，默认 512MiB 内存、1 CPU、pids 128、tmpfs 64MiB，包以只读挂 `/plugin`、数据目录读写挂 `/data`；镜像必须带 `sha256:` 摘要；Podman 不可用就报错，不回退到本地执行（`buildPodmanCommand`、`PodmanRunner.start`）。
 - `PluginUpgradeCoordinator`（暂存新包 → CAS 改指针 → 健康检查 → 起新进程，失败补偿回滚）和 `PluginProcessRunner` 在仓库里只被测试和 `plugin-hardening.ts` 的再导出引用，`PluginManager` 的安装路径并不经过它们。

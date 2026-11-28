@@ -111,6 +111,18 @@ describe("plugins API", () => {
 		expect(normalizePluginList({} as never)).toEqual([]);
 	});
 
+	test("discovery preserves quotaSources and future contribution kinds without requiring an iframe entry", () => {
+		const item: PluginSummary = {
+			pluginId: "third.party.quota",
+			contributions: [
+				{ id: "wallet", kind: "quotaSources", title: "Account credits" },
+				{ id: "future", kind: "future-data-kind" },
+			],
+		};
+		expect(normalizePluginList({ plugins: [item] })[0]?.contributions).toEqual(item.contributions);
+		expect(item.contributions?.[0]?.entryPath).toBeUndefined();
+	});
+
 	test("detail request encodes pluginId in the path", async () => {
 		let capturedUrl = "";
 		Object.defineProperty(g, "localStorage", {

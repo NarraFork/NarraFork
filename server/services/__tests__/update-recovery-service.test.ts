@@ -1912,6 +1912,7 @@ describe("planned update continuation scheduling", () => {
 					statusEntered.resolve();
 					await statusGate.promise;
 				}
+				return undefined;
 			},
 		);
 		const runtimeSpy = spyOn(runtime, "runAgentLoopUnlocked").mockResolvedValue({ started: true });

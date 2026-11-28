@@ -148,6 +148,44 @@ describe("integrity probe subprocess", () => {
 		expect(report.mode).toBe("quick");
 	}, 90_000);
 
+	test("never makes the server's own writes fail while it runs or exits", async () => {
+		createHealthyDb();
+		// The exact production connection (WAL, 250 ms busy_timeout): a probe that leaves its
+		// read-only handle to be torn down at process exit made these writes fail with
+		// "database is locked" for over a second on Windows, right after every unclean start.
+		const { openDatabase } = await import("../connection");
+		const writer = openDatabase(join(home, "narrafork.db"));
+		const insert = writer.prepare("INSERT INTO t (b) VALUES (?)");
+		const failures: string[] = [];
+		let writes = 0;
+		let stopped = false;
+		const loop = (async () => {
+			while (!stopped) {
+				try {
+					insert.run("w");
+					writes++;
+				} catch (error) {
+					failures.push(String((error as Error)?.message ?? error));
+				}
+				await Bun.sleep(2);
+			}
+		})();
+		try {
+			for (let index = 0; index < 3; index++) {
+				expect((await probeIn(home)).status).toBe("ok");
+				// Leave room for the lock release that follows the probe's exit.
+				await Bun.sleep(500);
+			}
+		} finally {
+			stopped = true;
+			await loop;
+			insert.finalize();
+			writer.close();
+		}
+		expect(failures).toEqual([]);
+		expect(writes).toBeGreaterThan(10);
+	}, 120_000);
+
 	test("reports corrupt for a database whose file is not a database", async () => {
 		writeFileSync(join(home, "narrafork.db"), "this is definitely not sqlite");
 		const report = await probeIn(home);

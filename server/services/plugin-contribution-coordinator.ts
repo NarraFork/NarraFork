@@ -13,6 +13,7 @@ import type { PluginCommandRegistry } from "./plugin-command-registry";
 import type { PluginContributionRegistry } from "./plugin-contribution-registry";
 import { providerRegistrationsFromManifest } from "./plugin-provider-manifest";
 import type { PluginProviderRegistry } from "./plugin-provider-registry";
+import type { PluginQuotaRegistry } from "./plugin-quota-registry";
 import type { PluginSearchRegistry } from "./plugin-search-registry";
 import type { PluginStateRecord } from "./plugin-state-store";
 import type { PluginToolRegistry } from "./plugin-tool-registry";
@@ -80,6 +81,8 @@ export interface PluginContributionCoordinatorOptions {
 	 * as `providerRegistry`; when absent, plugin search channels are simply never offered.
 	 */
 	searchRegistry?: PluginSearchRegistry;
+	/** Independent quota source discovery, never linked to a provider contribution. */
+	quotaRegistry?: PluginQuotaRegistry;
 	/** Persisted provider config, so a restart re-registers with the user's settings. */
 	providerConfigSource?: PluginProviderConfigSource;
 	/** Persisted prefix overrides, so a restart keeps the admin's chosen namespace. */
@@ -270,6 +273,7 @@ export class PluginContributionCoordinator {
 	private readonly pluginCommandRegistry?: PluginCommandRegistry;
 	readonly providerRegistry?: PluginProviderRegistry;
 	readonly searchRegistry?: PluginSearchRegistry;
+	readonly quotaRegistry?: PluginQuotaRegistry;
 	private readonly providerConfigSource?: PluginProviderConfigSource;
 	private readonly providerPrefixSource?: PluginProviderPrefixSource;
 	private readonly providerConfigPruner?: PluginProviderConfigPruner;
@@ -292,6 +296,7 @@ export class PluginContributionCoordinator {
 		this.pluginCommandRegistry = options.pluginCommandRegistry;
 		this.providerRegistry = options.providerRegistry;
 		this.searchRegistry = options.searchRegistry;
+		this.quotaRegistry = options.quotaRegistry;
 		this.providerConfigSource = options.providerConfigSource;
 		this.providerPrefixSource = options.providerPrefixSource;
 		this.providerConfigPruner = options.providerConfigPruner;
@@ -464,6 +469,7 @@ export class PluginContributionCoordinator {
 					this.providerRegistry?.removePlugin(pluginId);
 					this.pluginCommandRegistry?.removePlugin(pluginId);
 					this.searchRegistry?.unregisterPlugin(pluginId);
+					this.quotaRegistry?.removePlugin(pluginId);
 					continue;
 				}
 				if (!manifest || !sameManifestGeneration(manifest, packageSummary)) {
@@ -489,6 +495,7 @@ export class PluginContributionCoordinator {
 					this.pluginCommandRegistry?.registerManifest(manifest);
 					this.replaceProviderManifest(pluginId, manifest, generation, diagnostics);
 					this.replaceSearchManifest(pluginId, manifest);
+					if (generation) this.quotaRegistry?.replaceManifest(manifest, generation);
 				}
 				const state = stateMap(states).get(pluginId);
 				const unavailable = lifecycleUnavailableReason(state, packageSummary);
@@ -498,6 +505,7 @@ export class PluginContributionCoordinator {
 					this.toolRegistry.enablePlugin(pluginId);
 					this.providerRegistry?.enablePlugin(pluginId);
 					this.searchRegistry?.setPluginEnabled(pluginId, true);
+					this.quotaRegistry?.setPluginEnabled(pluginId, true);
 				}
 			}
 
@@ -523,6 +531,7 @@ export class PluginContributionCoordinator {
 			this.fingerprint = nextFingerprint;
 			this.revisionValue += 1;
 			this.agentToolBridge?.sync();
+			this.quotaRegistry?.setReady();
 			return this.report(true, false, states, options.reason, diagnostics);
 		} catch (error) {
 			try {
@@ -577,6 +586,7 @@ export class PluginContributionCoordinator {
 		// Keep the registration but mark it unusable, so the channel stays in the user's
 		// saved order and reappears when the plugin recovers.
 		this.searchRegistry?.setPluginEnabled(pluginId, false);
+		this.quotaRegistry?.setPluginEnabled(pluginId, false);
 	}
 
 	/**
@@ -683,6 +693,7 @@ export class PluginContributionCoordinator {
 			this.providerRegistry?.removePlugin(pluginId);
 			this.pluginCommandRegistry?.removePlugin(pluginId);
 			this.searchRegistry?.unregisterPlugin(pluginId);
+			this.quotaRegistry?.removePlugin(pluginId);
 		}
 		for (const [pluginId, manifest] of previousManifests) {
 			this.toolRegistry.replaceManifest(manifest);
@@ -691,6 +702,8 @@ export class PluginContributionCoordinator {
 			// original failure, which is the one worth surfacing.
 			this.replaceProviderManifest(pluginId, manifest, previousGenerations.get(pluginId), []);
 			this.replaceSearchManifest(pluginId, manifest);
+			const generation = previousGenerations.get(pluginId);
+			if (generation) this.quotaRegistry?.replaceManifest(manifest, generation);
 			const packageSummary = previousSnapshot
 				? packageForPlugin(
 						previousSnapshot,
@@ -713,8 +726,10 @@ export class PluginContributionCoordinator {
 				this.contributionRegistry.markAvailable(pluginId);
 				this.toolRegistry.enablePlugin(pluginId);
 				this.providerRegistry?.enablePlugin(pluginId);
+				this.quotaRegistry?.setPluginEnabled(pluginId, true);
 			}
 		}
+		this.quotaRegistry?.setReady(Boolean(previousSnapshot));
 		this.contributionRegistry.refresh(previousSnapshot ?? emptySnapshot());
 		this.manifests = new Map(previousManifests);
 		this.generations = new Map(previousGenerations);

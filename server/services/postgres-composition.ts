@@ -45,6 +45,8 @@ import {
 } from "./outline/access-reads";
 import { setOutlineStore } from "./outline/store";
 import { createPostgresOutlineStore } from "./outline/store/postgres-store";
+import { bindPostgresPluginSettingsStore } from "./plugin-settings-store-provider";
+import { createPostgresPluginSettingsStore } from "./postgres-plugin-settings-store";
 import { setProjectReadAdapter } from "./read";
 import { PostgresProjectReadAdapter } from "./read/postgres-project-read-adapter";
 import { createPostgresRegistrationAccountStore } from "./registration/postgres-account-store";
@@ -62,6 +64,7 @@ export function composePostgresStores(runtime: PostgresRuntime): void {
 	const db = runtime.client.db;
 	// Startup migrations (aggregation values, reserved `auto` prefix) use this handle too.
 	setMigrationPgHandle(db);
+	bindPostgresPluginSettingsStore(createPostgresPluginSettingsStore(runtime.client.sql));
 	setRegistrationAccountStore(createPostgresRegistrationAccountStore(db));
 	// The auth loop (login lookup, session gate, MFA factors, token-generation revocation)
 	// is one store pair over the same handle: a deployment can never register an account

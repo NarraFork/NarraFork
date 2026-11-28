@@ -1,0 +1,274 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "io.narrafork.provider-quota",
+	"version": "1.0.4",
+	"displayName": "Provider Quota",
+	"description": "Bounded Custom API allowance queries through credential-free Host API connections.",
+	"publisher": { "id": "io.narrafork", "name": "NarraFork" },
+	"license": "MPL-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [
+			"host_api.requests",
+			"rpc.cancel",
+			"host_api.provider_connection",
+			"host_api.provider_settings"
+		],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 15000
+	},
+	"activationEvents": ["onStartup"],
+	"contributes": {
+		"providerSettings": [
+			{
+				"id": "site-account",
+				"schemaVersion": 1,
+				"title": "Site account",
+				"description": "Optional account settings for reading a site-level quota balance.",
+				"i18n": {
+					"en": {
+						"title": "Site account",
+						"description": "Optional account settings for reading a site-level quota balance."
+					},
+					"zh-CN": {
+						"title": "站点账户",
+						"description": "可选的站点账户设置，用于读取账户级额度余额。"
+					}
+				},
+				"targetKinds": ["custom-api"],
+				"configSchema": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"useSiteAccount": {
+							"type": "boolean",
+							"default": false,
+							"title": "Use site account",
+							"description": "Read the account balance from the saved site account instead of the inference key.",
+							"x-narrafork-i18n": {
+								"en": {
+									"title": "Use site account",
+									"description": "Read the account balance from the saved site account instead of the inference key."
+								},
+								"zh-CN": {
+									"title": "使用站点账户",
+									"description": "使用已保存的站点账户读取账户余额，而不是使用推理密钥。"
+								}
+							}
+						},
+						"siteUrl": {
+							"type": "string",
+							"format": "uri",
+							"maxLength": 2048,
+							"title": "Site URL",
+							"description": "The site URL that owns the account connection.",
+							"x-narrafork-i18n": {
+								"en": {
+									"title": "Site URL",
+									"description": "The site URL that owns the account connection."
+								},
+								"zh-CN": {
+									"title": "站点 URL",
+									"description": "拥有该账户连接的站点 URL。"
+								}
+							}
+						},
+						"userId": {
+							"type": "string",
+							"maxLength": 128,
+							"x-narrafork-host-only": true,
+							"title": "Site user ID",
+							"description": "The site account identity sent only through the host connection.",
+							"x-narrafork-i18n": {
+								"en": {
+									"title": "Site user ID",
+									"description": "The site account identity sent only through the host connection."
+								},
+								"zh-CN": {
+									"title": "站点用户 ID",
+									"description": "仅通过宿主连接发送的站点账户标识。"
+								}
+							}
+						},
+						"token": {
+							"type": "string",
+							"writeOnly": true,
+							"maxLength": 4096,
+							"title": "Site token",
+							"description": "The site account token used only by the host connection.",
+							"x-narrafork-i18n": {
+								"en": {
+									"title": "Site token",
+									"description": "The site account token used only by the host connection."
+								},
+								"zh-CN": {
+									"title": "站点令牌",
+									"description": "仅由宿主连接使用的站点账户令牌。"
+								}
+							}
+						}
+					}
+				},
+				"connections": [
+					{
+						"id": "balance",
+						"destination": "extension",
+						"method": "GET",
+						"path": "/api/user/self",
+						"baseUrlField": "siteUrl",
+						"auth": { "kind": "bearer", "secretField": "token" },
+						"headers": [{ "name": "new-api-user", "field": "userId" }]
+					}
+				]
+			}
+		],
+		"quotaSources": [
+			{
+				"id": "relay",
+				"settingsContribution": "site-account",
+				"title": "Relay allowance",
+				"match": { "hosts": [], "pathPrefixes": [], "fallback": true },
+				"requests": [
+					{ "path": "/**/v1/usage", "auth": "bearer", "queryKeys": [], "headers": ["accept"] },
+					{
+						"path": "/**/api/usage/token/",
+						"auth": "bearer",
+						"queryKeys": [],
+						"headers": ["accept"]
+					},
+					{ "path": "/**/api/status", "auth": "none", "queryKeys": [], "headers": ["accept"] }
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"keepLastGoodMs": 600000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 8000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 8
+				}
+			},
+			{
+				"id": "deepseek",
+				"settingsContribution": "site-account",
+				"title": "DeepSeek balance",
+				"match": { "hosts": ["api.deepseek.com"], "pathPrefixes": ["/"], "fallback": false },
+				"requests": [
+					{ "path": "/user/balance", "auth": "bearer", "queryKeys": [], "headers": ["accept"] }
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			},
+			{
+				"id": "kimi",
+				"settingsContribution": "site-account",
+				"title": "Kimi coding allowance",
+				"match": {
+					"hosts": ["kimi.com", "kimi.ai", "*.kimi.com", "*.kimi.ai"],
+					"pathPrefixes": [],
+					"fallback": false
+				},
+				"requests": [
+					{
+						"path": "/coding/v1/usages",
+						"auth": "bearer",
+						"queryKeys": [],
+						"headers": ["accept", "user-agent"]
+					}
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			},
+			{
+				"id": "opencode",
+				"settingsContribution": "site-account",
+				"title": "OpenCode Go allowance",
+				"match": {
+					"hosts": ["opencode.ai", "*.opencode.ai"],
+					"pathPrefixes": ["/zen/go/", "/inference/go/"],
+					"fallback": false
+				},
+				"requests": [
+					{
+						"path": "/zen/go/v1/usage",
+						"auth": "bearer-and-api-key",
+						"queryKeys": [],
+						"headers": ["accept"]
+					},
+					{
+						"path": "/inference/go/v1/usage",
+						"auth": "bearer-and-api-key",
+						"queryKeys": [],
+						"headers": ["accept"]
+					}
+				],
+				"refresh": {
+					"staleMs": 60000,
+					"retryMs": 60000,
+					"maxRetryMs": 600000,
+					"activityMs": 20000,
+					"unsupportedMs": 3600000
+				},
+				"limits": {
+					"timeoutMs": 20000,
+					"requestTimeoutMs": 15000,
+					"maxResponseBytes": 65536,
+					"maxRequests": 1
+				}
+			}
+		]
+	},
+	"permissions": {
+		"host": [
+			"quota.provide",
+			"provider.connection.request",
+			"provider.settings.read_self",
+			"provider.settings.connection.use"
+		],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

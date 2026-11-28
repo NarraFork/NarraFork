@@ -30,7 +30,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconAlertTriangle, IconInfoCircle } from "@tabler/icons-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	buildConfigPayload,
@@ -63,6 +63,10 @@ export interface PluginConfigFormProps {
 	/** Server-side error from the last submit, shown verbatim above the fields. */
 	submitError?: string;
 	disabled?: boolean;
+	/** Consumers may disable actions while this independent draft is unsaved. */
+	onDirtyChange?: (dirty: boolean) => void;
+	/** Change after an acknowledged save even when only a masked secret changed. */
+	resetKey?: string | number;
 }
 
 function fieldDescription(field: ConfigField): string | undefined {
@@ -83,14 +87,16 @@ export function PluginConfigForm({
 	submitting = false,
 	submitError,
 	disabled = false,
+	onDirtyChange,
+	resetKey,
 }: PluginConfigFormProps) {
 	const { t } = useTranslation("plugins");
 	const model = useMemo(() => buildConfigFormModel(schema), [schema]);
 	// Re-seed whenever the server view changes identity, so a successful save or an
 	// external change is reflected instead of leaving a stale draft on screen.
 	const [draft, setDraft] = useState<ConfigDraft>(() => draftFromView(model.fields, view));
-	const [seededFor, setSeededFor] = useState(() => JSON.stringify(view));
-	const viewKey = JSON.stringify(view);
+	const [seededFor, setSeededFor] = useState(() => JSON.stringify([resetKey, view]));
+	const viewKey = JSON.stringify([resetKey, view]);
 	if (viewKey !== seededFor) {
 		setSeededFor(viewKey);
 		setDraft(draftFromView(model.fields, view));
@@ -104,6 +110,9 @@ export function PluginConfigForm({
 		? rawAll.trim() !== JSON.stringify(view.config, null, 2).trim()
 		: isDraftDirty(model.fields, draft, view);
 
+	useEffect(() => {
+		onDirtyChange?.(dirty);
+	}, [dirty, onDirtyChange]);
 	const handleSubmit = useCallback(async () => {
 		if (model.rawOnly) {
 			let parsed: unknown;

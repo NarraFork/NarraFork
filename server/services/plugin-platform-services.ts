@@ -1,5 +1,6 @@
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { outboundFetch } from "@server/lib/net/outbound-fetch";
 import { getOutboundProxy, resolveOverride } from "@server/lib/net/proxy";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import { registerExtraSearchChannelSource } from "@server/lib/search/plugin-source";
@@ -37,6 +38,10 @@ import {
 	declaredProviderSecretFields,
 	PluginProviderConfigService,
 } from "./plugin-provider-config-service";
+import {
+	type PluginProviderConnectionService,
+	pluginProviderConnectionService,
+} from "./plugin-provider-connection-service";
 import { PluginProviderCredentialResolver } from "./plugin-provider-credential-resolver";
 import {
 	findPluginProviderForModel,
@@ -58,6 +63,7 @@ import {
 	type PluginPublicApiAdapters,
 	QueryRegistry,
 } from "./plugin-public-api";
+import { PluginQuotaRegistry } from "./plugin-quota-registry";
 import { RuntimeSupervisor } from "./plugin-runtime";
 import { PluginScheduler } from "./plugin-scheduler";
 import { PluginSearchRegistry } from "./plugin-search-registry";
@@ -76,6 +82,9 @@ import {
 	pluginUiSessionService as defaultPluginUiSessionService,
 	type PluginUiSessionService,
 } from "./plugin-ui-session";
+import { type ProviderQuotaService, providerQuotaService } from "./provider-quota-service";
+import { ProviderSettingsBindings } from "./provider-settings-bindings";
+import { ProviderSettingsService } from "./provider-settings-service";
 
 export interface PluginPlatformServices {
 	runtimeSupervisor: RuntimeSupervisor;
@@ -97,6 +106,11 @@ export interface PluginPlatformServices {
 	pluginCommandRegistry: PluginCommandRegistry;
 	mcpAdapter: PluginMcpAdapter;
 	providerRegistry: PluginProviderRegistry;
+	quotaRegistry: PluginQuotaRegistry;
+	quotaService: ProviderQuotaService;
+	providerConnectionService: PluginProviderConnectionService;
+	providerSettingsBindings: ProviderSettingsBindings;
+	providerSettingsService: ProviderSettingsService;
 	providerClientPool: PluginProviderClientPool;
 	providerCatalogRefresher: PluginProviderCatalogRefresher;
 	providerConfigService: PluginProviderConfigService;
@@ -131,6 +145,10 @@ export interface PluginPlatformServicesOptions {
 	pluginCommandRegistry?: PluginCommandRegistry;
 	mcpAdapter?: PluginMcpAdapter;
 	providerRegistry?: PluginProviderRegistry;
+	quotaRegistry?: PluginQuotaRegistry;
+	quotaService?: ProviderQuotaService;
+	providerConnectionService?: PluginProviderConnectionService;
+	providerSettingsBindings?: ProviderSettingsBindings;
 	/** Registry of `contributes.searchProviders` sources. */
 	searchRegistry?: PluginSearchRegistry;
 	providerClientPool?: PluginProviderClientPool;
@@ -290,6 +308,20 @@ function revokeProviders(
 	services.providerRegistry.disablePlugin(context.event.pluginId, lifecycleReason(context));
 }
 
+function revokeQuotas(
+	services: Partial<Pick<PluginPlatformServices, "quotaRegistry">>,
+	context: PluginLifecycleRevokeContext,
+): void {
+	const registry = services.quotaRegistry;
+	if (!registry) return;
+	if (context.action === "clear") registry.removePlugin(context.event.pluginId);
+	else if (context.action === "invalidate")
+		registry.invalidatePlugin(context.event.pluginId, {
+			runtimeOnly: context.event.kind === "runtime_generation",
+		});
+	else registry.disablePlugin(context.event.pluginId);
+}
+
 /** Build the fixed-order adapter set from the actual host-owned plugin platform services. */
 export function createPluginLifecycleRevokeAdapters(
 	services: Pick<
@@ -303,7 +335,7 @@ export function createPluginLifecycleRevokeAdapters(
 		| "mcpAdapter"
 		| "providerRegistry"
 	> &
-		Partial<Pick<PluginPlatformServices, "hostServices">>,
+		Partial<Pick<PluginPlatformServices, "hostServices" | "quotaRegistry">>,
 ): PluginLifecycleRevokeAdapters {
 	return {
 		ui_session: (context) => revokeOrClearUiSession(services, context),
@@ -314,6 +346,7 @@ export function createPluginLifecycleRevokeAdapters(
 		tool_registry: (context) => revokeTools(services, context),
 		mcp_adapter: (context) => revokeMcp(services, context),
 		provider_registry: (context) => revokeProviders(services, context),
+		quota_registry: (context) => revokeQuotas(services, context),
 	};
 }
 
@@ -321,7 +354,8 @@ async function restorePluginAccess(
 	services: Pick<
 		PluginPlatformServices,
 		"capabilityBroker" | "secretBroker" | "toolRegistry" | "mcpAdapter" | "providerRegistry"
-	>,
+	> &
+		Partial<Pick<PluginPlatformServices, "quotaRegistry">>,
 	pluginId: string,
 ): Promise<void> {
 	const failures: unknown[] = [];
@@ -331,6 +365,7 @@ async function restorePluginAccess(
 		() => services.toolRegistry.enablePlugin(pluginId),
 		() => services.mcpAdapter.markAvailable(pluginId),
 		() => services.providerRegistry.enablePlugin(pluginId),
+		() => services.quotaRegistry?.enablePlugin(pluginId),
 	];
 	for (const step of steps) {
 		try {
@@ -493,9 +528,14 @@ export function createPluginPlatformServices(
 			adapters: options.publicApiAdapters,
 		});
 	const secretVault = options.secretVault ?? pluginSecretVault;
-	// A vault key alone cannot be split into contribution id and field (both may contain
-	// dots), so provider secrets are routed to `credentials.json` by what the plugin
-	// declares. Read lazily: the registry is constructed further down.
+	const providerConnectionService =
+		options.providerConnectionService ?? pluginProviderConnectionService;
+	const providerSettingsBindings =
+		options.providerSettingsBindings ??
+		options.hostServices?.providerSettingsBindings ??
+		new ProviderSettingsBindings({ fetch: outboundFetch });
+	const quotaService = options.quotaService ?? providerQuotaService;
+	// Provider vault secrets keep the main branch's declared-field routing.
 	secretVault.providerSecretFields = (pluginId) =>
 		declaredProviderSecretFields(providerRegistry, pluginId);
 	const hostServices =
@@ -503,6 +543,8 @@ export function createPluginPlatformServices(
 		createPluginHostServices({
 			capabilityBroker,
 			permissionStore,
+			providerConnectionService,
+			providerSettingsBindings,
 			publicApi,
 			eventGateway,
 			storageFactory,
@@ -868,6 +910,26 @@ export function createPluginPlatformServices(
 	// instead of reporting every credentialed channel as unconfigured.
 	void secretVault.warm().catch(() => undefined);
 	registerExtraSearchChannelSource("plugins", pluginSearchChannelSource(searchRegistry));
+	const providerSettingsService = new ProviderSettingsService({
+		registry: contributionRegistry,
+		states: stateStore,
+		runtimes: runtimeSupervisor,
+		host: hostServices,
+		broker: capabilityBroker,
+		bindings: providerSettingsBindings,
+	});
+	const quotaRegistry =
+		options.quotaRegistry ??
+		new PluginQuotaRegistry({
+			stateStore,
+			permissionStore,
+			hostServices,
+			capabilityBroker,
+			providerConnectionService,
+			providerSettingsService,
+			resolveRuntime: (pluginId) => runtimeSupervisor.get(pluginId),
+		});
+	quotaService.configureDriver(quotaRegistry);
 	const contributionCoordinator =
 		options.contributionCoordinator ??
 		new PluginContributionCoordinator({
@@ -876,6 +938,7 @@ export function createPluginPlatformServices(
 			pluginCommandRegistry,
 			providerRegistry,
 			searchRegistry,
+			quotaRegistry,
 			agentToolBridge: toolBridge,
 			lifecycleStates: () => stateStore.listStates(),
 			// Synchronous read from the already-loaded state document, so a restart
@@ -914,6 +977,7 @@ export function createPluginPlatformServices(
 				toolRegistry,
 				mcpAdapter,
 				providerRegistry,
+				quotaRegistry,
 			}),
 			logger: {
 				error: (message, context) => logger.error(message, context),
@@ -921,6 +985,7 @@ export function createPluginPlatformServices(
 		});
 
 	const services = {
+		providerSettingsService,
 		runtimeSupervisor,
 		uiSession,
 		uiHost,
@@ -940,6 +1005,10 @@ export function createPluginPlatformServices(
 		mcpAdapter,
 		providerRegistry,
 		searchRegistry,
+		quotaRegistry,
+		quotaService,
+		providerConnectionService,
+		providerSettingsBindings,
 		providerClientPool,
 		providerCatalogRefresher,
 		providerConfigService,
@@ -963,6 +1032,8 @@ export const pluginPlatformServices = hotSafe("narrafork.pluginPlatformServices.
 
 /** Main calls this before manager shutdown: stop schedule producers, without clearing durable state. */
 export function stopPluginPlatformProducers(): void {
+	pluginPlatformServices.providerSettingsService.close();
+	pluginPlatformServices.providerSettingsBindings.close();
 	pluginPlatformServices.scheduler.close();
 	pluginPlatformServices.runtimeSupervisor.stopProducers();
 }

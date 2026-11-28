@@ -34,6 +34,7 @@ import {
 	ensureTraceNarrator,
 } from "./modeltrace-store";
 import type { NarratorPrincipal } from "./narrator-acl";
+import { captureCustomApiQuotaPushTarget } from "./provider-quota-push";
 
 export interface ModelTraceOptions {
 	fork?: boolean;
@@ -340,6 +341,7 @@ async function runSample(
 			narratorId: id,
 			conversationId: params.conversationId,
 			provider: plan.provider,
+			customApiQuotaTarget: captureCustomApiQuotaPushTarget(plan.provider),
 			model: params.model,
 			locale,
 			getTurnStartedAt: () => new Date(startedAt).toISOString(),

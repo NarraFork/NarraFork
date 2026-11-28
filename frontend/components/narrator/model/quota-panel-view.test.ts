@@ -3,6 +3,7 @@ import {
 	formatQuotaAmount,
 	formatQuotaBadgeText,
 	formatQuotaCountdown,
+	formatQuotaSummaryLines,
 	pickLimitingWindow,
 	type QuotaPanelView,
 	quotaLevelForRemaining,
@@ -67,7 +68,74 @@ describe("quota panel view", () => {
 			limit: 0,
 		});
 		expect(noLimit.usedPercent).toBeNull();
-		expect(noLimit.used).toBeNull();
+		expect(noLimit.limit).toBe(0);
+		expect(noLimit.used).toBe(1);
+		expect(noLimit.level).toBe("exhausted");
+	});
+
+	test("positive fractions never become exhausted because the badge rounds to zero percent", () => {
+		const window = quotaWindowFromAmounts({
+			id: "tiny",
+			label: "Tiny",
+			shortLabel: "T",
+			used: 99.6,
+			limit: 100,
+			remaining: 0.4,
+		});
+		expect(window.remainingPercent).toBe(0);
+		expect(window.level).toBe("critical");
+		expect(formatQuotaBadgeText(view({ windows: [window], limiting: window }), t)).toBe(
+			"quotaPanel.badgeRemaining[T,0]",
+		);
+	});
+
+	test("unknown and nonfinite window values stay unknown while a true zero limit stays known", () => {
+		const unknown = quotaWindowFromAmounts({
+			id: "unknown",
+			label: "Unknown",
+			shortLabel: "?",
+			used: Number.NaN,
+			limit: Number.POSITIVE_INFINITY,
+			remaining: Number.NaN,
+		});
+		expect(unknown).toMatchObject({
+			used: null,
+			limit: null,
+			remainingPercent: null,
+			level: "unknown",
+		});
+		const overflow = quotaWindowFromAmounts({
+			id: "large",
+			label: "Large",
+			shortLabel: "L",
+			used: null,
+			limit: Number.MAX_VALUE,
+			remaining: -Number.MAX_VALUE,
+		});
+		expect(overflow.used).toBeNull();
+		expect(overflow.level).toBe("exhausted");
+		const zero = quotaWindowFromAmounts({
+			id: "zero",
+			label: "Zero",
+			shortLabel: "0",
+			used: 0,
+			limit: 0,
+			remaining: 0,
+		});
+		expect(zero).toMatchObject({ used: 0, limit: 0, remainingPercent: null, level: "exhausted" });
+	});
+
+	test("an authoritative badge status takes precedence over a positive limiting window", () => {
+		const window = quotaWindowFromAmounts({
+			id: "w",
+			label: "W",
+			shortLabel: "w",
+			used: 1,
+			limit: 10,
+		});
+		expect(
+			formatQuotaBadgeText(view({ windows: [window], limiting: window, badgeText: "Expired" }), t),
+		).toBe("Expired");
 	});
 
 	test("an exhausted window that refills last bounds the account", () => {
@@ -90,6 +158,21 @@ describe("quota panel view", () => {
 			"quotaPanel.badgeRemaining[Wk,70]",
 		);
 		expect(formatQuotaBadgeText(view(), t)).toBe("unavailable");
+	});
+
+	test("summary uses the same explicit reset caption as the panel", () => {
+		const window = quotaWindowFromAmounts({
+			id: "w",
+			label: "W",
+			shortLabel: "w",
+			used: 1,
+			limit: 10,
+			resetAt: 90_000,
+		});
+		window.resetCaptionKey = "quotaPanel.expiryCaption";
+		expect(formatQuotaSummaryLines(view({ windows: [window] }), 0, t)).toEqual([
+			"W: quotaPanel.remainingPercent[90] · quotaPanel.usedOfLimit[1,10] · quotaPanel.expiryCaption[quotaPanel.countdownM[2]]",
+		]);
 	});
 
 	test("countdown units", () => {

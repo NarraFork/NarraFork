@@ -1,4 +1,12 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import type {
+	PluginSource,
+	PluginSourceView,
+	PluginUpdateJob,
+	PluginUpdateView,
+} from "@shared/plugin-source";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { normalizePluginList, pluginsApi } from "../lib/api/plugins";
 
 const PLUGINS_QUERY_GC_TIME_MS = 60_000;
@@ -21,6 +29,10 @@ export const pluginKeys = {
 	uiHealth: ["plugins", "ui-health"] as const,
 	themes: ["plugins", "themes"] as const,
 	availableThemes: ["plugins", "available-themes"] as const,
+	builtins: ["plugins", "builtins"] as const,
+	source: (pluginId: string) => ["plugins", pluginId, "source"] as const,
+	updates: (pluginId: string) => ["plugins", pluginId, "updates"] as const,
+	updateJob: (jobId: string) => ["plugins", "update-jobs", jobId] as const,
 };
 
 /**
@@ -34,6 +46,13 @@ export function invalidatePluginQueries(qc: {
 	void qc.invalidateQueries({ queryKey: pluginKeys.all });
 	void qc.invalidateQueries({ queryKey: pluginKeys.uiContributions });
 	void qc.invalidateQueries({ queryKey: pluginKeys.uiHealth });
+	// Data-only contributions also invalidate their settings and unified quota projection.
+	void qc.invalidateQueries({ queryKey: ["provider-settings"] });
+	void qc.invalidateQueries({ queryKey: ["provider-quotas"] });
+	void qc.invalidateQueries({ queryKey: ["quota-snapshots"] });
+	// Quota-source enablement also controls the saved balance row and site-account form.
+	void qc.invalidateQueries({ queryKey: ["settings"] });
+	void qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 }
 
 function useInvalidatePlugins() {
@@ -255,5 +274,180 @@ export function useUninstallPlugin() {
 	return useMutation({
 		mutationFn: (pluginId: string) => pluginsApi.uninstall(pluginId),
 		onSuccess: invalidate,
+	});
+}
+
+export function usePluginSource(pluginId: string, options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: pluginKeys.source(pluginId),
+		queryFn: async ({ signal }) => {
+			const view = await pluginsApi.pluginGetSource(pluginId, { signal });
+			if (view.pluginId !== pluginId || !view.binding)
+				throw new Error("Invalid plugin source identity");
+			return view;
+		},
+		enabled: !REMOTE_BUILD && (options?.enabled ?? true) && Boolean(pluginId),
+		staleTime: 30_000,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		retry: false,
+	});
+}
+
+export function usePluginUpdates(pluginId: string, options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: pluginKeys.updates(pluginId),
+		queryFn: async ({ signal }) => {
+			const view = await pluginsApi.pluginGetUpdates(pluginId, { signal });
+			if (view.pluginId !== pluginId) throw new Error("Invalid plugin update identity");
+			return view;
+		},
+		enabled: !REMOTE_BUILD && (options?.enabled ?? true) && Boolean(pluginId),
+		staleTime: 5_000,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		refetchInterval: PLUGIN_REFETCH_INTERVAL_MS,
+		retry: false,
+	});
+}
+
+async function storeSourceMutation(
+	client: ReturnType<typeof useQueryClient>,
+	view: PluginSourceView,
+	expectedRevision: number,
+) {
+	await Promise.all([
+		client.cancelQueries({ queryKey: pluginKeys.source(view.pluginId), exact: true }),
+		client.cancelQueries({ queryKey: pluginKeys.updates(view.pluginId), exact: true }),
+	]);
+	const previous = client.getQueryData<PluginSourceView>(pluginKeys.source(view.pluginId));
+	if (previous && previous.binding.revision > view.binding.revision) return;
+	client.setQueryData(pluginKeys.source(view.pluginId), view);
+	if (view.binding.revision !== expectedRevision) {
+		// Candidates are bound to the approved revision; never offer one from an old binding.
+		client.setQueryData<PluginUpdateView>(pluginKeys.updates(view.pluginId), (old) =>
+			old
+				? {
+						...old,
+						status: view.binding.source ? "idle" : "no_source",
+						latest: null,
+						checkedAt: null,
+						candidateId: undefined,
+						jobId: undefined,
+						error: null,
+					}
+				: undefined,
+		);
+	}
+	void client.invalidateQueries({ queryKey: pluginKeys.updates(view.pluginId) });
+}
+
+export function useSetPluginSource(pluginId: string) {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: async (input: { source: PluginSource | null; expectedRevision: number }) => {
+			const view = await pluginsApi.pluginSetSource(pluginId, input);
+			if (view.pluginId !== pluginId) throw new Error("Invalid plugin source identity");
+			return { view, expectedRevision: input.expectedRevision };
+		},
+		onSuccess: ({ view, expectedRevision }) => storeSourceMutation(client, view, expectedRevision),
+	});
+}
+
+export function useSetPluginUpdatePreferences(pluginId: string) {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: async (input: { autoUpdate: boolean; expectedRevision: number }) => {
+			const view = await pluginsApi.pluginSetUpdatePreferences(pluginId, input);
+			if (view.pluginId !== pluginId) throw new Error("Invalid plugin source identity");
+			return { view, expectedRevision: input.expectedRevision };
+		},
+		onSuccess: ({ view, expectedRevision }) => storeSourceMutation(client, view, expectedRevision),
+	});
+}
+
+export function useCheckPluginUpdates(pluginId: string) {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: async () => ({ ...(await pluginsApi.pluginCheckUpdates(pluginId)), pluginId }),
+		onSuccess: (started) => {
+			void client.invalidateQueries({ queryKey: pluginKeys.updates(started.pluginId) });
+		},
+	});
+}
+
+export function useApplyPluginUpdate(pluginId: string) {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: async (input: {
+			candidateId: string;
+			expectedRevision: number;
+			allowTrustChange?: boolean;
+		}) => ({
+			...(await pluginsApi.pluginApplyUpdate(pluginId, input)),
+			pluginId,
+		}),
+		onSuccess: (started) => {
+			void client.invalidateQueries({ queryKey: pluginKeys.updates(started.pluginId) });
+		},
+	});
+}
+
+export function pluginUpdateJobPollInterval(job: PluginUpdateJob | undefined): number | false {
+	return !job || job.status === "queued" || job.status === "running" ? 1_000 : false;
+}
+
+export function usePluginUpdateJob(jobId: string | null, options?: { enabled?: boolean }) {
+	const client = useQueryClient();
+	const query = useQuery({
+		queryKey: pluginKeys.updateJob(jobId ?? ""),
+		queryFn: async ({ signal }) => {
+			const job = await pluginsApi.pluginGetUpdateJob(jobId ?? "", { signal });
+			if (job.id !== jobId) throw new Error("Invalid plugin update job identity");
+			return job;
+		},
+		enabled: !REMOTE_BUILD && (options?.enabled ?? true) && Boolean(jobId),
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		refetchInterval: (current) => pluginUpdateJobPollInterval(current.state.data),
+		retry: false,
+	});
+	const settledJobId = query.data?.id;
+	const status = query.data?.status;
+	useEffect(() => {
+		if (settledJobId && status && status !== "queued" && status !== "running")
+			invalidatePluginQueries(client);
+	}, [client, settledJobId, status]);
+	return query;
+}
+
+export function useCancelPluginUpdateJob() {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: (jobId: string) => pluginsApi.pluginCancelUpdateJob(jobId),
+		onSuccess: (job) => {
+			client.setQueryData(pluginKeys.updateJob(job.id), job);
+		},
+	});
+}
+
+export function useBuiltinPlugins(options?: { enabled?: boolean }) {
+	return useQuery({
+		queryKey: pluginKeys.builtins,
+		queryFn: ({ signal }) => pluginsApi.pluginListBuiltins({ signal }),
+		enabled: !REMOTE_BUILD && (options?.enabled ?? true),
+		staleTime: 30_000,
+		gcTime: PLUGINS_QUERY_GC_TIME_MS,
+		retry: false,
+	});
+}
+
+export function useInstallBuiltinPlugin() {
+	const client = useQueryClient();
+	return useMutation({
+		mutationFn: async (pluginId: string) => ({
+			...(await pluginsApi.pluginInstallBuiltin(pluginId)),
+			pluginId,
+		}),
+		onSuccess: () => {
+			invalidatePluginQueries(client);
+		},
 	});
 }

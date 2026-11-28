@@ -92,7 +92,9 @@ export function DataPortabilityCard() {
 	const [conflictDefault, setConflictDefault] = useState<ConflictDecision>("skip");
 	const [conflictById, setConflictById] = useState<Record<string, ConflictDecision>>({});
 	/** The archive has sealed keys and providers are being imported. */
-	const needsImportPassphrase = !!preview?.providerKeys?.sealed && includeSelection.providers;
+	const needsImportPassphrase =
+		!!(preview?.providerKeys?.sealed || preview?.providerSettings?.sealed) &&
+		includeSelection.providers;
 
 	const [clearTarget, setClearTarget] = useState<ClearTarget | null>(null);
 	const [password, setPassword] = useState("");
@@ -235,6 +237,14 @@ export function DataPortabilityCard() {
 								{t("dataImportKeys", { count: importResult.keysImported })}
 							</Text>
 						)}
+						{importResult.providerSettingsImported !== undefined && (
+							<Text size="sm" mt={4}>
+								{t("dataImportProviderSettingsResult", {
+									imported: importResult.providerSettingsImported,
+									skipped: importResult.providerSettingsSkipped ?? 0,
+								})}
+							</Text>
+						)}
 						{(importResult.keysFailed ?? 0) > 0 && (
 							<Text size="sm" c="orange.6" mt={4}>
 								{t("dataImportKeysFailed", { count: importResult.keysFailed })}
@@ -329,9 +339,7 @@ export function DataPortabilityCard() {
 						{needsImportPassphrase && (
 							<PasswordInput
 								label={t("dataImportPassphraseLabel")}
-								description={t("dataImportPassphraseDesc", {
-									count: preview.providerKeys?.count ?? 0,
-								})}
+								description={t("dataImportPassphraseDesc")}
 								value={importPassphrase}
 								onChange={(event) => setImportPassphrase(event.currentTarget.value)}
 								autoComplete="off"
@@ -339,6 +347,11 @@ export function DataPortabilityCard() {
 							/>
 						)}
 
+						{!!preview.providerSettings?.count && (
+							<Text size="sm" c="dimmed">
+								{t("dataImportProviderSettingsNotice", { count: preview.providerSettings.count })}
+							</Text>
+						)}
 						{preview.conflicts.length === 0 ? (
 							<Text size="sm" c="dimmed">
 								{t("dataImportNoConflicts")}

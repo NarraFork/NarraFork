@@ -24,6 +24,86 @@ const identity = {
 };
 
 describe("PluginHostDispatcher", () => {
+	it.each([
+		"context",
+		"resource",
+		"authorize",
+	] as const)("retains actual %s work and capacity after an aborted response", async (stage) => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const tracked = new Set<Promise<unknown>>();
+		let calls = 0;
+		const wait = async (at: string) => {
+			if (at !== stage) return;
+			entered.resolve();
+			await release.promise;
+		};
+		const dispatcher = new PluginHostDispatcher({
+			identity,
+			maxConcurrency: 1,
+			contextFactory: async (input) => {
+				await wait("context");
+				return { ...input, requestId: String(input.requestId) };
+			},
+			authorize: async () => {
+				await wait("authorize");
+				return true;
+			},
+			methods: {
+				work: {
+					method: "work",
+					resourceResolver: async () => {
+						await wait("resource");
+						return {};
+					},
+					handler: async () => {
+						calls++;
+						return true;
+					},
+				},
+			},
+		});
+		const controller = new AbortController();
+		const request = {
+			jsonrpc: "2.0" as const,
+			id: "first",
+			method: "work",
+			params: { trackWork: "forged-plugin-value" },
+		};
+		const operation = dispatcher.dispatch(request, {
+			signal: controller.signal,
+			trackWork: (promise) => {
+				tracked.add(promise);
+				void promise.then(
+					() => tracked.delete(promise),
+					() => tracked.delete(promise),
+				);
+			},
+		});
+		try {
+			await entered.promise;
+			controller.abort();
+			expect(await operation).toMatchObject({ error: { data: { code: "CANCELLED" } } });
+			expect(dispatcher.inboundActive.size).toBe(0);
+			expect(tracked.size).toBeGreaterThan(0);
+			expect(await dispatcher.dispatch({ ...request, id: "full" })).toMatchObject({
+				error: { data: { code: "PLUGIN_BUSY" } },
+			});
+			release.resolve();
+			await Promise.allSettled([...tracked]);
+			expect(calls).toBe(0);
+			expect(tracked.size).toBe(0);
+			expect(await dispatcher.dispatch({ ...request, id: "allowed" })).toMatchObject({
+				result: true,
+			});
+			expect(calls).toBe(1);
+		} finally {
+			release.resolve();
+			await operation;
+			await Promise.allSettled([...tracked]);
+		}
+	});
+
 	it("constructs Host-owned identity and ignores forged identity, user, and scope params", async () => {
 		const dispatcher = new PluginHostDispatcher({
 			identity,

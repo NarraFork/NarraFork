@@ -2,9 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	BalanceProbeRequestError,
 	type BalanceRequest,
-	balanceRootCandidates,
 	buildBalanceRoots,
-	hasSiteQuotaConfig,
 	parseNewApiBalance,
 	parseNewApiUserQuota,
 	parseSub2ApiBalance,
@@ -12,8 +10,13 @@ import {
 	probeSiteQuota,
 	refreshProviderBalance,
 	refreshSiteQuota,
+} from "../../../plugins/provider-quota/src/relay";
+import {
+	balanceRootCandidates,
+	hasSiteQuotaConfig,
 	resolveSiteQuotaConfig,
-} from "../provider-balance-adapters";
+} from "../../services/provider-quota-sites";
+import { ProviderQuotaError } from "../provider-quota-async";
 
 const wallet = { mode: "unrestricted", isValid: true, unit: "USD", balance: 12.5 };
 const token = {
@@ -624,10 +627,10 @@ describe("site-account credit query (/api/user/self)", () => {
 		{},
 	])("a half-filled site configuration is a deterministic error %#", (config) => {
 		expect(() => resolveSiteQuotaConfig({ baseUrl: "https://site.test", ...config })).toThrow(
-			BalanceProbeRequestError,
+			ProviderQuotaError,
 		);
 		expect(() => resolveSiteQuotaConfig({ baseUrl: "https://site.test", ...config })).toThrow(
-			expect.objectContaining({ kind: "invalid_configuration" }),
+			expect.objectContaining({ code: "invalid_configuration" }),
 		);
 	});
 
@@ -640,9 +643,9 @@ describe("site-account credit query (/api/user/self)", () => {
 	});
 
 	test("probe sends the site token, the user header and the site path", async () => {
-		const calls: Array<[string, string | undefined]> = [];
+		const calls: Array<Parameters<BalanceRequest>> = [];
 		const result = await probeSiteQuota(
-			{ ...credentials, baseUrl: "https://site.test/v1" },
+			resolveSiteQuotaConfig({ ...credentials, baseUrl: "https://site.test/v1" }).root,
 			async (url, auth) => {
 				calls.push([url, auth]);
 				return site;
@@ -661,13 +664,16 @@ describe("site-account credit query (/api/user/self)", () => {
 
 	test("an unparsable site answer is invalid_response, not unsupported", async () => {
 		await expect(
-			probeSiteQuota(credentials, async () => ({ success: true, data: { nothing: 1 } })),
+			probeSiteQuota(
+				resolveSiteQuotaConfig({ ...credentials, baseUrl: "https://site.test/v1" }).root,
+				async () => ({ success: true, data: { nothing: 1 } }),
+			),
 		).rejects.toMatchObject({ kind: "invalid_response" });
 	});
 
 	test("refresh reuses the stored root and the same authentication", async () => {
-		const calls: Array<[string, string | undefined]> = [];
-		const balance = await refreshSiteQuota(credentials, "https://site.test/", async (url, auth) => {
+		const calls: Array<Parameters<BalanceRequest>> = [];
+		const balance = await refreshSiteQuota("https://site.test/", async (url, auth) => {
 			calls.push([url, auth]);
 			return site;
 		});

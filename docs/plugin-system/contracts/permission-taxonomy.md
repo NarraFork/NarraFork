@@ -34,7 +34,8 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 | `query` | `query.read.projects`、`query.read.narrators`、`query.read.message_summary`、`query.read.message_content`、`query.read.audit_self`、`query.read.audit_all`、`query.read.host_settings` |
 | `event` | `event.subscribe.narrator`、`event.subscribe.permission`、`event.subscribe.provider` |
 | `command` | `command.narrator.send_message`、`command.narrator.interrupt`、`command.narrator.tasks_read`、`command.narrator.task_add`、`command.narrator.task_set_status`、`command.narrator.behavior_rules_set`、`command.permission.decide`、`command.routine.write` |
-| `provider` | `provider.register`、`provider.use`、`provider.refresh_catalog` |
+| `provider` | `provider.register`、`provider.use`、`provider.refresh_catalog`、`provider.connection.request` |
+| `quota` | `quota.provide` |
 | `config` | `config.read_self`、`config.write_self` |
 | `secret` | `secret.use_self` |
 | `storage` | `storage.read_self`、`storage.write_self`、`storage.purge_self` |
@@ -45,6 +46,14 @@ Capability ID 必须来自以下固定集合；不接受运行时自定义 capab
 | `process` | `process.spawn.allowlist` |
 | `schedule` | `schedule.register` |
 | `diagnostics` | `diagnostics.readOwnLogs` |
+
+**[当前事实：可选额度扩展，Host API 版本沿用原有机制]** `quota.provide` 与 `provider.connection.request` 分别一对一映射同名 canonical descriptor；额度 driver/后端 Host method 均检查 live grants，缺失、过期、撤销、安装/包/runtime/grant 代次不匹配都拒绝。当前无绑定调用上下文的额度发现只接受 global、无附加约束的有效 grant，不把 provider/user scope 默认为 global。额度源不使用 `provider.use` 代替自身授权，也不要求 provider 贡献。`provider.connection.request` 需显式 `host_api.provider_connection` 协商，只向后端开放，iframe 明确拒绝。更早的阶段 0 文字为历史设计；现行开放 capability 字符串、安装默认 seed 与 live 撤销语义以 [../11-capability-policy.md](../11-capability-policy.md) 及源码为准。
+
+**[当前事实：站点账号连接]** `provider.connection.request` 的 `destination: "site-account"` 复用同一能力，不是明文 secret API。必须有当前 reference、runtime/配置代次、两项 live grant 和 `requests[].auth: "site-token"` 声明；只允许宿主保存的站点根下固定 `/api/user/self`，无 query/跨 origin/redirect。站点 token 与 `New-Api-User` 由宿主注入，不进入 plugin 参数、iframe 或 inference headers。`destination` 缺省为 provider；显式账号配置不完整不可回退推理 Key。
+
+`io.narrafork.provider-quota@1.0.3` 以普通不可变 archive 安装，默认启用只作用于初次 bootstrap；既有 disable/uninstall/grant revoke/版本选择继续有效，不能以“官方随附”绕过安装身份与 live grants。`keyId`、`siteQuota.root` 和 snapshot 的 `pushCompatible: false` 是非秘密身份/显示隔离信息，不增加凭据访问 scope。`auth_failed` 是固定失败码，不是带上游 body 的成功额度；当前仅明确站点 token 的 401/403 使用该码，普通 provider-key 的 401/403 仍为 transient。
+
+可选来源副文件和 `origin: "builtin"` 标签不扩大任何 capability。来源管理是宿主管理接口，不是插件运行时 Host 方法；旧 Host API 声明/默认机制保持不变。普通内置归档仍可卸载（`packageKind: "installed"`、`canUninstall: true`），只有旧目录型 `builtin: true` 保持只读。`sourceHint` 不是已批准绑定，坏副文件的 `sourceDiagnostics` 不阻断有效旧插件；homepage 缺失也不自动从发布者或仓库生成链接。
 
 ### 2.1 高风险与默认拒绝
 

@@ -16,6 +16,7 @@
 import {
 	COMMAND_CODE_KEY_OWNER,
 	getProviderKeyStore,
+	isCustomApiKeyOwner,
 	nugKeyOwner,
 	nugOAuthKeyOwner,
 	quotaKeyOwner,
@@ -49,6 +50,7 @@ interface KeySlot {
 function keySlots(settings: NarraForkSettings): KeySlot[] {
 	const slots: KeySlot[] = [];
 	for (const holder of settings.customApiProviders ?? []) {
+		if (!isCustomApiKeyOwner(holder.id)) continue;
 		slots.push({ owner: holder.id, pruneOnDelete: false, holder, field: "apiKey", required: true });
 		slots.push({
 			owner: quotaKeyOwner(holder.id),
@@ -165,9 +167,11 @@ export function withoutProviderKeys(settings: NarraForkSettings): NarraForkSetti
 	const omit = <T extends { apiKey?: string }>({ apiKey: _secret, ...rest }: T) => rest;
 	return {
 		...settings,
-		customApiProviders: settings.customApiProviders?.map(
-			({ quotaAccessToken: _token, ...entry }) => ({ ...entry, apiKey: "" }),
-		),
+		customApiProviders: settings.customApiProviders?.map((entry) => {
+			if (!isCustomApiKeyOwner(entry.id)) return entry; // Keep rejected legacy config intact for repair.
+			const { quotaAccessToken: _token, ...rest } = entry;
+			return { ...rest, apiKey: "" };
+		}),
 		openaiProviders: blank(settings.openaiProviders),
 		anthropicProviders: blank(settings.anthropicProviders),
 		geminiProviders: blank(settings.geminiProviders),

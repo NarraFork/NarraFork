@@ -4,7 +4,12 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hashReleaseFile } from "../../scripts/lib/ci-release-io";
-import { descendantPids, SmokeProcessScope } from "../../scripts/lib/ci-release-smoke-process";
+import {
+	assertTaskkillTreeExited,
+	descendantPids,
+	SmokeProcessScope,
+	taskkillPids,
+} from "../../scripts/lib/ci-release-smoke-process";
 import {
 	assertFrontendJavaScript,
 	assertHealthIdentity,
@@ -306,6 +311,90 @@ describe("real process lifecycle", () => {
 	test("follows only root descendants even across process groups", () => {
 		expect(descendantPids("20 10\n30 20\n10 1\n40 1\n50 40\n", 10)).toEqual([30, 20]);
 	});
+	test("reads every PID taskkill names, in any locale, except the caller", () => {
+		const english =
+			"SUCCESS: The process with PID 20 (child process of PID 10) has been terminated.\r\nERROR: The process with PID 30 (child process of PID 20) could not be terminated.\r\nReason: The operation is not supported.\r\nSUCCESS: The process with PID 10 (child process of PID 7) has been terminated.";
+		const chinese =
+			"成功: 已终止 PID 20 (属于 PID 10 子进程)的进程。\r\n错误: 无法终止 PID 30 (属于 PID 20 子进程)的进程。\r\n原因: 操作不被支持。";
+		expect(taskkillPids(english, 7)).toEqual([20, 10, 30]);
+		expect(taskkillPids(chinese, 7)).toEqual([20, 10, 30]);
+		expect(taskkillPids('ERROR: The process "10" not found.', 7)).toEqual([]);
+	});
+	test.skipIf(process.platform !== "win32")(
+		"judges a non-zero taskkill by which named processes still run",
+		async () => {
+			const root = await temporary();
+			const scope = new SmokeProcessScope(root, process.env);
+			try {
+				const exited = scope.spawn([process.execPath, "-e", "process.exit(0)"]);
+				await scope.until("short-lived child close", () => (exited.closed ? true : undefined));
+				// Any later process reusing that PID was created after this cutoff.
+				const exitedAt = Date.now();
+				const live = scope.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"]);
+				const livePid = live.process.pid;
+				const exitedPid = exited.process.pid;
+				if (!livePid || !exitedPid) throw new Error("Missing fixture PID");
+				await new Promise((done) => setTimeout(done, 300));
+				const report = (pid: number) =>
+					`ERROR: The process with PID ${pid} (child process of PID ${process.pid}) could not be terminated.`;
+				// Already gone: the non-zero exit code was only the race, cleanup succeeded.
+				await assertTaskkillTreeExited(report(exitedPid), exitedAt);
+				// Still running from before taskkill finished: a real leak.
+				await expect(assertTaskkillTreeExited(report(livePid), Date.now())).rejects.toThrow(
+					`Owned processes survived cleanup: ${livePid}`,
+				);
+				// The same PID created after taskkill finished belongs to someone else.
+				await assertTaskkillTreeExited(report(livePid), Date.now() - 3_600_000);
+				// A report naming no process cannot be verified and still fails closed.
+				await expect(
+					assertTaskkillTreeExited('ERROR: The process "1" not found.', Date.now()),
+				).rejects.toThrow("taskkill failed");
+			} finally {
+				await scope.close();
+			}
+		},
+		60_000,
+	);
+	test("a tree whose children keep exiting is cleaned up without a false failure", async () => {
+		// taskkill /T /F exits non-zero for members that are already exiting, even though the
+		// whole tree is gone afterwards. Cleanup must judge the tree, not that exit code.
+		const root = await temporary();
+		const heartbeat = join(root, "heartbeat");
+		const scope = new SmokeProcessScope(root, process.env);
+		const worker = `const fs = require("node:fs"); setInterval(() => fs.writeFileSync(${JSON.stringify(heartbeat)}, String(Date.now())), 10);`;
+		const parent = [
+			'const { spawn } = require("node:child_process");',
+			`spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { detached: ${process.platform !== "win32"}, stdio: "ignore" });`,
+			'setInterval(() => spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" }), 40);',
+			"setInterval(() => {}, 1000);",
+		].join("\n");
+		const child = scope.spawn([process.execPath, "-e", parent]);
+		try {
+			let ready = false;
+			const timer = setInterval(() => {
+				void readFile(heartbeat).then(
+					() => {
+						ready = true;
+					},
+					() => {},
+				);
+			}, 10);
+			try {
+				await scope.until("descendant heartbeat", () => (ready ? true : undefined));
+			} finally {
+				clearInterval(timer);
+			}
+			// Let several short-lived children be mid-exit when cleanup runs.
+			await new Promise((done) => setTimeout(done, 400));
+			await scope.close();
+			expect(child.closed).toBe(true);
+			const stopped = await readFile(heartbeat, "utf8");
+			await new Promise((done) => setTimeout(done, 150));
+			expect(await readFile(heartbeat, "utf8")).toBe(stopped);
+		} finally {
+			await scope.close().catch(() => {});
+		}
+	}, 60_000);
 	test("observes spawn failure instead of hanging until global timeout", async () => {
 		const root = await temporary();
 		const scope = new SmokeProcessScope(root, process.env);

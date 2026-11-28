@@ -99,6 +99,14 @@ function previewResponse(preview: Awaited<ReturnType<typeof previewImport>>) {
 		...(preview.sealedKeys
 			? { providerKeys: { sealed: true, count: preview.sealedKeyCount ?? 0 } }
 			: {}),
+		...(preview.providerSettingsCount
+			? {
+					providerSettings: {
+						count: preview.providerSettingsCount,
+						sealed: !!preview.providerSettingsSealedPath,
+					},
+				}
+			: {}),
 	};
 }
 

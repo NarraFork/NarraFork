@@ -62,6 +62,7 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { ApiError } from "../../lib/api/client";
+import { providerSettingsApi, providerSettingsKeys } from "../../lib/api/provider-settings";
 import type {
 	CodexAuthMode,
 	CodexLoadBalancingMode,
@@ -91,6 +92,7 @@ import { reconcileCodexBrowserAuthState } from "./codex-browser-auth-state";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
+import { ProviderSettingsExtensions } from "./ProviderSettingsExtensions";
 import type { CustomApiProtocol } from "./types";
 
 interface CodexSectionProps {
@@ -1986,6 +1988,34 @@ interface CodexCredentialListEntry {
 	network?: CredentialNetwork;
 }
 
+function CodexSettingsButton({ credentialId }: { credentialId: string }) {
+	const { t } = useTranslation("plugins");
+	const [opened, setOpened] = useState(false);
+	const target = { kind: "platform" as const, id: `codex:credential:${credentialId}` };
+	const query = useQuery({
+		queryKey: providerSettingsKeys.list(target),
+		queryFn: ({ signal }) => providerSettingsApi.list(target, { signal }),
+		staleTime: 30000,
+		retry: false,
+	});
+	if (!query.data?.extensions.length) return null;
+	return (
+		<>
+			<Button size="compact-xs" variant="subtle" onClick={() => setOpened(true)}>
+				{t("providerSettings.title")}
+			</Button>
+			<Modal
+				opened={opened}
+				onClose={() => setOpened(false)}
+				title={t("providerSettings.title")}
+				size="lg"
+			>
+				<ProviderSettingsExtensions key={target.id} target={target} />
+			</Modal>
+		</>
+	);
+}
+
 /**
  * Opens the network identity editor for one account. Self-contained so the desktop
  * table and the mobile cards share it.
@@ -2341,6 +2371,7 @@ function CredentialList(props: CodexCredentialListProps) {
 													</ActionIcon>
 												</Tooltip>
 												<CredentialNetworkButton entry={entry} disabled={!canUpdateCredential} />
+												<CodexSettingsButton credentialId={entry.id} />
 
 												<Tooltip label={t("codexQueryUsage")}>
 													<ActionIcon
@@ -2758,6 +2789,7 @@ function CredentialCards(props: CodexCredentialListProps) {
 											disabled={!canUpdateCredential}
 											compact
 										/>
+										<CodexSettingsButton credentialId={entry.id} />
 
 										<Button
 											variant="subtle"

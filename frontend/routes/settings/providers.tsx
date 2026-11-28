@@ -82,6 +82,7 @@ import {
 } from "../../hooks/usePlatform";
 import { invalidateQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
+import type { ProviderSettingsTarget } from "../../lib/api/provider-settings";
 import type { ModelOption } from "../../lib/constants";
 import { replaceCurrentHistoryState } from "../../lib/history-entry";
 import { SAFE_AREA_INSET_BOTTOM } from "../../lib/safe-area";
@@ -1123,10 +1124,14 @@ function SettingsProvidersPage() {
 	 */
 	const selectedPluginProvider = useMemo(() => {
 		if (!selectedProvider) return undefined;
-		const group = providerGroups.find((item) => item.prefix === selectedProvider);
+		const group = pluginProviderGroups?.find((item) => item.prefix === selectedProvider);
 		if (!group?.pluginId || !group.contributionId) return undefined;
-		return { pluginId: group.pluginId, contributionId: group.contributionId };
-	}, [selectedProvider, providerGroups]);
+		return {
+			pluginId: group.pluginId,
+			contributionId: group.contributionId,
+			...(group.providerInstanceId ? { providerInstanceId: group.providerInstanceId } : {}),
+		};
+	}, [selectedProvider, pluginProviderGroups]);
 
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
@@ -1161,6 +1166,71 @@ function SettingsProvidersPage() {
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		return configured ? configured.prefix || null : selectedProvider;
 	}, [selectedProvider, state.customApiProviders, state.nugProviders]);
+
+	const selectedProviderSettingsTarget = useMemo<ProviderSettingsTarget | undefined>(() => {
+		if (!selectedProvider) return undefined;
+		if (selectedPluginProvider) {
+			return selectedPluginProvider.providerInstanceId
+				? { kind: "executable-plugin", id: selectedPluginProvider.providerInstanceId }
+				: undefined;
+		}
+		if (selectedProvider === "codex") return { kind: "platform", id: "codex:pool" };
+		if (selectedProvider === "CommandCode")
+			return { kind: "platform", id: "commandcode:singleton" };
+		if (selectedProvider === "tokendance") return { kind: "platform", id: "tokendance:singleton" };
+		if (
+			state.customApiProviders.some((provider) => provider.id === selectedProvider) &&
+			savedProviderSnapshot.customApiProviders.some((provider) => provider.id === selectedProvider)
+		)
+			return { kind: "custom-api", id: selectedProvider };
+		if (
+			state.nugProviders.some((provider) => provider.id === selectedProvider) &&
+			savedProviderSnapshot.nugProviders.some((provider) => provider.id === selectedProvider)
+		)
+			return { kind: "nug", id: selectedProvider };
+		return undefined;
+	}, [
+		selectedPluginProvider,
+		selectedProvider,
+		state.customApiProviders,
+		state.nugProviders,
+		savedProviderSnapshot,
+	]);
+
+	const selectedProviderSettingsCoreDirty = useMemo(() => {
+		if (!selectedProvider) return false;
+		if (selectedPluginProvider) {
+			const prefix = selectedProviderPrefix;
+			return Boolean(
+				prefix &&
+					state.disabledProviders.has(prefix) !==
+						savedProviderSnapshot.disabledProviders.includes(prefix),
+			);
+		}
+		if (selectedProvider === "CommandCode")
+			return (
+				JSON.stringify(state.commandCode) !== JSON.stringify(savedProviderSnapshot.commandCode)
+			);
+		if (selectedProvider === "tokendance")
+			return state.tokenDanceDisabled !== savedProviderSnapshot.tokenDanceDisabled;
+		if (state.customApiProviders.some((provider) => provider.id === selectedProvider))
+			return isCustomApiProviderDirty(selectedProvider);
+		if (state.nugProviders.some((provider) => provider.id === selectedProvider))
+			return isNugProviderDirty(selectedProvider);
+		return false;
+	}, [
+		isCustomApiProviderDirty,
+		isNugProviderDirty,
+		savedProviderSnapshot,
+		selectedPluginProvider,
+		selectedProvider,
+		selectedProviderPrefix,
+		state.commandCode,
+		state.customApiProviders,
+		state.disabledProviders,
+		state.nugProviders,
+		state.tokenDanceDisabled,
+	]);
 
 	// ── Auto-fetch models after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
@@ -1279,6 +1349,11 @@ function SettingsProvidersPage() {
 							/>
 						) : undefined
 					}
+					providerSettings={{
+						target: selectedProviderSettingsTarget,
+						pluginProvider: selectedPluginProvider,
+						coreDirty: selectedProviderSettingsCoreDirty,
+					}}
 				>
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection

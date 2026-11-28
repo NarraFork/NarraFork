@@ -136,14 +136,10 @@ describe("PluginLifecycleRevokeCoordinator", () => {
 
 		const report = await coordinator.revokeWithReport({ ...event, eventId: "stop-1" });
 
+		// The failed broker step, then every later layer reported as never attempted.
 		expect(report.errors.map((error) => error.code)).toEqual([
 			undefined,
-			"NOT_ATTEMPTED",
-			"NOT_ATTEMPTED",
-			"NOT_ATTEMPTED",
-			"NOT_ATTEMPTED",
-			"NOT_ATTEMPTED",
-			"NOT_ATTEMPTED",
+			...Array.from({ length: PLUGIN_LIFECYCLE_REVOKE_LAYERS.length - 2 }, () => "NOT_ATTEMPTED"),
 		]);
 		expect(report.steps[0]?.status).toBe("succeeded");
 		expect(report.steps[1]?.status).toBe("failed");

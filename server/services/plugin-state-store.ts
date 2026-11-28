@@ -16,6 +16,7 @@ import {
 } from "@server/lib/plugins/permissions";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import type { ProxyOverride } from "@server/lib/settings/types";
+import { type PluginSourceBinding, pluginSourceBindingSchema } from "@shared/plugin-source";
 
 const STATE_FILE_VERSION = 1;
 const JOURNAL_FILE_VERSION = 1;
@@ -28,6 +29,7 @@ const DEFAULT_MAX_STRING_BYTES = 16 * 1024;
 const DEFAULT_MAX_OPERATIONS = 1_000;
 const DEFAULT_MAX_DIAGNOSTICS = 50;
 const DEFAULT_MAX_ERROR_BYTES = 4 * 1024;
+const MAX_BUNDLED_BOOTSTRAPS = 64;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const VERSION_PATTERN =
 	/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -137,6 +139,8 @@ export interface PluginStateRecord {
 	providerPrefixes: PluginProviderPrefixMap;
 	/** Proxy overrides by contribution id; absent entries follow the global proxy policy. */
 	providerProxies: PluginProviderProxyMap;
+	/** Optional for old state files; package hints never replace an approved binding on upgrade. */
+	sourceBinding?: PluginSourceBinding;
 	crashCount: number;
 	restartCount: number;
 	consecutiveFailures: number;
@@ -161,6 +165,9 @@ export interface PluginJournalContext {
 	phase?: string;
 	reason?: string;
 	recoveredAt?: string;
+	/** Source upgrades persist a bounded, validated old-state checkpoint for compensation. */
+	sourceUpdate?: boolean;
+	rollbackState?: PluginStateRecord;
 }
 
 export interface PluginJournalEntry {
@@ -211,9 +218,22 @@ export interface BeginPluginOperationInput {
 	context?: PluginJournalContext;
 }
 
+export type BundledPluginDefaultChoice = "enabled" | "disabled" | "removed" | "revoked";
+
+export interface BundledPluginBootstrap {
+	status: "initializing" | "seeded" | "adopted" | "removed";
+	version: string;
+	archiveSha256: string | null;
+	/** Preserve the operator's choice before a retired builtin loses its package. */
+	defaultChoice?: BundledPluginDefaultChoice;
+	/** A replacement ID inherits refusals only, never the retired plugin's grants. */
+	inheritedFrom?: string;
+	updatedAt: string;
+}
 interface StateFileDocument {
 	version: number;
 	plugins: Record<string, PluginStateRecord>;
+	bundledBootstrap: Record<string, BundledPluginBootstrap>;
 	diagnostics: PluginPersistenceDiagnostic[];
 	updatedAt: string;
 }
@@ -317,6 +337,9 @@ function assertDocumentLimits(document: unknown, limits: PluginStateStoreLimits)
 	if (isRecord(document.plugins)) {
 		for (const state of Object.values(document.plugins)) assertJsonLimits(state, limits);
 	}
+	if (isRecord(document.bundledBootstrap)) {
+		for (const entry of Object.values(document.bundledBootstrap)) assertJsonLimits(entry, limits);
+	}
 	if (Array.isArray(document.operations)) {
 		for (const operation of document.operations) assertJsonLimits(operation, limits);
 	}
@@ -411,6 +434,33 @@ function parseError(value: unknown, limits: PluginStateStoreLimits): PluginState
 	};
 }
 
+function parseSourceBinding(value: unknown): PluginSourceBinding {
+	const parsed = pluginSourceBindingSchema.safeParse(value);
+	if (
+		parsed.success &&
+		Number.isSafeInteger(parsed.data.revision) &&
+		(parsed.data.mode !== "none" || parsed.data.source === null)
+	)
+		return parsed.data;
+	// A damaged optional source disables only updates, not the healthy plugin or its grants.
+	logger.warn("Invalid optional plugin source binding; source updates disabled");
+	return {
+		revision:
+			isRecord(value) &&
+			isNonNegativeInteger(value.revision) &&
+			Number.isSafeInteger(value.revision)
+				? (value.revision as number)
+				: 0,
+		mode: "none",
+		source: null,
+		autoUpdate: false,
+	};
+}
+
+export function validatePluginStateRecord(value: unknown, pluginId: string): PluginStateRecord {
+	return parseStateRecord(pluginId, value, createLimits());
+}
+
 function parseStateRecord(
 	key: string,
 	value: unknown,
@@ -481,6 +531,9 @@ function parseStateRecord(
 		providerConfigs: parseProviderConfigs(value.providerConfigs, pluginId, limits),
 		providerPrefixes: parseProviderPrefixes(value.providerPrefixes, pluginId),
 		providerProxies: parseProviderProxies(value.providerProxies, pluginId),
+		...(value.sourceBinding === undefined
+			? {}
+			: { sourceBinding: parseSourceBinding(value.sourceBinding) }),
 		crashCount,
 		restartCount,
 		consecutiveFailures,
@@ -658,6 +711,26 @@ function parseJournalContext(value: unknown): PluginJournalContext {
 	if (context.recoveredAt !== undefined && !isIsoDate(context.recoveredAt)) {
 		throw new ValidationError("Plugin journal recoveredAt is invalid");
 	}
+	if (value.sourceUpdate !== undefined) {
+		if (typeof value.sourceUpdate !== "boolean")
+			throw new ValidationError("Plugin journal sourceUpdate is invalid");
+		context.sourceUpdate = value.sourceUpdate;
+	}
+	if (value.rollbackState !== undefined) {
+		if (
+			!isRecord(value.rollbackState) ||
+			typeof value.rollbackState.pluginId !== "string" ||
+			Buffer.byteLength(JSON.stringify(value.rollbackState)) > 64 * 1024
+		) {
+			throw new ValidationError(
+				"Plugin update recovery state is invalid or exceeds its byte budget",
+			);
+		}
+		context.rollbackState = validatePluginStateRecord(
+			value.rollbackState,
+			value.rollbackState.pluginId,
+		);
+	}
 	return context;
 }
 
@@ -709,6 +782,52 @@ function parseJournalEntry(value: unknown, limits: PluginStateStoreLimits): Plug
 	};
 }
 
+function parseBundledBootstrapRecord(value: unknown): BundledPluginBootstrap {
+	if (
+		!isRecord(value) ||
+		!["initializing", "seeded", "adopted", "removed"].includes(String(value.status)) ||
+		typeof value.version !== "string" ||
+		!VERSION_PATTERN.test(value.version) ||
+		(value.archiveSha256 !== null &&
+			(typeof value.archiveSha256 !== "string" || !HASH_PATTERN.test(value.archiveSha256))) ||
+		(value.defaultChoice !== undefined &&
+			!["enabled", "disabled", "removed", "revoked"].includes(String(value.defaultChoice))) ||
+		(value.inheritedFrom !== undefined &&
+			(typeof value.inheritedFrom !== "string" ||
+				!pluginIdSchema.safeParse(value.inheritedFrom).success ||
+				value.status !== "removed" ||
+				value.defaultChoice === undefined ||
+				value.defaultChoice === "enabled")) ||
+		!isIsoDate(value.updatedAt)
+	) {
+		throw new ValidationError("Bundled plugin bootstrap record is invalid");
+	}
+	return {
+		status: value.status as BundledPluginBootstrap["status"],
+		version: value.version,
+		archiveSha256: value.archiveSha256 as string | null,
+		...(value.defaultChoice === undefined
+			? {}
+			: { defaultChoice: value.defaultChoice as BundledPluginDefaultChoice }),
+		...(value.inheritedFrom === undefined ? {} : { inheritedFrom: value.inheritedFrom as string }),
+		updatedAt: value.updatedAt,
+	};
+}
+
+function parseBundledBootstraps(value: unknown): Record<string, BundledPluginBootstrap> {
+	if (value === undefined) return {};
+	if (!isRecord(value) || Object.keys(value).length > MAX_BUNDLED_BOOTSTRAPS) {
+		throw new ValidationError("Bundled plugin bootstrap map is invalid");
+	}
+	const entries: Record<string, BundledPluginBootstrap> = {};
+	for (const [pluginId, record] of Object.entries(value)) {
+		if (!pluginIdSchema.safeParse(pluginId).success) {
+			throw new ValidationError("Bundled plugin bootstrap identity is invalid");
+		}
+		entries[pluginId] = parseBundledBootstrapRecord(record);
+	}
+	return entries;
+}
 function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): StateFileDocument {
 	assertDocumentLimits(value, limits);
 	if (!isRecord(value) || value.version !== STATE_FILE_VERSION || !isRecord(value.plugins)) {
@@ -725,6 +844,7 @@ function parseStateDocument(value: unknown, limits: PluginStateStoreLimits): Sta
 	return {
 		version: STATE_FILE_VERSION,
 		plugins,
+		bundledBootstrap: parseBundledBootstraps(value.bundledBootstrap),
 		diagnostics: value.diagnostics.map(parseDiagnostic),
 		updatedAt: value.updatedAt,
 	};
@@ -849,6 +969,35 @@ export class PluginStateStore {
 		return this.getState(pluginId);
 	}
 
+	/** This ledger outlives installed state, so missing packages never imply first installation. */
+	async getBundledBootstrap(pluginId: string): Promise<BundledPluginBootstrap | undefined> {
+		await this.ensureLoaded();
+		const record = this.stateDocument?.bundledBootstrap[pluginId];
+		return record ? clone(record) : undefined;
+	}
+
+	async setBundledBootstrap(
+		pluginId: string,
+		record: Omit<BundledPluginBootstrap, "updatedAt">,
+	): Promise<BundledPluginBootstrap> {
+		pluginIdSchema.parse(pluginId);
+		return this.mutex.acquire("store", async () => {
+			await this.ensureLoadedLocked();
+			const candidate = clone(this.requireStateDocument());
+			if (
+				!candidate.bundledBootstrap[pluginId] &&
+				Object.keys(candidate.bundledBootstrap).length >= MAX_BUNDLED_BOOTSTRAPS
+			) {
+				throw new ValidationError("Bundled plugin bootstrap count exceeds the limit");
+			}
+			const parsed = parseBundledBootstrapRecord({ ...record, updatedAt: this.timestamp() });
+			candidate.bundledBootstrap[pluginId] = parsed;
+			candidate.updatedAt = parsed.updatedAt;
+			await this.writeStateLocked(candidate);
+			this.stateDocument = candidate;
+			return clone(parsed);
+		});
+	}
 	async getState(pluginId: string): Promise<PluginStateRecord | undefined> {
 		await this.ensureLoaded();
 		const state = this.stateDocument?.plugins[pluginId];
@@ -1272,6 +1421,7 @@ export class PluginStateStore {
 		return {
 			version: STATE_FILE_VERSION,
 			plugins: {},
+			bundledBootstrap: {},
 			diagnostics,
 			updatedAt: this.timestamp(),
 		};

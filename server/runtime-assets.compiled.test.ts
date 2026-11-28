@@ -1,9 +1,16 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { renderBuiltinPluginModule } from "../scripts/generate-builtin-plugins";
+import quotaManifest from "../plugins/provider-quota/manifest.json";
+import {
+	bundledPluginArchiveIdentity,
+	renderBundledPluginModule,
+} from "../scripts/build-bundled-plugins";
 import { compileRuntimeBundle } from "../scripts/lib/runtime-compiler";
 import { testEnvironment } from "../tests/preload";
+import { buildZip } from "./lib/document-preview/__tests__/docx-fixture";
+import { parseManifest } from "./lib/plugins/manifest";
 import { safeSpawn } from "./lib/spawn";
 
 const root = resolve(import.meta.dir, "..");
@@ -198,29 +205,68 @@ try {
 	}
 }, 60_000);
 
-test("frozen builds embed builtin plugins without sharing mutable materialized copies", async () => {
-	const temp = await mkdtemp(join(testEnvironment.isolatedHome, "frozen-plugins-"));
+test("frozen builds embed independent bundled plugin archives across A/B/A launches", async () => {
+	const temp = await mkdtemp(join(root, ".frozen-plugins-"));
 	try {
 		const source = join(temp, "source");
-		const plugin = join(source, "server/builtin-plugins/fixture");
-		await mkdir(plugin, { recursive: true });
-		await writeFile(
-			join(plugin, "manifest.json"),
-			JSON.stringify({ pluginId: "fixture", version: "1.0.0" }),
-		);
-		const entry = join(temp, "probe.ts");
+		const cwd = join(temp, "empty-cwd");
+		const home = join(temp, "home");
+		await Promise.all([mkdir(source), mkdir(cwd), mkdir(home)]);
+		const pluginId = "io.narrafork.provider-quota";
+		const version = quotaManifest.version;
+		const fixture = join(root, "tests/fixtures/plugins/packages/valid-package");
+		const manifest = parseManifest({
+			...JSON.parse(await readFile(join(fixture, "manifest.json"), "utf8")),
+			pluginId,
+			version,
+		});
+		// The fixture throws if evaluated: plugin JavaScript must remain opaque archive content.
+		const server = await readFile(join(fixture, "server/index.js"), "utf8");
+		const archivePath = join(source, "provider-quota.nfplugin");
+		const entry = join(source, "probe.ts");
 		await writeFile(
 			entry,
 			`
-import { materializeBuiltinPlugins } from ${JSON.stringify(join(root, "server/builtin-plugins/materialize.ts"))};
-const [directory] = await materializeBuiltinPlugins();
-if (!directory) throw new Error("builtin package missing from frozen build");
-console.log(JSON.stringify({ directory, content: await Bun.file(directory + "/index.js").text() }));
+import { isCompiledModuleUrl, isCompiledRuntime, RUNTIME_BUILD_ID } from ${JSON.stringify(join(root, "server/lib/runtime-target.ts"))};
+if (!isCompiledRuntime()) throw new Error("probe must be compiled");
+let sourceReads = 0;
+const originalFile = Bun.file;
+Bun.file = (path, ...options) => {
+  if (!isCompiledModuleUrl(String(path))) {
+    sourceReads++;
+    throw new Error("mutable plugin asset read");
+  }
+  return originalFile(path, ...options);
+};
+const { getBundledPluginDescriptors } = await import(${JSON.stringify(join(root, "server/services/bundled-plugin-assets.ts"))});
+const descriptors = getBundledPluginDescriptors();
+if (descriptors.length !== 1) throw new Error("expected one bundled plugin");
+const [descriptor] = descriptors;
+const loaded = await descriptor.load();
+console.log(JSON.stringify({ buildId: RUNTIME_BUILD_ID, pluginId: descriptor.pluginId,
+  version: descriptor.version, size: loaded.bytes.byteLength, sha256: loaded.sha256,
+  bytes: Buffer.from(loaded.bytes).toString("base64"), sourceReads }));
 `,
 		);
-		const binaries = new Map<string, string>();
+		const builds = new Map<
+			string,
+			{ binary: string; bytes: Buffer; size: number; sha256: string }
+		>();
 		for (const id of ["A", "B"]) {
-			await writeFile(join(plugin, "index.js"), `export const marker = "${id}";`);
+			const bytes = buildZip([
+				{ name: "manifest.json", data: JSON.stringify(manifest) },
+				{
+					name: "server/index.js",
+					data: `${server}\nexport const marker = "${id}";${id === "B" ? "\n// Build B has a different byte length." : ""}`,
+				},
+			]);
+			// Reuse the same input pathname, as a later publication would, but freeze each module.
+			await writeFile(archivePath, bytes);
+			const identity = await bundledPluginArchiveIdentity(archivePath);
+			expect(identity).toEqual({
+				size: bytes.byteLength,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			});
 			const binary = join(temp, `probe-${id}${process.platform === "win32" ? ".exe" : ""}`);
 			await compileRuntimeBundle({
 				root,
@@ -229,33 +275,51 @@ console.log(JSON.stringify({ directory, content: await Bun.file(directory + "/in
 				buildId: id,
 				repository: "fixture/repository",
 				modules: new Map([
-					["embedded-builtin-plugins.ts", await renderBuiltinPluginModule(source)],
 					[
-						"build-info.ts",
-						'export const buildVersion = "fixture"; export const buildCommit = "fixture";',
+						"embedded-bundled-plugins.ts",
+						renderBundledPluginModule({ pluginId, version, ...identity }, archivePath),
 					],
 				]),
 			});
-			binaries.set(id, binary);
+			builds.set(id, { binary, bytes, ...identity });
 		}
+		// Neither source code, an on-disk generated module, nor the archive exists at runtime.
 		await rm(source, { recursive: true });
-		const directories: string[] = [];
+		expect(await Bun.file(archivePath).exists()).toBe(false);
+		const identities: { buildId: string; size: number; sha256: string }[] = [];
 		for (const id of ["A", "B", "A"]) {
+			const build = builds.get(id);
+			if (!build) throw new Error(`Missing fixture build ${id}`);
 			const result = await safeSpawn({
-				cmd: [binaries.get(id) as string],
-				cwd: temp,
-				env: { ...process.env, NARRAFORK_HOME: join(temp, "home") },
+				cmd: [build.binary],
+				cwd,
+				env: { ...process.env, HOME: home, USERPROFILE: home, NARRAFORK_HOME: home },
 				timeout: 10_000,
 				maxOutputBytes: 32 * 1024,
+				maxStderrBytes: 32 * 1024,
+				killProcessTree: true,
 			});
 			expect(result.exitCode, result.stderr).toBe(0);
+			expect(result.terminationReason).toBeUndefined();
+			expect(Boolean(result.stdoutTruncated || result.stderrTruncated)).toBe(false);
 			const output = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "");
-			expect(output.content).toBe(`export const marker = "${id}";`);
-			directories.push(output.directory);
+			expect(output).toEqual({
+				buildId: id,
+				pluginId,
+				version,
+				size: build.size,
+				sha256: build.sha256,
+				bytes: build.bytes.toString("base64"),
+				sourceReads: 0,
+			});
+			identities.push({ buildId: output.buildId, size: output.size, sha256: output.sha256 });
 		}
-		expect(directories[0]).not.toBe(directories[1]);
-		expect(directories[0]).toBe(directories[2]);
+		expect(identities[0].buildId).not.toBe(identities[1].buildId);
+		expect(identities[0].size).not.toBe(identities[1].size);
+		expect(identities[0].sha256).not.toBe(identities[1].sha256);
+		expect(identities[0]).toEqual(identities[2]);
 	} finally {
+		// safeSpawn drains both pipes and awaits child exit before fixtures can be removed.
 		await rm(temp, { recursive: true, force: true });
 	}
 }, 60_000);

@@ -6727,6 +6727,137 @@ export const oauthClients = sqliteTable(
 	],
 );
 
+// Provider extensions belong to user configuration, not to grant rows. Revoking an
+// installation must never cascade-delete settings. Host-controlled tombstones block re-import.
+export const pluginProviderSettings = sqliteTable(
+	"plugin_provider_settings",
+	{
+		id: text("id").primaryKey(),
+		pluginId: text("plugin_id").notNull(),
+		contributionId: text("contribution_id").notNull(),
+		targetKind: text("target_kind", {
+			enum: ["custom-api", "nug", "platform", "executable-plugin"],
+		}).notNull(),
+		targetId: text("target_id").notNull(),
+		installationId: text("installation_id").notNull(),
+		state: text("state", { enum: ["active", "dormant", "deleted", "blocked"] })
+			.notNull()
+			.default("active"),
+		schemaVersion: integer("schema_version").notNull(),
+		schemaFingerprint: text("schema_fingerprint").notNull(),
+		bindingFingerprint: text("binding_fingerprint").notNull(),
+		revision: integer("revision").notNull().default(1),
+		configText: text("config_text").notNull(),
+		secretsEnvelope: text("secrets_envelope"),
+		keyId: text("key_id"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_plugin_provider_settings_target").on(
+			table.pluginId,
+			table.contributionId,
+			table.targetKind,
+			table.targetId,
+		),
+		index("idx_plugin_provider_settings_list").on(table.pluginId, table.id),
+		index("idx_plugin_provider_settings_provider").on(table.targetKind, table.targetId, table.id),
+		check(
+			"ck_plugin_provider_settings_revision",
+			sql`${table.revision} >= 1 and ${table.revision} <= 9007199254740990`,
+		),
+		check("ck_plugin_provider_settings_version", sql`${table.schemaVersion} >= 1`),
+		check(
+			"ck_plugin_provider_settings_state",
+			sql`${table.state} in ('active','dormant','deleted','blocked')`,
+		),
+		check(
+			"ck_plugin_provider_settings_bytes",
+			sql`length(cast(${table.configText} as blob)) + coalesce(length(cast(${table.secretsEnvelope} as blob)), 0) <= 65536`,
+		),
+		check(
+			"ck_plugin_provider_settings_secret_key",
+			sql`(${table.secretsEnvelope} is null and ${table.keyId} is null) or (${table.secretsEnvelope} is not null and ${table.keyId} is not null)`,
+		),
+	],
+);
+
+// Opaque bounded resource values. The owner kind is chosen by host code, never by a plugin.
+export const pluginResourceEntries = sqliteTable(
+	"plugin_resource_entries",
+	{
+		id: text("id").primaryKey(),
+		pluginId: text("plugin_id").notNull(),
+		ownerKind: text("owner_kind", {
+			enum: ["plugin", "host-projection", "host-migration", "host-operation"],
+		}).notNull(),
+		scopeType: text("scope_type", { enum: ["plugin", "provider", "credential"] }).notNull(),
+		scopeId: text("scope_id").notNull(),
+		key: text("key").notNull(),
+		installationId: text("installation_id").notNull(),
+		bindingFingerprint: text("binding_fingerprint").notNull(),
+		revision: integer("revision").notNull().default(1),
+		state: text("state", { enum: ["active", "deleted"] })
+			.notNull()
+			.default("active"),
+		valueText: text("value_text").notNull(),
+		bytes: integer("bytes").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_plugin_resource_identity").on(
+			table.pluginId,
+			table.ownerKind,
+			table.scopeType,
+			table.scopeId,
+			table.key,
+		),
+		index("idx_plugin_resource_list").on(
+			table.pluginId,
+			table.ownerKind,
+			table.scopeType,
+			table.scopeId,
+			table.id,
+		),
+		check(
+			"ck_plugin_resource_revision",
+			sql`${table.revision} >= 1 and ${table.revision} <= 9007199254740990`,
+		),
+		check("ck_plugin_resource_state", sql`${table.state} in ('active','deleted')`),
+		check(
+			"ck_plugin_resource_bytes",
+			sql`${table.bytes} >= 0 and ${table.bytes} <= 65536 and length(cast(${table.valueText} as blob)) = ${table.bytes}`,
+		),
+	],
+);
+
+// Incremented in the same transaction as entries; no request-time SUM/COUNT or full scan.
+export const pluginResourceBudgets = sqliteTable(
+	"plugin_resource_budgets",
+	{
+		pluginId: text("plugin_id").primaryKey(),
+		resourceBytes: integer("resource_bytes").notNull().default(0),
+		resourceCount: integer("resource_count").notNull().default(0),
+		settingsCount: integer("settings_count").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		check(
+			"ck_plugin_budget_bytes",
+			sql`${table.resourceBytes} >= 0 and ${table.resourceBytes} <= 8388608`,
+		),
+		check(
+			"ck_plugin_budget_resources",
+			sql`${table.resourceCount} >= 0 and ${table.resourceCount} <= 4096`,
+		),
+		check(
+			"ck_plugin_budget_settings",
+			sql`${table.settingsCount} >= 0 and ${table.settingsCount} <= 4096`,
+		),
+	],
+);
+
 // === integration_authorities ===
 // Durable authorization root shared by OAuth grants and plugin installations. The authority id
 // is intentionally the OAuth grant id / plugin installation id so resource provenance can use one

@@ -1,3 +1,8 @@
+import { providerQuotaSourceSchema } from "@shared/provider-quota";
+import {
+	type ProviderSettingsContribution,
+	providerSettingsContributionSchema,
+} from "@shared/provider-settings";
 import {
 	getContributionFullId,
 	isContributionId,
@@ -37,6 +42,7 @@ export interface PluginRegistryDiagnostic extends PluginDiagnostic {
 export type ActivationEventKind =
 	| "onStartup"
 	| "onProvider"
+	| "onQuota"
 	| "onTool"
 	| "onCommand"
 	| "onView"
@@ -127,10 +133,23 @@ function cloneDiagnostic(
 	return pluginId ? { ...diagnostic, pluginId } : { ...diagnostic };
 }
 
+function freezeStaticMetadata(value: unknown): void {
+	if (value === null || typeof value !== "object") return;
+	for (const child of Object.values(value)) freezeStaticMetadata(child);
+	Object.freeze(value);
+}
+
 function freezeDescriptor(
 	descriptor: PluginContributionSummary,
 ): Readonly<PluginContributionSummary> {
-	return Object.freeze({ ...descriptor });
+	const providerSettings = descriptor.providerSettings
+		? structuredClone(descriptor.providerSettings)
+		: undefined;
+	if (providerSettings) freezeStaticMetadata(providerSettings);
+	return Object.freeze({
+		...descriptor,
+		...(providerSettings ? { providerSettings } : {}),
+	});
 }
 
 function freezeRegistryEntry(
@@ -148,9 +167,14 @@ function contributionIdentityIsValid(
 	packageSummary: PluginPackageSummary,
 	contribution: PluginContributionSummary,
 ): boolean {
+	let validId = isContributionId(contribution.id);
+	if (contribution.kind === "quotaSource")
+		validId = providerQuotaSourceSchema.shape.id.safeParse(contribution.id).success;
+	if (contribution.kind === "providerSettings")
+		validId = providerSettingsContributionSchema.shape.id.safeParse(contribution.id).success;
 	return (
 		isPluginId(contribution.pluginId) &&
-		isContributionId(contribution.id) &&
+		validId &&
 		contribution.pluginId === plugin.pluginId &&
 		contribution.version === packageSummary.version &&
 		contribution.hash === packageSummary.hash &&
@@ -325,6 +349,22 @@ export class PluginContributionRegistry {
 		return this.list().filter((entry) => entry.kind === kind);
 	}
 
+	/**
+	 * Read static declarations without activating a plugin or reading any saved values.
+	 * Unavailable entries remain discoverable; this is never an execution/permission gate.
+	 * Return a detached copy so a host form cannot change future discovery results.
+	 */
+	getProviderSettingsDescriptor(fullId: string): ProviderSettingsContribution | undefined {
+		const entry = this.entries.get(fullId);
+		if (
+			entry?.kind !== "providerSettings" ||
+			!entry.descriptor.providerSettings ||
+			entry.descriptor.providerSettings.id !== entry.contributionId
+		)
+			return undefined;
+		return structuredClone(entry.descriptor.providerSettings);
+	}
+
 	markUnavailable(fullIdOrPluginId: string, reason: string): boolean;
 	markUnavailable(pluginId: string, contributionId: string, reason: string): boolean;
 	markUnavailable(
@@ -415,16 +455,20 @@ function containsControlCharacter(value: string): boolean {
 function normalizeContributionReference(
 	pluginId: string,
 	reference: string,
+	quota = false,
 ): { contributionId: string; fullId: string } | undefined {
+	const validId = quota
+		? (id: string) => providerQuotaSourceSchema.shape.id.safeParse(id).success
+		: isContributionId;
 	if (reference.length > 256 || containsControlCharacter(reference)) return undefined;
 	if (reference.includes("/")) {
 		const prefix = `${pluginId}/`;
 		if (!reference.startsWith(prefix)) return undefined;
 		const contributionId = reference.slice(prefix.length);
-		if (!isContributionId(contributionId)) return undefined;
+		if (!validId(contributionId)) return undefined;
 		return { contributionId, fullId: getContributionFullId(pluginId, contributionId) };
 	}
-	if (!isContributionId(reference)) return undefined;
+	if (!validId(reference)) return undefined;
 	return { contributionId: reference, fullId: getContributionFullId(pluginId, reference) };
 }
 
@@ -609,12 +653,17 @@ export class ActivationIndex {
 					continue;
 				}
 
-				const normalized = normalizeContributionReference(plugin.pluginId, parsed.reference);
+				const normalized = normalizeContributionReference(
+					plugin.pluginId,
+					parsed.reference,
+					parsed.kind === "onQuota",
+				);
 				const expectedKind: Record<
-					"onProvider" | "onTool" | "onCommand" | "onView",
+					"onProvider" | "onQuota" | "onTool" | "onCommand" | "onView",
 					PluginContributionKind
 				> = {
 					onProvider: "provider",
+					onQuota: "quotaSource",
 					onTool: "tool",
 					onCommand: "command",
 					onView: "view",

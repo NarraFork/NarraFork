@@ -21,6 +21,7 @@ import { logger } from "../logger";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	getProviderKeyStore,
+	isCustomApiKeyOwner,
 	nugKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../provider-keys";
@@ -135,8 +136,15 @@ export interface ChatParams extends ProtocolChatParams {
 	 */
 	onRequestStart?: (info?: {
 		credentialId?: string;
+		/** Host-only exact Custom API key, independent of the billing group id. */
+		quotaCredentialId?: string;
 		validateDiagnosticCredential?: () => boolean;
 	}) => void;
+	/** Host-local capture at key selection, before request preparation can yield. */
+	captureCustomApiQuotaTarget?: (
+		providerId: string,
+		keyId: string,
+	) => import("../provider-quota-async").FrozenCustomApiQuotaTarget | null;
 	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
@@ -537,13 +545,19 @@ function registerCredentialProviderSource<
 					keys[0]?.apiKey === config.apiKey &&
 					!keys[0]?.network &&
 					(owner === config.id || stored.length === 1));
+			const selectedKeyId = keys[0]?.id;
 			const selectedConfig = keys[0] ? withProviderKey(config, keys[0]) : config;
+			const selectedConfigVersion = JSON.stringify(selectedConfig);
 			const configVersion = JSON.stringify(config);
 			const proxyVersion = JSON.stringify(settings.proxy);
 			const protocolVersion = resolveModelProtocol(prefix, model);
 			// A single-credential connection is billed to the connection itself.
 			const adapter: ProviderAdapter = plain
-				? reportCredentialId(adapterFor(prefix, model, selectedConfig), config.id)
+				? reportCredentialId(
+						adapterFor(prefix, model, selectedConfig),
+						config.id,
+						isCustomApiKeyOwner(owner) ? { providerId: owner, keyId: selectedKeyId } : undefined,
+					)
 				: new PooledProvider(
 						owner,
 						(key) => adapterFor(prefix, model, withProviderKey(config, key)),
@@ -563,9 +577,16 @@ function registerCredentialProviderSource<
 					return false;
 				if (!plain) return true;
 				const stored = getProviderKeyStore().list(owner);
-				return stored.length === 0
-					? keys.length === 0
-					: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
+				if (selectedKeyId === undefined) return stored.length === 0;
+				// A different key can restore the group's old secret after a reorder, but
+				// it cannot validate the key this adapter was created to use.
+				const selected = stored.find((key) => key.id === selectedKeyId);
+				return (
+					!!selected &&
+					!selected.disabled &&
+					!selected.network &&
+					JSON.stringify(withProviderKey(live, selected)) === selectedConfigVersion
+				);
 			};
 			return adapter;
 		},

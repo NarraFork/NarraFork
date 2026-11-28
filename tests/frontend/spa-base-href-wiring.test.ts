@@ -22,7 +22,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { injectSpaBaseHref } from "@server/lib/spa-base-href";
+import { injectSpaBaseHref, isSpaNavigationPath } from "@server/lib/spa-base-href";
 
 const VITE_CONFIG = await Bun.file("frontend/vite.config.ts").text();
 const SERVER_MAIN = await Bun.file("server/main.ts").text();
@@ -79,4 +79,24 @@ describe("the app shell survives injection", () => {
 		// If these were rooted, the injected base would be decorative.
 		expect(APP_SHELL).not.toMatch(/rel="(?:icon|apple-touch-icon)" href="\//);
 	});
+});
+
+test("reverse-DNS plugin detail URLs remain SPA routes while unknown asset files remain 404", () => {
+	for (const path of [
+		"/settings/plugins/io.narrafork.provider-quota",
+		"/settings/plugins/com.example.provider/",
+		"/projects/example",
+	])
+		expect(isSpaNavigationPath(path)).toBe(true);
+	for (const path of [
+		"/assets/missing.js",
+		"/settings/plugins/../../secret.txt",
+		"/settings/plugins/com.example.provider/assets/private.js",
+		"/favicon.ico",
+	])
+		expect(isSpaNavigationPath(path)).toBe(false);
+	expect(SERVER_MAIN.match(/isSpaNavigationPath\(c.req.path\)/g)?.length).toBe(2);
+	expect(injectSpaBaseHref(APP_SHELL, "/settings/plugins/com.example.provider")).toContain(
+		'<base href="../../">',
+	);
 });

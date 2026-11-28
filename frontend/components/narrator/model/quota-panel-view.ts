@@ -63,6 +63,8 @@ export interface QuotaPanelView {
 	title: string;
 	/** Badge text when no window has a number (e.g. "Kimi usage unavailable"). */
 	unavailableText: string;
+	/** Authoritative status text (e.g. expired), taking precedence over old numeric windows. */
+	badgeText?: string;
 	/** Windows upstream reported, in display order. */
 	windows: QuotaWindowView[];
 	/** The window with the least allowance left, which bounds the next request. */
@@ -70,7 +72,7 @@ export interface QuotaPanelView {
 	/** Worst level across windows. */
 	level: QuotaLevel;
 	/** Extra label/value rows under the windows (balance, monthly credits …). */
-	rows: Array<{ label: string; value: string }>;
+	rows: Array<{ id?: string; label: string; value: string }>;
 	/** A known validity deadline passed; this is not a missing or zero-valued allowance. */
 	expired?: boolean;
 	/** The last refresh failed; any numbers shown are from an earlier fetch. */
@@ -146,21 +148,40 @@ export function quotaWindowFromAmounts(input: {
 	remaining?: number | null;
 	resetAt?: number | null;
 }): QuotaWindowView {
-	const limit = input.limit != null && input.limit > 0 ? input.limit : null;
-	let used = input.used ?? null;
-	if (used == null && limit != null && input.remaining != null) used = limit - input.remaining;
-	const usedPercent = limit != null && used != null ? clampPercent((used / limit) * 100) : null;
-	const remainingPercent = usedPercent == null ? null : Math.round(100 - usedPercent);
+	const limit =
+		input.limit != null && Number.isFinite(input.limit) && input.limit >= 0 ? input.limit : null;
+	const remaining =
+		input.remaining != null && Number.isFinite(input.remaining) ? input.remaining : null;
+	let used = input.used != null && Number.isFinite(input.used) ? input.used : null;
+	if (used == null && limit != null && remaining != null) {
+		const inferred = limit - remaining;
+		used = Number.isFinite(inferred) ? inferred : null;
+	}
+	const usedPercent =
+		limit != null && limit > 0 && used != null ? clampPercent((used / limit) * 100) : null;
+	const rawRemainingPercent =
+		limit != null && limit > 0 && remaining != null
+			? clampPercent((remaining / limit) * 100)
+			: usedPercent == null
+				? null
+				: 100 - usedPercent;
+	const remainingPercent = rawRemainingPercent == null ? null : Math.round(rawRemainingPercent);
+	const exhausted =
+		remaining != null ? remaining <= 0 : limit != null && used != null && used >= limit;
 	return {
 		id: input.id,
 		label: input.label,
 		shortLabel: input.shortLabel,
 		usedPercent,
 		remainingPercent,
-		used: limit != null && used != null ? used : null,
+		used,
 		limit,
 		resetAt: input.resetAt ?? null,
-		level: quotaLevelForRemaining(remainingPercent),
+		// A rounded 0% is not exhaustion when a positive allowance was actually reported.
+		level:
+			rawRemainingPercent == null && remaining != null && remaining > 0
+				? "ok"
+				: quotaLevelForRemaining(rawRemainingPercent, exhausted),
 	};
 }
 
@@ -208,6 +229,7 @@ export function formatQuotaWindowAmount(value: number, unit?: string): string {
  * "exhausted" once spent, or the provider's unavailable placeholder.
  */
 export function formatQuotaBadgeText(view: QuotaPanelView, t: QuotaPanelT): string {
+	if (view.badgeText) return view.badgeText;
 	const limiting = view.limiting;
 	if (!limiting || limiting.remainingPercent == null) {
 		if (limiting?.level === "exhausted") return t("quotaPanel.exhaustedShort");
@@ -236,7 +258,9 @@ export function formatQuotaSummaryLines(
 		const reset =
 			window.resetAt == null
 				? ""
-				: ` · ${t("quotaPanel.resetsIn", { time: formatQuotaCountdown(window.resetAt - now, t) })}`;
+				: ` · ${t(window.resetCaptionKey ?? "quotaPanel.resetsIn", {
+						time: formatQuotaCountdown(window.resetAt - now, t),
+					})}`;
 		const amounts =
 			window.used != null && window.limit != null
 				? ` · ${t("quotaPanel.usedOfLimit", { used: formatQuotaWindowAmount(window.used, window.unit), limit: formatQuotaWindowAmount(window.limit, window.unit) })}`

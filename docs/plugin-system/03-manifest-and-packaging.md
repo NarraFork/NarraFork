@@ -40,8 +40,10 @@
 | 版本层 | 示例 | 作用 | 不兼容时处理 |
 |---|---|---|---|
 | Manifest schema | `1` | 宿主是否能安全读取 `manifest.json` | 安装检查失败，不执行代码 |
-| Host API | `1.0` | 插件可调用的 Query/Command/Event/Storage/Secret API | 选择共同版本；无交集则 incompatible |
+| Host API | 原有版本声明 | 插件可调用的 Query/Command/Event/Storage/Secret API 与后端连接扩展 | 选择共同版本；无交集则 incompatible |
 | RPC protocol | `narrafork.rpc/1` | framing、握手、流、取消、错误和背压 | major 不同拒绝握手 |
+
+**[当前事实]** Host API 沿用原有 catalog、manager 与 runtime 的版本声明、默认值及兼容性检查。本分支不提升版本，也不新增统一固定常量。Manifest v1 新增可选 `contributes.quotaSources` 和 `onQuota:<id>`：额度源复用 [shared/provider-quota.ts](../../shared/provider-quota.ts) 的公开 schema，仅面向 Custom API 配置，要求 server，且无 provider 绑定；旧贡献默认空。`host_api.provider_connection` 是显式后端协商 feature，不是 iframe API。禁用、卸载、升级/回滚和 grant/runtime 代次变化都通过 platform 的 `quota_registry` 撤销层处理。
 
 - **[设计建议]** `schemaVersion` 是整数主版本，表示 Manifest 结构版本；同一主版本只能增加可选字段，不得改变必填字段语义。
 - **[设计建议]** `version` 遵循 SemVer，表示插件发布版本；预发布版本可以安装但默认不参与稳定通道自动升级。
@@ -439,6 +441,16 @@ manifest 校验会拒绝指向未声明 provider 的 `providerId`（悬空绑定
 
 `search.provide` 需要在 `permissions.host` 里声明，但它是声明性 capability，**不设运行时 gate** —— 与 provider 执行路径一致，详见 `11-capability-policy.md`。
 
+### 3.5.8 `quotaSources`（Custom API 额度源，可选 feature 扩展）
+
+**[当前事实]** 额度源是独立后端贡献，只要求 `server` 和两项 live grant（`quota.provide`、`provider.connection.request`），不声明 provider 贡献，不接管模型、搜索或内置 provider。现行字段、默认值和数值上限来自 [shared/provider-quota.ts](../../shared/provider-quota.ts)，JSON Schema companion 保持同形。
+
+- `match` 包含 `hosts`、`pathPrefixes`、`fallback`；贡献 ID 和匹配声明不能选择任意凭据。
+- `requests[]` 声明允许的 GET 路径、`auth`、`queryKeys` 及 harmless `headers`。`auth` 为 `none`、`bearer`、`bearer-and-api-key` 或 `site-token`；插件只可提供 `accept` 和 `user-agent`，不能提供认证或推理自定义头。
+- `site-token` 只适用于后端 `provider.connection.request` 的 `destination: "site-account"`。宿主从已保存的站点根和凭据派生固定 `<root>/api/user/self`；查询串为空，拒绝跨 origin/重定向，不把站点 token 或 `New-Api-User` 交给插件。
+- `refresh.keepLastGoodMs` 是可选整数（0–31536000000 毫秒），无默认值。relay 明确声明 `600000`；未声明的 Kimi/OpenCode 保留原有 SWR，不被全局十分钟策略截短。认证、配置、协议或授权确定性错误不保留旧成功值；临时失败才受该 retention 限制。
+- `limits` 的宿主上限为整次查询 30 秒、单请求 20 秒、原始 body 256 KiB、最多 16 请求；规范化额度最多 16 KiB。插件可声明更小预算，不能把 JSON 封装余量转作任意大响应。
+
 - `mcp`：**[建议]** v1 不允许 Manifest 直接修改 `settings.mcpServers`；如未来支持 MCP contribution，必须由宿主创建受控配置、独立授权和审计，并复用现有 MCP Manager 的连接/重连语义。
 
 完整 contribution ID 必须带命名空间，例如：
@@ -448,6 +460,57 @@ com.example.review/review-chapter
 com.example.review/provider/main
 com.example.review/openReviewDashboard
 ```
+
+### 3.5.9 `providerSettings`（为已保存供应商追加设置）
+
+**[候选实现，双基线升级已验证，整合检查仍有未通过项]** `contributes.providerSettings` 是可选数组，最多 32 项。Manifest、catalog 和贡献 registry 在不执行插件入口的情况下发现其声明；候选已接通独立表单保存、管理员 action 与后端受控连接。它与 `surface: "provider-settings"` 不同：后者配置插件自己注册的 provider，本贡献按目标种类为宿主已有供应商追加独立配置。
+
+```json
+{
+  "id": "display-preferences",
+  "schemaVersion": 1,
+  "title": "Display preferences",
+  "targetKinds": ["custom-api", "nug", "platform", "executable-plugin"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "compact": { "type": "boolean", "default": false },
+      "weight": { "type": "integer", "minimum": 0, "maximum": 10, "default": 2 }
+    }
+  }
+}
+```
+
+目标身份包含 kind：Custom API/NUG 使用各自持久 ID，可执行插件 provider 使用实际注册的 `providerInstanceId`，平台使用持久账户 ID 或固定连接槽位。名称和前缀变化不创建新身份；未保存、重复、不可用和禁用目标分别处理。Codex 默认池与具体账户是不同目标，仅在内存生成的旧账户 ID 不能用于建立设置记录。解析输出只有 `{kind,id,name,disabled,available}`，不携带凭据或完整配置。
+
+`configSchema` 仅支持一层对象及 string/boolean/integer/number 字段，最多 32 个字段；原始声明预算为 256 节点、深度 8、32 KiB UTF-8。可用约束为受限长度、数值范围、枚举、默认值及纯文本标题/描述，支持 `en`/`zh-CN` 文案；字段 minLength/maxLength 按 Unicode code point 计数。禁止额外属性、嵌套对象/数组、`$ref`、`pattern`、脚本格式、原型键和访问器。字符串的 `writeOnly`、`format: "password"` 或 `x-narrafork-secret` 表示秘密；`x-narrafork-host-only` 字段不进入插件公开配置。私有字段不能声明默认值或枚举。
+
+可选 `action` 只声明标题、描述和翻译；宿主入口负责绑定已保存目标，声明不能指定任意目标、owner、安装或处理器。只有 action 或非空 connections 才要求 server entry；静态表单或空 connections 不要求后端。
+
+可选 `connections` 最多 8 项，声明 literal GET 路径后缀。`destination: "provider"` 仅允许 `none` 或 `provider-key`，后者仅绑定原供应商保存的根；`destination: "extension"` 通过同贡献的 URI 字段选择根，只使用本贡献的秘密字段作 bearer 或 `x-api-key`/`api-key`，不允许选择推理 Key。可声明根缺失时 `unavailable` 或 `provider-root`。身份头最多 8 个，仅接受受限的小写 user/account/tenant 名称并引用已保存非秘密字符串字段；不允许代理或路由头。路径不能包含 URL、query、fragment、编码分隔符或 `.`/`..` 跳转。声明本身不授予网络权限。
+
+规范来源为 `shared/provider-settings.ts`；JSON Schema companion 保留同形结构，跨字段引用、去重、预算和一致性约束由 canonical parser 进一步校验。新能力的显式授权规则见 [11-capability-policy.md](11-capability-policy.md) §3.11。
+
+#### 字段值与独立保存契约
+
+**[当前事实：纯校验层]** `shared/provider-settings-values.ts` 定义保存载荷与只含秘密存在状态的读取 DTO；`ProviderSettingsConfigPolicy` 实现值校验和宿主内部保存准备，不执行授权、目标查询、文件/SQL 写入或 HTTP 请求。管理员 HTTP 入口为 `/api/provider-settings`，以下是存储/UI 共用契约；普通用户和 OAuth 只读取公开字段摘要。
+
+保存载荷包含 `schemaVersion: 1`、`schemaFingerprint`、`expectedRevision`、`expectedBindingRevision`、`values` 和 `secrets`。`values` 完整替换本扩展的非秘密字段（含仅宿主可见字段）；省略可选普通字段即移除，不能把秘密塞进 values。`secrets` 按字段分别使用 `{operation:"set",value:"…"}`、`{operation:"keep"}`、`{operation:"clear"}`，省略某项表示保留现值；空字符串不等同 clear，占位串不等同 keep。字段必填规则针对合并后的配置执行，初始缺少必填项的读取状态为 `incomplete`，不能作为已配置值运行。默认值仅用于没有记录时初始化表单，不在读取已保存配置或移除字段后重新填入。
+
+`schemaFingerprint` 覆盖字段约束、目标种类与连接用途，文案变化不改变它；即使 `schemaVersion` 仍为 1，字段或连接变化也会使旧记录进入 `schema-mismatch`，在专门迁移或显式重新配置前拒绝覆盖。配置 revision 处理并发保存；绑定 revision 由宿主当前保存的目标、安装、账户/根地址身份生成，客户端不能提交 owner、pluginId 或任意凭据归属。
+
+秘密的绑定还包含该秘密被用于的规范根、租户路径、请求路径及身份头字段。跨 origin、同源换租户路径、换账户或核心绑定变化时，隐式/显式 keep 都返回 `PROVIDER_SETTINGS_SECRET_REBIND_REQUIRED`；管理员必须明确 set 或 clear。根缺失时声明的 provider-root 回退同样参与绑定。URI 仅接受有界 HTTP(S) 根，拒绝 URL 凭据、query、fragment、控制字符、点路径和编码 ASCII 分隔符；支持合法 Unicode 路径，规范化后再次检查长度，保留租户与 API 路径，不猜测或剥除 `/v1`。旧额度路径的兼容转换由可信迁移处理，先在 Worker 准备密文，再提交小型 CAS 事务和宿主回执；Worker 失败不回退主线程。
+
+每个值最多 4096 个 Unicode 字符；普通值与保留/新增秘密的 UTF-8 数据合计最多 32 KiB，保存请求整体最多 48 KiB、256 节点、深度 6。普通值只允许 string/number/integer/boolean，integer 字段限定安全整数；禁止非有限数、未知字段、数组、嵌套对象、原型键、访问器与序列化钩子。连接身份头另限 128 个可打印 ASCII 字符，凭据头禁止空白/控制字符。
+
+管理员 DTO 回传非秘密值与 `{isSet:boolean}`，不回传秘密、密文或秘密绑定材料；插件值投影还移除 host-only 字段。`dormant`、`schema-mismatch`、`binding-changed` 与损坏记录不能当作空配置重新保存。纯层产出的 `secretWrites` 仅供宿主加密后与配置一起 CAS 提交，绝不可返回 UI 或插件。
+
+**[候选接线]** 核心供应商草稿与扩展独立保存；核心账户/地址有未保存编辑时，UI 禁止扩展写入和 action 并提示先保存，扩展自身草稿未保存也禁止 action，保存失败保留草稿。停用、撤权、卸载和未安装状态由宿主生命周期层明确展示，不因不可执行而清空配置。存储必须再次验证目标、安装和 revision，并在同一事务提交配置与密文；纯函数校验本身不构成事务或授权。
+
+管理员可在同贡献下通过 `/retained` 分页读取旧目标的摘要（每页最多50项、只含旧稳定ID/revision/更新时间），然后在 `/rebind` 确认中附 `source:{targetId,expectedRevision}`。顶层 `expectedRevision` 比较目的记录，`schemaFingerprint` 与 `expectedBindingRevision` 比较当前声明和目标。源目标必须已不存在，目的不能已有活动配置；在一个有界事务中写入重新加密的新归属并留下源删除标记。跨安装或导入的删除标记可由当前安装以匹配revision显式创建全新配置，不继承旧秘密。
+
+后端 action 收到宿主派生的目标摘要、schema版本/指纹和短期 reference；公开值通过该引用读取。插件用 `provider.settings.get({reference})` 读取公开值，用 `provider.settings.connection.request({reference,connectionId})` 发送声明连接；不能指定owner、URL、认证头或目标。引用最多128个、30秒有效、最多16次请求；单请求20秒、响应256KiB，停用/撤权/目标变化/runtime退出立即失效。真实 stdio 例子位于 `examples/plugins/provider-settings-reference`，不依赖额度业务。
 
 ## 4. 配置、secret 与依赖声明
 
@@ -531,6 +594,37 @@ NOTICE
 - 归档解压必须逐项进行路径规范化和真实路径检查，拒绝 zip bomb、重复文件、大小写碰撞和超出总解压大小的包。
 - `manifest.json` 解析和静态检查在 staging 目录完成；在校验结束前不执行 server、UI、安装脚本或依赖脚本。
 - **[假设]** 未来可支持 `.tar.gz` 导入，但要复用现有 pack 的类型/大小/路径穿越检查；v1 建议只承诺 ZIP，减少跨平台归档差异。
+
+### 5.1.1 随主程序提供的 Provider Quota 包
+
+**[当前事实]** 只有真实可安装的 `io.narrafork.provider-quota@1.0.3` 包，没有第二套 `server/builtin-plugins/apikey-quota` 或宿主内执行的额度查询 engine。包的兼容声明为 `>=1.0 <2`，额度接口通过可选 feature 协商，宿主版本沿用原有维护机制；server 入口、锁定依赖、MPL 源码、许可证、SPDX SBOM 和可选 `plugin-source.json` 都在 `.nfplugin` 内。插件版本独立于 APP_VERSION。
+
+- [scripts/build-bundled-plugins.ts](../../scripts/build-bundled-plugins.ts) 固定并核对包身份、16 MiB archive 大小和 SHA-256；[scripts/generate-builtin-plugins.ts](../../scripts/generate-builtin-plugins.ts) 为 immutable local-runtime/release 生成同一 archive 模块，旧 builtin 数组明确为空。
+- 编译宿主使用 `with { type: "file" }` 嵌入 opaque archive 与 ID/version/size/SHA 元数据。插件 JS 不在宿主 imports 或 worker entrypoints；运行时只读取已嵌入的字节，经普通 PackageStore 校验并 materialize 到不可变安装目录，缺嵌入资源失败而不回退源码执行。
+- `.nfplugin` 和 package tree 先在带独占锁的 staging 生成；完整 archive 校验后复制到按 SHA-256 命名的内容寻址缓存，以 no-replace 方式冻结，后续对 canonical `dist/` 的重建不会改写该缓存 inode。local-runtime 的 `publishGenerated: false` 路径使用 `.narrafork/` 私有 build 输出，不改 plugin `dist/` 或 `server/generated`。同一 checkout 的并发 publisher 由输出锁串行/失败关闭，未知遗留锁不自动删除。
+- 正式生成会原子替换单个 archive、metadata、package directory 和 generated module；可恢复的发布失败回滚旧文件。它不是跨多个路径对非协作读取者可见的单一文件系统事务，因此 descriptor/archive digest 不匹配必须 fail closed。release 的所有目标复用本次冻结的同一内容寻址 archive；`--skip-frontend` 不跳过插件生成。启用 remote-peer 的 NF 宿主同样携带此材料；独立 Go remote-peer 网络代理不运行或复制另一套额度插件。
+- 默认安装、启用属于一次 bootstrap：已有禁用、卸载、grant 撤销及当前版本选择不会因重启或升级宿主被覆盖。包清单自报的 pluginId 不构成内置信任；descriptor、archive 元数据和解包 Manifest 必须一致。
+- 固定 SPDX 创建时间、ZIP 时间/权限和排序保证同源、同版本、同工具链的 archive bytes 与内容 hash 可重复。PackageStore 的同版本不同 hash 拒绝策略不放宽。
+
+### 5.1.2 可选来源副文件与可卸载的内置归档
+
+**[当前事实]** 来源是包根的可选 `plugin-source.json`，不是 Manifest 新必填字段，也不是新的运行时 Host API。其 schema 独立于 Manifest/RPC，来自 [shared/plugin-source.ts](../../shared/plugin-source.ts)；companion 定义位于 `contracts/manifest-v1.schema.json` 的 `$defs.pluginSourceMetadata`，不改变 Manifest 根结构。
+
+```json
+{
+  "schemaVersion": 1,
+  "pluginId": "io.narrafork.provider-quota",
+  "source": { "type": "local", "builtinId": "io.narrafork.provider-quota" }
+}
+```
+
+- 来源可为 `github`、`website`、`local`。GitHub 声明 owner/repo/assetName；网站声明 updateApi 和可选 downloadOrigins；local 仅声明宿主已知 builtinId，不接受任意磁盘路径或扫描最高版本。
+- `homepage` 可选，缺失不从仓库、publisher 或更新接口猜测主页；插件名称保持普通文字。随附 Provider Quota 未设置主页，包中不加入链接。
+- [server/lib/plugins/source-metadata.ts](../../server/lib/plugins/source-metadata.ts) 有界读取至多 16 KiB，核对插件身份与 local builtinId。缺失为无来源；坏 JSON/schema、错配和超限只进入 `sourceDiagnostics`，不进入决定有效插件兼容性的 `diagnostics`，不影响原上传/运行流程。
+- `sourceHint` 仅是作者提示，不替代管理员来源绑定、来源 revision、自动更新偏好或信任策略；新包不能靠提示覆盖已批准来源或自动开启更新。
+- [server/services/builtin-plugin-catalog.ts](../../server/services/builtin-plugin-catalog.ts) 是 host-owned 已知身份表。同步 `get(id)` 返回 NF 自带 descriptor 的版本、名称、本地来源和延迟 `load(signal)`；只有 load 才读取/校验归档与摘要，latest 不来自服务器磁盘上的任意包。
+- 安装标记来自真实安装记录而非残留 archive 目录；`list(installedVersions)` 返回 `installed`、`installedVersion`、`canInstall`。未安装的内置插件可由管理员明确重装，不用 bootstrap 覆盖卸载记忆。
+- 目录型旧 builtin 仍 `builtin: true`、`packageKind: "builtin-directory"`、`canUninstall: false`。NF 随附归档是普通安装包：`origin: "builtin"`、`packageKind: "installed"`、`canUninstall: true`，不设置旧只读 builtin 标记。内置标签不免授权/签名/不可变校验，也不阻止卸载。
 
 ### 5.2 完整性与签名
 

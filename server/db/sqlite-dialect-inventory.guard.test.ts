@@ -407,6 +407,14 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"固定表清单的快照构建子进程：ATTACH 源库后逐表 `INSERT … SELECT` 拷贝，再 `VACUUM` 压实；两者都是 SQLite 专属且 O(数据量) 的同步操作",
 	],
 	[
+		"server/db/provider-settings-import-stage.ts",
+		"snapshot subprocess helper: validates and re-encrypts provider settings into a local SQLite staging file; clear opens the same SQLite file for bounded batches",
+	],
+	[
+		"server/services/sqlite-plugin-settings-store.ts",
+		"synchronous SQLite adapter for plugin settings and resources; PostgreSQL uses postgres-plugin-settings-store.ts",
+	],
+	[
 		"server/db/integrity-check.ts",
 		"orchestrates the SQLite integrity probe and the `sqlite3 .recover` fallback",
 	],
@@ -554,6 +562,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
+	"server/db/provider-settings-import-stage.ts": ["driver", "connectionModule", "pragma"],
+	"server/services/sqlite-plugin-settings-store.ts": ["driver"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/lib/db-worker/compact-summary-query.ts": ["driver"],

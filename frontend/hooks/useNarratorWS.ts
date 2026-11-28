@@ -48,6 +48,34 @@ import {
 	useAsyncQuestionListChange,
 } from "./useAsyncQuestions";
 
+export interface CustomApiQuotaPushTarget {
+	providerId: string;
+	generation: string;
+}
+
+/** Absent means a legacy sender; malformed/null means explicitly not this Custom API. */
+export function readCustomApiQuotaPushTarget(
+	value: unknown,
+): CustomApiQuotaPushTarget | null | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const target = value as Record<string, unknown>;
+	return typeof target.providerId === "string" &&
+		target.providerId.length > 0 &&
+		target.providerId.length <= 256 &&
+		typeof target.generation === "string" &&
+		target.generation.length > 0 &&
+		target.generation.length <= 256
+		? { providerId: target.providerId, generation: target.generation }
+		: null;
+}
+
+/** Only the opaque Key identity is carried alongside quota text, never credential material. */
+export function readQuotaCredentialId(value: unknown): string | null | undefined {
+	if (value === undefined) return undefined;
+	return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
+}
+
 function nonEmptyString(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const trimmed = value.trim();
@@ -788,7 +816,12 @@ export interface NarratorWSCallbacks {
 		truncated: boolean;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
-	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
+	onQuotaBalance?: (
+		quotaBalance: string | null,
+		detailedQuotaBalance?: string | null,
+		customApiQuotaTarget?: CustomApiQuotaPushTarget | null,
+		credentialId?: string | null,
+	) => void;
 	onPaymentRequired?: (info: {
 		paymentContext?: string;
 		providerId?: string;
@@ -1621,6 +1654,8 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onQuotaBalance?.(
 							quotaBalance == null ? null : String(quotaBalance),
 							detailedText?.trim() ? detailedText : null,
+							readCustomApiQuotaPushTarget(data.customApiQuotaTarget),
+							readQuotaCredentialId(data.credentialId),
 						);
 						break;
 					}

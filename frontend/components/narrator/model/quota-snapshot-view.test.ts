@@ -198,3 +198,105 @@ test("clamps out-of-range windows and leaves non-finite numbers unknown", () => 
 	expect(view.windows[0]).toMatchObject({ label: "Custom", usedPercent: 100, level: "exhausted" });
 	expect(view.windows[1]?.usedPercent).toBeNull();
 });
+
+test("plugin details and exact amounts remain separate from the summary and quota constraints", () => {
+	const value: PublicQuotaSnapshot = {
+		fetchedAt: 1,
+		scope: "wallet",
+		details: "Saved subscription",
+		windows: [],
+		balances: [
+			{
+				id: "wallet",
+				unit: "USD",
+				remaining: 0.000000000001,
+				remainingText: "0.000000000001",
+				quota: "required",
+			},
+			{
+				id: "history",
+				label: "Previous period",
+				unit: "USD",
+				remaining: 0,
+				used: 4,
+				window: "monthly",
+				windowStart: 1_000,
+				display: "detail",
+				quota: "none",
+			},
+		],
+	};
+	const view = quotaSnapshotView(value, "Provider", t);
+	expect(view.unavailableText).toBe("0.000000000001 USD");
+	expect(view.level).toBe("ok");
+	expect(view.rows).toContainEqual({
+		id: "balance:1:history",
+		label: "Previous period",
+		value: "0 USD",
+	});
+	expect(view.rows).toContainEqual({
+		id: "balance:1:history:used",
+		label: "Used (USD)",
+		value: "4 USD",
+	});
+	expect(view.rows.some((row) => row.id === "balance:1:history:window-start")).toBe(true);
+	expect(view.rows).toContainEqual({ label: "Details", value: "Saved subscription" });
+	expect(quotaSnapshotView({ ...value, available: false }, "Provider", t).level).toBe("exhausted");
+	expect(quotaSnapshotText({ ...value, available: false }, t).balance).toBe("Account unavailable");
+});
+
+test("required balances constrain independently and unknown alternatives never prove exhaustion", () => {
+	const alternatives: PublicQuotaSnapshot = {
+		fetchedAt: 1,
+		scope: "wallet",
+		windows: [],
+		balances: [
+			{ unit: "USD", remaining: 0, quota: "alternative" },
+			{ unit: "credits", remaining: null, quota: "alternative" },
+		],
+	};
+	expect(quotaSnapshotView(alternatives, "", t).level).toBe("unknown");
+	expect(
+		quotaSnapshotView(
+			{
+				...alternatives,
+				balances: [...alternatives.balances, { unit: "CNY", remaining: 5, quota: "alternative" }],
+			},
+			"",
+			t,
+		).level,
+	).toBe("ok");
+	expect(
+		quotaSnapshotView(
+			{
+				...alternatives,
+				balances: [
+					...alternatives.balances,
+					{ unit: "requests", remaining: 0, quota: "required", display: "detail" },
+				],
+			},
+			"",
+			t,
+		).level,
+	).toBe("exhausted");
+});
+
+test("a rounded full window with positive credit remains critical until explicitly rate-limited", () => {
+	const value: PublicQuotaSnapshot = {
+		fetchedAt: 1,
+		scope: "key",
+		windows: [{ kind: "5h", usedRatio: 1, remaining: 0.000001, resetsAt: null }],
+		balances: [],
+	};
+	expect(quotaSnapshotView(value, "", t).windows[0]?.level).toBe("critical");
+	expect(
+		quotaSnapshotView(
+			{
+				...value,
+				windows: value.windows.map((window) => ({ ...window, status: "rate-limited" as const })),
+			},
+			"",
+			t,
+		).windows[0]?.level,
+	).toBe("exhausted");
+});

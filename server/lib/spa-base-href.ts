@@ -39,6 +39,12 @@
  * form by default, so the supported path is also the default one.
  */
 
+/** Reverse-DNS plugin IDs are route parameters, not static filename extensions. */
+export function isSpaNavigationPath(requestPath: string): boolean {
+	if (!requestPath.includes(".")) return true;
+	return /^\/settings\/plugins\/[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])\/?$/.test(requestPath);
+}
+
 /**
  * How many `../` segments lead from the document's directory back to the mount root.
  *

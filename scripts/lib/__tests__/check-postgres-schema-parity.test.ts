@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 151 tables and 1985 columns", () => {
-		expect(target.tables.length).toBe(151);
+	test("covers 154 tables and 2020 columns", () => {
+		expect(target.tables.length).toBe(154);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -581,7 +581,16 @@ describe("real schema parity", () => {
 		// executor_session_cleanups (3).
 		// Work item dependencies (D) add team_work_item_dependencies (4).
 		// Background Bash on executor sessions adds background_tasks.executor_session_json (nullable).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1985);
+		// Provider extensions add plugin_provider_settings (16), plugin_resource_entries (14)
+		// and plugin_resource_budgets (5); validateCoverage above compares every field and constraint.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(2020);
+		for (const [name, count] of [
+			["plugin_provider_settings", 16],
+			["plugin_resource_entries", 14],
+			["plugin_resource_budgets", 5],
+		] as const) {
+			expect(target.tables.find((table) => table.name === name)?.columns).toHaveLength(count);
+		}
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")

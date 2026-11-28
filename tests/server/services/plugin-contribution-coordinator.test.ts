@@ -16,6 +16,7 @@ import {
 	type PluginContributionLifecycleState,
 } from "@server/services/plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "@server/services/plugin-contribution-registry";
+import { PluginQuotaRegistry } from "@server/services/plugin-quota-registry";
 import { PluginToolRegistry } from "@server/services/plugin-tool-registry";
 
 const pluginId = "com.example.coordinator";
@@ -146,6 +147,99 @@ function state(
 }
 
 describe("PluginContributionCoordinator", () => {
+	test("refreshes quota discovery through the real coordinator without starting a provider runtime", async () => {
+		const manifest = parseManifest({
+			...manifestInput(),
+			activationEvents: ["onQuota:quota"],
+			permissions: { host: ["quota.provide", "provider.connection.request"] },
+			contributes: {
+				quotaSources: [
+					{
+						id: "quota",
+						title: "Quota",
+						match: { hosts: ["example.test"] },
+						requests: [{ path: "/quota", auth: "bearer" }],
+					},
+				],
+			},
+		});
+		const catalog = snapshotFor(manifest);
+		const summary: PluginContributionSummary = {
+			pluginId,
+			version: "1.0.0",
+			hash,
+			id: "quota",
+			fullId: `${pluginId}/quota`,
+			kind: "quotaSource",
+			title: "Quota",
+			hasSchema: false,
+		};
+		for (const pkg of catalog.packages) pkg.contributions = [summary];
+		for (const plugin of catalog.plugins) plugin.contributions = [summary];
+		const record = {
+			pluginId,
+			current: { version: "1.0.0", hash },
+			installationId: "installation-coordinator",
+			authorityInstallationId: "installation-coordinator",
+			desiredState: "enabled" as "enabled" | "disabled",
+			compatibility: "compatible" as const,
+			runtimeState: "inactive" as const,
+			grants: {
+				count: 2,
+				capabilities: ["quota.provide", "provider.connection.request"],
+				revision: 1,
+			},
+		};
+		let runtimeLookups = 0;
+		const quotaRegistry = new PluginQuotaRegistry({
+			stateStore: { getCachedState: () => record as never },
+			permissionStore: {
+				hasCachedUnrestrictedGlobalGrant: () => true,
+				getSet: async () => ({
+					pluginId,
+					installationId: record.installationId,
+					revision: 1,
+					grants: [],
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				}),
+			},
+			hostServices: { getRuntimeBinding: () => undefined },
+			capabilityBroker: { authorize: async () => ({ allowed: true }) as never },
+			providerConnectionService: {
+				issue: () => {
+					throw new Error("static contribution refresh cannot issue a connection");
+				},
+				revokePlugin: () => undefined,
+			},
+			resolveRuntime: () => {
+				runtimeLookups++;
+				return undefined;
+			},
+		});
+		const contributionRegistry = new PluginContributionRegistry();
+		const coordinator = new PluginContributionCoordinator({
+			contributionRegistry,
+			quotaRegistry,
+			toolRegistry: new PluginToolRegistry({ capabilityBroker: broker() }),
+			manifestLoader: async () => manifest,
+			lifecycleStates: () => [record],
+		});
+		expect(quotaRegistry.isReady()).toBe(false);
+		await coordinator.initialize(catalog);
+		expect(quotaRegistry.isReady()).toBe(true);
+		expect(quotaRegistry.listSources()).toHaveLength(1);
+		expect(contributionRegistry.listByKind("quotaSource")).toHaveLength(1);
+		expect(contributionRegistry.listByKind("provider")).toEqual([]);
+		record.desiredState = "disabled";
+		await coordinator.disable(catalog);
+		expect(quotaRegistry.listSources()).toEqual([]);
+		record.desiredState = "enabled";
+		await coordinator.enable(catalog);
+		expect(quotaRegistry.listSources()).toHaveLength(1);
+		await coordinator.uninstall(emptySnapshot());
+		expect(quotaRegistry.listSources()).toEqual([]);
+		expect(runtimeLookups).toBe(0);
+	});
 	test.each([
 		"command",
 		"view",

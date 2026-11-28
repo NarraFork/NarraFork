@@ -16,6 +16,7 @@ import { useCallback, useEffect, useId, useMemo, useSyncExternalStore } from "re
 import { api } from "../lib/api";
 import { ApiError, getAuthSnapshot, subscribeAuth } from "../lib/api/client";
 import type { QuotaSnapshotRefreshTarget } from "../lib/api/quota-snapshots";
+import { subscribeProviderQuotaEvents } from "../lib/provider-quota-events";
 import { runtimeSettingsQueryKey } from "./useRuntimeSettings";
 
 /** Shared invalidation prefix; every actual read is partitioned by its auth lifetime. */
@@ -252,6 +253,10 @@ export function useQuotaSnapshots(enabled = true, scope?: QuotaSnapshotReadScope
 		subscribeAuth,
 		getAuthSnapshot,
 		getAuthSnapshot,
+	);
+	useEffect(
+		() => (!REMOTE_BUILD && enabled ? subscribeProviderQuotaEvents(client) : undefined),
+		[client, enabled],
 	);
 	const query = useQuery(quotaSnapshotsOptions(enabled, client, scope));
 	const cli = cliEntry(query.data);

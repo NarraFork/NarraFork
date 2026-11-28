@@ -241,9 +241,8 @@ export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): bo
 		}
 	}
 	// The message protocol v1 fallback switch, retired with v1 (P3d): every client speaks v2.
-	// The plugin subsystem no longer carries per-plugin switches: `apikey-quota` became a
-	// normal plugin toggled through the plugin store, so this key is dead. Never released, so
-	// it is simply dropped rather than migrated.
+	// This historical host-level quota switch was never released. The current Provider Quota
+	// plugin keeps enable/disable and uninstall choices in the plugin state store.
 	const plugins = settings.plugins;
 	if (plugins && typeof plugins === "object" && !Array.isArray(plugins)) {
 		if ("apikeyQuotaEnabled" in (plugins as Record<string, unknown>)) {

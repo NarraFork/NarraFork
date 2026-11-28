@@ -1,14 +1,16 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { integrationAuditEvents, integrationAuthorities } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { integrationAuditService } from "../integration-audit-service";
 import { integrationAuthorityService } from "../integration-authority-service";
 import { integrationAuthorizationService } from "../integration-authorization-service";
 
 const authorityIds = new Set<string>();
 
 afterEach(async () => {
+	mock.restore();
 	integrationAuthorizationService.clear();
 	for (const authorityId of authorityIds) {
 		await db
@@ -18,6 +20,37 @@ afterEach(async () => {
 	}
 	authorityIds.clear();
 });
+
+async function deviceReadRequest() {
+	const authorityId = generateId();
+	const projectId = generateId();
+	authorityIds.add(authorityId);
+	const created = await integrationAuthorityService.create({
+		id: authorityId,
+		kind: "oauth_grant",
+		integrationId: generateId(),
+		grants: [
+			{
+				capabilityId: "device.read",
+				scope: { type: "project", id: projectId },
+				createdBy: { type: "system" },
+			},
+		],
+	});
+	return {
+		authorityId,
+		authorityRevision: created.authority.revision,
+		operation: "device.read",
+		capability: "device.read" as const,
+		scope: { type: "project" as const, id: projectId },
+		resource: { type: "device" as const, id: generateId() },
+		resourceProjectId: projectId,
+		boundScopes: [{ type: "project" as const, id: projectId }],
+		runtime: { type: "server" as const, id: "external-v1", generation: 1 },
+		permittedCapabilities: ["device.read" as const],
+		transport: "external-v1",
+	};
+}
 
 describe("IntegrationAuthorizationService", () => {
 	test("binds decisions to authority revision and invalidates cached allows immediately", async () => {
@@ -95,6 +128,47 @@ describe("IntegrationAuthorizationService", () => {
 		expect(
 			audit.some((event) => event.operationId === "device.read" && event.outcome === "denied"),
 		).toBe(true);
+	});
+
+	test("retries a briefly locked audit write instead of failing the authorization", async () => {
+		const request = await deviceReadRequest();
+		const record = integrationAuditService.record.bind(integrationAuditService);
+		let attempts = 0;
+		spyOn(integrationAuditService, "record").mockImplementation(async (input) => {
+			attempts++;
+			if (attempts === 1)
+				throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+			return record(input);
+		});
+		const result = await integrationAuthorizationService.authorize(request);
+		expect(result.decision.allowed).toBe(true);
+		expect(attempts).toBe(2);
+		const audit = await db.query.integrationAuditEvents.findMany({
+			where: eq(integrationAuditEvents.authorityId, request.authorityId),
+		});
+		expect(audit.filter((event) => event.outcome === "allowed")).toHaveLength(1);
+	});
+
+	test("still fails closed when the audit row cannot be written at all", async () => {
+		const request = await deviceReadRequest();
+		let attempts = 0;
+		spyOn(integrationAuditService, "record").mockImplementation(async () => {
+			attempts++;
+			throw new Error("disk I/O error");
+		});
+		// Let the real read Worker settle before invoking Bun's rejection matcher.
+		// Matching the live promise here can block its message delivery.
+		const error = await integrationAuthorizationService.authorize(request).then(
+			() => undefined,
+			(cause: unknown) => cause,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toBe("disk I/O error");
+		// Not a lock conflict: no retry, and the decision was never cached as allowed.
+		expect(attempts).toBe(1);
+		mock.restore();
+		const fresh = await integrationAuthorizationService.authorize(request);
+		expect(fresh.cacheHit).toBe(false);
 	});
 
 	test("fails closed when token capabilities or grant constraints do not cover the operation", async () => {

@@ -1,30 +1,17 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { BalanceProbeRequestError } from "@server/lib/provider-balance-adapters";
-import { builtinProviderBalanceEngine } from "@server/lib/provider-balance-engine";
-import type { CustomApiProviderConfig } from "@server/lib/settings";
+import { parseSub2ApiBalance, relayQuotaData } from "../../../plugins/provider-quota/src/relay";
+import { parseNewApiUserQuota } from "../../../plugins/provider-quota/src/site";
 import {
-	createApikeyQuotaEngine,
-	invokeApikeyQuotaCommand,
-} from "@server/services/apikey-quota-plugin-engine";
-import { PluginManager } from "@server/services/plugin-manager";
-import { pluginPlatformServices } from "@server/services/plugin-platform-services";
-import { apikeyQuotaCommandInputSchema } from "@shared/apikey-quota-plugin";
-import type { ProviderBalanceData } from "@shared/provider-balance";
+	archivedQuotaFixture,
+	closeQuotaTestPackage,
+	quotaConfig,
+	required,
+} from "../../../server/lib/__tests__/provider-quota-legacy-fixture";
+import type { outboundFetch } from "../../../server/lib/net/outbound-fetch";
+import { providerQuotaSourceSchema, quotaQueryParamsSchema } from "../../../shared/provider-quota";
 
-/**
- * End-to-end parity between the two implementations of one engine interface.
- *
- * Both are driven against the same mock relay with the same provider config. Every plugin
- * invocation must cross the real commands.invoke RPC after host authorization;
- * falling back to the host implementation fails the test instead of comparing it with itself.
- */
 const payloads = {
-	"sub2api wallet": {
-		mode: "unrestricted",
-		isValid: true,
-		balance: 12.5,
-		unit: "USD",
-	},
+	"sub2api wallet": { mode: "unrestricted", isValid: true, balance: 12.5, unit: "USD" },
 	"sub2api quota limited": {
 		mode: "quota_limited",
 		isValid: true,
@@ -51,629 +38,327 @@ const payloads = {
 			weekly_window_start: "2029-12-25T00:00:00Z",
 		},
 	},
-} as const;
-
-/**
- * The engine under test is wired to the *real* plugin manager, so the plugin is reached through
- * the same activation + authorized-command path production uses. Without that, the engine would find
- * no registered command, silently answer from the bundled adapters, and this whole file would be
- * comparing the bundled engine with itself.
- */
-let managerPromise: Promise<PluginManager> | undefined;
-
-function sharedManager(): Promise<PluginManager> {
-	managerPromise ??= (async () => {
-		// Match the production singleton: registry resolvers, lifecycle bindings and the
-		// manager must all refer to the same supervisor and state store.
-		const manager = new PluginManager({
-			disabled: false,
-			runtimeSupervisor: pluginPlatformServices.runtimeSupervisor,
-			stateStore: pluginPlatformServices.stateStore,
-			permissionStore: pluginPlatformServices.permissionStore,
-			hostServices: pluginPlatformServices.hostServices,
-			contributionRegistry: pluginPlatformServices.contributionRegistry,
-			toolRegistry: pluginPlatformServices.toolRegistry,
-			agentToolBridge: pluginPlatformServices.toolBridge,
-			contributionCoordinator: pluginPlatformServices.contributionCoordinator,
-			providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
-			lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
-			restorePluginLifecycle: pluginPlatformServices.restorePlugin,
-		});
-		await manager.initialize();
-		return manager;
-	})();
-	return managerPromise;
-}
-
+};
+let server: ReturnType<typeof Bun.serve>;
+let f: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+let responder: (request: Request) => Response | Promise<Response> = () =>
+	new Response(null, { status: 404 });
+const calls: Array<Parameters<typeof outboundFetch>> = [];
+const paths: string[] = [];
+beforeAll(async () => {
+	server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch: (request) => {
+			paths.push(new URL(request.url).pathname);
+			return responder(request);
+		},
+	});
+	f = await archivedQuotaFixture({
+		approveSettings: true,
+		fetch: async (...args) => {
+			calls.push(args);
+			const url = new URL(String(args[0]));
+			if (url.hostname !== "127.0.0.1") return Response.json(payloads["sub2api wallet"]);
+			if (url.port !== String(server.port)) throw new Error("Unexpected loopback destination");
+			return fetch(args[0], args[1]);
+		},
+	});
+}, 60000);
 afterAll(async () => {
-	const manager = await managerPromise?.catch(() => undefined);
-	await manager?.shutdown();
+	await f?.close();
+	server?.stop(true);
+	await closeQuotaTestPackage();
 });
-
-async function pluginEngine() {
-	const manager = await sharedManager();
-	const forbiddenFallback = async (): Promise<never> => {
-		throw new Error("Quota parity must execute plugin RPC, not the host fallback");
-	};
-	return createApikeyQuotaEngine({
-		commands: {
-			async invoke(
-				...args: Parameters<typeof pluginPlatformServices.pluginCommandRegistry.invoke>
-			) {
-				const [commandId, pluginId, input, context] = args;
-				expect(commandId).toBe("com.narrafork.apikey-quota/query-balance");
-				expect(pluginId).toBe("com.narrafork.apikey-quota");
-				const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
-				if (!runtime) throw new Error("Quota runtime was not activated");
-				const rpc = spyOn(runtime, "request");
-				try {
-					const result = await invokeApikeyQuotaCommand(
-						apikeyQuotaCommandInputSchema.parse(input),
-						context,
-					);
-					expect(rpc).toHaveBeenCalledWith(
-						"commands.invoke",
-						expect.objectContaining({ contributionId: "query-balance" }),
-						expect.any(Object),
-					);
-					expect(rpc.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
-					expect(pluginPlatformServices.toolRegistry.list(pluginId)).toEqual([]);
-					return result;
-				} finally {
-					rpc.mockRestore();
-				}
-			},
-		},
-		activator: manager,
-		fallback: { id: "forbidden-in-parity", probe: forbiddenFallback, refresh: forbiddenFallback },
-	});
-}
-
-/** Disabling the same plugin must reject before RPC without invoking the host fallback. */
-async function disabledPluginEngine() {
-	const manager = await sharedManager();
-	await manager.disable("com.narrafork.apikey-quota");
-	const engine = await pluginEngine();
-	return {
-		...engine,
-		probe: engine.probe.bind(engine),
-		refresh: engine.refresh.bind(engine),
-		async dispose() {
-			await manager.enable("com.narrafork.apikey-quota");
-			await engine.dispose();
-		},
-	};
-}
-
-const config = (baseUrl: string): CustomApiProviderConfig => ({
-	id: "relay-parity",
-	name: "relay-parity",
-	prefix: "relay-parity",
-	baseUrl,
-	protocol: "completions-compatible",
-	apiKey: "sk-parity",
-	defaultModel: "m",
-});
-
-describe("plugin and bundled engine parity over one mock relay", () => {
-	let server: ReturnType<typeof Bun.serve>;
-	let body: unknown = null;
-	let requests: string[] = [];
-
-	beforeAll(() => {
-		server = Bun.serve({
-			port: 0,
-			fetch: (request) => {
-				const url = new URL(request.url);
-				requests.push(url.pathname);
-				if (url.pathname === "/v1/usage" && body !== null) return Response.json(body);
-				if (url.pathname === "/api/usage/token/" && body !== null) {
-					return Response.json({ code: true, data: body });
-				}
-				return new Response("not found", { status: 404 });
-			},
-		});
-	});
-
-	afterAll(() => {
-		server.stop(true);
-	});
-
-	for (const [name, payload] of Object.entries(payloads)) {
-		test(`${name}: probe yields the same discovery and balance`, async () => {
-			body = payload;
-			requests = [];
-			const base = `http://127.0.0.1:${server.port}/v1`;
-			const plugin = await pluginEngine();
-			try {
-				const viaPlugin = await plugin.probe({
-					config: config(base),
-					signal: AbortSignal.timeout(20_000),
-				});
-				const viaBuiltin = await builtinProviderBalanceEngine.probe({
-					config: config(base),
-					signal: AbortSignal.timeout(20_000),
-				});
-				expect(viaPlugin).toEqual(viaBuiltin);
-				expect(viaPlugin?.balance).not.toBeNull();
-			} finally {
-				await plugin.dispose();
+const config = (baseUrl = `http://127.0.0.1:${server.port}/v1`) =>
+	quotaConfig({ id: `parity-${crypto.randomUUID()}`, baseUrl });
+async function rpc(
+	configValue: ReturnType<typeof config>,
+	mode: "probe" | "refresh" = "probe",
+	cursor?: string,
+) {
+	const runtime = required(f.supervisor.get(f.pluginId));
+	const trace = spyOn(runtime, "request");
+	try {
+		const result = await f.rpc(configValue, mode, cursor);
+		expect(trace.mock.calls.some(([method]) => method === "quota.query")).toBe(true);
+		expect(trace.mock.calls.some(([method]) => method === "tools.invoke")).toBe(false);
+		expect(trace.mock.calls.some(([method]) => method === "commands.invoke")).toBe(false);
+		expect(f.platform.toolRegistry.list(f.pluginId)).toEqual([]);
+		for (const [method, params] of trace.mock.calls)
+			if (method === "quota.query") {
+				expect(quotaQueryParamsSchema.safeParse(params).success).toBe(true);
+				expect(JSON.stringify(params)).not.toMatch(
+					/test-secret-key|apiKey|proxy|tlsRejectUnauthorized/,
+				);
 			}
-		});
+		return result;
+	} finally {
+		trace.mockRestore();
 	}
+}
 
-	test("sub2api refresh matches the bundled refresh", async () => {
-		body = payloads["sub2api subscription"];
-		const base = `http://127.0.0.1:${server.port}/v1`;
-		const root = `http://127.0.0.1:${server.port}`;
-		const plugin = await pluginEngine();
+/** A real bundle/process must match its distributed pure parser, never a retired native fallback. */
+describe("archived quota RPC preserves upstream engine parity over real loopback HTTP", () => {
+	for (const [name, payload] of Object.entries(payloads))
+		test(`${name}: independently compiled RPC equals the parser projection`, async () => {
+			responder = () => Response.json(payload);
+			const result = await rpc(config());
+			expect(result.status).toBe("supported");
+			expect(result.data).toEqual(
+				relayQuotaData(required(parseSub2ApiBalance(payload)), "sub2api"),
+			);
+		});
+	test("sub2api refresh retains the confirmed root, subscription metadata and amounts", async () => {
+		responder = () => Response.json(payloads["sub2api subscription"]);
+		const cfg = config();
+		const found = await rpc(cfg);
+		paths.length = 0;
+		const refreshed = await rpc(cfg, "refresh", found.cursor);
+		expect(refreshed.data).toEqual(found.data);
+		expect(paths).toEqual(["/v1/usage"]);
+	});
+	test("an origin without a quota endpoint is unsupported without fallback or false zero", async () => {
+		responder = () => new Response(null, { status: 404 });
+		expect(await rpc(config())).toMatchObject({ status: "unsupported", data: null });
+	});
+	test("500 is a fixed transient failure and not an unsupported or auth answer", async () => {
+		responder = () => new Response("PRIVATE-UPSTREAM-CREDENTIAL", { status: 500 });
+		const result = await rpc(config());
+		expect(result).toMatchObject({ status: "error", data: null, error: "request_failed" });
+		expect(JSON.stringify(result)).not.toContain("PRIVATE-UPSTREAM");
+	});
+	test("non-JSON HTML is unsupported as it was before migration", async () => {
+		responder = () => new Response("<html></html>", { headers: { "content-type": "text/html" } });
+		expect(await rpc(config())).toMatchObject({ status: "unsupported", data: null });
+	});
+	test("an oversized body fails at the bounded Host reader, not whole-body buffering", async () => {
+		responder = () => Response.json({ ...payloads["sub2api wallet"], pad: "x".repeat(96 * 1024) });
+		expect(await rpc(config())).toMatchObject({
+			status: "error",
+			data: null,
+			error: "request_failed",
+		});
+	});
+	test("disabled plugin denies quota querying instead of returning a native success", async () => {
+		await f.manager.disable(f.pluginId);
+		const count = calls.length;
 		try {
-			const viaPlugin = await plugin.refresh({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-				adapter: "sub2api",
-				root,
+			f.setProviders([config()]);
+			expect(
+				await f.service.refresh(required(f.directory.primaryEntries()[0]).providerId),
+			).toMatchObject({
+				status: "unavailable",
+				data: null,
 			});
-			const viaBuiltin = await builtinProviderBalanceEngine.refresh({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-				adapter: "sub2api",
-				root,
-			});
-			expect(viaPlugin).toEqual(viaBuiltin);
+			expect(calls).toHaveLength(count);
+			expect(f.platform.quotaRegistry.listSources()).toEqual([]);
 		} finally {
-			await plugin.dispose();
+			await f.manager.enable(f.pluginId);
+			await f.manager.activate(f.pluginId);
 		}
 	});
-
-	test("an origin without a quota endpoint is 'unsupported' in both", async () => {
-		body = null;
-		const base = `http://127.0.0.1:${server.port}/v1`;
-		const plugin = await pluginEngine();
-		try {
-			const viaPlugin = await plugin.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			const viaBuiltin = await builtinProviderBalanceEngine.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			expect(viaPlugin).toBeNull();
-			expect(viaBuiltin).toBeNull();
-		} finally {
-			await plugin.dispose();
-		}
+	test("wallet retains its exact amount", async () => {
+		responder = () => Response.json(payloads["sub2api wallet"]);
+		expect((await rpc(config())).data).toMatchObject({
+			scope: "wallet",
+			unlimited: false,
+			amounts: [{ unit: "USD", remaining: 12.5 }],
+		});
 	});
-
-	test("a 500 response is a transient failure in both", async () => {
-		const failing = Bun.serve({ port: 0, fetch: () => new Response("boom", { status: 500 }) });
-		const base = `http://127.0.0.1:${failing.port}/v1`;
-		const plugin = await pluginEngine();
-		try {
-			const pluginError = await plugin
-				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
-				.catch((error) => error);
-			const builtinError = await builtinProviderBalanceEngine
-				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
-				.catch((error) => error);
-
-			// Both surface the same named transport error, so the cache classifies them alike.
-			expect(pluginError?.name).toBe(builtinError?.name);
-			expect(pluginError?.kind).toBe(builtinError?.kind);
-		} finally {
-			await plugin.dispose();
-			failing.stop(true);
-		}
+	const siteBody = { success: true, data: { quota: 2500000, used_quota: 500000, group: "pro" } };
+	const siteConfig = () => ({
+		...config(),
+		quotaSiteUrl: `http://127.0.0.1:${server.port}`,
+		quotaAccessToken: "site-token",
+		quotaUserId: "42",
 	});
-
-	test("a non-JSON content type is 'unsupported' in both", async () => {
-		const html = Bun.serve({
-			port: 0,
-			fetch: () => new Response("<html></html>", { headers: { "content-type": "text/html" } }),
-		});
-		const base = `http://127.0.0.1:${html.port}/v1`;
-		const plugin = await pluginEngine();
-		try {
-			const viaPlugin = await plugin.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			const viaBuiltin = await builtinProviderBalanceEngine.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			expect(viaPlugin).toBeNull();
-			expect(viaBuiltin).toBeNull();
-		} finally {
-			await plugin.dispose();
-			html.stop(true);
-		}
+	test("site probe retains USD credit/group through actual RPC", async () => {
+		responder = () => Response.json(siteBody);
+		const result = await rpc(siteConfig());
+		expect(result.data).toEqual(
+			relayQuotaData(required(parseNewApiUserQuota(siteBody)), "new-api-user"),
+		);
 	});
-
-	test("an oversized body is rejected as transient by both, without buffering it whole", async () => {
-		// 96 KiB of valid-JSON padding exceeds the 64 KiB cap.
-		const oversized = Bun.serve({
-			port: 0,
-			fetch: () =>
-				Response.json({
-					mode: "unrestricted",
-					isValid: true,
-					unit: "USD",
-					balance: 1,
-					pad: "x".repeat(96 * 1024),
-				}),
+	test("site rejected token is auth_failed rather than transient", async () => {
+		responder = () => new Response(null, { status: 401 });
+		expect(await rpc(siteConfig())).toMatchObject({
+			status: "error",
+			error: "auth_failed",
+			data: null,
 		});
-		const base = `http://127.0.0.1:${oversized.port}/v1`;
-		const plugin = await pluginEngine();
-		try {
-			const pluginError = await plugin
-				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
-				.catch((error) => error);
-			const builtinError = await builtinProviderBalanceEngine
-				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
-				.catch((error) => error);
-			expect(pluginError?.kind).toBe("transient");
-			expect(builtinError?.kind).toBe("transient");
-		} finally {
-			await plugin.dispose();
-			oversized.stop(true);
-		}
 	});
-
-	test("a disabled plugin reports plugin_disabled instead of answering like the bundled engine", async () => {
-		body = payloads["sub2api wallet"];
-		requests = [];
-		const base = `http://127.0.0.1:${server.port}/v1`;
-		const disabled = await disabledPluginEngine();
-		try {
-			const error = await disabled
-				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
-				.catch((thrown) => thrown);
-			// The plugin owns the capability: a disabled plugin is a deterministic failure, not
-			// an invitation for the bundled adapters to answer the same question in-process.
-			expect(error).toBeInstanceOf(BalanceProbeRequestError);
-			expect((error as BalanceProbeRequestError).kind).toBe("plugin_disabled");
-			expect(requests).toEqual([]);
-		} finally {
-			await disabled.dispose();
-		}
+	test("site missing userId is invalid_configuration and produces no HTTP", async () => {
+		const count = calls.length;
+		const result = await f.query({ ...siteConfig(), quotaUserId: "" });
+		expect(result).toMatchObject({ status: "error", error: "invalid_configuration", data: null });
+		expect(calls).toHaveLength(count);
 	});
-
-	test("both report the same wallet amount for the sub2api wallet payload", async () => {
-		body = payloads["sub2api wallet"];
-		const base = `http://127.0.0.1:${server.port}/v1`;
-		const plugin = await pluginEngine();
-		try {
-			const found = await plugin.probe({
-				config: config(base),
-				signal: AbortSignal.timeout(20_000),
-			});
-			const expected: ProviderBalanceData = {
-				scope: "wallet",
-				unlimited: false,
-				amounts: [{ unit: "USD", remaining: 12.5 }],
-			};
-			expect(found?.balance).toEqual(expected);
-		} finally {
-			await plugin.dispose();
-		}
-	});
-
-	/**
-	 * The site-account route (`/api/user/self`) must behave identically through both
-	 * implementations, including its failure classification.
-	 *
-	 * The file-level manager remains live through these cases and the timeout cases below.
-	 * All use the same fail-fast engine and real RPC assertions.
-	 */
-	describe("site-account credit", () => {
-		const siteBody = {
-			success: true,
-			data: { quota: 2_500_000, used_quota: 500_000, group: "pro" },
-		};
-		let site: ReturnType<typeof Bun.serve>;
-		/** Swapped per test so one server can answer success or a fixed status. */
-		let respond: () => Response = () => Response.json(siteBody);
-
-		beforeAll(() => {
-			site = Bun.serve({
-				port: 0,
-				fetch: (request) => {
-					const url = new URL(request.url);
-					if (url.pathname !== "/api/user/self") {
-						return new Response("not found", { status: 404 });
-					}
-					return respond();
-				},
-			});
-		});
-
-		afterAll(() => {
-			site.stop(true);
-		});
-
-		const siteConfig = (baseUrl: string): CustomApiProviderConfig => ({
-			...config(baseUrl),
-			quotaSiteUrl: `http://127.0.0.1:${site.port}`,
-			quotaAccessToken: "site-token",
-			quotaUserId: "42",
-		});
-
-		test("probe returns the same USD credit and group", async () => {
-			respond = () => Response.json(siteBody);
-			const base = `http://127.0.0.1:${site.port}/v1`;
-			const plugin = await pluginEngine();
-			try {
-				const viaPlugin = await plugin.probe({
-					config: siteConfig(base),
-					signal: AbortSignal.timeout(20_000),
-				});
-				const viaBuiltin = await builtinProviderBalanceEngine.probe({
-					config: siteConfig(base),
-					signal: AbortSignal.timeout(20_000),
-				});
-				expect(viaPlugin).toEqual(viaBuiltin);
-				expect(viaPlugin?.adapter).toBe("new-api-user");
-				expect(viaPlugin?.balance.amounts[0]).toMatchObject({
-					unit: "USD",
-					remaining: 5,
-					used: 1,
-					total: 6,
-				});
-				expect(viaPlugin?.balance.planName).toBe("pro");
-			} finally {
-				await plugin.dispose();
-			}
-		});
-
-		test("a rejected token is the same deterministic kind in both", async () => {
-			respond = () => new Response(null, { status: 401 });
-			const base = `http://127.0.0.1:${site.port}/v1`;
-			const plugin = await pluginEngine();
-			try {
-				const pluginError = await plugin
-					.probe({ config: siteConfig(base), signal: AbortSignal.timeout(20_000) })
-					.catch((error) => error);
-				const builtinError = await builtinProviderBalanceEngine
-					.probe({ config: siteConfig(base), signal: AbortSignal.timeout(20_000) })
-					.catch((error) => error);
-				expect(pluginError?.kind).toBe("auth");
-				expect(builtinError?.kind).toBe("auth");
-			} finally {
-				await plugin.dispose();
-			}
-		});
-
-		test("a missing user id is invalid_configuration in both", async () => {
-			respond = () => Response.json(siteBody);
-			const base = `http://127.0.0.1:${site.port}/v1`;
-			const missing = { ...siteConfig(base), quotaUserId: "" };
-			const plugin = await pluginEngine();
-			try {
-				const pluginError = await plugin
-					.probe({ config: missing, signal: AbortSignal.timeout(20_000) })
-					.catch((error) => error);
-				const builtinError = await builtinProviderBalanceEngine
-					.probe({ config: missing, signal: AbortSignal.timeout(20_000) })
-					.catch((error) => error);
-				expect(pluginError?.kind).toBe("invalid_configuration");
-				expect(builtinError?.kind).toBe("invalid_configuration");
-			} finally {
-				await plugin.dispose();
-			}
-		});
-
-		test("refresh matches the bundled refresh on the confirmed root", async () => {
-			respond = () => Response.json(siteBody);
-			const base = `http://127.0.0.1:${site.port}/v1`;
-			const root = `http://127.0.0.1:${site.port}`;
-			const plugin = await pluginEngine();
-			try {
-				const viaPlugin = await plugin.refresh({
-					config: siteConfig(base),
-					signal: AbortSignal.timeout(20_000),
-					adapter: "new-api-user",
-					root,
-				});
-				const viaBuiltin = await builtinProviderBalanceEngine.refresh({
-					config: siteConfig(base),
-					signal: AbortSignal.timeout(20_000),
-					adapter: "new-api-user",
-					root,
-				});
-				expect(viaPlugin).toEqual(viaBuiltin);
-			} finally {
-				await plugin.dispose();
-			}
-		});
+	test("site refresh reuses only the confirmed account root", async () => {
+		responder = () => Response.json(siteBody);
+		const cfg = siteConfig();
+		const found = await rpc(cfg);
+		paths.length = 0;
+		expect((await rpc(cfg, "refresh", found.cursor)).data).toEqual(found.data);
+		expect(paths).toEqual(["/api/user/self"]);
 	});
 });
 
-/**
- * The per-request timeout crosses the process boundary, so it must mean the same thing on both
- * sides. These cases pin the semantics rather than the exact milliseconds: a short bound aborts
- * a slow upstream in both engines, and a value far above the plugin's old 60 s ceiling is not
- * silently shortened.
- */
-describe("per-request timeout means the same thing in both engines", () => {
-	const slowRelay = () =>
-		Bun.serve({
-			port: 0,
-			fetch: async () => {
-				await Bun.sleep(1_500);
-				return Response.json({ mode: "unrestricted", isValid: true, balance: 1, unit: "USD" });
-			},
+describe("per-request timeout and cancellation cross the real process boundary", () => {
+	test("a short injected bound stops slow HTTP below one second-scale round", async () => {
+		let signal: AbortSignal | undefined;
+		// A probe tries several allowed roots; shorten only the fixture's Host timeout,
+		// not the production deadline or the end-to-end assertion.
+		f.setRequestTimeout(50);
+		f.setTestHttp(async (_url, init) => {
+			signal = init?.signal ?? undefined;
+			return new Promise(() => {});
 		});
-
-	for (const [label, timeoutMs] of [
-		["a short 300 ms bound", 300],
-		["a value above the old 60 s clamp", 90_000],
-	] as const) {
-		test(`${label} is classified the same by both engines`, async () => {
-			const slow = slowRelay();
-			const base = `http://127.0.0.1:${slow.port}/v1`;
-			const plugin = await pluginEngine();
+		try {
 			const started = performance.now();
-			try {
-				const pluginOutcome = await plugin
-					.probe({
-						config: config(base),
-						signal: AbortSignal.timeout(20_000),
-						requestTimeoutMs: timeoutMs,
-					})
-					.then(
-						(value) => ({ ok: true, value }),
-						(error) => ({ ok: false, kind: error?.kind, name: error?.name }),
-					);
-				const elapsed = performance.now() - started;
-				const builtinOutcome = await builtinProviderBalanceEngine
-					.probe({
-						config: config(base),
-						signal: AbortSignal.timeout(20_000),
-						requestTimeoutMs: timeoutMs,
-					})
-					.then(
-						(value) => ({ ok: true, value }),
-						(error) => ({ ok: false, kind: error?.kind, name: error?.name }),
-					);
-
-				expect(pluginOutcome).toEqual(builtinOutcome);
-				if (timeoutMs < 1_000) {
-					// A short bound must actually bound the round, not be rounded up to a second.
-					expect(elapsed).toBeLessThan(1_400);
-				}
-			} finally {
-				await plugin.dispose();
-				slow.stop(true);
-			}
-		}, 20_000);
-	}
+			// Host timeout is projected as a fixed request_failed over generic Host RPC;
+			// the actual deadline, abort and released reference remain mandatory.
+			expect(await f.rpc(config())).toMatchObject({
+				status: "error",
+				error: "request_failed",
+				data: null,
+			});
+			expect(performance.now() - started).toBeLessThan(1400);
+			expect(signal?.aborted).toBe(true);
+			expect(f.connection.activeReferences).toBe(0);
+		} finally {
+			f.setRequestTimeout();
+			f.setTestHttp();
+		}
+	}, 20000);
+	test("normal bounded request may finish after 300ms, but old 90s overrides cannot bypass protocol limits", async () => {
+		responder = async () => {
+			await Bun.sleep(450);
+			return Response.json(payloads["sub2api wallet"]);
+		};
+		expect(await rpc(config())).toMatchObject({ status: "supported" });
+		expect(
+			providerQuotaSourceSchema.safeParse({
+				id: "slow",
+				title: "slow",
+				requests: [{ path: "/quota", auth: "bearer" }],
+				limits: { requestTimeoutMs: 90000 },
+			}).success,
+		).toBe(false);
+	});
+	test("cancellation consumes a delayed response and releases the reference", async () => {
+		let signal: AbortSignal | undefined;
+		let done!: (response: Response) => void;
+		let enter!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		f.setTestHttp(async (_url, init) => {
+			signal = init?.signal ?? undefined;
+			enter();
+			return new Promise((resolve) => {
+				done = resolve;
+			});
+		});
+		try {
+			const controller = new AbortController();
+			const pending = f.rpc(config(), "probe", undefined, controller.signal);
+			await entered;
+			controller.abort();
+			await expect(pending).rejects.toThrow();
+			expect(signal?.aborted).toBe(true);
+			expect(f.connection.activeReferences).toBe(0);
+			let canceled!: () => void;
+			const discarded = new Promise<void>((resolve) => {
+				canceled = resolve;
+			});
+			done(
+				new Response(
+					new ReadableStream({
+						cancel() {
+							canceled();
+						},
+					}),
+				),
+			);
+			await discarded;
+		} finally {
+			f.setTestHttp();
+		}
+	}, 20000);
 });
 
-test("quota backend rejects the former tools.invoke RPC", async () => {
-	const manager = await sharedManager();
-	const pluginId = "com.narrafork.apikey-quota";
-	await manager.activate(pluginId);
-	const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
-	if (!runtime) throw new Error("Quota runtime was not activated");
-	await expect(
-		runtime.request("tools.invoke", {
-			contributionId: "query-balance",
-			input: { mode: "probe", baseUrl: "https://unused.invalid/v1", apiKey: "quota-test-only" },
-		}),
-	).rejects.toMatchObject({ code: "-32601" });
+describe("Host, not the plugin process, applies the unchanged saved egress policy", () => {
+	test("saved proxy, TLS and configured User-Agent reach Host HTTP unchanged", async () => {
+		const cfg = config("https://relay.corp.invalid/v1");
+		cfg.proxy = { mode: "custom", url: "http://proxy.corp.invalid:3128" };
+		cfg.tlsRejectUnauthorized = false;
+		cfg.userAgentMode = "custom";
+		cfg.customUserAgent = "ua/1";
+		cfg.extraHeaders = { "X-Tenant": "a" };
+		await rpc(cfg);
+		const call = required(calls.at(-1));
+		expect(call[2]).toEqual({
+			proxyUrl: "http://proxy.corp.invalid:3128",
+			tlsRejectUnauthorized: false,
+			retryPolicy: "never",
+		});
+		const headers = new Headers(call[1]?.headers);
+		expect(headers.get("user-agent")).toBe("ua/1");
+		expect(headers.get("x-tenant")).toBe("a");
+	});
+	test("the wire excludes connection credentials and facts formerly sent into the plugin", async () => {
+		const runtime = required(f.supervisor.get(f.pluginId));
+		const trace = spyOn(runtime, "request");
+		try {
+			await f.rpc(config("https://relay.corp.invalid/v1"));
+			const wire = JSON.stringify(trace.mock.calls.filter(([method]) => method === "quota.query"));
+			expect(wire).not.toMatch(/test-secret-key|apiKey|headers|proxy|tlsRejectUnauthorized/);
+		} finally {
+			trace.mockRestore();
+		}
+	});
+	test("direct egress has no injected proxy", async () => {
+		const cfg = config("https://relay.corp.invalid/v1");
+		cfg.proxy = { mode: "direct" };
+		await rpc(cfg);
+		expect(calls.at(-1)?.[2]?.proxyUrl).toBeUndefined();
+	});
 });
 
-test("revoking the initial grant still denies RPC after re-enabling the builtin", async () => {
-	const manager = await sharedManager();
-	const pluginId = "com.narrafork.apikey-quota";
-	const permissions = await manager.getPermissions(pluginId);
-	await manager.replacePermissions(pluginId, {
+for (const method of ["tools.invoke", "commands.invoke"])
+	test(`archived quota backend rejects ${method} without reaching Host HTTP`, async () => {
+		const runtime = required(f.supervisor.get(f.pluginId));
+		const count = calls.length;
+		await expect(
+			runtime.request(
+				method,
+				{ contributionId: "relay", input: { mode: "probe" } },
+				{ timeoutMs: 3000 },
+			),
+		).rejects.toMatchObject({ code: "-32601" });
+		expect(calls).toHaveLength(count);
+	});
+
+test("revoked grants remain denied before quota RPC after explicit re-enable", async () => {
+	const permissions = await f.manager.getPermissions(f.pluginId);
+	await f.manager.replacePermissions(f.pluginId, {
 		grants: [],
 		expectedRevision: permissions.revision,
 		grantedBy: "quota-parity-admin",
 	});
-	await manager.disable(pluginId);
-	await manager.enable(pluginId);
-	await manager.activate(pluginId);
-	const runtime = pluginPlatformServices.runtimeSupervisor.get(pluginId);
-	if (!runtime) throw new Error("Quota runtime was not activated");
-	const rpc = spyOn(runtime, "request");
+	await f.manager.disable(f.pluginId);
+	await f.manager.enable(f.pluginId);
+	await f.manager.activate(f.pluginId);
+	const runtime = required(f.supervisor.get(f.pluginId));
+	const trace = spyOn(runtime, "request");
+	const count = calls.length;
 	try {
-		await expect(
-			invokeApikeyQuotaCommand(
-				{ mode: "probe", baseUrl: "https://unused.invalid/v1", apiKey: "quota-test-only" },
-				{ requestId: "quota-revoked-grant" },
-			),
-		).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
-		expect(rpc.mock.calls.some(([method]) => method === "commands.invoke")).toBe(false);
-		expect((await manager.getPermissions(pluginId)).grants).toEqual([]);
+		await expect(f.rpc(config())).rejects.toThrow();
+		expect(trace.mock.calls.some(([method]) => method === "quota.query")).toBe(false);
+		expect(calls).toHaveLength(count);
+		expect((await f.manager.getPermissions(f.pluginId)).grants).toEqual([]);
 	} finally {
-		rpc.mockRestore();
+		trace.mockRestore();
 	}
-});
-
-/**
- * A configured proxy is an egress policy, not a performance hint. It cannot be tested over a
- * loopback relay (the host exempts loopback from proxying in both engines, so a local target
- * never proves anything), so it is pinned at the boundary itself: the plugin's request builder
- * must hand the host-supplied proxy to `fetch`. Dropping it would send a corporate deployment
- * straight to provider origins after the switch.
- */
-describe("host egress policy is handed to the plugin transport verbatim", () => {
-	// Runtime-built specifier: the plugin entry is plain JS with no type declarations, exactly
-	// as the release validator loads it.
-	const pluginEntry = `${process.cwd()}/server/builtin-plugins/apikey-quota/server/index.js`;
-	const plugin = () =>
-		import(pluginEntry) as Promise<{
-			probeProviderBalance: (
-				input: Record<string, unknown>,
-				signal: AbortSignal,
-				fetcher: (url: string, init: Record<string, unknown>) => Promise<Response>,
-			) => Promise<{ balance?: unknown } | null>;
-			parseCommandInput: (raw: Record<string, unknown>) => Record<string, unknown>;
-		}>;
-
-	test("the resolved proxy and the timeout reach fetch options unchanged", async () => {
-		const { probeProviderBalance } = await plugin();
-		const seen: Array<Record<string, unknown>> = [];
-		const fetcher = async (_url: string, init: Record<string, unknown>) => {
-			seen.push(init);
-			return Response.json({ mode: "unrestricted", isValid: true, balance: 3, unit: "USD" });
-		};
-		const result = await probeProviderBalance(
-			{
-				mode: "probe",
-				baseUrl: "https://relay.example.test/v1",
-				apiKey: "sk-parity",
-				proxy: "http://proxy.corp.example:3128",
-				tlsRejectUnauthorized: false,
-				timeoutMs: 90_000,
-			},
-			AbortSignal.timeout(20_000),
-			fetcher,
-		);
-		expect(result?.balance).toMatchObject({ scope: "wallet" });
-		expect(seen[0]?.proxy).toBe("http://proxy.corp.example:3128");
-		expect(seen[0]?.tls).toEqual({ rejectUnauthorized: false });
-	});
-
-	test("the wire input keeps every connection fact the host sent", async () => {
-		const { parseCommandInput } = await plugin();
-		const parsed = parseCommandInput({
-			mode: "probe",
-			baseUrl: "https://relay.example.test/v1",
-			apiKey: "sk-parity",
-			headers: { "X-Tenant": "a" },
-			userAgent: "ua/1",
-			proxy: "http://proxy.corp.example:3128",
-			tlsRejectUnauthorized: false,
-			timeoutMs: 90_000,
-		});
-		// This is the exact set the host put in `connectionFields`; a field silently dropped
-		// here would change egress or timing without any error surfacing.
-		expect(parsed).toMatchObject({
-			proxy: "http://proxy.corp.example:3128",
-			userAgent: "ua/1",
-			headers: { "X-Tenant": "a" },
-			tlsRejectUnauthorized: false,
-			timeoutMs: 90_000,
-		});
-	});
-
-	test("no proxy in the input means no proxy in fetch options", async () => {
-		const { probeProviderBalance } = await plugin();
-		const seen: Array<Record<string, unknown>> = [];
-		const fetcher = async (_url: string, init: Record<string, unknown>) => {
-			seen.push(init);
-			return Response.json({ mode: "unrestricted", isValid: true, balance: 3, unit: "USD" });
-		};
-		await probeProviderBalance(
-			{ mode: "probe", baseUrl: "https://relay.example.test/v1", apiKey: "sk-parity" },
-			AbortSignal.timeout(20_000),
-			fetcher,
-		);
-		expect(seen[0]).not.toHaveProperty("proxy");
-	});
 });

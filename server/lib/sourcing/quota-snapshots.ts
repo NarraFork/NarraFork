@@ -5,6 +5,7 @@ import type {
 	QuotaSnapshotEntry,
 	QuotaSnapshotsResponse,
 } from "@shared/quota-snapshot";
+import { providerQuotaService, toQuotaSnapshot } from "../../services/provider-quota-service";
 import {
 	getTokenDanceBalance,
 	getTokenDanceQuotaSnapshot,
@@ -21,24 +22,11 @@ import {
 	refreshCommandCodeQuota,
 } from "../commandcode-usage";
 import { getCustomApiQuotaSnapshot } from "../custom-api-quota-cache";
-import {
-	getDeepSeekQuotaSnapshot,
-	isDeepSeekQuotaRefreshing,
-	refreshStaleDeepSeekBalances,
-} from "../deepseek-balance-cache";
+import { getDeepSeekQuotaSnapshot, isDeepSeekQuotaRefreshing } from "../deepseek-balance-cache";
 import { AppError } from "../errors";
-import {
-	getKimiQuotaSnapshot,
-	isKimiQuotaRefreshing,
-	KIMI_USAGES_STALE_MS,
-	refreshStaleKimiUsages,
-} from "../kimi-usage-cache";
+import { getKimiQuotaSnapshot, isKimiQuotaRefreshing } from "../kimi-usage-cache";
 import { getNugQuotaSnapshot, isNugQuotaRefreshing } from "../nug-quota-cache";
-import {
-	getOpencodeQuotaSnapshot,
-	isOpencodeQuotaRefreshing,
-	refreshStaleOpencodeUsages,
-} from "../opencode-usage-cache";
+import { getOpencodeQuotaSnapshot, isOpencodeQuotaRefreshing } from "../opencode-usage-cache";
 import { providerBalanceCache } from "../provider-balance-cache";
 import { usageSubjects } from "../provider-key-subjects";
 import {
@@ -62,12 +50,14 @@ export function publicQuotaSnapshot(
 	return {
 		fetchedAt: snapshot.fetchedAt,
 		scope: snapshot.scope,
+		...(typeof snapshot.available === "boolean" ? { available: snapshot.available } : {}),
 		windows: snapshot.windows.map(
-			({ kind, label, usedRatio, resetsAt, used, total, remaining, unit }) => ({
+			({ kind, label, status, usedRatio, resetsAt, used, total, remaining, unit }) => ({
 				kind,
 				...(label ? { label } : {}),
 				usedRatio,
 				resetsAt,
+				...(status === "ok" || status === "rate-limited" ? { status } : {}),
 				...(typeof used === "number" && Number.isFinite(used) ? { used } : {}),
 				...(typeof total === "number" && Number.isFinite(total) ? { total } : {}),
 				...(typeof remaining === "number" && Number.isFinite(remaining) ? { remaining } : {}),
@@ -75,15 +65,47 @@ export function publicQuotaSnapshot(
 			}),
 		),
 		balances: snapshot.balances.map(
-			({ unit, remaining, total, unlimited, remainingObservedAt, totalObservedAt }) => ({
+			({
+				id,
+				label,
+				display,
 				unit,
 				remaining,
+				remainingText,
+				quota,
+				used,
+				window,
+				windowStart,
+				total,
+				unlimited,
+				remainingObservedAt,
+				totalObservedAt,
+			}) => ({
+				...(typeof id === "string" && id.length <= 256 ? { id } : {}),
+				...(typeof label === "string" && label.length <= 256 ? { label } : {}),
+				...(display === "summary" || display === "detail" ? { display } : {}),
+				unit,
+				remaining,
+				...(typeof remainingText === "string" &&
+				remainingText.length <= 64 &&
+				/^-?(?:\d+\.?\d*|\.\d+)$/.test(remainingText) &&
+				remaining !== null &&
+				Number(remainingText) === remaining
+					? { remainingText }
+					: {}),
+				...(quota === "required" || quota === "alternative" || quota === "none" ? { quota } : {}),
+				...(typeof used === "number" && Number.isFinite(used) ? { used } : {}),
+				...(typeof window === "string" && window.length <= 64 ? { window } : {}),
+				...(typeof windowStart === "number" && Number.isFinite(windowStart) ? { windowStart } : {}),
 				...(total !== undefined ? { total } : {}),
 				...(unlimited !== undefined ? { unlimited } : {}),
 				...(isObservationTime(remainingObservedAt) ? { remainingObservedAt } : {}),
 				...(isObservationTime(totalObservedAt) ? { totalObservedAt } : {}),
 			}),
 		),
+		...(typeof snapshot.details === "string" && snapshot.details.length <= 4 * 1024
+			? { details: snapshot.details }
+			: {}),
 		...(snapshot.plan ? { plan: snapshot.plan } : {}),
 		...(snapshot.expiresAt !== undefined ? { expiresAt: snapshot.expiresAt } : {}),
 		hasError: !!snapshot.error,
@@ -222,19 +244,77 @@ function codexOverview(): PublicQuotaSnapshot | null {
 
 /** Preserve the sources' own TTL/backoff/concurrency budgets. Never await an upstream. */
 function revalidate(isAdmin: boolean, groupId?: string): void {
-	if (!groupId) {
-		void refreshStaleKimiUsages(KIMI_USAGES_STALE_MS).catch(() => {});
-		void refreshStaleOpencodeUsages().catch(() => {});
-		void refreshStaleDeepSeekBalances().catch(() => {});
-		providerBalanceCache.read();
-		getTokenDanceBalance();
-	}
+	if (!groupId || settings.customApiProviders?.some((config) => config.id === groupId))
+		void providerQuotaService.refreshStale(groupId ? [groupId] : undefined).catch(() => {});
+	if (!groupId) getTokenDanceBalance();
 	if ((!groupId || groupId === "CommandCode") && !settings.commandCode?.disabled) {
 		if (isAdmin) {
 			for (const subject of listCommandCodeUsageSubjects())
 				void refreshCommandCodeQuota(false, subject.id).catch(() => {});
 		} else void refreshCommandCodeQuota(false).catch(() => {});
 	}
+}
+
+/** One projection per live plugin subject, with independent site-account and stream namespaces. */
+function customApiEntries(group: SourceGroupView, isAdmin: boolean): QuotaSnapshotEntry[] {
+	const base = { groupId: group.id, prefix: group.prefix, templateId: group.templateId };
+	const primary = group.disabled ? null : providerQuotaService.peek(group.id);
+	const site = primary?.pushCompatible === false;
+	const selected = primary ? (site ? null : (primary.keyId ?? group.id)) : null;
+	const ids: Array<string | null> = site
+		? [null]
+		: isAdmin
+			? credentialIds(group)
+			: selected
+				? [selected]
+				: [];
+	const entries: QuotaSnapshotEntry[] = [];
+	for (const id of ids.length ? ids : [null]) {
+		const source = group.disabled
+			? null
+			: site || id === selected
+				? primary
+				: id
+					? providerQuotaService.peekKey(id)
+					: null;
+		const current = source?.providerId === group.id ? source : null;
+		const metadata = {
+			...base,
+			credentialId: isAdmin ? id : null,
+			primary: site || (!!selected && id === selected),
+			...(current ? { generation: current.generation } : {}),
+		};
+		const unavailable =
+			!current || current.status === "unavailable" || current.error === "unavailable";
+		entries.push({
+			...metadata,
+			source: "probe",
+			snapshot: unavailable ? null : publicQuotaSnapshot(toQuotaSnapshot(current)),
+			...(unavailable || current?.status === "unsupported"
+				? { supported: false }
+				: current?.status === "supported"
+					? { supported: true }
+					: {}),
+			refreshing: current?.status === "probing" || current?.status === "pending",
+		});
+		if (
+			!id ||
+			!current ||
+			current.status === "unavailable" ||
+			current.error === "unavailable" ||
+			current.pushCompatible === false
+		)
+			continue;
+		const stream = getCustomApiQuotaSnapshot(group.id, id, current.generation);
+		if (stream)
+			entries.push({
+				...metadata,
+				source: "quota_balance",
+				supported: true,
+				snapshot: publicQuotaSnapshot(stream),
+			});
+	}
+	return entries;
 }
 
 export function readQuotaSnapshots(
@@ -246,6 +326,10 @@ export function readQuotaSnapshots(
 	const entries: QuotaSnapshotEntry[] = [];
 	for (const group of listSourceGroups()) {
 		if (groupId && group.id !== groupId) continue;
+		if (settings.customApiProviders?.some((config) => config.id === group.id)) {
+			entries.push(...customApiEntries(group, isAdmin));
+			continue;
+		}
 		const template = getServiceTemplate(group.templateId);
 		const ids = credentialIds(group);
 		const selected =
@@ -335,9 +419,13 @@ export function quotaRefreshRetryAfterMs(filter: QuotaRefreshFilter): number {
 	let delay = 0;
 	for (const group of listSourceGroups()) {
 		if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
-		const quota = providerBalanceCache.quotaSnapshot(group.id);
-		if (!quota || (filter.credentialId && filter.credentialId !== quota.credentialId)) continue;
-		delay = Math.max(delay, providerBalanceCache.manualRetryAfterMs(group.id));
+		if (settings.customApiProviders?.some((config) => config.id === group.id)) {
+			if (filter.credentialId && !credentialIds(group).includes(filter.credentialId)) continue;
+			delay = Math.max(
+				delay,
+				providerQuotaService.manualRetryAfterMs(group.id, filter.credentialId),
+			);
+		}
 	}
 	return delay;
 }
@@ -347,14 +435,39 @@ export function refreshQuotaSnapshots(
 	filter: QuotaRefreshFilter,
 ): Promise<(QuotaSnapshot | undefined)[]> {
 	const jobs: Promise<QuotaSnapshot | undefined>[] = [];
-	for (const group of listSourceGroups()) {
-		if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
-		const probe = getServiceTemplate(group.templateId).probeQuota;
-		if (!probe) continue;
-		for (const id of credentialIds(group)) {
-			if (getProviderKeyStore().get(id)?.disabled) continue;
-			if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
+	try {
+		for (const group of listSourceGroups()) {
+			if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
+			if (settings.customApiProviders?.some((config) => config.id === group.id)) {
+				const primary = providerQuotaService.peek(group.id);
+				if (primary?.pushCompatible === false) {
+					if (!filter.credentialId)
+						jobs.push(
+							providerQuotaService.refresh(group.id, { manual: true }).then(toQuotaSnapshot),
+						);
+				} else
+					for (const id of credentialIds(group)) {
+						if (
+							getProviderKeyStore().get(id)?.disabled ||
+							(filter.credentialId && filter.credentialId !== id)
+						)
+							continue;
+						jobs.push(providerQuotaService.refreshKey(id, { manual: true }).then(toQuotaSnapshot));
+					}
+				continue;
+			}
+			const probe = getServiceTemplate(group.templateId).probeQuota;
+			if (!probe) continue;
+			for (const id of credentialIds(group)) {
+				if (getProviderKeyStore().get(id)?.disabled) continue;
+				if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
+			}
 		}
+	} catch (error) {
+		// A later subject can be refused while earlier jobs were accepted. Keep their
+		// results observed without delaying the caller's immediate admission failure.
+		void Promise.allSettled(jobs);
+		throw error;
 	}
 	return Promise.all(jobs);
 }

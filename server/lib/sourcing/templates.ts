@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
 import { pluginProviderRegistry } from "../../services/plugin-provider-registry";
+import { providerQuotaService, toQuotaSnapshot } from "../../services/provider-quota-service";
 import {
 	getTokenDanceQuotaSnapshot,
 	refreshTokenDanceBalance,
@@ -43,7 +44,7 @@ import {
 	opencodeQuotaIdentity,
 	refreshOpencodeKeyUsage,
 } from "../opencode-usage-cache";
-import { providerBalanceCache, providerBalanceQuotaIdentity } from "../provider-balance-cache";
+import { providerBalanceQuotaIdentity } from "../provider-balance-cache";
 import { settings } from "../settings";
 import type { CustomApiProviderConfig } from "../settings/types";
 import { readTemplateModelList, type SourceModel } from "./model-list-readers";
@@ -105,10 +106,9 @@ type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
  * endpoint that is not a dedicated service, official APIs included, as before.
  */
 const relay: ProbeQuota = async (group, credentialId) => {
-	if (credentialId !== providerBalanceCache.quotaSnapshot(group.id)?.credentialId) return;
-	await providerBalanceCache.request(group.id, "refresh");
-	const quota = providerBalanceCache.quotaSnapshot(group.id);
-	return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+	const source = providerQuotaService.peekKey(credentialId);
+	if (source?.providerId !== group.id) return;
+	return toQuotaSnapshot(await providerQuotaService.refreshKey(credentialId, { mode: "refresh" }));
 };
 const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
 	"kimi-code": async (_group, credentialId) => {
@@ -150,10 +150,20 @@ type RoutingBehavior = Pick<
 >;
 const customConfig = (group: SourceGroupView) =>
 	settings.customApiProviders?.find((provider) => provider.id === group.id);
+const customQuotaRouting = {
+	probeSnapshot: (credentialId: string) =>
+		toQuotaSnapshot(providerQuotaService.peekKeyForSelection(credentialId)),
+	streamCurrent: (credentialId: string, snapshot: QuotaSnapshot) =>
+		providerQuotaService.isStreamSnapshotCurrent(
+			credentialId,
+			(snapshot.detail as { generation?: string } | undefined)?.generation,
+		),
+	streamIdentity: customApiStreamQuotaIdentity,
+};
 const relayRouting = keyRouting(
 	customConfig,
 	(config) => providerBalanceQuotaIdentity(config, settings.proxy),
-	{ streamIdentity: customApiStreamQuotaIdentity },
+	customQuotaRouting,
 );
 const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 	// Codex's manager owns credits continuation and window policy, not the generic quota filter.
@@ -161,16 +171,12 @@ const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 		hasAvailableCredentials: () => (peekCodexManager()?.availableCount ?? 0) > 0,
 		routingPreview: () => peekCodexManager()?.routingPreview ?? null,
 	},
-	"kimi-code": keyRouting(customConfig, kimiQuotaIdentity, {
-		streamIdentity: customApiStreamQuotaIdentity,
-	}),
+	"kimi-code": keyRouting(customConfig, kimiQuotaIdentity, customQuotaRouting),
 	"opencode-go": keyRouting(customConfig, opencodeQuotaIdentity, {
+		...customQuotaRouting,
 		probeBalanceIsFallback: true,
-		streamIdentity: customApiStreamQuotaIdentity,
 	}),
-	deepseek: keyRouting(customConfig, deepSeekQuotaIdentity, {
-		streamIdentity: customApiStreamQuotaIdentity,
-	}),
+	deepseek: keyRouting(customConfig, deepSeekQuotaIdentity, customQuotaRouting),
 	tokendance: keyRouting(() => settings.tokendance, tokenDanceQuotaIdentity),
 	"command-code": keyRouting(
 		() => ({ ...settings.commandCode, apiKey: settings.commandCode?.apiKey ?? "" }),

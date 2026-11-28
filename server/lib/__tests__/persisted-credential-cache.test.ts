@@ -1,14 +1,16 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { providerQuotaSourceSchema } from "@shared/provider-quota";
+import { parsePersistedProviderQuota } from "../../services/provider-quota-persistence";
+import {
+	ProviderQuotaService,
+	type ProviderQuotaSource,
+} from "../../services/provider-quota-service";
+import { CustomApiQuotaTargetDirectory } from "../../services/provider-quota-targets";
 import { getNarraforkPath } from "../narrafork-home";
 import { createPersistedCredentialCache } from "../persisted-credential-cache";
-import {
-	type PersistedProviderBalance,
-	ProviderBalanceCache,
-	parsePersistedProviderBalance,
-} from "../provider-balance-cache";
 import type { CustomApiProviderConfig } from "../settings";
-import { parseQuotaSnapshot, QuotaStore } from "../sourcing/quota-store";
+import { quotaConfig, walletQuota } from "./provider-quota-legacy-fixture";
 
 const parseNumber = (raw: unknown) => (typeof raw === "number" ? raw : null);
 
@@ -43,64 +45,99 @@ describe("persisted credential cache", () => {
 	});
 });
 
-describe("provider balance cache persistence", () => {
-	function provider(): CustomApiProviderConfig {
-		return {
-			id: "relay",
-			name: "Relay",
-			prefix: "relay",
-			baseUrl: "https://relay.example/v1",
-			apiKey: "secret-key",
-			protocol: "completions-compatible",
-			defaultModel: "model",
+const services: ProviderQuotaService[] = [];
+afterEach(() => {
+	for (const service of services.splice(0)) service.dispose();
+});
+
+describe("provider quota persistence replaces the independent balance cache", () => {
+	test("source discovery and balance survive restart only under the same account identity", async () => {
+		const file = `provider-quota-test-${crypto.randomUUID()}.json`;
+		const persistence = createPersistedCredentialCache(file, parsePersistedProviderQuota);
+		const source: ProviderQuotaSource = {
+			id: "test-quota/relay",
+			pluginId: "test-quota",
+			contributionId: "relay",
+			revision: "v1",
+			declaration: providerQuotaSourceSchema.parse({
+				id: "relay",
+				title: "Relay",
+				match: { fallback: true },
+				requests: [{ path: "/quota", auth: "bearer" }],
+			}),
 		};
-	}
-
-	test("a supported discovery survives a restart and keeps refreshing its endpoint", async () => {
-		const file = `provider-balance-test-${crypto.randomUUID()}.json`;
-		const persistence = createPersistedCredentialCache(file, parseQuotaSnapshot);
-		let providers = [provider()];
-		const fetch = mock(async () =>
-			Response.json({ mode: "unrestricted", isValid: true, balance: 7, unit: "USD" }),
-		);
-		const before = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => null,
-			fetch,
-			store: new QuotaStore(persistence),
+		const query = mock(async () => ({
+			status: "supported" as const,
+			data: walletQuota,
+			error: null,
+			cursor: "sub2api:/",
+		}));
+		let providers: CustomApiProviderConfig[] = [];
+		const create = () => {
+			const service = new ProviderQuotaService({
+				directory: new CustomApiQuotaTargetDirectory({
+					providers: () => providers,
+					globalProxy: () => null,
+					userAgent: () => "quota-test",
+				}),
+				driver: { listSources: () => [source], query },
+				persistence: createPersistedCredentialCache(file, parsePersistedProviderQuota),
+				onChanged: () => {},
+			});
+			services.push(service);
+			service.start();
+			return service;
+		};
+		const before = new ProviderQuotaService({
+			directory: new CustomApiQuotaTargetDirectory({
+				providers: () => providers,
+				globalProxy: () => null,
+				userAgent: () => "quota-test",
+			}),
+			driver: { listSources: () => [source], query },
+			persistence,
+			onChanged: () => {},
 		});
-		const found = await before.request("relay");
-		expect(found?.status).toBe("supported");
+		services.push(before);
+		before.start();
+		providers = [quotaConfig()];
+		expect((await before.refresh("relay-test"))?.status).toBe("supported");
 		await persistence.flush();
+		before.stop();
 
-		const restarted = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => null,
-			fetch,
-			store: new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot)),
-		});
-		const restored = restarted.peek("relay");
-		expect(restored).toMatchObject({ status: "supported", adapter: "sub2api" });
-		expect(restored?.balance?.amounts[0]?.remaining).toBe(7);
+		providers = [];
+		const restarted = create();
+		providers = [quotaConfig()];
+		const restored = restarted.peek("relay-test");
+		expect(restored).toMatchObject({ status: "supported", sourceId: "test-quota/relay" });
+		expect(restored?.data?.amounts[0]?.remaining).toBe(12);
+		expect(restored).not.toHaveProperty("cursor");
+		expect(readFileSync(getNarraforkPath(file), "utf8")).not.toContain("test-secret-key");
 
-		// A different key must not see the old account's balance.
-		providers = [{ ...provider(), apiKey: "other-key" }];
-		const otherAccount = new ProviderBalanceCache({
-			providers: () => providers,
-			globalProxy: () => null,
-			fetch,
-			store: new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot)),
-		});
-		expect(otherAccount.peek("relay")).toMatchObject({ status: "pending", balance: null });
+		providers = [];
+		const otherAccount = create();
+		providers = [quotaConfig({ apiKey: "other-key" })];
+		expect(otherAccount.peek("relay-test")).toMatchObject({ status: "pending", data: null });
 	});
 
-	test("rejects persisted supported entries without an endpoint", () => {
-		const value: Omit<PersistedProviderBalance, "endpoint"> = {
-			status: "supported",
-			balance: null,
-			fetchedAt: 1,
-			attemptedAt: 1,
-		};
-		expect(parsePersistedProviderBalance(value)).toBeNull();
+	test("rejects persisted supported entries without source identity or normalized data", () => {
+		expect(
+			parsePersistedProviderQuota({
+				status: "supported",
+				data: null,
+				fetchedAt: 1,
+				attemptedAt: 1,
+			}),
+		).toBeNull();
+		expect(
+			parsePersistedProviderQuota({
+				sourceId: "test/relay",
+				sourceRevision: "v1",
+				status: "supported",
+				data: null,
+				fetchedAt: 1,
+				attemptedAt: 1,
+			}),
+		).toBeNull();
 	});
 });

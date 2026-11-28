@@ -44,6 +44,11 @@ import type { ProxyOverride } from "./settings/types";
 
 export const PROVIDER_KEYS_FILE = "provider-keys.json";
 
+/** Colons are reserved for site/platform/search credential owners, never Custom API IDs. */
+export function isCustomApiKeyOwner(id: string): boolean {
+	return id.length > 0 && !id.includes(":");
+}
+
 // Custom API provider ids are nanoids, which never contain ":", so these cannot collide.
 export const TOKENDANCE_KEY_OWNER = "builtin:tokendance";
 export const COMMAND_CODE_KEY_OWNER = "builtin:CommandCode";

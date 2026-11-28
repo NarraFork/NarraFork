@@ -3,8 +3,13 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { settingRowId } from "../services/plugin-settings-store";
 import { buildSnapshotInSubprocess, closeSnapshotBuilds } from "./snapshot-build";
-import { SNAPSHOT_TABLES } from "./snapshot-protocol";
+import {
+	PROVIDER_SETTINGS_TRANSFER_LIMITS,
+	type ProviderSettingsTransferTarget,
+	SNAPSHOT_TABLES,
+} from "./snapshot-protocol";
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 const paths: string[] = [];
@@ -18,6 +23,59 @@ const input = {
 	requests: true,
 	sessions: true,
 };
+
+async function providerSource(targets: ProviderSettingsTransferTarget[], configText = "") {
+	const root = await mkdtemp(join(tmpdir(), "nf-provider-snapshot-"));
+	paths.push(root);
+	const sourcePath = join(root, "source.sqlite"),
+		outputPath = join(root, "snapshot.sqlite");
+	const source = new Database(sourcePath);
+	try {
+		for (const table of [...SNAPSHOT_TABLES.requests, ...SNAPSHOT_TABLES.sessions])
+			source.run(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
+		source.run(`CREATE TABLE plugin_provider_settings (
+			id TEXT PRIMARY KEY,plugin_id TEXT,contribution_id TEXT,target_kind TEXT,target_id TEXT,
+			installation_id TEXT,state TEXT,schema_version INTEGER,schema_fingerprint TEXT,
+			binding_fingerprint TEXT,revision INTEGER,config_text TEXT,secrets_envelope TEXT,
+			key_id TEXT,created_at TEXT,updated_at TEXT
+		)`);
+		const now = new Date().toISOString();
+		const insert = source.query(
+			"INSERT INTO plugin_provider_settings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		);
+		source.transaction(() => {
+			for (const { kind, id } of targets) {
+				const address = {
+					pluginId: "test.portability",
+					contributionId: "settings",
+					targetKind: kind,
+					targetId: id,
+				};
+				insert.run(
+					settingRowId(address),
+					address.pluginId,
+					address.contributionId,
+					kind,
+					id,
+					"old-installation",
+					configText ? "active" : "deleted",
+					1,
+					"a".repeat(64),
+					"b".repeat(64),
+					1,
+					configText,
+					null,
+					null,
+					now,
+					now,
+				);
+			}
+		})();
+	} finally {
+		source.close();
+	}
+	return { sourcePath, outputPath, requests: false, sessions: false };
+}
 
 describe("dedicated snapshot process", () => {
 	test("real process copies selected tables without mutating source", async () => {
@@ -46,12 +104,135 @@ describe("dedicated snapshot process", () => {
 		verify.close();
 	});
 
+	test("provider snapshots include all four kinds and orphan tombstones without a core target filter", async () => {
+		const targets: ProviderSettingsTransferTarget[] = [
+			{ kind: "custom-api", id: "orphan-custom" },
+			{ kind: "nug", id: "orphan-nug" },
+			{ kind: "platform", id: "codex:credential:old-account" },
+			{ kind: "platform", id: "codex:pool" },
+			{ kind: "platform", id: "commandcode:singleton" },
+			{ kind: "executable-plugin", id: "old-provider-generation" },
+		];
+		const fixture = await providerSource(targets);
+		expect(await buildSnapshotInSubprocess({ ...fixture, providers: {} })).toEqual({
+			ok: true,
+			providerSettingsCount: targets.length,
+			providerSettingsSealed: false,
+		});
+		const snapshot = new Database(fixture.outputPath, { readonly: true });
+		try {
+			const rows = snapshot
+				.query("SELECT target_kind AS kind,target_id AS id,state FROM plugin_provider_settings")
+				.all();
+			for (const target of targets) expect(rows).toContainEqual({ ...target, state: "deleted" });
+		} finally {
+			snapshot.close();
+		}
+	});
+
+	test("unmapped old-installation tombstones are retained by import staging", async () => {
+		const fixture = await providerSource([
+			{ kind: "executable-plugin", id: "retired-generation" },
+			{ kind: "platform", id: "codex:credential:missing-credential" },
+		]);
+		expect(
+			await buildSnapshotInSubprocess({
+				...fixture,
+				providerImport: { mappings: [], expectedCount: 2 },
+			}),
+		).toEqual({ ok: true, providerSettingsCount: 2, providerSettingsSkipped: 0 });
+		const stage = new Database(fixture.outputPath, { readonly: true });
+		try {
+			const rows = stage
+				.query("SELECT target_id,state,installation_id FROM plugin_provider_settings")
+				.all() as Array<{ target_id: string; state: string; installation_id: string }>;
+			expect(rows.map((row) => row.target_id).sort()).toEqual([
+				"codex:credential:missing-credential",
+				"retired-generation",
+			]);
+			for (const row of rows) {
+				expect(row.state).toBe("deleted");
+				expect(row.installation_id).toMatch(/^import-/);
+			}
+		} finally {
+			stage.close();
+		}
+	});
+
+	test("many-to-one mappings report the skipped extension without hiding a source record", async () => {
+		const fixture = await providerSource([
+			{ kind: "custom-api", id: "first" },
+			{ kind: "custom-api", id: "second" },
+		]);
+		expect(
+			await buildSnapshotInSubprocess({
+				...fixture,
+				providerImport: {
+					mappings: [
+						{ kind: "custom-api", from: "first", to: "local" },
+						{ kind: "custom-api", from: "second", to: "local" },
+					],
+					expectedCount: 2,
+				},
+			}),
+		).toEqual({ ok: true, providerSettingsCount: 1, providerSettingsSkipped: 1 });
+	});
+
+	test("export rejects more than 512 retained records rather than truncating them", async () => {
+		const fixture = await providerSource(
+			Array.from({ length: PROVIDER_SETTINGS_TRANSFER_LIMITS.records + 1 }, (_, i) => ({
+				kind: "executable-plugin" as const,
+				id: `old-generation-${i}`,
+			})),
+		);
+		await expect(buildSnapshotInSubprocess({ ...fixture, providers: {} })).rejects.toThrow(
+			"record limit exceeded",
+		);
+	});
+
+	test("export rejects the combined 4 MiB budget across otherwise valid retained records", async () => {
+		const configText = JSON.stringify({
+			owner: "b".repeat(64),
+			schemaVersion: 1,
+			schemaFingerprint: "a".repeat(64),
+			revision: 1,
+			values: { first: "x".repeat(4096), second: "y".repeat(4096), third: "z".repeat(4096) },
+			secrets: {},
+		});
+		const fixture = await providerSource(
+			Array.from({ length: PROVIDER_SETTINGS_TRANSFER_LIMITS.records }, (_, i) => ({
+				kind: "platform" as const,
+				id: `codex:credential:old-${i}`,
+			})),
+			configText,
+		);
+		await expect(buildSnapshotInSubprocess({ ...fixture, providers: {} })).rejects.toThrow(
+			"byte limit exceeded",
+		);
+	});
+
 	test("creation failure and missing reports fail closed", async () => {
 		const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
 			throw new Error("spawn denied");
 		});
 		try {
 			await expect(buildSnapshotInSubprocess(input)).rejects.toThrow("spawn denied");
+			for (const job of [
+				{
+					...input,
+					requests: false,
+					sessions: false,
+					providers: { passphrase: "fixture export passphrase" },
+				},
+				{
+					...input,
+					requests: false,
+					sessions: false,
+					providerImport: { mappings: [], expectedCount: 0 },
+				},
+				{ ...input, requests: false, sessions: false, providerClear: true },
+			])
+				await expect(buildSnapshotInSubprocess(job)).rejects.toThrow("spawn denied");
 		} finally {
 			spawn.mockRestore();
 		}
@@ -66,6 +247,56 @@ describe("dedicated snapshot process", () => {
 			await expect(buildSnapshotInSubprocess(input)).rejects.toThrow("no report");
 		} finally {
 			noReport.mockRestore();
+		}
+	});
+
+	test("an older child reporting only ok cannot hide skipped provider transfer work", async () => {
+		const original = Bun.spawn;
+		const stub = spyOn(Bun, "spawn").mockImplementation(
+			(_command, options?) =>
+				original(
+					[process.execPath, "-e", "process.stdout.write(JSON.stringify({ok:true}));"],
+					options as never,
+				) as ReturnType<typeof Bun.spawn>,
+		);
+		try {
+			await expect(
+				buildSnapshotInSubprocess({
+					...input,
+					requests: false,
+					sessions: false,
+					providerClear: true,
+				}),
+			).rejects.toThrow("incomplete provider transfer report");
+		} finally {
+			stub.mockRestore();
+		}
+	});
+
+	test("child reports must account for every imported or skipped source extension", async () => {
+		const original = Bun.spawn;
+		const stub = spyOn(Bun, "spawn").mockImplementation(
+			(_command, options?) =>
+				original(
+					[
+						process.execPath,
+						"-e",
+						"process.stdout.write(JSON.stringify({ok:true,providerSettingsCount:1,providerSettingsSkipped:0}));",
+					],
+					options as never,
+				) as ReturnType<typeof Bun.spawn>,
+		);
+		try {
+			await expect(
+				buildSnapshotInSubprocess({
+					...input,
+					requests: false,
+					sessions: false,
+					providerImport: { mappings: [], expectedCount: 2 },
+				}),
+			).rejects.toThrow("incomplete provider transfer report");
+		} finally {
+			stub.mockRestore();
 		}
 	});
 

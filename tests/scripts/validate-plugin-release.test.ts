@@ -26,15 +26,16 @@ async function waitForProcessesToExit(pids: number[], timeoutMs = 2_500): Promis
 describe("plugin GA release validation", () => {
 	test("validates the remaining generic references across the supported matrix", async () => {
 		const summary = await validatePluginRelease(examplesRoot);
+		expect(summary.errors).toEqual([]);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(9);
-		// 9 packages across the 6 os/arch combinations the release matrix supports.
-		expect(summary.matrixCombinationCount).toBe(54);
-		expect(summary.errors).toEqual([]);
+		expect(summary.packageCount).toBe(10);
+		// 10 packages across the 6 os/arch combinations the release matrix supports.
+		expect(summary.matrixCombinationCount).toBe(60);
 		// Discovery sorts by directory name, so this list is alphabetical.
 		expect(summary.packages.map((item) => item.kind)).toEqual([
 			"provider",
+			"provider-settings-reference",
 			"sandbox-ui-panel",
 			"theme-duo",
 			"theme-framed",
@@ -158,16 +159,23 @@ describe("plugin GA release validation", () => {
 		}
 	});
 
-	test("rejects a runtime that omits the installer package digest", async () => {
+	test.each([
+		"\n",
+		"\r\n",
+	])("rejects a runtime that omits the installer package digest with newline=%j", async (newline) => {
 		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-hello-"));
 		try {
 			const packageRoot = join(root, "tool-command");
 			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
 			const entryPath = join(packageRoot, "server/index.js");
-			const entry = await readFile(entryPath, "utf8");
-			const digestField = "\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),\n";
-			expect(entry).toContain(digestField);
-			await writeFile(entryPath, entry.replace(digestField, ""));
+			const entry = (await readFile(entryPath, "utf8"))
+				.replaceAll("\r\n", "\n")
+				.replaceAll("\n", newline);
+			const digestField = `\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),${newline}`;
+			expect(entry.split(digestField)).toHaveLength(2);
+			const missingDigest = entry.replace(digestField, "");
+			expect(missingDigest).not.toContain("packageDigest: PACKAGE_DIGEST");
+			await writeFile(entryPath, missingDigest);
 
 			const summary = await validatePluginRelease(root, {
 				mode: "runtime",
@@ -185,10 +193,26 @@ describe("plugin GA release validation", () => {
 			mode: "ga",
 			runtimeTimeoutMs: 8_000,
 		});
+		expect(summary.errors).toEqual([]);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("ga");
-		expect(summary.errors).toEqual([]);
-		expect(summary.packageCount).toBe(9);
+		expect(summary.packageCount).toBe(10);
+		expect(summary.matrixCombinationCount).toBe(60);
+
+		const providerSettings = summary.packages.find(
+			(item) => item.pluginId === "com.example.provider-settings.reference",
+		);
+		expect(providerSettings?.runtime).toMatchObject({
+			status: "passed",
+			handshake: { hello: true, initialize: true, activate: true, health: true, generation: 1 },
+			providerSettingsAction: {
+				contributionId: "settings",
+				settingsReads: 1,
+				text: "provider-settings-reference:reference:disabled:3",
+			},
+		});
+		expect(providerSettings?.runtime.provider).toBeUndefined();
+		expect(providerSettings?.runtime.toolInvoke).toBeUndefined();
 
 		const tool = summary.packages.find((item) => item.pluginId === "com.example.tool-command");
 		expect(tool?.runtime).toMatchObject({
@@ -210,6 +234,43 @@ describe("plugin GA release validation", () => {
 
 		const ui = summary.packages.find((item) => item.pluginId === "com.example.sandbox-ui");
 		expect(ui?.runtime.status).toBe("skipped-no-server");
+	});
+
+	test.each([
+		{
+			name: "unbound settings reference",
+			from: "const snapshot = await hostGet(params.reference);",
+			to: 'const snapshot = await hostGet("00000000-0000-4000-8000-000000000000");',
+			error: /Provider settings read was denied/,
+		},
+		{
+			name: "fabricated settings without a host read",
+			from: "const snapshot = await hostGet(params.reference);",
+			to: "const snapshot = { values: {} };",
+			error: /did not read its bound public settings/,
+		},
+		{
+			name: "invalid action response",
+			from: "text: `provider-settings-reference:",
+			to: "text: 42, ignored: `provider-settings-reference:",
+			error: /expected string/,
+		},
+	])("rejects a real provider-settings action with $name", async ({ from, to, error }) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-settings-release-reject-"));
+		try {
+			const packageRoot = join(root, "provider-settings-reference");
+			await cp(join(examplesRoot, "provider-settings-reference"), packageRoot, { recursive: true });
+			const entryPath = join(packageRoot, "server/index.js");
+			const entry = await readFile(entryPath, "utf8");
+			expect(entry.split(from)).toHaveLength(2);
+			await writeFile(entryPath, entry.replace(from, to));
+			const summary = await validatePluginRelease(root, { mode: "ga", runtimeTimeoutMs: 5_000 });
+			expect(summary.valid).toBe(false);
+			expect(summary.packages[0]?.runtime.status).toBe("failed");
+			expect(summary.errors.join("\n")).toMatch(error);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("fails runtime validation within the bounded hello timeout", async () => {

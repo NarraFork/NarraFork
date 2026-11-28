@@ -1,0 +1,24 @@
+{
+	"name": "@narrafork/provider-quota-plugin",
+	"version": "1.0.4",
+	"type": "module",
+	"private": true,
+	"license": "MPL-2.0",
+	"engines": {
+		"bun": ">=1.2 <2"
+	},
+	"scripts": {
+		"build": "bun build.ts",
+		"typecheck": "bunx tsgo --noEmit -p tsconfig.json",
+		"test": "bun test --isolate tests"
+	},
+	"dependencies": {
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/archiver": "^7.0.0",
+		"@types/bun": "^1.4.3",
+		"@typescript/native-preview": "^7.0.0-dev.20260421.1",
+		"archiver": "^7.0.1"
+	}
+}

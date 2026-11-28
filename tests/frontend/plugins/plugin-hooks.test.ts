@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { invalidatePluginQueries, pluginKeys } from "../../../frontend/hooks/usePlugins";
 
 describe("plugin query invalidation", () => {
-	test("lifecycle mutations invalidate list, ui-contributions and ui-health", () => {
+	test("lifecycle mutations invalidate list, ui-contributions, ui-health and quota snapshots", () => {
 		const calls: unknown[][] = [];
 		invalidatePluginQueries({
 			invalidateQueries: ({ queryKey }) => {
@@ -10,7 +10,18 @@ describe("plugin query invalidation", () => {
 			},
 		});
 
-		expect(calls).toEqual([["plugins"], ["plugins", "ui-contributions"], ["plugins", "ui-health"]]);
+		// Quota sources have no iframe contribution, so their lifecycle refreshes the
+		// Custom API quota snapshots directly.
+		expect(calls).toEqual([
+			["plugins"],
+			["plugins", "ui-contributions"],
+			["plugins", "ui-health"],
+			["provider-settings"],
+			["provider-quotas"],
+			["quota-snapshots"],
+			["settings"],
+			["admin", "settings"],
+		]);
 	});
 
 	test("query keys follow the plugins resource convention", () => {

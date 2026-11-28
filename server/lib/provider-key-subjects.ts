@@ -1,6 +1,7 @@
 /** Effective credentials shared by usage caches and request-time stream attribution. */
 import {
 	getProviderKeyStore,
+	isCustomApiKeyOwner,
 	nugKeyOwner,
 	peekProviderKeyStore,
 	withProviderKey,
@@ -81,11 +82,27 @@ export function streamQuotaIdentityForPrefix(
 /** Reject a prepared transport that outlived an edit before capturing its attempt. */
 export function streamQuotaIdentityForRequest(
 	prefix: string,
-	info?: { credentialId?: string; validateDiagnosticCredential?: () => boolean },
+	info?: {
+		credentialId?: string;
+		quotaCredentialId?: string;
+		validateDiagnosticCredential?: () => boolean;
+	},
 ): string | undefined {
-	return info?.validateDiagnosticCredential?.() === false
-		? undefined
-		: streamQuotaIdentityForPrefix(prefix, info?.credentialId);
+	if (info?.validateDiagnosticCredential?.() === false) return undefined;
+	if (info?.quotaCredentialId !== undefined) {
+		// A plain adapter can bill its group even when that id names a disabled old
+		// key. Its explicit quota key must resolve exactly, never through group fallback.
+		const config = (settings.customApiProviders ?? []).find((entry) => entry.prefix === prefix);
+		const key =
+			config &&
+			peekProviderKeyStore()
+				?.list(config.id)
+				.find((entry) => entry.id === info.quotaCredentialId);
+		return config && key && !key.disabled
+			? streamQuotaIdentity(withProviderKey(config, key), key.id)
+			: undefined;
+	}
+	return streamQuotaIdentityForPrefix(prefix, info?.credentialId);
 }
 
 /** Validate the captured attempt, not whichever key happens to be first when it finishes. */
@@ -109,19 +126,23 @@ export function usageSubjects(
 	belongs: (provider: CustomApiProviderConfig) => boolean,
 ): UsageSubject[] {
 	const store = getProviderKeyStore();
-	return (settings.customApiProviders ?? []).filter(belongs).flatMap((provider) => {
-		const keys = store.list(provider.id).filter((key) => !key.disabled);
-		if (keys.length === 0) {
-			return provider.apiKey
-				? [{ id: provider.id, providerId: provider.id, config: provider }]
-				: [];
-		}
-		return keys.map((key) => ({
-			id: key.id,
-			providerId: provider.id,
-			config: withProviderKey(provider, key),
-		}));
-	});
+	return (settings.customApiProviders ?? [])
+		.filter((provider) => isCustomApiKeyOwner(provider.id) && belongs(provider))
+		.flatMap((provider) => {
+			const stored = store.readable ? store.list(provider.id) : [];
+			if (!stored.length)
+				return provider.apiKey
+					? [{ id: provider.id, providerId: provider.id, config: provider }]
+					: [];
+			// Existing but disabled keys must never fall back to the settings projection of that key.
+			return stored
+				.filter((key) => !key.disabled)
+				.map((key) => ({
+					id: key.id,
+					providerId: provider.id,
+					config: withProviderKey(provider, key),
+				}));
+		});
 }
 
 /** The subject a provider-level view (status bar, quota wait) reports: its first usable key. */

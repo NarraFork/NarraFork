@@ -7,6 +7,7 @@ import {
 	resourceScopeKey,
 	resourceScopeSchema,
 } from "@shared/integrations/resources";
+import { withDbRetry } from "../lib/db-resilience";
 import { AppError } from "../lib/errors";
 import {
 	type AuthorizationConstraints,
@@ -139,6 +140,20 @@ function relationResolver(
 	};
 }
 
+/**
+ * The audit row stays mandatory: a write that keeps failing still fails the authorization.
+ * A short SQLITE_BUSY (another process briefly holding the database) is retried with async
+ * backoff instead, so it is not reported to the caller as a denied operation.
+ */
+function recordAuthorizationAudit(
+	input: Parameters<typeof integrationAuditService.record>[0],
+): ReturnType<typeof integrationAuditService.record> {
+	return withDbRetry(() => integrationAuditService.record(input), {
+		label: "integration authorization audit",
+		maxRetries: 4,
+	});
+}
+
 function authorityState(snapshot: IntegrationAuthoritySnapshot, now: number) {
 	if (
 		snapshot.authority.state === "active" &&
@@ -164,7 +179,7 @@ export class IntegrationAuthorizationService {
 				stage: "state" as const,
 				code: "authority_inactive" as const,
 			};
-			await integrationAuditService.record({
+			await recordAuthorizationAudit({
 				principal: { type: "system" },
 				authorityId: request.authorityId,
 				transport: request.transport ?? "server",
@@ -228,7 +243,7 @@ export class IntegrationAuthorizationService {
 			relationResolver: relationResolver(request),
 		});
 		if (!decision.allowed || request.operation !== "event.deliver") {
-			await integrationAuditService.record({
+			await recordAuthorizationAudit({
 				principal: identity.subject,
 				credential: identity.credential,
 				authorityId: snapshot.authority.id,

@@ -112,9 +112,10 @@ describe("PluginIntegrationAuthorityService", () => {
 			createdById: "admin-user-1",
 		});
 
+		const mirrorBeforeEdit = await permissionStore.getSet(pluginId, installationId);
+		expect(mirrorBeforeEdit.authorityRevision).toBe(4);
 		await permissionStore.replace(pluginId, installationId, [], {
-			expectedRevision: 4,
-			targetRevision: 5,
+			expectedRevision: mirrorBeforeEdit.revision,
 			grantedBy: "legacy-file-editor",
 		});
 		const authorityWins = await service.ensureInstallation(pluginId, installationId, {

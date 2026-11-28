@@ -794,6 +794,8 @@ export type AgentEvent =
 			type: "quota_balance";
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			credentialId?: string;
+			customApiQuotaTarget?: import("../provider-quota-async").FrozenCustomApiQuotaTarget | null;
 			/** Request-start credential identity; stale events cannot update a replacement key/network. */
 			providerIdentity?: string;
 	  }

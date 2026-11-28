@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { api } from "../lib/api";
 import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { getRecentTabsScope, recentTabsSectionQueryKey } from "../lib/recent-tabs-owner";
 import { useFastModeUpdates } from "./useFastModeUpdates";
 import { userPreferencesQueryKey, useUpdateUserPreferences } from "./useUserPreferences";
 
@@ -143,6 +144,9 @@ describe("authenticated fast-mode invalidation", () => {
 	test("targeted preferences hints merge with the global hint and only literal true refreshes preferences", async () => {
 		const detail = watch(["narrators", "child"]);
 		const preferences = watch(userPreferencesQueryKey("ui"));
+		const preferenceDetails = watch(userPreferencesQueryKey("detail"));
+		const workTabs = watch(recentTabsSectionQueryKey(getRecentTabsScope(), "work"));
+		const projectTabs = watch(recentTabsSectionQueryKey(getRecentTabsScope(), "projects"));
 		await mount();
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed" });
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed", refreshPreferences: true });
@@ -154,10 +158,18 @@ describe("authenticated fast-mode invalidation", () => {
 		await flushHints();
 		expect(detail).toHaveBeenCalledTimes(2);
 		expect(preferences).toHaveBeenCalledTimes(1);
+		expect(preferenceDetails).toHaveBeenCalledTimes(1);
+		expect(workTabs).not.toHaveBeenCalled();
+		expect(projectTabs).not.toHaveBeenCalled();
 	});
 	test("first connection and reconnect repair missed detail and preference changes; disconnect alone does not read", async () => {
 		const detail = watch(["narrators", "child"]);
 		const preferences = watch(userPreferencesQueryKey("ui"));
+		const preferenceDetails = watch(userPreferencesQueryKey("detail"));
+		const workKey = recentTabsSectionQueryKey(getRecentTabsScope(), "work");
+		const projectKey = recentTabsSectionQueryKey(getRecentTabsScope(), "projects");
+		const workTabs = watch(workKey);
+		const projectTabs = watch(projectKey);
 		await mount();
 		connection(false, false);
 		expect(scheduled.size).toBe(0);
@@ -171,6 +183,11 @@ describe("authenticated fast-mode invalidation", () => {
 		await flushHints();
 		expect(detail).toHaveBeenCalledTimes(2);
 		expect(preferences).toHaveBeenCalledTimes(2);
+		expect(preferenceDetails).toHaveBeenCalledTimes(2);
+		expect(workTabs).not.toHaveBeenCalled();
+		expect(projectTabs).not.toHaveBeenCalled();
+		expect(client.getQueryState(workKey)?.isInvalidated).toBe(false);
+		expect(client.getQueryState(projectKey)?.isInvalidated).toBe(false);
 	});
 	test("disabling/unmounting removes listeners and cancels a pending flush", async () => {
 		const detail = watch(["narrators", "child"]);
