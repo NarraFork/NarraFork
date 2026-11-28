@@ -5876,35 +5876,30 @@ const sqliteNarratorPersistence = {
 	},
 
 	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = fillBody(
-			await db.query.narratorMessages.findFirst({
-				...bodyColumns(),
-				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-			}),
-		);
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		const scBlock = blocks.find(
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(b: any) => b.type === "segment_compact" && b.status === "compacted",
-		);
-		if (!scBlock) throw new ValidationError("Message is not a compacted segment compact message");
-
-		const newBlock = {
-			type: "segment_compact" as const,
-			status: "compacted" as const,
-			summary,
-			messageCount: scBlock.messageCount ?? 0,
-		};
-
 		const now = new Date().toISOString();
 		db.transaction((tx) => {
-			writeEnvelopeBody(tx, messageId, [newBlock], {
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns({ id: true, contentJson: true }),
+						where: and(
+							eq(narratorMessages.id, messageId),
+							eq(narratorMessages.narratorId, narratorId),
+						),
+					})
+					.sync(),
+			);
+			if (!msg) throw new NotFoundError("Message", messageId);
+
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const marker = blocks.find((b) => b?.type === "segment_compact" && b.status === "compacted");
+			if (!marker) throw new ValidationError("Message is not a compacted segment compact message");
+			marker.summary = summary;
+
+			writeEnvelopeBody(tx, messageId, blocks, {
 				allowHistoryRewrite: true,
 				set: {
-					contextCharsJson: measureMessageCharacters("user", [newBlock]),
+					contextCharsJson: measureMessageCharacters("user", blocks),
 					contentText: `[Segment Compact]\n${summary}`,
 				},
 			});

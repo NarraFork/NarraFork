@@ -120,6 +120,39 @@ export interface CompactSummaryRetryPolicy {
 	onRequestFailure?: () => void;
 }
 
+type CompactChunkResult = { summary: string; contextPercent?: number };
+type CompactOverflowFallback = (
+	failure: unknown,
+	source: "estimate" | "provider",
+) => Promise<CompactChunkResult>;
+
+function hasCompactRetry(policy: CompactSummaryRetryPolicy): boolean {
+	return policy.limit === -1 || policy.used < policy.limit;
+}
+
+function scheduleCompactRetry(
+	policy: CompactSummaryRetryPolicy,
+	failure: unknown,
+	delayMs: number,
+	onRetryScheduled?: CompactSummaryRetryHandler,
+): () => void {
+	onRetryScheduled?.({
+		attempt: policy.used + 1,
+		maxRetries: policy.limit,
+		delayMs,
+		error: failure instanceof Error ? failure.message : String(failure),
+	});
+	// A replan can produce several chunks. Charge once, at its first actual request,
+	// not during backoff or a local split that may still fail without sending anything.
+	let pending = true;
+	return () => {
+		if (!pending) return;
+		if (policy.shouldChangeModel?.() || !hasCompactRetry(policy)) throw failure;
+		pending = false;
+		policy.used += 1;
+	};
+}
+
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
 function stripTodoReminderBlocks(value: unknown): unknown {
@@ -463,7 +496,8 @@ export const narratorContext = {
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
 		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
-	): Promise<{ summary: string; contextPercent?: number }> {
+		beginRetry?: () => void,
+	): Promise<CompactChunkResult> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
 
@@ -498,6 +532,7 @@ export const narratorContext = {
 				onRetryScheduled,
 				userId,
 				retryPolicy,
+				beginRetry,
 			);
 
 			onProgress?.();
@@ -534,30 +569,14 @@ export const narratorContext = {
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
 		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
-	): Promise<{ summary: string; contextPercent?: number }> {
-		try {
-			return await this._summarizeChunk(
-				narratorId,
-				entries,
-				previousSummary,
-				compactSystemPrompt,
-				compactSuffix,
-				baseFixedTokens,
-				tokenBudget,
-				signal,
-				modelOverride,
-				onTextDelta,
-				onReasoningDelta,
-				onProgress,
-				onRetryScheduled,
-				userId,
-				retryPolicy,
-			);
-		} catch (err) {
+		beginRetry?: () => void,
+	): Promise<CompactChunkResult> {
+		const split: CompactOverflowFallback = (err, source) => {
+			signal?.throwIfAborted();
 			if (
-				retryPolicy.shouldChangeModel?.() ||
-				!isCompactContextOverflowError(err) ||
-				depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH
+				depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH ||
+				(source === "provider" &&
+					(retryPolicy.shouldChangeModel?.() || !hasCompactRetry(retryPolicy)))
 			) {
 				throw err;
 			}
@@ -573,6 +592,7 @@ export const narratorContext = {
 			logger.warn("Compact chunk exceeded summary model context, cascading into smaller chunks", {
 				narratorId,
 				depth,
+				source,
 				chunkEntries: entries.length,
 				fallbackChunks: fallbackChunks.length,
 				error: err instanceof Error ? err.message : String(err),
@@ -595,8 +615,30 @@ export const narratorContext = {
 				onRetryScheduled,
 				userId,
 				retryPolicy,
+				source === "provider"
+					? scheduleCompactRetry(retryPolicy, err, 0, onRetryScheduled)
+					: beginRetry,
 			);
-		}
+		};
+		return this._summarizeChunk(
+			narratorId,
+			entries,
+			previousSummary,
+			compactSystemPrompt,
+			compactSuffix,
+			baseFixedTokens,
+			tokenBudget,
+			signal,
+			modelOverride,
+			onTextDelta,
+			onReasoningDelta,
+			onProgress,
+			onRetryScheduled,
+			userId,
+			retryPolicy,
+			beginRetry,
+			split,
+		);
 	},
 
 	/**
@@ -619,7 +661,9 @@ export const narratorContext = {
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
 		retryPolicy: CompactSummaryRetryPolicy = { limit: getCompactMaxRetries(), used: 0 },
-	): Promise<{ summary: string; contextPercent?: number }> {
+		beginRetry?: () => void,
+		onOverflow?: CompactOverflowFallback,
+	): Promise<CompactChunkResult> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
 			: "";
@@ -632,7 +676,9 @@ export const narratorContext = {
 		// The caller splits oversized chunks/text recursively with a bounded depth;
 		// if even fixed overhead cannot fit, fail without committing a lossy summary.
 		if (totalTokens > contentBudget) {
-			throw new Error("Compact input exceeds maximum context length");
+			const err = new Error("Compact input exceeds maximum context length");
+			if (onOverflow) return onOverflow(err, "estimate");
+			throw err;
 		}
 
 		// ── Assemble final conversation text ──
@@ -646,14 +692,19 @@ export const narratorContext = {
 		if (!conversationText.trim()) return { summary: "No conversation history." };
 
 		const compactUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`;
-
+		let providerOverflow: unknown;
 		while (true) {
 			if (signal?.aborted) {
 				throw new DOMException("Compact summary aborted", "AbortError");
 			}
 			onProgress?.();
 			const requestSignal = retryPolicy.onRequestStart?.() ?? signal;
+			let requestStarted = false;
 			try {
+				signal?.throwIfAborted();
+				requestSignal?.throwIfAborted();
+				beginRetry?.();
+				requestStarted = true;
 				const result = await summaryGenerate(
 					compactUserText,
 					compactSystemPrompt,
@@ -688,6 +739,7 @@ export const narratorContext = {
 					contextPercent: result.contextPercent,
 				};
 			} catch (failure) {
+				if (!requestStarted) throw failure;
 				const err = requestSignal?.aborted && !signal?.aborted ? requestSignal.reason : failure;
 				if ((err instanceof Error && err.name === "AbortError") || signal?.aborted) {
 					throw err;
@@ -702,28 +754,25 @@ export const narratorContext = {
 						activeEntries: activeTexts.length,
 						error: err instanceof Error ? err.message : String(err),
 					});
-					throw err;
+					if (!onOverflow) throw err;
+					providerOverflow = err;
+					break;
 				}
-				if (retryPolicy.limit !== -1 && retryPolicy.used >= retryPolicy.limit) throw err;
-				const error = err instanceof Error ? err.message : String(err);
+				if (!hasCompactRetry(retryPolicy)) throw err;
 				// Unlimited retries must yield even for immediately rejected/empty responses.
 				const delayMs =
 					retryPolicy.limit === -1 || isRetryableError(err)
 						? auxiliaryRetryDelayMs(retryPolicy.used)
 						: 0;
-				onRetryScheduled?.({
-					attempt: retryPolicy.used + 1,
-					maxRetries: retryPolicy.limit,
-					delayMs,
-					error,
-				});
+				beginRetry = scheduleCompactRetry(retryPolicy, err, delayMs, onRetryScheduled);
 				if (delayMs > 0) await sleep(delayMs, undefined, { signal });
 				if (retryPolicy.shouldChangeModel?.()) throw err;
-				retryPolicy.used += 1;
 			} finally {
 				retryPolicy.onRequestFinish?.();
 			}
 		}
+		// Finish the rejected request before its replacement installs a new stall handler.
+		return onOverflow(providerOverflow, "provider");
 	},
 };
 

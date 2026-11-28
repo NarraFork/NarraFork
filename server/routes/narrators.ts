@@ -4982,11 +4982,12 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 	}
 
 	return streamSSE(c, async (stream) => {
-		const queue: LiveCompactStreamEvent[] = [];
+		type StreamEvent = Readonly<LiveCompactStreamEvent>;
+		const queue: StreamEvent[] = [];
 		let wake: (() => void) | undefined;
 		let finished = false;
 		let stopped = false;
-		const enqueue = (event: LiveCompactStreamEvent) => {
+		const enqueue = (event: StreamEvent) => {
 			if (event.kind === "delta") {
 				const previous = queue.at(-1);
 				if (
@@ -4994,9 +4995,8 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 					previous.channel === event.channel &&
 					previous.delta.length + event.delta.length <= 32_000
 				) {
-					previous.delta += event.delta;
-					previous.outputChars = event.outputChars;
-					previous.thinkingChars = event.thinkingChars;
+					// Subscribers share the broadcast event; replace only the local queue entry.
+					queue[queue.length - 1] = { ...event, delta: previous.delta + event.delta };
 					wake?.();
 					return;
 				}

@@ -24,6 +24,7 @@ anchors:
   - server/services/context-display-refiners.ts
   - server/services/context-numeric-cache.ts
   - shared/compact-message.ts
+  - shared/compact-settings.ts
   - shared/context-composition.ts
   - shared/context-thresholds.ts
   - shared/context-usage.ts
@@ -43,12 +44,13 @@ keywords:
   - context_usage
   - settings.agent.contextThresholds
   - settings.agent.summaryModel
+  - settings.agent.compactMaxRetries
   - 摘要模型
   - 上下文占用
   - api_conversation_id
   - model_history_revision
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 上下文与压缩
 
@@ -57,11 +59,12 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ## 关键规则
 - 三种压缩：整段历史压缩 `runCustomCompact`（模式 blocking / background）、对选定消息的分段压缩 `runSegmentCompact`、由计划批准触发的 `runPlanCompact`（`narrator-compact.ts`）。
 - 每个叙述者同一时刻只有一把压缩锁 `compactLocks`：已有压缩在跑时，blocking 请求会等待它，并把后台压缩升级为 blocking；`triggerMidTurnCompact` 遇到锁直接跳过（避免第二个 `[Compacting]` 标记）。
-- 压缩标记有 compacting / compacted / failed 状态；超时或停滞由 watchdog 判定并把原因写进失败标记（`createCompactWatchdog`，中止后另有 60s 宽限 `COMPACT_ABORT_GRACE_MS`），测试用 `__setCompactWatchdogTimingsForTests` 缩短时限（`compact-timeout-failure.test.ts`）。从未流出任何字符就失败时，错误信息会追加“检查摘要模型的上下文窗口设置”的提示（`enrichCompactFailureMessage`）。
+- 压缩标记有 compacting / compacted / failed 状态。单次请求停滞时，`createCompactWatchdog` 可以先中止本次请求，让已选替换模型或剩余自动重试额度接手；整次操作到达 30 分钟总时限仍然失败。用户取消普通压缩会还原或移除标记，不启动新请求。
+- `agent.compactMaxRetries` 独立于普通 API 的重试设置：默认 1，0 关闭自动重试，-1 表示不按次数限制，正整数是整次压缩可消耗的自动重试次数。用户显式换模不占用自动额度；摘要请求的重试与分块规则见[一次上下文压缩](../flows/compaction.md)。
 - 计划压缩：`narrator-persistence.ts:persistPlanMessage` 的实现里设置 `isCompact: 1`、`contextSummary` 与 `apiConversationId: null`（已核对），之后重置上游会话（`runPlanCompact`）。
 - 压缩期间叙述者可能是空闲的但不能起新一轮（会基于即将被替换的历史运行），所以用户输入进队列；每次压缩退出（成功、失败、取消、超时）都要重查队列并唤醒（`compact-queue-drain.ts:drainQueuedMessagesAfterCompact`，测试 `compact-exit-drains-queue.test.ts`）。
 - 撤回压缩：`DELETE /:id/compact/:messageId` → `narrator-messages.ts:deleteCompactMessage`，只删本叙述者对该标记的引用（分叉兄弟保留自己的视图），正在进行（compacting）的压缩须先取消，否则 409 `COMPACT_IN_PROGRESS`。
-- 压缩流式进度：`compact-live-state.ts` 在内存里按消息缓存输出/思考文本，总量上限 200k 字符、单个增量上限 32k 字符。
+- 压缩流式进度：`compact-live-state.ts` 在内存中按消息分别缓存思考与输出两个通道的前 200k 字符，每个增量不超过 32k 字符；多个查看器的队列独立。
 - 摘要生成：`narrator-context.ts:narratorContext.generateContextSummary` 取“上次压缩以来”的模型历史，已有 `contextSummary` 时一并带入，避免更早的内容丢失；compressed 分叉用同一个摘要（见 [分叉](fork.md)）。
 - 上下文占用统计：`narrator-context-composition.ts:getNarratorContextComposition` 按类别（system / summary / tools / 历史各段）汇总字符数，`freezeNarratorContextComposition` 在每次请求时冻结输入字符计数，`storeNarratorContextUsage` 存用量快照。历史读取在 `context-composition-history.ts` 中分批并让出事件循环（`CONTEXT_COMPOSITION_LIMITS`：批 64、切片 4ms、响应 256KiB），单次扫描最多 4096 段；PG 后端不可用时返回 503 `CONTEXT_COMPOSITION_UNAVAILABLE`。
 - ContextAsk：`context-ask-service.ts:contextAskService` 用摘要模型对另一叙述者的历史做分块 map/reduce 回答问题，并发上限 4、输出上限 16000 字符、历史最多 `CONTEXT_ASK_HISTORY_MESSAGE_LIMIT`=400 条。
@@ -69,8 +72,8 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 触发阈值：按模型上下文窗口分档——大于 `LARGE_CONTEXT_BOUNDARY`（600000）为 large，否则 standard；阈值取 `settings.agent.contextThresholds[tier]`，缺省 `DEFAULT_CONTEXT_THRESHOLDS`（standard 95%、large 75%）（`lib/settings/provider.ts:getContextThresholds`、`shared/context-thresholds.ts`）。`context_usage` 事件把 `compactStart` 发给前端，并调用 `hooks.onContextUsage`；真正的触发判断在 `narrator-session.ts:buildContextManagementHooks`（测试 `context-usage-compact-guard.test.ts` 注入固定阈值）。
 - 占用快照有硬上限：序列化超过 16 KiB（`CONTEXT_USAGE_SNAPSHOT_MAX_BYTES`）或输入构成与总量对不上就整体丢弃，读时同样校验（`context-usage-snapshot.ts:boundedContextSnapshot`）；构成分段最多 2048 段，各段字符数之和必须恰好等于总量，否则整组作废（`shared/context-usage.ts:readInputCompositionSegments`）；字符数一律是 UTF-16 `length`，不是 token 或字节（`lib/context-characters.ts`）。类别固定为 system / summary / toolDefinition / user / assistant / reasoning / toolCall / toolResult / attachment / other（`shared/context-composition.ts`）。`context-numeric-cache.ts` 只缓存数值（最多 32 个 actor、8 MiB），从不保留正文。
 - 上下文变化摘要：`context_update` 行写入时可注册 refiner，用上一行与当前值生成“变了什么”的读者摘要（`context-display-refiners.ts:registerContextDisplayRefiner`）。
-- 压缩状态消息：`status` 为 compacting / compacted / failed，`mode` 为 blocking / background，`trigger` 为 manual / background / context_overflow / reasoning_only / retry，最多保留 10 次尝试、错误文本 2000 字符（`shared/compact-message.ts`）。
-- 压缩详情实时流：`GET /api/narrators/:id/compact/:messageId/live`（SSE，带 `outputOffset` 等偏移参数），前端 `consumeCompactLiveStream` 只在压缩详情弹窗打开时消费，缓冲上限 64000 字符。
+- 压缩状态消息：`status` 为 compacting / compacted / failed；最多保留 10 条历史尝试记录、每条错误文本最多 2000 字符。该历史长度不是重试次数上限。复用旧标记重试时，详情从当前尝试开始计时。
+- 普通、分段标记从等待首段起即可打开详情。`GET /api/narrators/:id/compact/:messageId/live` 用 `streamVersion`、`outputOffset` 和 `thinkingOffset` 续接 SSE。失败请求的草稿会回退，手动换模重跑时清空旧草稿；分段摘要被编辑时只改摘要，保留生成模型。
 - 对话身份：`narrators.api_conversation_id` 由 `claimConversationIdentity` 以 `model_history_revision` 做乐观比对后写入，比对失败报 409 `CONVERSATION_IDENTITY_CHANGED`；须在叙述者变更准入内、任何 provider 请求之前完成，不轮换前缀纪元（`narrator-conversation-identity.ts`）。
 - 压缩后的占用估计：`estimateNarratorBuildHistoryTokens` 用与主循环相同的构建历史与系统提示路径估算下一次请求的 prompt 规模，仅作显示用的临时值，超时 10 秒（`narrator-history-token-estimate.ts`）。
 - 摘要模型不可用：轻量 runtime 设置接口的 `summaryModelAvailable === false` 且已配置摘要模型时，管理员会看到摘要模型选择弹窗；非管理员或向导未完成时不弹（`frontend/components/settings/SummaryModelPickerHost.tsx`、`SummaryModelPickerModal.tsx`）。

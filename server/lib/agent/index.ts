@@ -160,6 +160,7 @@ export async function agentGenerateWithMetaResolved(
 	systemInstruction?: string,
 	options?: GenerateOptions,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
+	retryOnReasoningRejection = true,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const generate = () =>
 		withReasoningMandatoryFallback(
@@ -172,6 +173,7 @@ export async function agentGenerateWithMetaResolved(
 					systemInstruction,
 					effectiveOptions,
 				),
+			retryOnReasoningRejection,
 		);
 	if (!tracking) return generate();
 	return trackApiRequest(
@@ -492,7 +494,7 @@ export async function summaryGenerate(
 	 * connected to the caller's request.
 	 */
 	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">> & {
-		/** Overrides auxiliary retries when the caller manages its own retry budget. */
+		/** An explicit zero leaves transient and reasoning-mandatory retries to the caller. */
 		maxRetries?: number;
 	},
 ): Promise<import("./provider").GenerateMetaResult> {
@@ -511,7 +513,15 @@ export async function summaryGenerate(
 		...generationOverrides,
 	};
 	return withSummaryRetry(
-		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),
+		() =>
+			agentGenerateWithMetaResolved(
+				text,
+				resolveProviderAndModel(model),
+				systemInstruction,
+				generateOptions,
+				requestTracking,
+				maxRetries !== 0,
+			),
 		signal,
 		model,
 		reportSummaryModelErrors,

@@ -18,6 +18,7 @@ anchors:
   - server/lib/agent/switchable-protocols.ts
   - server/lib/agent/provider-transport.ts
   - server/lib/agent/reasoning-mandatory-fallback.ts
+  - server/lib/agent/index.ts
   - server/lib/agent/reasoning-source.ts
   - server/lib/agent/response-body.ts
   - server/lib/agent/response-format.ts
@@ -56,7 +57,7 @@ keywords:
   - 原生媒体
   - 快速模式
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 适配器与历史构造
 
@@ -76,7 +77,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
   - 其他（NUG 按网关渠道路由、Codex 与插件提供商只有一种线协议）：空，不可切换。
   - 换适配器时代理、指纹、额外头、官方 API 标志留在连接上；选中协议与连接原适配器一致时不重建（`protocol-override.ts`）。
 - 上游拒绝时的降级，都是进程内、重启即忘（故意不落盘，避免上游已放开后仍被压制）：
-  - 拒绝 `reasoningEffort: "none"`（"Reasoning is mandatory"）：去掉推理偏好重发，不替换成某个档位（`reasoning-mandatory-fallback.ts`）。
+  - 拒绝 `reasoningEffort: "none"`（"Reasoning is mandatory"）：按提供商和模型记住该限制，后续不再发送这个偏好。普通辅助请求可以去掉偏好再试一次；当[上下文压缩](../../flows/compaction.md)自己管理重试时，只记录能力并抛出第一次拒绝，由压缩层决定是否换模或动用剩余额度，不在适配器内补发。
   - 拒绝某个请求字段（如 `max_output_tokens`）：学到后剥掉该字段重试，记忆表有上限（`unsupported-parameter-fallback.ts`）。
   - 中转站忽略或拒绝 JSON-Schema 输出约束：按模型记住并降级，原生结构化输出仍是首选（`structured-output-fallback.ts`）。
   - 顶层联合类型的工具 schema 在提供商边界处展平，嵌套组合保持；展平会丢失属性间关联，不支持的约束只留诊断不猜测（`tool-schema-compat.ts`）；Gemini 另有 schema 清洗（`gemini-tool-schema.ts`）。

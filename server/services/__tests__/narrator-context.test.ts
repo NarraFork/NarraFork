@@ -7,6 +7,7 @@ import * as requestTracker from "../../lib/api-request-tracker";
 import { replaceModelOverridesForTests } from "../../lib/model-catalog";
 import * as prompts from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
+import type { CompactSummaryRetryHandler, CompactSummaryRetryPolicy } from "../narrator-context";
 import { narratorService } from "../narrator-service";
 import type { NarratorTaskSource } from "../task-source";
 import * as taskSource from "../task-source";
@@ -18,15 +19,47 @@ function compactOnlyTaskSource(compactContext: () => Promise<string | null>): Na
 	return { compactContext } as unknown as NarratorTaskSource;
 }
 
-const originalSummarizeChunk = narratorContext._summarizeChunk.bind(narratorContext);
-const summaryCalls: number[] = [];
-
-afterEach(() => {
-	narratorContext._summarizeChunk = originalSummarizeChunk;
-	summaryCalls.length = 0;
-});
-
 describe("narrator compact summary", () => {
+	let generate: ReturnType<typeof spyOn<typeof agent, "summaryGenerate">>;
+	beforeEach(() => {
+		generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "summary" });
+	});
+	afterEach(() => generate.mockRestore());
+
+	function entriesFor(...texts: string[]) {
+		return texts.map((text, i) => ({
+			message: { id: `m${i}`, role: "user" as const, contentText: text },
+			text,
+		}));
+	}
+
+	function cascade(
+		entries: ReturnType<typeof entriesFor>,
+		policy: CompactSummaryRetryPolicy,
+		onRetry?: CompactSummaryRetryHandler,
+		tokenBudget = 40_000,
+		signal?: AbortSignal,
+	) {
+		return narratorContext._summarizeChunkSequence(
+			"n-test",
+			[entries],
+			"",
+			"system",
+			"suffix",
+			0,
+			tokenBudget,
+			0,
+			signal,
+			"old-model",
+			undefined,
+			undefined,
+			undefined,
+			onRetry,
+			"compact-user",
+			policy,
+		);
+	}
+
 	test("oversized input is rejected for splitting without deleting tool evidence", async () => {
 		const entries = [
 			{
@@ -36,105 +69,218 @@ describe("narrator compact summary", () => {
 		];
 		const before = JSON.stringify(entries);
 		await expect(
-			originalSummarizeChunk("n-test", entries, "", "system", "suffix", 0, 100),
+			narratorContext._summarizeChunk("n-test", entries, "", "system", "suffix", 0, 100),
 		).rejects.toThrow("maximum context length");
 		expect(JSON.stringify(entries)).toBe(before);
 	});
 
-	test("single oversized message is split with both halves retained", async () => {
+	test.each([
+		false,
+		true,
+	])("local token splitting preserves both halves with zero retries (replacement queued: %s)", async (queued) => {
 		const text = `FIRST ${"x".repeat(4_000)} LAST`;
-		const entries = [{ message: { id: "m", role: "user" as const, contentText: text }, text }];
-		narratorContext._summarizeChunk = async (
-			id,
-			chunk,
-			previous,
-			system,
-			suffix,
-			fixed,
-			budget,
-		) => {
-			if (chunk.some((entry) => entry.text.length > 3_000)) {
-				return originalSummarizeChunk(id, chunk, previous, system, suffix, fixed, budget);
-			}
-			return { summary: [previous, ...chunk.map((entry) => entry.text)].join("|") };
-		};
-		const result = await narratorContext._summarizeChunkSequence(
-			"n-test",
-			[entries],
-			"",
-			"system",
-			"suffix",
-			0,
-			100,
-			0,
+		const entries = entriesFor(text);
+		const policy = { limit: 0, used: 0, shouldChangeModel: () => queued };
+		const retry = mock();
+		generate.mockImplementation(async (input) => ({
+			text: ["FIRST", "LAST"].filter((marker) => input.includes(marker)).join("|"),
+		}));
+		const result = await cascade(entries, policy, retry, 800);
+		expect(generate).toHaveBeenCalledTimes(2);
+		expect(generate.mock.calls.map((args) => args[5])).toEqual(["old-model", "old-model"]);
+		const [first, second] = generate.mock.calls.map(([input]) => input);
+		const midpoint = Math.floor(text.length / 2);
+		expect(first).toContain(
+			`${text.slice(0, midpoint)}\n[Message continues in next compact chunk]`,
 		);
-		expect(result.summary).toContain("FIRST");
-		expect(result.summary).toContain("LAST");
+		expect(first).not.toContain("LAST");
+		expect(second).toContain("[Previous context summary]:\nFIRST");
+		expect(second).toContain(`[Continuation of previous message]\n${text.slice(midpoint)}`);
+		expect(result.summary).toBe("FIRST|LAST");
 		expect(entries[0].text).toBe(text);
+		expect(policy.used).toBe(0);
+		expect(retry).not.toHaveBeenCalled();
 	});
 
 	test("cancellation stops before fitting or requesting a summary", async () => {
 		const controller = new AbortController();
 		controller.abort();
 		await expect(
-			originalSummarizeChunk("n-test", [], "", "system", "suffix", 0, 100, controller.signal),
+			narratorContext._summarizeChunk(
+				"n-test",
+				[],
+				"",
+				"system",
+				"suffix",
+				0,
+				100,
+				controller.signal,
+			),
 		).rejects.toThrow("aborted");
 	});
 
-	test("falls back to cascading chunks when summary provider reports context overflow", async () => {
+	const overflow = new Error("maximum context length exceeded");
+
+	test("one provider overflow spends one retry for the entire smaller-chunk sequence", async () => {
 		const longText = "x".repeat(2_300);
-		const entries = [
-			{
-				message: { id: "m1", role: "user", contentText: `PART_ONE ${longText}`, toolCalls: [] },
-				text: `[User]: PART_ONE ${longText}`,
-			},
-			{
-				message: {
-					id: "m2",
-					role: "assistant",
-					contentText: `PART_TWO ${longText}`,
-					toolCalls: [],
-				},
-				text: `[Assistant]: PART_TWO ${longText}`,
-			},
-		];
+		const entries = entriesFor(`[User]: PART_ONE ${longText}`, `[Assistant]: PART_TWO ${longText}`);
+		const policy = { limit: 1, used: 0 };
+		const usedAtRequest: number[] = [];
+		const chunks: string[][] = [];
+		generate.mockImplementation(async (input, _system, tracking) => {
+			expect(tracking?.userId).toBe("compact-user");
+			usedAtRequest.push(policy.used);
+			const chunk = entries
+				.filter((entry) => input.includes(entry.text))
+				.map((entry) => entry.text);
+			chunks.push(chunk);
+			if (chunk.length > 1) throw overflow;
+			const text = ["PART_ONE", "PART_TWO"].filter((marker) => input.includes(marker)).join("|");
+			return { text, contextPercent: 12 };
+		});
+		const retry = mock();
+		const result = await cascade(entries, policy, retry);
+		expect(chunks).toEqual([
+			entries.map((entry) => entry.text),
+			[entries[0].text],
+			[entries[1].text],
+		]);
+		expect(usedAtRequest).toEqual([0, 1, 1]);
+		expect(generate.mock.calls[2][0]).toContain("[Previous context summary]:\nPART_ONE");
+		expect(result).toEqual({ summary: "PART_ONE|PART_TWO", contextPercent: 12 });
+		expect(retry.mock.calls).toEqual([
+			[{ attempt: 1, maxRetries: 1, delayMs: 0, error: overflow.message }],
+		]);
+	});
 
-		narratorContext._summarizeChunk = async (...args) => {
-			const [, chunkEntries, previousSummary] = args;
-			expect(args[13]).toBe("compact-user");
-			summaryCalls.push(chunkEntries.length);
-			if (chunkEntries.length > 1) throw new Error("maximum context length exceeded");
-
-			const markers = ["PART_ONE", "PART_TWO"].filter((marker) =>
-				chunkEntries.some((entry) => entry.text.includes(marker)),
+	for (const [limit, used] of [
+		[0, 0],
+		[1, 1],
+	]) {
+		test(`provider overflow cannot replan with retry budget ${used}/${limit}`, async () => {
+			const policy = { limit, used };
+			const retry = mock();
+			generate.mockRejectedValue(overflow);
+			await expect(cascade(entriesFor("PART_ONE", "PART_TWO"), policy, retry)).rejects.toBe(
+				overflow,
 			);
-			return {
-				summary: [previousSummary, ...markers].filter(Boolean).join("|"),
-				contextPercent: 12,
-			};
-		};
+			expect(generate).toHaveBeenCalledTimes(1);
+			expect(policy.used).toBe(used);
+			expect(retry).not.toHaveBeenCalled();
+		});
+	}
 
-		const result = await narratorContext._summarizeChunkSequence(
-			"n-test",
-			[entries as never],
-			"",
-			"compact system prompt",
-			"compact suffix",
-			0,
-			40_000,
-			0,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			"compact-user",
+	test("ordinary retries and recursive provider replans exhaust the same budget", async () => {
+		const policy = { limit: 3, used: 0 };
+		const ordinary = new Error("provider rejected request");
+		const entries = entriesFor(...Array.from({ length: 8 }, (_, i) => `[part:${i}]`));
+		const trace: number[][] = [];
+		generate.mockImplementation(async (input) => {
+			trace.push([entries.filter((entry) => input.includes(entry.text)).length, policy.used]);
+			throw trace.length === 2 ? ordinary : overflow;
+		});
+		const retry = mock();
+		await expect(cascade(entries, policy, retry)).rejects.toBe(overflow);
+		expect(trace).toEqual([
+			[8, 0],
+			[4, 1],
+			[4, 2],
+			[2, 3],
+		]);
+		expect(retry.mock.calls).toEqual(
+			[overflow, ordinary, overflow].map((err, i) => [
+				{ attempt: i + 1, maxRetries: 3, delayMs: 0, error: err.message },
+			]),
 		);
+		expect(policy.used).toBe(3);
+	});
 
-		expect(summaryCalls).toEqual([2, 1, 1]);
-		expect(result.summary).toContain("PART_ONE");
-		expect(result.summary).toContain("PART_TWO");
+	for (const limit of [15, -1]) {
+		test(`provider replans can use more than ten retries with limit ${limit}`, async () => {
+			const policy = { limit, used: 0 };
+			const entries = entriesFor(...Array.from({ length: 16 }, (_, i) => `[part:${i}]`));
+			const completed: string[] = [];
+			generate.mockImplementation(async (input) => {
+				const chunk = entries.filter((entry) => input.includes(entry.text));
+				if (chunk.length > 1) throw overflow;
+				completed.push(chunk[0].text);
+				return { text: "summary" };
+			});
+			const ordinals: number[] = [];
+			await cascade(entries, policy, (info) => ordinals.push(info.attempt));
+			expect(completed).toEqual(entries.map((entry) => entry.text));
+			expect(generate).toHaveBeenCalledTimes(31);
+			expect(ordinals).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
+			expect(policy.used).toBe(15);
+		});
+	}
+
+	test("unsplittable provider overflows never schedule or charge a retry", async () => {
+		const policy = { limit: -1, used: 3 };
+		const retry = mock();
+		generate.mockRejectedValue(overflow);
+		await expect(cascade(entriesFor("short"), policy, retry)).rejects.toBe(overflow);
+		expect(generate).toHaveBeenCalledTimes(1);
+		expect(policy.used).toBe(3);
+		expect(retry).not.toHaveBeenCalled();
+	});
+
+	for (const pendingAt of ["failure", "replan"]) {
+		test(`a model queued at ${pendingAt} takes priority over a provider replan`, async () => {
+			let queued = false;
+			const policy = { limit: 1, used: 0, shouldChangeModel: () => queued };
+			generate.mockImplementation(async () => {
+				queued = pendingAt === "failure";
+				throw overflow;
+			});
+			const retry = mock(() => {
+				queued = true;
+			});
+			await expect(cascade(entriesFor("ONE", "TWO"), policy, retry)).rejects.toBe(overflow);
+			expect(generate.mock.calls.map((args) => args[5])).toEqual(["old-model"]);
+			expect(policy.used).toBe(0);
+			expect(retry).toHaveBeenCalledTimes(pendingAt === "failure" ? 0 : 1);
+		});
+	}
+
+	test("cancelling a scheduled provider replan avoids both request and charge", async () => {
+		const controller = new AbortController();
+		const policy = { limit: 2, used: 1 };
+		const retry = mock(() => controller.abort());
+		generate.mockRejectedValue(overflow);
+		await expect(
+			cascade(entriesFor("ONE", "TWO"), policy, retry, 40_000, controller.signal),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(generate).toHaveBeenCalledTimes(1);
+		expect(policy.used).toBe(1);
+		expect(retry.mock.calls).toEqual([
+			[{ attempt: 2, maxRetries: 2, delayMs: 0, error: overflow.message }],
+		]);
+	});
+
+	test("a model queued during backoff reaches failover without another old-model request", async () => {
+		const delay = spyOn(errorHandling, "auxiliaryRetryDelayMs").mockReturnValue(1);
+		const error = new Error("429 rate limit");
+		let queued = false;
+		const policy = { limit: 1, used: 0, shouldChangeModel: () => queued };
+		generate.mockRejectedValue(error);
+		const retry = mock(() =>
+			queueMicrotask(() => {
+				queued = true;
+			}),
+		);
+		try {
+			await expect(cascade(entriesFor("text"), policy, retry)).rejects.toBe(error);
+			expect(retry.mock.calls).toEqual([
+				[{ attempt: 1, maxRetries: 1, delayMs: 1, error: error.message }],
+			]);
+			expect(delay.mock.calls).toEqual([[0]]);
+			expect(queued).toBe(true);
+			expect(generate.mock.calls.map((args) => args[5])).toEqual(["old-model"]);
+			expect(policy.used).toBe(0);
+		} finally {
+			delay.mockRestore();
+		}
 	});
 });
 

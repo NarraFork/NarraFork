@@ -1,6 +1,6 @@
 import {
+	type CompactAttempt,
 	type CompactMessageTrigger,
-	normalizeCompactAttempts,
 	parseCompactMessageBlock,
 } from "@shared/compact-message";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
@@ -626,12 +626,12 @@ function compactTriggerFor(
 	return options?.trigger ?? (mode === "background" ? "background" : "manual");
 }
 
-function compactAttemptNumber(message: unknown): number | undefined {
+function latestCompactAttempt(message: unknown): CompactAttempt | undefined {
 	if (!message || typeof message !== "object" || !("contentJson" in message)) return undefined;
-	const contentJson = (message as { contentJson?: unknown }).contentJson;
+	const { contentJson } = message;
 	const blocks = Array.isArray(contentJson) ? contentJson : [];
-	const block = blocks.map(parseCompactMessageBlock).find(Boolean);
-	return block ? normalizeCompactAttempts(block.attempts).at(-1)?.attempt : undefined;
+	const attempts = blocks.map(parseCompactMessageBlock).find(Boolean)?.attempts;
+	return Array.isArray(attempts) ? attempts.at(-1) : undefined;
 }
 
 /** The `before` occupancy a marker already carries, if any. */
@@ -1328,7 +1328,7 @@ async function doRunCustomCompact({
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
 		: undefined;
 	let expectedAttempt = options?.preparedRetryMessage
-		? compactAttemptNumber(options.preparedRetryMessage)
+		? latestCompactAttempt(options.preparedRetryMessage)?.attempt
 		: undefined;
 	let expectedSeq = options?.preparedRetryMessage?.seq;
 
@@ -1372,7 +1372,8 @@ async function doRunCustomCompact({
 			model: selectedModel,
 			contextPercentBefore: options?.contextPercentBefore,
 		}));
-	expectedAttempt = compactAttemptNumber(compactingMsg);
+	const attempt = latestCompactAttempt(compactingMsg);
+	expectedAttempt = attempt?.attempt;
 	expectedSeq = compactingMsg.seq;
 	const lock = compactLocks.get(narratorId);
 	if (lock) lock.messageId = compactingMsg.id;
@@ -1382,7 +1383,8 @@ async function doRunCustomCompact({
 		attempt: expectedAttempt,
 		mode,
 		model: selectedModel,
-		startedAt: compactingMsg.createdAt,
+		// A manual retry reuses the marker, but its elapsed time starts with this attempt.
+		startedAt: attempt?.startedAt,
 		onActivity: hooks?.beat,
 	});
 	let contextWindowSource: ModelContextWindowSource | undefined;

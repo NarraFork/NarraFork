@@ -4,6 +4,8 @@ title: 一次上下文压缩
 summary: 什么时候触发、压缩消息怎么插入、之后的请求从哪开始读。
 anchors:
   - server/services/narrator-compact.ts
+  - server/services/narrator-context.ts
+  - shared/compact-settings.ts
   - server/services/narrator-persistence.ts
   - server/services/narrator-refs-backfill.ts
   - server/services/narrator-session.ts
@@ -18,13 +20,14 @@ keywords:
   - compact
   - compactStart
   - autoCompactKeepPairs
+  - compactMaxRetries
   - compact_done
   - compact_failed
   - 压缩标记
   - 自动压缩
   - 上下文超长
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 一次上下文压缩
 
@@ -40,9 +43,11 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 3. 选边界：`narratorService.getCompactBoundaryMessage(narratorId, getAutoCompactKeepPairs())` 找出保留最近若干对消息之外的压缩边界（保留对数限制在 1–25）；找不到边界就不压缩。手动压缩可带 `beforeMessageId`。
 4. 加锁：`compactLocks` 每个叙述者一把；已有压缩时 blocking 请求等待它并把后台升级为 blocking，`triggerMidTurnCompact` 直接跳过。见 [上下文与压缩](../narrator/context.md)。
 5. 插入标记：`persistCompactingMessage` 在边界处插入一条状态为 compacting 的 system 标记消息，设置 `compacting` 子状态，广播 `message`（标记消息，重试时为 `message_updated`）与 `compacting`，界面显示压缩中。
-6. 生成摘要：`narratorContext.generateCompactSummary` 用摘要模型（`settings.agent.summaryModel` 或调用方指定）读"上次压缩以来"的模型历史，流式输出由 watchdog 监控；超时或停滞判失败。
+6. 生成摘要：`generateLiveCompactSummary` 调用 `narratorContext.generateCompactSummary`。普通和分段压缩共用一个操作级自动重试预算 `agent.compactMaxRetries`（默认 1；0 关闭；-1 不限次数）。首次请求和发送前按本地容量分块不扣额度；模型已拒绝的请求再发送或缩小输入重试，要检查并消耗额度。
+   - 首段思考或摘要输出前可指定替换模型或选择当前会话模型。当前请求成功就保留结果；请求失败则优先用手选模型继续，仅本次生效。退避期间选择新模型，下一请求用新模型，不强制先试旧模型；显式换模不消耗也不重置自动重试额度。
+   - 单次请求 5 分钟无进展时，有待用模型或剩余额度则中止该请求，等它结束后再开始下一次；没有可用恢复路径才判最终失败。30 分钟总时限和用户取消不触发换模或重试。
 7. 分支，成功：在叙述者的变更准入内 `finalizeCompactingMessage` 一个事务里把该引用置 `isCompact = 1`，写 `narrators.contextSummary`，清 `apiConversationId` 与上下文用量快照；随后重置上游会话、标记"历史压缩待应用"，广播 `message_updated`（带压缩后占用估算）与 `compact_done`。标记与摘要状态冲突时报 `COMPACT_FINALIZE_CONFLICT`。
-8. 分支，失败 / 取消 / 超时：标记被定为 failed（带原因）或还原，广播 `compact_failed`，`contextSummary` 不变。
+8. 最终失败时保留带原因和实际模型的失败标记，广播 `compact_failed`；用户取消普通压缩则删除新标记或恢复原失败标记，通过 `compact_done` 结束等待，不写入新摘要。
 9. 之后的请求怎么读：`model-history-query.ts` 查最近一个 `is_compact = 1` 的 `seq` 作为游标，只读 `seq` 大于它、未被分段压缩隐藏、非 `disp` 的消息；摘要不在消息里，而是随 `contextSummary` 进入 `buildSystemPrompt`。见 [模型历史](../narrator/runtime/model-history.md)、[提示词与注入](../narrator/prompts.md)。
 10. 运行中的循环：下一次请求前，`rebuildRequestHistory` / `onBeforeTurn` 钩子重建历史与系统提示词（并 `clearActiveHistoryCompactPending`）；本轮已发出的请求不受影响。
 11. 排队消息：压缩期间用户输入只入队；每次压缩退出（成功、失败、取消、超时）都调 `drainQueuedMessagesAfterCompact` 重查队列并唤醒，见 [一轮对话](turn.md) 的排队分支。
@@ -64,4 +69,4 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - [上下文与压缩](../narrator/context.md)
 - [一轮对话](turn.md)
 - [消息存储](../narrator/messages/index.md)
-- 「未核实」：步骤 6 中摘要模型请求的具体重试层次与 watchdog 时限数值；步骤 10 中钩子在每个请求前被调用的确切条件（只确认了 `rebuildRequestHistory` 在 `buildContextManagementHooks` 里清待应用标记）。
+- 「未核实」：步骤 10 中钩子在每个请求前被调用的确切条件（只确认了 `rebuildRequestHistory` 在 `buildContextManagementHooks` 里清待应用标记）。

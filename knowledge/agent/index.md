@@ -18,7 +18,7 @@ keywords:
   - 凭证池
   - server/lib/agent
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: baa90b20842e4d5280efcd8b80cfcbd72a49596b
 ---
 # 代理运行时
 
@@ -29,6 +29,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 模型发出的 tool_use 由 `tool-executor.ts` 准入、做权限与目标冻结后，在 [工具体系](tools/index.md) 注册的工具里执行；文件和命令类工具通过 [执行后端](execution.md) 落到本机或远程设备，且远程不可用时不回退本机。可选工具、MCP 工具与按需加载由前缀保持机制处理，MCP 见 [MCP 集成](mcp.md)。
 - 委派给 [子代理](subagents.md) 时，只是创建另一条叙述者记录并按模板收紧能力上限，嵌套最多两层；[程序化执行与沙箱](programmatic.md) 目前只有 Eval 工具使用（默认关闭）。
 - 每次请求结束，[用量与费用](usage.md) 在一个事务里写明细与汇总。
+- 摘要等辅助调用通过 `summaryGenerate`；[上下文压缩](../flows/compaction.md)显式接管自动重试预算时，普通错误与 reasoning 强制开启的拒绝都交回压缩层处理。其他辅助调用保留原重试规则。
 
 ## 下面有什么
 
