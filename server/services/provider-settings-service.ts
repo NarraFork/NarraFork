@@ -137,9 +137,9 @@ export class ProviderSettingsService {
 		} catch {
 			return;
 		}
-		if (settings.customApiProviders.length > 1024)
-			unavailable("PROVIDER_SETTINGS_LIMIT_EXCEEDED", 413);
-		const providers = [...settings.customApiProviders];
+		const source = settings.customApiProviders ?? [];
+		if (source.length > 1024) unavailable("PROVIDER_SETTINGS_LIMIT_EXCEEDED", 413);
+		const providers = [...source];
 		for (const provider of providers) beginQuotaSettingsProjection(provider);
 		for (const provider of providers) {
 			if (this.closing) return;

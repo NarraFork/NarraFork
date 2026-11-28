@@ -987,7 +987,7 @@ async function buildSettingsResponse(
 	const admin = extra?.admin === true;
 	source = {
 		...source,
-		customApiProviders: source.customApiProviders.map((provider) => ({ ...provider })),
+		customApiProviders: (source.customApiProviders ?? []).map((provider) => ({ ...provider })),
 	};
 	await projectQuotaSettingsInto(source);
 	const codexManager = getCodexManager();

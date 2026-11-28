@@ -9,11 +9,13 @@ import {
 	QuotaSmokeContext,
 } from "../../scripts/smoke-provider-quota";
 import {
+	detectUpgradeBaseline,
 	sameSmokeFile,
 	upgradeBuildReady,
 	upgradeOptions,
 	verifyReplacementGrants,
 	verifyRetainedGrants,
+	verifyUpgradeKeyState,
 } from "../../scripts/smoke-provider-quota-upgrade";
 
 const args = ["--binary=original.exe", "--archive=quota.nfplugin", "--out=evidence"];
@@ -48,6 +50,70 @@ describe("original-host upgrade acceptance", () => {
 			[candidate, "--skip-browser"],
 		])
 			expect(() => upgradeOptions([...args, ...extra])).toThrow();
+	});
+	test("discovers the actual baseline package without guessing from the commit", () => {
+		const legacyPlugin = {
+			pluginId: "com.narrafork.apikey-quota",
+			current: { version: "1.0.0" },
+			builtin: true,
+			desiredState: "enabled",
+		};
+		const replacement = {
+			pluginId: "io.narrafork.provider-quota",
+			current: { version: "1.0.3" },
+			runtimeState: "active",
+			desiredState: "enabled",
+		};
+		expect(detectUpgradeBaseline(legacyPlugin, null)).toMatchObject({
+			pluginId: legacyPlugin.pluginId,
+			legacyBaseline: true,
+		});
+		expect(detectUpgradeBaseline(null, replacement)).toMatchObject({
+			pluginId: replacement.pluginId,
+			legacyBaseline: false,
+		});
+		expect(detectUpgradeBaseline(null, null)).toBeUndefined();
+		expect(
+			detectUpgradeBaseline({ ...legacyPlugin, desiredState: "disabled" }, null),
+		).toBeUndefined();
+		expect(() => detectUpgradeBaseline(legacyPlugin, replacement)).toThrow(
+			"both quota plugin identities",
+		);
+		expect(() =>
+			detectUpgradeBaseline(null, { ...replacement, current: { version: "9.0.0" } }),
+		).toThrow("Unsupported baseline");
+	});
+	test("credential migration permits only the expected billing ID mapping and keeps the spare", () => {
+		const original = [
+			{ id: "old-primary", label: "primary", priority: 0, disabled: false },
+			{ id: "spare", label: "spare", priority: 1, disabled: true },
+		];
+		const migrated = [{ ...original[0], id: "provider-id" }, { ...original[1] }];
+		expect(() => verifyUpgradeKeyState(original, migrated, "provider-id")).not.toThrow();
+		expect(() =>
+			verifyUpgradeKeyState(original, structuredClone(original), "old-primary"),
+		).not.toThrow();
+		for (const change of [
+			"primary",
+			"spare",
+			"order",
+			"disabled",
+			"label",
+			"network",
+			"secret",
+			"removed",
+		] as const) {
+			const broken: Array<Record<string, unknown>> = structuredClone(migrated);
+			if (change === "primary") broken[0].id = "unexpected-primary";
+			if (change === "spare") broken[1].id = "unexpected-spare";
+			if (change === "order") broken.reverse();
+			if (change === "disabled") broken[1].disabled = false;
+			if (change === "label") broken[0].label = "other";
+			if (change === "network") broken[0].network = { proxy: { mode: "direct" } };
+			if (change === "secret") broken[0].apiKey = "exposed";
+			if (change === "removed") broken.pop();
+			expect(() => verifyUpgradeKeyState(original, broken, "provider-id")).toThrow();
+		}
 	});
 	test("startup liveness and recovery cannot be mistaken for the candidate build", () => {
 		const build = { version: "0.9.15", commit: "123456789" };
@@ -97,7 +163,8 @@ describe("original-host upgrade acceptance", () => {
 			resolve("unused-upgrade-home"),
 		);
 		context.token = "fixture-token";
-		const browser = new QuotaBrowserSmoke(context, "unused-narrator");
+		const localeContexts = new Map<"en" | "zh-CN", BrowserContext>();
+		const browser = new QuotaBrowserSmoke(context, "unused-narrator", localeContexts);
 		const seeded: unknown[][] = [];
 		const page = {
 			setDefaultTimeout() {},
@@ -112,7 +179,7 @@ describe("original-host upgrade acceptance", () => {
 				seeded.push(values);
 			},
 		} as unknown as Page;
-		browser.localeContexts.set("zh-CN", {
+		localeContexts.set("zh-CN", {
 			async newPage() {
 				return page;
 			},

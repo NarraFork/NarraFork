@@ -21,6 +21,7 @@ import { logger } from "../logger";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	getProviderKeyStore,
+	isCustomApiKeyOwner,
 	nugKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../provider-keys";
@@ -135,6 +136,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 */
 	onRequestStart?: (info?: {
 		credentialId?: string;
+		/** Host-only exact Custom API key, independent of the billing group id. */
+		quotaCredentialId?: string;
 		validateDiagnosticCredential?: () => boolean;
 	}) => void;
 	/** Host-local capture at key selection, before request preparation can yield. */
@@ -548,7 +551,11 @@ function registerCredentialProviderSource<
 			const protocolVersion = resolveModelProtocol(prefix, model);
 			// A single-credential connection is billed to the connection itself.
 			const adapter: ProviderAdapter = plain
-				? reportCredentialId(adapterFor(prefix, model, selectedConfig), config.id)
+				? reportCredentialId(
+						adapterFor(prefix, model, selectedConfig),
+						config.id,
+						isCustomApiKeyOwner(owner) ? { providerId: owner, keyId: keys[0]?.id } : undefined,
+					)
 				: new PooledProvider(
 						owner,
 						(key) => adapterFor(prefix, model, withProviderKey(config, key)),

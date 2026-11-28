@@ -69,6 +69,11 @@ function setProviders(providers: ReturnType<typeof provider>[]) {
 	next.codex = undefined;
 	saveSettings(next);
 }
+function savedProviders() {
+	const providers = settings.customApiProviders;
+	if (!providers) throw new Error("missing custom provider collection");
+	return providers;
+}
 function resetRows() {
 	for (const table of [
 		"plugin_provider_settings",
@@ -157,9 +162,7 @@ describe("provider extensions in portable archives", () => {
 		const preview = await previewImport(bytes(zip), "move.zip");
 		const result = await applyImport(preview.token, { include: selection, passphrase });
 		expect(result.providerSettingsImported).toBe(1);
-		const imported = settings.customApiProviders.find(
-			(p) => p.baseUrl === "https://source.invalid/v1",
-		);
+		const imported = savedProviders().find((p) => p.baseUrl === "https://source.invalid/v1");
 		if (!imported) throw Error("missing imported provider");
 		expect(imported.id).not.toBe("source-id");
 		expect(await store.getSetting(address("source-id"))).toEqual(local);
@@ -203,7 +206,7 @@ describe("provider extensions in portable archives", () => {
 			providerSettingsSkipped: 0,
 			providerSettingsConflicts: 0,
 		});
-		expect(settings.customApiProviders.map((p) => p.id)).toEqual(["local-id"]);
+		expect(savedProviders().map((p) => p.id)).toEqual(["local-id"]);
 		expect(await store.getSetting(address("source-id"))).toBeNull();
 		const row = await store.getSetting(address("local-id"));
 		if (!row) throw Error("missing merged extension");
@@ -335,7 +338,7 @@ describe("provider extensions in portable archives", () => {
 		});
 		expect(tombstone?.installationId).toMatch(/^import-/);
 		expect(await store.getSetting(address("different-local-id"))).toBeNull();
-		expect(settings.customApiProviders.map((p) => p.id)).toEqual(["different-local-id"]);
+		expect(savedProviders().map((p) => p.id)).toEqual(["different-local-id"]);
 		expect(settings.nugProviders).toHaveLength(0);
 		expect(settings.codex).toBeUndefined();
 		expect(settings.commandCode).toBeUndefined();

@@ -713,7 +713,9 @@ describe("Codex saved identity projections", () => {
 		const exporting = spyOn(manager, "exportForTransfer").mockImplementation(noRead);
 		const enumerate = spyOn(manager, "listProviderSettingsIdentities").mockImplementation(noRead);
 		const acquire = spyOn(manager, "acquireContext").mockImplementation(noRead);
-		const fetch = spyOn(globalThis, "fetch").mockImplementation(noRead);
+		const fetch = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(() => noRead(), { preconnect: noRead }),
+		);
 		const targets = directory({}, undefined, { getCodexManager: () => manager });
 		expect(targets.resolve("platform", codexProviderSettingsTargetId("saved-a"))).toMatchObject({
 			status: "disabled",

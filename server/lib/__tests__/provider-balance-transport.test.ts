@@ -96,6 +96,8 @@ function createBalanceRequest(
 	return createRelayRequest(
 		params,
 		async (request, requestSignal) => {
+			if (typeof request === "string" || !(requestSignal instanceof AbortSignal))
+				throw new Error("Transport fixture requires a legacy provider connection request");
 			try {
 				return await service.request(request, principal, requestSignal);
 			} catch (error) {

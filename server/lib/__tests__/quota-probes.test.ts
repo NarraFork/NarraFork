@@ -1,5 +1,5 @@
 /** Plugin queries own quota normalization; legacy views and routing read the same service snapshot. */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { type CustomApiQuotaTarget, providerQuotaSourceSchema } from "@shared/provider-quota";
@@ -11,11 +11,12 @@ import {
 	QUOTA_PROTOCOL_VERSION,
 	type QuotaErrorCode,
 } from "../../../plugins/provider-quota/src/protocol";
-import { queryQuota, QUOTA_SOURCES } from "../../../plugins/provider-quota/src/query";
+import { QUOTA_SOURCES, queryQuota } from "../../../plugins/provider-quota/src/query";
 import { PluginProviderConnectionService } from "../../services/plugin-provider-connection-service";
 import { parsePersistedProviderQuota } from "../../services/provider-quota-persistence";
 import {
 	type ProviderQuotaServiceOptions,
+	providerQuotaService,
 	toQuotaSnapshot,
 } from "../../services/provider-quota-service";
 import {
@@ -44,6 +45,8 @@ import { getProviderKeyStore } from "../provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../settings";
 import { readQuotaSnapshots, refreshQuotaSnapshots } from "../sourcing/quota-snapshots";
 import {
+	archivedQuotaFixture,
+	closeQuotaTestPackage,
 	deferred,
 	legacyQuotaFixture,
 	required,
@@ -262,10 +265,17 @@ describe("plugin snapshot persistence", () => {
 			expect(restored.service.peekKey(restored.keyId)?.data).toBeNull();
 			getProviderKeyStore().update(restored.keyId, { apiKey: "sk-one" });
 			expect(restored.service.peekKey(restored.keyId)?.data).toEqual(observed.data);
+			expect(restored.query).not.toHaveBeenCalled();
+			const pending = deferred<Response>();
+			respond = () => pending.promise;
 			restored.source.revision = "revision-2";
 			restored.service.invalidateSources();
 			expect(restored.service.peekKey(restored.keyId)?.data).toBeNull();
-			expect(restored.query).not.toHaveBeenCalled();
+			expect(restored.query).toHaveBeenCalledTimes(1);
+			expect(restored.query.mock.calls[0]?.[0].revision).toBe("revision-2");
+			pending.resolve(new Response(null, { status: 500 }));
+			await restored.service.refreshKey(restored.keyId);
+			expect(restored.service.peekKey(restored.keyId)?.data).toBeNull();
 		});
 	}
 });
@@ -284,7 +294,7 @@ describe("Kimi Code plugin quota", () => {
 			sourceId: `${PLUGIN_ID}/kimi`,
 			status: "supported",
 		});
-		expect(observed.generation).toBe(f.directory.getKey(f.keyId)?.target.generation);
+		expect(observed.generation).toBe(required(f.directory.getKey(f.keyId)).target.generation);
 		expect(snapshot.scope).toBe("subscription");
 		expect(snapshot.error).toBeUndefined();
 		expect(snapshot.windows).toEqual([
@@ -675,10 +685,11 @@ describe("relay and site plugin quota", () => {
 		f.source.declaration = providerQuotaSourceSchema.parse(
 			QUOTA_SOURCES.find((source) => source.id === "kimi"),
 		);
-		f.service.invalidateSources();
-		expect(providerBalanceCache.peek(config.id)?.balance).toBeNull();
-		expect(f.service.peekKey(f.keyId)?.generation).not.toBe(generation);
 		respond = async () => Response.json(kimiBody);
+		f.service.invalidateSources();
+		expect(providerBalanceCache.peek(config.id)).toBeNull();
+		expect(f.service.peekKey(f.keyId)?.data).toBeNull();
+		expect(f.service.peekKey(f.keyId)?.generation).not.toBe(generation);
 		await f.service.refreshKey(f.keyId);
 		expect(toQuotaSnapshot(f.service.peekKey(f.keyId))?.scope).toBe("subscription");
 		saved(config.id).baseUrl = config.baseUrl;
@@ -722,36 +733,46 @@ describe("relay and site plugin quota", () => {
 			quotaAccessToken: "site-token",
 			quotaUserId: "42",
 		};
-		const f = pluginFixture(config, "relay");
-		respond = async () =>
-			Response.json({
-				success: true,
-				data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" },
-			});
-		const observed = required(await f.service.refresh(config.id));
-		const snapshot = required(toQuotaSnapshot(observed));
-		expect(observed).toMatchObject({
-			providerId: config.id,
-			pushCompatible: false,
-			status: "supported",
+		const f = await archivedQuotaFixture({
+			fetch: async () =>
+				Response.json({
+					success: true,
+					data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" },
+				}),
 		});
-		expect(observed.keyId).toBeUndefined();
-		expect(snapshot.scope).toBe("wallet");
-		expect(snapshot.plan).toBe("vip");
-		expect(snapshot.balances).toMatchObject([
-			{ id: "amount:0", unit: "USD", remaining: 10, total: 12 },
-		]);
-		for (const admin of [false, true]) {
-			const entries = readQuotaSnapshots(admin, false).entries.filter(
-				(entry) => entry.groupId === config.id,
-			);
-			expect(entries).toHaveLength(1);
-			expect(entries[0]).toMatchObject({
-				credentialId: null,
-				primary: true,
-				source: "probe",
-				generation: observed.generation,
+		try {
+			const observed = required(await f.query(config));
+			const snapshot = required(toQuotaSnapshot(observed));
+			expect(observed).toMatchObject({
+				providerId: config.id,
+				pushCompatible: false,
+				status: "supported",
 			});
+			expect(observed.keyId).toBeUndefined();
+			expect(snapshot.scope).toBe("wallet");
+			expect(snapshot.plan).toBe("vip");
+			expect(snapshot.balances).toMatchObject([
+				{ id: "amount:0", unit: "USD", remaining: 10, total: 12 },
+			]);
+			spyOn(providerQuotaService, "peek").mockImplementation((id) => f.service.peek(id));
+			for (const admin of [false, true]) {
+				const entries = readQuotaSnapshots(admin, false).entries.filter(
+					(entry) => entry.groupId === config.id,
+				);
+				expect(entries).toHaveLength(1);
+				expect(entries[0]).toMatchObject({
+					credentialId: null,
+					primary: true,
+					source: "probe",
+					generation: observed.generation,
+				});
+			}
+		} finally {
+			try {
+				await f.close();
+			} finally {
+				await closeQuotaTestPackage();
+			}
 		}
-	});
+	}, 60_000);
 });

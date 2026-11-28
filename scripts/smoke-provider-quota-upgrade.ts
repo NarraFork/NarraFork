@@ -305,12 +305,33 @@ async function screenshot(
 async function legacyBalance(c: QuotaSmokeContext, provider: string, remaining: number) {
 	const result = await c.http(`/api/provider-balances/${provider}/probe`, { method: "POST" });
 	insist(result.ok || result.status === 429, "Legacy quota probe rejected saved provider");
+	let unified = false;
 	await c.wait("old saved account quota", async () => {
-		const snapshot = (await json(c, `/api/provider-balances?providerId=${provider}`))[provider];
-		if (!snapshot || row(snapshot).status !== "supported") return undefined;
-		return rows(row(row(snapshot).balance).amounts).some(
-			(a) => a.unit === "USD" && a.remaining === remaining,
-		)
+		if (!unified) {
+			const response = await c.http(`/api/provider-balances?providerId=${provider}`);
+			if (response.status === 404) unified = true;
+			else {
+				insist(response.ok, "Legacy balance read failed");
+				const snapshot = row(response.body)[provider];
+				if (!snapshot || row(snapshot).status !== "supported") return undefined;
+				return rows(row(row(snapshot).balance).amounts).some(
+					(a) => a.unit === "USD" && a.remaining === remaining,
+				)
+					? true
+					: undefined;
+			}
+		}
+		const page = await json(c, `/api/quota-snapshots?groupId=${provider}`);
+		return rows(page.entries).some((entry) => {
+			if (entry.groupId !== provider || entry.source !== "probe" || !entry.snapshot) return false;
+			const snapshot = row(entry.snapshot);
+			return (
+				!snapshot.error &&
+				rows(snapshot.balances).some(
+					(balance) => balance.unit === "USD" && balance.remaining === remaining,
+				)
+			);
+		})
 			? true
 			: undefined;
 	});
@@ -490,6 +511,46 @@ async function verifyReinstallAndEdits(
 	c.check(c.stage);
 }
 
+export function detectUpgradeBaseline(legacy: Row | null, current: Row | null) {
+	insist(!(legacy && current), "Baseline contains both quota plugin identities");
+	const plugin = legacy ?? current;
+	if (!plugin) return undefined;
+	const legacyBaseline = legacy !== null;
+	const version = plugin.current ? row(plugin.current).version : plugin.version;
+	insist(version === (legacyBaseline ? "1.0.0" : "1.0.3"), "Unsupported baseline quota package");
+	if (
+		plugin.desiredState !== "enabled" ||
+		(legacyBaseline ? plugin.builtin !== true : plugin.runtimeState !== "active")
+	)
+		return undefined;
+	return { pluginId: legacyBaseline ? LEGACY : QUOTA, legacyBaseline, version, plugin };
+}
+
+/** The fixture has one enabled plain primary and one disabled spare. Only its billing ID changes. */
+export function verifyUpgradeKeyState(original: Row[], current: Row[], primaryId: string): void {
+	insist(original.length === 2 && current.length === 2, "Key count changed");
+	insist(
+		original[0]?.disabled === false && original[1]?.disabled === true,
+		"Invalid original key fixture",
+	);
+	insist(
+		current[0]?.id === primaryId && current[1]?.id === original[1]?.id,
+		"Migrated key identity differs from the expected billing mapping",
+	);
+	insist(current[0]?.id !== current[1]?.id, "Migrated keys share an identity");
+	for (let index = 0; index < original.length; index++) {
+		const before = original[index],
+			after = current[index];
+		insist(before && after && after.apiKey === undefined, "Public key response exposed a secret");
+		for (const field of ["label", "priority", "disabled"])
+			insist(after[field] === before[field], `Key ${field} or order changed`);
+		insist(
+			JSON.stringify(after.network ?? {}) === JSON.stringify(before.network ?? {}),
+			"Key network configuration changed",
+		);
+	}
+}
+
 async function exercise(
 	c: QuotaSmokeContext,
 	choice: Choice,
@@ -501,36 +562,24 @@ async function exercise(
 	c.report.artifacts.candidate = next;
 	c.report.artifacts.choice = choice;
 	c.report.expectedVersion = "1.0.4";
-	const legacyBaseline = old.commit.startsWith("7a77c8306");
-	const baselineId = legacyBaseline ? LEGACY : QUOTA;
-	c.report.artifacts.baselinePlugin = baselineId;
 	c.stage = "original binary and original bundled plugin";
 	await buildIdentity(c, old);
-	const p = await c.wait(
+	const baseline = await c.wait(
 		"original bundled plugin initialized",
 		async () => {
-			const response = await c.http(`/api/plugins/${baselineId}`);
-			if (response.status === 404) return undefined;
-			insist(response.ok, "Original plugin status failed");
-			const plugin = row(response.body);
-			return plugin.desiredState === "enabled" &&
-				(legacyBaseline ? plugin.builtin === true : plugin.runtimeState === "active")
-				? plugin
-				: undefined;
+			const read = async (id: string) => {
+				const response = await c.http(`/api/plugins/${id}`);
+				if (response.status === 404) return null;
+				insist(response.ok, "Original plugin status failed");
+				return row(response.body);
+			};
+			const [legacy, current] = await Promise.all([read(LEGACY), read(QUOTA)]);
+			return detectUpgradeBaseline(legacy, current);
 		},
 		90000,
 	);
-	insist(
-		p.desiredState === "enabled" &&
-			(p.version === (legacyBaseline ? "1.0.0" : "1.0.3") ||
-				(p.current && row(p.current).version === (legacyBaseline ? "1.0.0" : "1.0.3"))),
-		"Missing baseline bundled plugin",
-	);
-	if (legacyBaseline)
-		insist(
-			(await c.http(`/api/plugins/${QUOTA}`)).status === 404,
-			"Baseline already contains replacement",
-		);
+	const { legacyBaseline, pluginId: baselineId } = baseline;
+	c.report.artifacts.baselinePlugin = baselineId;
 	const oldGrants = await json(c, `/api/plugins/${baselineId}/grants`);
 	insist(
 		rows(oldGrants.grants)
@@ -594,6 +643,23 @@ async function exercise(
 		row((await json(c, keyPath, "POST", { apiKey: reserveKey, label: "Upgrade spare" })).key).id,
 	);
 	await json(c, `/api/provider-keys/key/${spare}`, "PATCH", { disabled: true });
+	const originalKeys = rows((await json(c, keyPath)).keys);
+	insist(
+		originalKeys[0]?.id === first && originalKeys[1]?.id === spare,
+		"Original key order differs from the fixture",
+	);
+	const alreadyUnified = await lstat(join(c.env.NARRAFORK_HOME, "credentials.json")).then(
+		(stat) => {
+			insist(stat.isFile() && !stat.isSymbolicLink(), "Invalid original credential store");
+			return true;
+		},
+		(error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") return false;
+			throw error;
+		},
+	);
+	const migratedPrimaryId = alreadyUnified ? first : RELAY;
+	let migratedCredentials = false;
 	await json(c, `/api/openai/providers/${RELAY}/models/refresh`, "POST");
 	const title = "额度升级验收会话";
 	const narrator = text(
@@ -625,15 +691,7 @@ async function exercise(
 			"Migrated settings lost identities or disclosed secrets",
 		);
 		const keys = rows((await json(c, keyPath)).keys);
-		insist(
-			keys.length === 2 &&
-				keys[0]?.id === first &&
-				keys[0].disabled === false &&
-				keys[1]?.id === spare &&
-				keys[1].disabled === true &&
-				keys.every((k) => k.apiKey === undefined),
-			"Key order, identity or disabled choice changed",
-		);
+		verifyUpgradeKeyState(originalKeys, keys, migratedCredentials ? migratedPrimaryId : first);
 	};
 	await draftPrefs();
 	await legacyBalance(c, RELAY, 12.34);
@@ -698,7 +756,7 @@ async function exercise(
 		);
 		const element = legacyRow.asElement();
 		insist(element, "Legacy plugin row was not rendered for the signed-in session");
-		await element.click();
+		await (await element.toElement("tr")).click();
 		await page.waitForFunction(
 			(id) => location.pathname === `/settings/plugins/${id}`,
 			{ polling: 100 },
@@ -775,7 +833,7 @@ async function exercise(
 					);
 					if (pid === RELAY) {
 						assertQuotaSnapshot(v, value);
-						insist(v.keyId === first, "Wrong key subject");
+						insist(v.keyId === migratedPrimaryId, "Wrong migrated credential subject");
 					} else
 						insist(
 							v.keyId === undefined &&
@@ -852,6 +910,13 @@ async function exercise(
 		);
 		return undefined;
 	};
+	migratedCredentials = true;
+	c.report.artifacts.credentialIdentityMapping = {
+		alreadyUnified,
+		originalPrimary: first,
+		currentPrimary: migratedPrimaryId,
+		spare,
+	};
 	await c.start();
 	const installed = await verify();
 	c.check(c.stage, { sameDatabase: true, originalSessionAccepted: true, choice });
@@ -918,11 +983,7 @@ export async function smokeQuotaUpgrade(args: readonly string[]) {
 	const { candidate, ...options } = upgradeOptions(args);
 	const old = await artifact(options.binary),
 		next = await artifact(candidate);
-	insist(
-		old.sha256 !== next.sha256 &&
-			(old.commit.startsWith("7a77c8306") || old.commit.startsWith("cfd067361")),
-		"Expected one of the two unmodified baseline builds and a distinct candidate binary",
-	);
+	insist(old.sha256 !== next.sha256, "Upgrade requires two distinct verified executable builds");
 	const { mkdir } = await import("node:fs/promises");
 	await mkdir(options.out, { mode: 0o700 });
 	for (const choice of CHOICES) {

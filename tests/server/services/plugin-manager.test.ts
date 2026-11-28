@@ -2242,6 +2242,7 @@ describe("PluginManager", () => {
 			},
 		});
 		const installed = await manager.install(fixture.source);
+		if (!installed.current) throw new Error("Missing installed package reference fixture");
 		await manager.enable(pluginId);
 		const starts = spyOn(supervisor, "start");
 		const work = manager.activate(pluginId).then(
@@ -2316,6 +2317,7 @@ describe("PluginManager", () => {
 			expect(hostInstall).not.toHaveBeenCalled();
 			refuseWorker = false;
 			const installed = await manager.install(source);
+			if (!installed.current) throw new Error("Missing installed package reference fixture");
 			await manager.enable(pluginId);
 			const pointer = (await manager.packageStore.readCurrent()).plugins[pluginId];
 			const stagingBefore = await readdir(join(manager.root, "staging"));
@@ -3926,7 +3928,9 @@ describe("host bundled plugin defaults", () => {
 				fixture.descriptor,
 			],
 			{
-				startQuota: () => events.push("quota.start"),
+				startQuota: () => {
+					events.push("quota.start");
+				},
 				onBootstrapError: () => events.push("bootstrap.error"),
 			},
 		);
@@ -3968,7 +3972,9 @@ describe("host bundled plugin defaults", () => {
 			return snapshot;
 		});
 		const startup = initializePluginServices(manager, [fixture.descriptor], {
-			startQuota: () => events.push("quota.start"),
+			startQuota: () => {
+				events.push("quota.start");
+			},
 			onBootstrapError: () => events.push("bootstrap.error"),
 		});
 		try {

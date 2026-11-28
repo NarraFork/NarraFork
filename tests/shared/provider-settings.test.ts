@@ -56,7 +56,7 @@ describe("saved provider settings declaration", () => {
 			action: { title: "Inspect", i18n: { "zh-CN": { title: "检查" } } },
 		});
 		const parsed = providerSettingsContributionSchema.parse(input);
-		expect(parsed).toEqual(input);
+		expect(input).toEqual(parsed);
 		expect(parsed.connections).toBeUndefined();
 		expect(providerSettingsContributionSchema.shape.id.safeParse("sample.action").success).toBe(
 			true,

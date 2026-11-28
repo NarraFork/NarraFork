@@ -89,7 +89,7 @@ async function migrate(
 	if (existing) {
 		// An explicit save/import/deletion is newer user intent. Never overwrite it from backup.
 		if (existing.state !== "deleted") openProviderSetting(existing);
-		const provider = settings.customApiProviders.find((item) => item.id === input.providerId);
+		const provider = settings.customApiProviders?.find((item) => item.id === input.providerId);
 		if (!provider) return fail();
 		publishQuotaSettings(provider, existing);
 		return;
@@ -99,7 +99,7 @@ async function migrate(
 	)
 		return fail();
 	if (receipt) return fail(); // Missing data with a durable receipt is not a fresh installation.
-	const provider = settings.customApiProviders.find((value) => value.id === input.providerId);
+	const provider = settings.customApiProviders?.find((value) => value.id === input.providerId);
 	const keys = getProviderKeyStore();
 	if (!provider || !keys.readable) return fail();
 	const tokens = keys.list(quotaKeyOwner(input.providerId));
@@ -162,7 +162,7 @@ async function migrate(
 			{
 				signal: input.signal,
 				assertCurrent: () => {
-					const current = settings.customApiProviders.find(
+					const current = settings.customApiProviders?.find(
 						(value) => value.id === input.providerId,
 					);
 					if (!current || !keys.readable) return fail();

@@ -61,7 +61,9 @@ describe("CodexManager provider settings identities without any host startup", (
 		const snapshot = spyOn(manager, "snapshot").mockImplementation(forbidden);
 		const exporting = spyOn(manager, "exportForTransfer").mockImplementation(forbidden);
 		const acquire = spyOn(manager, "acquireContext").mockImplementation(forbidden);
-		const fetch = spyOn(globalThis, "fetch").mockImplementation(forbidden);
+		const fetch = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(() => forbidden(), { preconnect: forbidden }),
+		);
 		const raw = (manager as unknown as { entries: CodexCredential[] }).entries[0];
 		raw.displayName = JSON.stringify({ apiKey: SECRET });
 		const secretRead = mock(forbidden);

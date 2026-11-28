@@ -6,9 +6,9 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
-import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import { buildProviderQuotaView } from "./provider-quota-view";
 import { QuotaPanelIndicator, useQuotaNow } from "./QuotaPanelIndicator";
 import { formatQuotaBadgeText } from "./quota-panel-view";
@@ -222,10 +222,19 @@ test("account replacement hides an already open old panel before the new snapsho
 test("quota expiry updates idle consumers on one clock and releases the last subscription", async () => {
 	let tick: (() => void) | undefined;
 	const time = spyOn(Date, "now").mockReturnValue(NOW);
-	const interval = spyOn(globalThis, "setInterval").mockImplementation((callback) => {
-		tick = callback as () => void;
-		return 123 as unknown as ReturnType<typeof setInterval>;
-	});
+	const nativeInterval = globalThis.setInterval;
+	const nativeClear = globalThis.clearInterval;
+	const interval = spyOn(globalThis, "setInterval").mockImplementation(((
+		callback: () => void,
+		delay?: number,
+	) => {
+		expect(delay).toBe(30_000);
+		tick = callback;
+		// Keep the runtime's timer handle; advance the clock only through the captured callback.
+		const timer = nativeInterval(callback, delay);
+		nativeClear(timer);
+		return timer;
+	}) as typeof setInterval);
 	const clear = spyOn(globalThis, "clearInterval").mockImplementation(() => {});
 	const data = snapshot();
 	if (!data.data) throw new Error("Missing quota fixture");
@@ -258,6 +267,7 @@ test("quota expiry updates idle consumers on one clock and releases the last sub
 		expect(clear).not.toHaveBeenCalled();
 		await act(async () => root.render(null));
 		expect(clear).toHaveBeenCalledTimes(1);
+		expect(clear).toHaveBeenCalledWith(interval.mock.results[0]?.value);
 	} finally {
 		await act(async () => root.render(null));
 		clear.mockRestore();

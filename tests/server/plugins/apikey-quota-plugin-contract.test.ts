@@ -63,7 +63,7 @@ describe("archived quota manifest and credential-free contract", () => {
 		expect(manifest.contributes.commands).toEqual([]);
 		expect(manifest.contributes.providers).toEqual([]);
 		expect(manifest.contributes.providerSettings).toHaveLength(1);
-		expect(manifest.contributes.providerSettings[0]?.id).toBe("site-account");
+		expect(manifest.contributes.providerSettings?.[0]?.id).toBe("site-account");
 		expect(manifest.contributes.quotaSources).toHaveLength(4);
 		expect(manifest.contributes.quotaSources.map(({ id }) => id).sort()).toEqual([
 			"deepseek",

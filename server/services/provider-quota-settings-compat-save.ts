@@ -80,7 +80,7 @@ function coreInput(provider: ReturnType<typeof inputOf>) {
 	return core;
 }
 function currentInput(id: string) {
-	const p = settings.customApiProviders.find((p) => p.id === id);
+	const p = settings.customApiProviders?.find((p) => p.id === id);
 	if (!p) return undefined;
 	const store = getProviderKeyStore();
 	if (!store.readable)
@@ -183,11 +183,11 @@ export async function projectQuotaSettingsInto(
 ): Promise<void> {
 	const store = await getPluginSettingsStore();
 	for (const provider of source.customApiProviders ?? []) {
-		const original = settings.customApiProviders.find((p) => p.id === provider.id);
+		const original = settings.customApiProviders?.find((p) => p.id === provider.id);
 		await recoverQuotaCompatibilitySave(provider.id, store, repairFiles);
 		// Admin recovery may have repaired core files after the caller cloned its baseline.
 		if (repairFiles) {
-			const saved = settings.customApiProviders.find((p) => p.id === provider.id);
+			const saved = settings.customApiProviders?.find((p) => p.id === provider.id);
 			if (saved && saved !== original) Object.assign(provider, saved);
 		}
 		const row = await store.getSetting(address(provider.id));
@@ -214,7 +214,7 @@ export async function beginQuotaCompatibilitySave(
 	let store: PluginSettingsStore;
 	try {
 		for (const id of new Set(
-			[...before.customApiProviders, ...next.customApiProviders].map((p) => p.id),
+			[...(before.customApiProviders ?? []), ...(next.customApiProviders ?? [])].map((p) => p.id),
 		)) {
 			assertQuotaCompatibilityIdle(id);
 			inFlight.add(id);
@@ -222,7 +222,7 @@ export async function beginQuotaCompatibilitySave(
 		}
 		store = await getPluginSettingsStore();
 		for (const provider of next.customApiProviders ?? []) {
-			const previous = before.customApiProviders.find((p) => p.id === provider.id);
+			const previous = before.customApiProviders?.find((p) => p.id === provider.id);
 			await recover(provider.id, store);
 			const row = await store.getSetting(address(provider.id));
 			if (!row) {
@@ -422,7 +422,7 @@ async function recover(
 	if (!row) return pendingError();
 	if (row.state !== "deleted") openProviderSetting(row);
 	const publish = () => {
-		const provider = settings.customApiProviders.find((p) => p.id === providerId);
+		const provider = settings.customApiProviders?.find((p) => p.id === providerId);
 		if (provider) publishQuotaSettings(provider, row);
 	};
 	if (
@@ -440,8 +440,9 @@ async function recover(
 		return;
 	}
 	if (row.revision !== journal.expectedSettingsRevision) return pendingError();
-	let current = currentInput(providerId),
-		fingerprint = digest(current);
+	let current = currentInput(providerId);
+	if (!current) return pendingError();
+	let fingerprint = digest(current);
 	if (fingerprint === journal.before && fingerprint !== journal.after) {
 		await retire(store, operation, journal);
 		publish();
@@ -465,11 +466,12 @@ async function recover(
 		)
 			return pendingError();
 		const next = structuredClone(settings),
-			provider = next.customApiProviders.find((p) => p.id === providerId);
+			provider = next.customApiProviders?.find((p) => p.id === providerId);
 		if (!provider) return pendingError();
 		Object.assign(provider, journal.next);
 		saveSettings(next);
 		current = currentInput(providerId);
+		if (!current) return pendingError();
 		fingerprint = digest(current);
 		if (fingerprint !== journal.after) return pendingError();
 	}
@@ -494,12 +496,13 @@ async function recover(
 				},
 			},
 			assertCurrent: () => {
-				if (digest(currentInput(providerId)) !== journal.after) pendingError();
+				const current = currentInput(providerId);
+				if (!current || digest(current) !== journal.after) pendingError();
 			},
 		},
 	);
 	const verified = await store.getSetting(address(providerId)),
-		provider = settings.customApiProviders.find((p) => p.id === providerId);
+		provider = settings.customApiProviders?.find((p) => p.id === providerId);
 	if (!verified || !provider) return pendingError();
 	openProviderSetting(verified);
 	publishQuotaSettings(provider, verified);

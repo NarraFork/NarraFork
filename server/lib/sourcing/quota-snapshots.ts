@@ -435,30 +435,39 @@ export function refreshQuotaSnapshots(
 	filter: QuotaRefreshFilter,
 ): Promise<(QuotaSnapshot | undefined)[]> {
 	const jobs: Promise<QuotaSnapshot | undefined>[] = [];
-	for (const group of listSourceGroups()) {
-		if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
-		if (settings.customApiProviders?.some((config) => config.id === group.id)) {
-			const primary = providerQuotaService.peek(group.id);
-			if (primary?.pushCompatible === false) {
-				if (!filter.credentialId)
-					jobs.push(providerQuotaService.refresh(group.id, { manual: true }).then(toQuotaSnapshot));
-			} else
-				for (const id of credentialIds(group)) {
-					if (
-						getProviderKeyStore().get(id)?.disabled ||
-						(filter.credentialId && filter.credentialId !== id)
-					)
-						continue;
-					jobs.push(providerQuotaService.refreshKey(id, { manual: true }).then(toQuotaSnapshot));
-				}
-			continue;
+	try {
+		for (const group of listSourceGroups()) {
+			if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
+			if (settings.customApiProviders?.some((config) => config.id === group.id)) {
+				const primary = providerQuotaService.peek(group.id);
+				if (primary?.pushCompatible === false) {
+					if (!filter.credentialId)
+						jobs.push(
+							providerQuotaService.refresh(group.id, { manual: true }).then(toQuotaSnapshot),
+						);
+				} else
+					for (const id of credentialIds(group)) {
+						if (
+							getProviderKeyStore().get(id)?.disabled ||
+							(filter.credentialId && filter.credentialId !== id)
+						)
+							continue;
+						jobs.push(providerQuotaService.refreshKey(id, { manual: true }).then(toQuotaSnapshot));
+					}
+				continue;
+			}
+			const probe = getServiceTemplate(group.templateId).probeQuota;
+			if (!probe) continue;
+			for (const id of credentialIds(group)) {
+				if (getProviderKeyStore().get(id)?.disabled) continue;
+				if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
+			}
 		}
-		const probe = getServiceTemplate(group.templateId).probeQuota;
-		if (!probe) continue;
-		for (const id of credentialIds(group)) {
-			if (getProviderKeyStore().get(id)?.disabled) continue;
-			if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
-		}
+	} catch (error) {
+		// A later subject can be refused while earlier jobs were accepted. Keep their
+		// results observed without delaying the caller's immediate admission failure.
+		void Promise.allSettled(jobs);
+		throw error;
 	}
 	return Promise.all(jobs);
 }

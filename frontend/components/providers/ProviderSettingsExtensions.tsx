@@ -11,6 +11,7 @@ import {
 	Text,
 } from "@mantine/core";
 import { providerSettingsFieldVisibility } from "@shared/provider-settings";
+import type { ProviderSettingsConfigView } from "@shared/provider-settings-values";
 import {
 	IconAlertTriangle,
 	IconCheck,
@@ -56,16 +57,16 @@ export interface ProviderSettingsExtensionsProps {
 	coreDirty?: boolean;
 }
 
-function isFullConfig(config: ProviderSettingsExtensionView["config"]): config is NonNullable<
-	ProviderSettingsExtensionView["config"]
-> & {
-	schemaFingerprint: string;
-	bindingRevision: string;
-	secrets: Record<string, { isSet: boolean }>;
-	values: Record<string, string | number | boolean>;
-} {
+function isFullConfig(
+	config: ProviderSettingsExtensionView["config"],
+): config is ProviderSettingsConfigView & { schemaVersion: 1 } {
 	return Boolean(
-		config && "schemaFingerprint" in config && "bindingRevision" in config && "secrets" in config,
+		config &&
+			"schemaVersion" in config &&
+			config.schemaVersion === 1 &&
+			"schemaFingerprint" in config &&
+			"bindingRevision" in config &&
+			"secrets" in config,
 	);
 }
 
@@ -559,9 +560,13 @@ function ProviderSettingsExtension({
 				) : null}
 				<Group justify="space-between" wrap="wrap">
 					<Button
-						component={Link}
-						to="/settings/plugins/$pluginId"
-						params={{ pluginId: extension.pluginId }}
+						renderRoot={(props) => (
+							<Link
+								{...props}
+								to="/settings/plugins/$pluginId"
+								params={{ pluginId: extension.pluginId }}
+							/>
+						)}
 						variant="subtle"
 						size="compact-xs"
 						leftSection={<IconExternalLink size={14} />}

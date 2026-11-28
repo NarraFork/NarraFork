@@ -2,25 +2,25 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import type { ProviderQuotaData } from "@shared/provider-quota";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import {
 	deferred,
 	legacyQuotaFixture,
 	quotaConfig,
+	required,
 	walletQuota,
 } from "../../lib/__tests__/provider-quota-legacy-fixture";
 import { AppError } from "../../lib/errors";
-import { settings } from "../../lib/settings";
+import { saveSettings, settings } from "../../lib/settings";
 import { requireSessionAuth } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { initializePluginServices } from "../../services/plugin-manager";
-import { deepseekRoutes } from "../deepseek";
-import { kimiRoutes } from "../kimi";
-import { opencodeRoutes } from "../opencode";
 import { providerBalanceRoutes } from "../provider-balances";
 import { providerQuotaRoutes } from "../provider-quotas";
+import { quotaSnapshotRoutes } from "../quota-snapshots";
 
 let fixture: ReturnType<typeof legacyQuotaFixture>;
 function appForRole(role: "admin" | "user", principalType: "session" | "oauth" = "session") {
@@ -63,9 +63,7 @@ function appForRole(role: "admin" | "user", principalType: "session" | "oauth" =
 	});
 	app.route("/api/provider-quotas", providerQuotaRoutes);
 	app.route("/api/provider-balances", providerBalanceRoutes);
-	app.route("/api/kimi", kimiRoutes);
-	app.route("/api/deepseek", deepseekRoutes);
-	app.route("/api/opencode", opencodeRoutes);
+	app.route("/api/quota-snapshots", quotaSnapshotRoutes);
 	return app;
 }
 
@@ -73,11 +71,15 @@ function appForRole(role: "admin" | "user", principalType: "session" | "oauth" =
 function runPluginStartup(
 	initialized: Promise<unknown[]>,
 	logError = mock(() => {}),
-	options: { startSource?: () => void; isShuttingDown?: () => boolean } = {},
+	options: {
+		startSource?: () => void;
+		prepareSettings?: () => Promise<void>;
+		isShuttingDown?: () => boolean;
+	} = {},
 ): Promise<void> {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 	const chain = main.match(
-		/^initializePluginServices\(pluginManager,[\s\S]*?\r?\n\t\.catch\(\(err\) => \{[\s\S]*?\r?\n\t\}\);/m,
+		/^[\t ]*initializePluginServices\(pluginManager,[\s\S]*?\r?\n[\t ]*\.catch\([^\r\n]+\);/m,
 	)?.[0];
 	if (!chain) throw new Error("Production plugin initialization chain was not found");
 	return runInNewContext(chain, {
@@ -92,6 +94,11 @@ function runPluginStartup(
 			list: async () => [],
 		},
 		providerQuotaService: fixture.service,
+		pluginPlatformServices: {
+			providerSettingsService: {
+				prepareQuotaMigrations: options.prepareSettings ?? (async () => {}),
+			},
+		},
 		pluginSourceService: { start: options.startSource ?? (() => {}) },
 		logger: { info: () => {}, warn: () => {}, error: logError },
 	}) as Promise<void>;
@@ -281,7 +288,7 @@ describe("generic Custom API quota routes", () => {
 		expect(response.status).toBe(429);
 		expect(response.headers.get("Retry-After")).toBe("10");
 		expect(
-			(await app.request("/api/provider-balances/relay-test/refresh", { method: "POST" })).status,
+			(await app.request("/api/provider-balances/relay-test/probe", { method: "POST" })).status,
 		).toBe(429);
 		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
@@ -320,31 +327,50 @@ describe("generic Custom API quota routes", () => {
 		expect(fixture.query).not.toHaveBeenCalled();
 	});
 
-	test("legacy named-provider routes retain role redaction and use the same manual throttle", async () => {
-		settings.customApiProviders = [
+	test("named providers retain role redaction and share the manual throttle through unified snapshots", async () => {
+		const providers = [
 			quotaConfig({ id: "kimi", prefix: "kimi", baseUrl: "https://api.kimi.com" }),
 			quotaConfig({ id: "deepseek", prefix: "deepseek", baseUrl: "https://api.deepseek.com" }),
 			quotaConfig({ id: "opencode", prefix: "opencode", baseUrl: "https://opencode.ai/zen/go/v1" }),
 		];
+		saveSettings({ ...settings, customApiProviders: providers });
 		fixture.query.mockRejectedValue(new Error("private credentials in upstream text"));
-		await Promise.all(settings.customApiProviders.map(({ id }) => fixture.service.refresh(id)));
-		for (const [id, suffix] of [
-			["kimi", "usages"],
-			["deepseek", "balances"],
-			["opencode", "usages"],
-		]) {
-			const userResponse = await appForRole("user").request(`/api/${id}/${suffix}`);
-			const user = (await userResponse.json())[id];
-			expect(user.hasError).toBe(true);
-			expect(user).not.toHaveProperty("error");
-			const admin = (await (await appForRole("admin").request(`/api/${id}/${suffix}`)).json())[id];
-			expect(admin.error).toBeString();
-			expect(JSON.stringify(admin)).not.toContain("private credentials");
+		await Promise.all(providers.map(({ id }) => fixture.service.refresh(id)));
+		fixture.advance(10_000);
+		for (const { id } of providers) {
+			for (const role of ["user", "admin"] as const) {
+				const response = await appForRole(role).request(
+					`/api/quota-snapshots?groupId=${id}&cachedOnly=true`,
+				);
+				expect(response.status).toBe(200);
+				expect(response.headers.get("Cache-Control")).toBe("no-store");
+				const page: QuotaSnapshotsResponse = await response.json();
+				expect(page.entries).toHaveLength(1);
+				const entry = required(page.entries[0]);
+				expect(entry.snapshot).toMatchObject({ hasError: true, error: "quota_unavailable" });
+				if (role === "user") expect(entry.credentialId).toBeNull();
+				else expect(entry.credentialId).toBeString();
+				expect(JSON.stringify(page)).not.toMatch(/private credentials|test-secret-key|detail/);
+			}
+			const request = {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ groupId: id }),
+			};
 			expect(
-				(await appForRole("user").request(`/api/${id}/${suffix}/refresh`, { method: "POST" }))
-					.status,
+				(await appForRole("user").request("/api/quota-snapshots/refresh", request)).status,
 			).toBe(403);
+			expect(
+				(await appForRole("admin").request("/api/quota-snapshots/refresh", request)).status,
+			).toBe(200);
+			await fixture.service.refresh(id);
+			const throttled = await appForRole("admin").request(`/api/provider-quotas/${id}/probe`, {
+				method: "POST",
+			});
+			expect(throttled.status).toBe(429);
+			expect(throttled.headers.get("Retry-After")).toBe("10");
 		}
+		expect(fixture.query).toHaveBeenCalledTimes(6);
 	});
 
 	test("mounting stays behind the session-only boundary and has no retired warmup paths", () => {
@@ -354,21 +380,36 @@ describe("generic Custom API quota routes", () => {
 		expect(boundary).toBeGreaterThanOrEqual(0);
 		expect(mount).toBeGreaterThan(boundary);
 		const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
-		expect(main).not.toMatch(/refreshAll(?:KimiUsages|OpencodeUsages|DeepSeekBalances)/);
+		expect(/refreshAll(?:KimiUsages|OpencodeUsages|DeepSeekBalances)/.test(main)).toBe(false);
 	});
 
-	test("the production initialization chain starts quota then sources only after plugins are ready", async () => {
+	test("the production initialization chain starts quota then sources only after plugins and settings are ready", async () => {
 		fixture.service.stop();
 		const initialized = deferred<unknown[]>();
+		const preparing = deferred<void>();
+		const prepared = deferred<void>();
 		const logError = mock(() => {});
+		const prepareSettings = mock(() => {
+			preparing.resolve();
+			return prepared.promise;
+		});
 		const startSource = mock(() => {
 			expect(fixture.service.getDiagnostics().running).toBe(true);
 		});
-		const startup = runPluginStartup(initialized.promise, logError, { startSource });
+		const startup = runPluginStartup(initialized.promise, logError, {
+			startSource,
+			prepareSettings,
+		});
 		expect(fixture.service.getDiagnostics().running).toBe(false);
 		expect(fixture.query).not.toHaveBeenCalled();
 		expect(startSource).not.toHaveBeenCalled();
+		expect(prepareSettings).not.toHaveBeenCalled();
 		initialized.resolve([]);
+		await preparing.promise;
+		expect(prepareSettings).toHaveBeenCalledTimes(1);
+		expect(fixture.service.getDiagnostics().running).toBe(false);
+		expect(startSource).not.toHaveBeenCalled();
+		prepared.resolve();
 		await startup;
 		expect(fixture.service.getDiagnostics().running).toBe(true);
 		expect(startSource).toHaveBeenCalledTimes(1);
@@ -418,9 +459,8 @@ describe("generic Custom API quota routes", () => {
 			["/api/provider-quotas/relay-test/refresh", "POST"],
 			["/api/provider-balances", "GET"],
 			["/api/provider-balances/relay-test/probe", "POST"],
-			["/api/kimi/usages", "GET"],
-			["/api/deepseek/balances", "GET"],
-			["/api/opencode/usages", "GET"],
+			["/api/quota-snapshots", "GET"],
+			["/api/quota-snapshots/refresh", "POST"],
 		]) {
 			const response = await app.request(path, { method });
 			expect(response.status).toBe(401);
@@ -432,11 +472,11 @@ describe("generic Custom API quota routes", () => {
 	for (const [path, baseUrl] of [
 		["/api/provider-quotas/target/refresh", "https://relay.invalid/v1"],
 		["/api/provider-balances/target/probe", "https://relay.invalid/v1"],
-		["/api/kimi/usages/refresh", "https://api.kimi.com"],
-		["/api/deepseek/balances/refresh", "https://api.deepseek.com"],
-		["/api/opencode/usages/refresh", "https://opencode.ai/zen/go/v1"],
+		["/api/quota-snapshots/refresh", "https://api.kimi.com"],
+		["/api/quota-snapshots/refresh", "https://api.deepseek.com"],
+		["/api/quota-snapshots/refresh", "https://opencode.ai/zen/go/v1"],
 	]) {
-		test(`${path} reports a full shared queue instead of pretending a refresh was accepted`, async () => {
+		test(`${path} reports a full shared queue for ${baseUrl} instead of pretending a refresh was accepted`, async () => {
 			fixture.dispose();
 			mock.restore();
 			fixture = legacyQuotaFixture(
@@ -448,10 +488,20 @@ describe("generic Custom API quota routes", () => {
 				walletQuota,
 				{ maxConcurrent: 1, maxQueued: 1 },
 			);
+			saveSettings({ ...settings });
 			fixture.query.mockImplementation(() => new Promise(() => {}));
 			void fixture.service.refresh("busy-a");
 			void fixture.service.refresh("busy-b");
-			const response = await appForRole("admin").request(path, { method: "POST" });
+			expect(fixture.service.getDiagnostics()).toMatchObject({ active: 1, queued: 1 });
+			const response = await appForRole("admin").request(path, {
+				method: "POST",
+				...(path === "/api/quota-snapshots/refresh"
+					? {
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({ groupId: "target" }),
+						}
+					: {}),
+			});
 			expect(response.status).toBe(429);
 			expect(response.headers.get("Retry-After")).toBe("1");
 			expect(await response.json()).toEqual({ error: "PROVIDER_QUOTA_BUSY" });

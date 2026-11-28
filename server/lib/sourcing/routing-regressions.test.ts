@@ -76,7 +76,7 @@ describe("template routing review regressions", () => {
 			],
 			amounts: [{ id: "balance:USD", unit: "USD", remaining: 0, quota: "none" }],
 		};
-		const f = pluginQuota(config, data);
+		const f = pluginQuota(credential.config, data);
 		await f.service.refreshKey(credential.key.id);
 		expect(autoSourceFacts(config.prefix, now)).toEqual({ available: true, subscription: true });
 		// The source declares this wallet informational, not an alternative subscription allowance.
@@ -106,7 +106,7 @@ describe("template routing review regressions", () => {
 			windows: [],
 			amounts: [{ id: "balance:USD", unit: "USD", remaining: 10 }],
 		};
-		const f = pluginQuota(config, data);
+		const f = pluginQuota(credential.config, data);
 		f.advance(1000);
 		const probe = required(await f.service.refreshKey(credential.key.id));
 		const streamIdentity = customApiStreamQuotaIdentity(credential.config);

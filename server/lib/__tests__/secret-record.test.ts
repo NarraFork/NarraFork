@@ -30,12 +30,13 @@ afterEach(() => {
 });
 const binding = "com.example.settings/preferences/custom-api/provider-1/token/revision-1";
 const plain = Buffer.from('{"token":"fictional-record-token"}');
-function code(body: () => unknown, expected: string) {
+function code(body: () => unknown, expected: SecretRecordError["code"]) {
 	try {
 		body();
 	} catch (error) {
 		expect(error).toBeInstanceOf(SecretRecordError);
-		expect((error as SecretRecordError).code).toBe(expected);
+		if (!(error instanceof SecretRecordError)) throw error;
+		expect(error.code).toBe(expected);
 		expect(String(error)).not.toContain(root);
 		expect(String(error)).not.toContain("fictional-record-token");
 		return;

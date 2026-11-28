@@ -242,6 +242,83 @@ describe("response quota_balance snapshots", () => {
 		}
 	});
 
+	test("an explicit quota key selects a promoted backup while billing still names its disabled predecessor", () => {
+		useProvider();
+		const store = getProviderKeyStore();
+		const first = required(store.listGroup(providerId)[0]);
+		expect(first.id).toBe(providerId);
+		const backup = store.add(providerId, { apiKey: "promoted-backup" });
+		store.update(first.id, { disabled: true });
+		store.reorder(providerId, [backup.id, first.id]);
+		const capture = captureQuota(backup.id);
+		const info = { credentialId: providerId, quotaCredentialId: backup.id };
+		expect(streamQuotaIdentityForRequest("custom-quota", info)).toBe(capture.identity);
+		// The ambiguous billing id on its own must still be rejected.
+		expect(
+			streamQuotaIdentityForRequest("custom-quota", { credentialId: providerId }),
+		).toBeUndefined();
+		expect(
+			streamQuotaIdentityForRequest("custom-quota", {
+				...info,
+				validateDiagnosticCredential: () => false,
+			}),
+		).toBeUndefined();
+		reportQuota("custom-quota", "6", null, capture);
+		expect(quotaStore.peek(backup.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(6);
+		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+	});
+
+	test("explicit quota keys never borrow a group alias, disabled key, unknown key or another prefix", () => {
+		useProvider();
+		const store = getProviderKeyStore();
+		const first = required(store.listGroup(providerId)[0]);
+		store.remove(first.id);
+		const only = store.add(providerId, { id: "explicit-quota-key", apiKey: "key-one" });
+		const disabled = store.add(providerId, { apiKey: "disabled-quota-key" });
+		store.update(disabled.id, { disabled: true });
+		expect(store.get(disabled.id)?.disabled).toBe(true);
+		const capture = captureQuota(only.id);
+		const foreignOwner = "other-custom-quota-owner";
+		const foreign = store.add(foreignOwner, { apiKey: only.apiKey });
+		try {
+			for (const quotaCredentialId of [providerId, "unknown-key", "", disabled.id, foreign.id]) {
+				const identity = streamQuotaIdentityForRequest("custom-quota", {
+					credentialId: only.id,
+					quotaCredentialId,
+				});
+				expect(identity).toBeUndefined();
+				updateCustomApiQuotaByPrefix("custom-quota", "99", null, identity, capture.generation);
+				expect(quotaStore.peek(only.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+			}
+			expect(
+				streamQuotaIdentityForRequest("missing-prefix", {
+					credentialId: providerId,
+					quotaCredentialId: only.id,
+				}),
+			).toBeUndefined();
+		} finally {
+			store.removeGroup(foreignOwner);
+		}
+	});
+
+	test("a deleted explicit quota key cannot follow a new key with the same secret", () => {
+		useProvider();
+		const store = getProviderKeyStore();
+		const first = required(store.listGroup(providerId)[0]);
+		const info = { credentialId: providerId, quotaCredentialId: first.id };
+		expect(streamQuotaIdentityForRequest("custom-quota", info)).toBeString();
+		store.remove(first.id);
+		const replacement = store.add(providerId, { apiKey: first.apiKey });
+		expect(replacement.id).not.toBe(first.id);
+		expect(streamQuotaIdentityForRequest("custom-quota", info)).toBeUndefined();
+		expect(
+			streamQuotaIdentityForRequest("custom-quota", {
+				...info,
+				quotaCredentialId: replacement.id,
+			}),
+		).toBeString();
+	});
+
 	test("purging a pooled provider removes all recorded stream keys but retains their probe slots", () => {
 		useProvider();
 		reportQuota("custom-quota", "11");

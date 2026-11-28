@@ -145,6 +145,7 @@ describe("new provider settings capability boundary", () => {
 			capability: "config.read_self",
 			scope: { type: "global" },
 		});
+		if (!pending) throw new Error("Missing pending permission request fixture");
 		await f.mirror.addPermanentDenial(f.pluginId, f.installationId, {
 			capability: "diagnostics.readOwnLogs",
 			scope: { type: "global" },

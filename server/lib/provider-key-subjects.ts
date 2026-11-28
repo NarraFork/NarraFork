@@ -82,11 +82,27 @@ export function streamQuotaIdentityForPrefix(
 /** Reject a prepared transport that outlived an edit before capturing its attempt. */
 export function streamQuotaIdentityForRequest(
 	prefix: string,
-	info?: { credentialId?: string; validateDiagnosticCredential?: () => boolean },
+	info?: {
+		credentialId?: string;
+		quotaCredentialId?: string;
+		validateDiagnosticCredential?: () => boolean;
+	},
 ): string | undefined {
-	return info?.validateDiagnosticCredential?.() === false
-		? undefined
-		: streamQuotaIdentityForPrefix(prefix, info?.credentialId);
+	if (info?.validateDiagnosticCredential?.() === false) return undefined;
+	if (info?.quotaCredentialId !== undefined) {
+		// A plain adapter can bill its group even when that id names a disabled old
+		// key. Its explicit quota key must resolve exactly, never through group fallback.
+		const config = (settings.customApiProviders ?? []).find((entry) => entry.prefix === prefix);
+		const key =
+			config &&
+			peekProviderKeyStore()
+				?.list(config.id)
+				.find((entry) => entry.id === info.quotaCredentialId);
+		return config && key && !key.disabled
+			? streamQuotaIdentity(withProviderKey(config, key), key.id)
+			: undefined;
+	}
+	return streamQuotaIdentityForPrefix(prefix, info?.credentialId);
 }
 
 /** Validate the captured attempt, not whichever key happens to be first when it finishes. */

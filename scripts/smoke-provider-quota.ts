@@ -974,7 +974,6 @@ const PROBE_LABELS = ["Rediscover quota", "重新探测额度"];
 export class QuotaBrowserSmoke {
 	readonly settings = new Map<SmokeLocale, Page>();
 	readonly narrators = new Map<SmokeLocale, Page>();
-	private readonly localeContexts = new Map<SmokeLocale, BrowserContext>();
 	private networkBytes = 0;
 	private responses = 0;
 	private screenshots = 0;
@@ -984,6 +983,7 @@ export class QuotaBrowserSmoke {
 	constructor(
 		readonly context: QuotaSmokeContext,
 		readonly narratorId: string,
+		private readonly localeContexts = new Map<SmokeLocale, BrowserContext>(),
 	) {}
 
 	async start(): Promise<void> {
@@ -2454,7 +2454,14 @@ export async function smokeProviderQuota(
 		}
 	} finally {
 		const errors: unknown[] = [];
-		await Promise.resolve(context.browser?.disconnect()).catch((error) => errors.push(error));
+		if (context.browser) {
+			// This connection was made only after matching the spawned browser's own endpoint.
+			// Ask it to exit before closing process handles so Windows releases its profile files.
+			await boundedQuotaWork(context.browser.close(), AbortSignal.timeout(10_000)).catch((error) =>
+				errors.push(error),
+			);
+			await Promise.resolve(context.browser.disconnect()).catch((error) => errors.push(error));
+		}
 		context.report.fixture = context.fixture?.evidence();
 		context.report.siteFixture = context.siteFixture?.evidence();
 		context.fixture?.stop();

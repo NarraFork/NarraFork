@@ -706,6 +706,15 @@ export class ProviderQuotaService {
 			(!entry.task && this.now() < entry.nextManualAt)
 		)
 			return Promise.resolve(this.publicSnapshot(entry));
+		// Admission is synchronous, before any provider projection adds Promise turns.
+		// Shared in-flight work stays joinable even when the waiting queue is full.
+		if (
+			options.manual &&
+			!entry.task &&
+			this.candidates(entry).length > 0 &&
+			this.queue.length >= this.maxQueued
+		)
+			throw new ProviderQuotaError("queue_full");
 		const promise = this.schedule(entry, options.mode ?? (entry.cursor ? "refresh" : "probe"));
 		return options.signal ? quotaAbortable(promise, options.signal) : promise;
 	}

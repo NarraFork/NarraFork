@@ -6,9 +6,9 @@ import {
 	parseDeepSeekBalanceResponse,
 } from "../../../../plugins/provider-quota/src/deepseek";
 import { parseSub2ApiBalance, relayQuotaData } from "../../../../plugins/provider-quota/src/relay";
+import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
-import { matchesProviderQuotaIdentity } from "../../../hooks/useProviderQuota";
 import { buildProviderQuotaView, formatProviderQuotaAmount } from "./provider-quota-view";
 import { formatQuotaBadgeText, formatQuotaSummaryLines } from "./quota-panel-view";
 

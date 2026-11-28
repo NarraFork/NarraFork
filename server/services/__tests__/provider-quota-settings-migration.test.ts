@@ -85,8 +85,18 @@ async function saveExtension(
 		options,
 	);
 }
+function fixtureSettings() {
+	const customApiProviders = settings.customApiProviders;
+	if (
+		!customApiProviders ||
+		customApiProviders.length !== 1 ||
+		customApiProviders[0].id !== providerId
+	)
+		throw new Error("missing migration provider fixture");
+	return { ...settings, customApiProviders };
+}
 async function baseline() {
-	const before = structuredClone(settings);
+	const before = structuredClone(fixtureSettings());
 	await projectQuotaSettingsInto(before);
 	return before;
 }
@@ -151,8 +161,56 @@ afterEach(() => {
 });
 
 describe("trusted site settings migration", () => {
+	test.each([
+		false,
+		true,
+	])("an absent provider collection blocks migration without changing saved data (migrated=%s)", async (migrated) => {
+		if (migrated) await ensureQuotaSettingsMigration(migration, store);
+		const providers = fixtureSettings().customApiProviders,
+			row = await store.getSetting(address),
+			receiptAddress = quotaSettingsReceiptAddress(pluginId, providerId),
+			receipt = await store.getResource(receiptAddress);
+		settings.customApiProviders = undefined;
+		try {
+			expect(() => readProviderSettingsCoreContext("custom-api", providerId)).toThrow(
+				expect.objectContaining({ code: "PROVIDER_SETTINGS_TARGET_UNAVAILABLE" }),
+			);
+			await expect(ensureQuotaSettingsMigration(migration, store)).rejects.toMatchObject({
+				code: "PROVIDER_SETTINGS_MIGRATION_REQUIRED",
+			});
+			expect(await store.getSetting(address)).toEqual(row);
+			expect(await store.getResource(receiptAddress)).toEqual(receipt);
+			expect(getProviderKeyStore().firstKey(quotaKeyOwner(providerId))).toBe(
+				"fixture-account-token",
+			);
+		} finally {
+			settings.customApiProviders = providers;
+		}
+	});
+	test("a provider collection removed before migration commit leaves settings and receipt unwritten", async () => {
+		const providers = fixtureSettings().customApiProviders;
+		const interrupted: PluginSettingsStore = {
+			...store,
+			commit(input, options) {
+				settings.customApiProviders = undefined;
+				return store.commit(input, options);
+			},
+		};
+		try {
+			await expect(ensureQuotaSettingsMigration(migration, interrupted)).rejects.toMatchObject({
+				code: "PLUGIN_SETTINGS_STORE_UNAVAILABLE",
+			});
+			expect(await store.getSetting(address)).toBeNull();
+			expect(await store.getResource(quotaSettingsReceiptAddress(pluginId, providerId))).toBeNull();
+			expect(getProviderKeyStore().firstKey(quotaKeyOwner(providerId))).toBe(
+				"fixture-account-token",
+			);
+		} finally {
+			settings.customApiProviders = providers;
+		}
+	});
 	test("retains token and old fallback tenant root, commits receipt, and does not grant capabilities", async () => {
-		const old = settings.customApiProviders[0],
+		const old = fixtureSettings().customApiProviders[0],
 			token = getProviderKeyStore().firstKey(quotaKeyOwner(providerId));
 		await ensureQuotaSettingsMigration(migration, store);
 		const row = await store.getSetting(address);
@@ -166,7 +224,7 @@ describe("trusted site settings migration", () => {
 		expect(
 			await store.getResource(quotaSettingsReceiptAddress(pluginId, providerId)),
 		).toMatchObject({ state: "active", revision: 1 });
-		expect(settings.customApiProviders[0]).toEqual(old);
+		expect(fixtureSettings().customApiProviders[0]).toEqual(old);
 		expect(getProviderKeyStore().firstKey(quotaKeyOwner(providerId))).toBe(token);
 		await ensureQuotaSettingsMigration(migration, store);
 		expect(await store.getSetting(address)).toEqual(row);
@@ -210,7 +268,7 @@ describe("trusted site settings migration", () => {
 	});
 	test("legacy mixed save journals intent and recovers after files succeed but SQL fails", async () => {
 		await ensureQuotaSettingsMigration(migration, store);
-		const before = structuredClone(settings);
+		const before = structuredClone(fixtureSettings());
 		await projectQuotaSettingsInto(before);
 		const next = structuredClone(before);
 		next.customApiProviders[0].quotaUserId = "bob";
@@ -241,7 +299,7 @@ describe("trusted site settings migration", () => {
 	});
 	test("partial key/file save stays blocked until an admin retry replays the bounded intended fields", async () => {
 		await ensureQuotaSettingsMigration(migration, store);
-		const before = structuredClone(settings);
+		const before = structuredClone(fixtureSettings());
 		await projectQuotaSettingsInto(before);
 		const next = structuredClone(before);
 		next.customApiProviders[0].quotaUserId = "bob";
@@ -259,7 +317,7 @@ describe("trusted site settings migration", () => {
 			code: "PROVIDER_SETTINGS_SAVE_PENDING",
 		});
 		await recoverQuotaCompatibilitySave(providerId, store, true);
-		expect(settings.customApiProviders[0].quotaUserId).toBe("bob");
+		expect(fixtureSettings().customApiProviders[0].quotaUserId).toBe("bob");
 		const recovered = await store.getSetting(address);
 		if (!recovered) throw Error("missing recovered settings");
 		expect(openProviderSetting(recovered).secrets.token).toBe("fixture-bob-token");
@@ -269,7 +327,7 @@ describe("trusted site settings migration", () => {
 test("dormant quota settings never create an unrecoverable compatibility journal", async () => {
 	await ensureQuotaSettingsMigration(migration, store);
 	sqlite.run("UPDATE plugin_provider_settings SET state='dormant' WHERE plugin_id=?", [pluginId]);
-	const before = structuredClone(settings);
+	const before = structuredClone(fixtureSettings());
 	await projectQuotaSettingsInto(before);
 	const coreEdit = structuredClone(before);
 	coreEdit.customApiProviders[0].baseUrl = "https://changed.invalid/v1";
@@ -293,6 +351,63 @@ test("dormant quota settings never create an unrecoverable compatibility journal
 });
 
 describe("legacy PATCH intent and concurrent SQL boundaries", () => {
+	test("omitted legacy collections are empty snapshots and do not overwrite saved providers", async () => {
+		const saved = structuredClone(settings),
+			keys = getProviderKeyStore().all(),
+			empty = { ...structuredClone(settings), customApiProviders: undefined };
+		await projectQuotaSettingsInto(empty);
+		expect(empty.customApiProviders).toBeUndefined();
+		for (const [before, next] of [
+			[empty, empty],
+			[empty, saved],
+			[saved, empty],
+		]) {
+			const finish = await beginQuotaCompatibilitySave(before, next);
+			try {
+				await finish();
+			} finally {
+				finish.abort();
+			}
+		}
+		expect(settings).toEqual(saved);
+		expect(getProviderKeyStore().all()).toEqual(keys);
+		expect(await store.getSetting(address)).toBeNull();
+		expect(await store.getResource(operationAddress)).toBeNull();
+		expect(() => assertQuotaCompatibilityIdle(providerId)).not.toThrow();
+	});
+	test("a missing provider collection keeps recovery pending and preserves the saved journal", async () => {
+		await ensureQuotaSettingsMigration(migration, store);
+		const before = await baseline(),
+			next = structuredClone(before);
+		next.customApiProviders[0].quotaAccessToken = "pending-recovery-token";
+		const finish = await beginQuotaCompatibilitySave(
+			before,
+			next,
+			quotaCompatibilityTokenIntents(next.customApiProviders),
+		);
+		try {
+			saveSettings(next);
+		} finally {
+			finish.abort();
+		}
+		const providers = fixtureSettings().customApiProviders,
+			row = await store.getSetting(address),
+			operation = await store.getResource(operationAddress);
+		expect(operation).toMatchObject({ state: "active" });
+		settings.customApiProviders = undefined;
+		try {
+			await expect(recoverQuotaCompatibilitySave(providerId, store, true)).rejects.toMatchObject({
+				code: "PROVIDER_SETTINGS_SAVE_PENDING",
+			});
+			expect(await store.getSetting(address)).toEqual(row);
+			expect(await store.getResource(operationAddress)).toEqual(operation);
+			expect(getProviderKeyStore().firstKey(quotaKeyOwner(providerId))).toBe(
+				"pending-recovery-token",
+			);
+		} finally {
+			settings.customApiProviders = providers;
+		}
+	});
 	test("ordinary concurrent projections do not reserve writes when there is no WAL", async () => {
 		await ensureQuotaSettingsMigration(migration, store);
 		const views = await Promise.all([baseline(), baseline(), baseline()]);
@@ -310,8 +425,8 @@ describe("legacy PATCH intent and concurrent SQL boundaries", () => {
 		const before = await baseline(),
 			next = structuredClone(before);
 		// Match every persisted core input, while changing SQL's newer extension token.
-		Object.assign(next.customApiProviders[0], settings.customApiProviders[0]);
-		next.customApiProviders[0].quotaSiteUrl = settings.customApiProviders[0].quotaSiteUrl;
+		Object.assign(next.customApiProviders[0], fixtureSettings().customApiProviders[0]);
+		next.customApiProviders[0].quotaSiteUrl = fixtureSettings().customApiProviders[0].quotaSiteUrl;
 		const finish = await beginQuotaCompatibilitySave(
 			before,
 			next,
@@ -344,7 +459,7 @@ describe("legacy PATCH intent and concurrent SQL boundaries", () => {
 			key = keys.list(quotaKeyOwner(providerId))[0];
 		keys.update(key.id, { apiKey: "partial-core-token" });
 		finish.abort();
-		const current = structuredClone(settings);
+		const current = structuredClone(fixtureSettings());
 		await projectQuotaSettingsInto(current, true);
 		expect(current.customApiProviders[0].protocol).toBe("anthropic-messages");
 		expect(current.customApiProviders[0].quotaAccessToken).toBe("partial-core-token");
@@ -683,7 +798,7 @@ describe("legacy PATCH intent and concurrent SQL boundaries", () => {
 		const dormant = await store.getSetting(address);
 		await recoverQuotaCompatibilitySave(providerId, store, true);
 		expect(await store.getSetting(address)).toEqual(dormant);
-		expect(settings.customApiProviders[0].quotaUserId).toBe("alice");
+		expect(fixtureSettings().customApiProviders[0].quotaUserId).toBe("alice");
 		expect(keys.firstKey(quotaKeyOwner(providerId))).toBe("partial-token");
 		expect(await store.getResource(operationAddress)).toMatchObject({ state: "deleted" });
 		await baseline();

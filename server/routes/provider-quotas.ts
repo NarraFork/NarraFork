@@ -77,15 +77,12 @@ export async function scheduleManualQuotaRefresh(
 			"Quota refresh requested too frequently",
 		);
 	}
-	const queued = Symbol("queued");
 	for (const id of ready) {
-		// Observe immediate admission failure only, never wait for plugin I/O.
-		// Racing also consumes a later rejection from an accepted job.
-		const admission = await Promise.race([
-			providerQuotaService.refresh(id, { mode, manual: true }),
-			Promise.resolve(queued),
-		]);
-		if (admission === null && providerQuotaService.peek(id)) {
+		try {
+			// Queue admission happens before this call returns; accepted work remains detached.
+			void providerQuotaService.refresh(id, { mode, manual: true }).catch(() => {});
+		} catch (error) {
+			if (!(error instanceof ProviderQuotaError) || error.code !== "queue_full") throw error;
 			c.header("Retry-After", "1");
 			throw new RateLimitError("PROVIDER_QUOTA_BUSY", 1_000, "Quota refresh queue is full");
 		}

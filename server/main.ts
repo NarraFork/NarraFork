@@ -1242,34 +1242,8 @@ async function initializeDatabaseStartup(): Promise<void> {
 		logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 	}
 
-	try {
-		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-		// demand-driven (stale-while-revalidate on GET /api/quota-snapshots, plus a
-		// refresh when provider settings change).
-		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
-		void refreshAllKimiUsages().catch(() => {});
-	} catch (err) {
-		logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-	}
-	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
-
-	try {
-		// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
-		// restart re-reads it rather than trusting numbers from the previous process.
-		const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
-		void refreshAllOpencodeUsages().catch(() => {});
-	} catch (err) {
-		logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
-	}
-	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
-
-	try {
-		// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
-		const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
-		void refreshAllDeepSeekBalances().catch(() => {});
-	} catch {
-		logger.warn("DeepSeek balance startup refresh failed");
-	}
+	// Custom API quota warmup belongs to the plugin scheduler, which starts below
+	// only after contributions and provider-settings migrations are ready.
 	if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 
 	// A user's template in a built-in's directory moves aside without losing its contents.

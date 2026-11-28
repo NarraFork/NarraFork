@@ -6,7 +6,7 @@
  *   bun scripts/build-cross-platform.ts --platform=darwin-arm64  # specific platform
  *   bun scripts/build-cross-platform.ts --skip-frontend    # skip Vite build
  */
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -58,9 +58,7 @@ const BUILD_PROFILE = resolveBuildProfile(VERSION, process.env);
 const alphaFrontend = args.includes("--alpha-frontend");
 if (
 	alphaFrontend &&
-	(BUILD_PROFILE.name !== "diagnostic" ||
-		skipFrontend ||
-		!existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
+	(BUILD_PROFILE.name !== "diagnostic" || skipFrontend || !existsSync(join(ROOT, ALPHA_BUILD_LOCK)))
 ) {
 	throw new Error("--alpha-frontend requires a full local build through make build-alpha");
 }
@@ -72,8 +70,9 @@ console.log(
 console.log(`Backend compile flags: ${BUILD_PROFILE.compileArgs.join(" ")}`);
 let commitHash = "";
 try {
-	commitHash = execSync(
-		releaseCi ? "git rev-parse --verify HEAD^{commit}" : "git rev-parse --short HEAD",
+	commitHash = execFileSync(
+		"git",
+		releaseCi ? ["rev-parse", "--verify", "HEAD^{commit}"] : ["rev-parse", "--short", "HEAD"],
 		{
 			cwd: ROOT,
 			encoding: "utf-8",

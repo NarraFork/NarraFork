@@ -391,12 +391,8 @@ describe("independent quota contributions", () => {
 		expect(result.status).toBe("supported");
 		expect(result.data?.unlimited).toBe(unlimited);
 		expect(result.data?.windows).toEqual([]);
-		expect(result.data?.amounts[0]).toMatchObject({
-			remaining: 0,
-			total: 0,
-			display: "detail",
-			quota: "none",
-		});
+		// A zero subscription limit means no configured cap, not an exhausted allowance.
+		expect(result.data?.amounts).toEqual([]);
 	});
 
 	test("cursor cannot replace the configured origin or candidate root", async () => {

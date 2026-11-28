@@ -579,7 +579,7 @@ let streamQuotaFixture:
 	  >
 	| undefined;
 
-async function useStreamQuotaFixture(
+async function createStreamQuotaFixture(
 	providers: import("../../lib/settings").CustomApiProviderConfig[],
 ) {
 	const { legacyQuotaFixture } = await import("../../lib/__tests__/provider-quota-legacy-fixture");
@@ -3299,7 +3299,7 @@ test("provider switching rebinds quota once and refuses retired provider frames"
 	const first = make("switch-quota-a");
 	const second = make("switch-quota-b");
 	try {
-		await useStreamQuotaFixture([first, second]);
+		await createStreamQuotaFixture([first, second]);
 		const a = captureCustomApiQuotaPushTarget(first.prefix);
 		const b = captureCustomApiQuotaPushTarget(second.prefix);
 		if (!a || !b) throw new Error("Missing quota fixture identity");
@@ -3390,7 +3390,7 @@ describe("Custom API stream quota generation", () => {
 			protocol: "completions-compatible" as const,
 			defaultModel: "model",
 		};
-		await useStreamQuotaFixture([provider]);
+		await createStreamQuotaFixture([provider]);
 		purgeCustomApiQuotaCache([provider.id]);
 		const target = captureCustomApiQuotaPushTarget(provider.prefix);
 		if (!target) throw new Error("expected captured Custom API target");
@@ -3429,7 +3429,7 @@ describe("Custom API stream quota generation", () => {
 			protocol: "completions-compatible" as const,
 			defaultModel: "model",
 		};
-		await useStreamQuotaFixture([provider]);
+		await createStreamQuotaFixture([provider]);
 		const target = captureCustomApiQuotaPushTarget(provider.prefix);
 		if (!target) throw new Error("expected captured Custom API target");
 		const providerIdentity = quotaIdentityForTarget(provider.prefix, target);
@@ -3470,7 +3470,7 @@ test("a captured Custom API quota pass never feeds the independent NUG cache", a
 		protocol: "completions-compatible" as const,
 		defaultModel: "model",
 	};
-	await useStreamQuotaFixture([provider]);
+	await createStreamQuotaFixture([provider]);
 	const target = captureCustomApiQuotaPushTarget(provider.prefix);
 	if (!target) throw new Error("expected captured Custom API target");
 	const providerIdentity = quotaIdentityForTarget(provider.prefix, target);

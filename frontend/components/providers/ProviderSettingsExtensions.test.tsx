@@ -370,6 +370,53 @@ const saveKey = "admin.detail.config.save";
 const actionKey = "providerSettings.runAction";
 
 describe("ProviderSettingsExtensions DOM interactions", () => {
+	test("plugin management renders a link to the extension's plugin", async () => {
+		await render();
+		const link = [...container.querySelectorAll("a")].find(
+			(anchor) => anchor.textContent?.trim() === i18n.t("providerSettings.managePlugin"),
+		);
+		expect(link?.getAttribute("href")).toBe(`/settings/plugins/${pluginId}`);
+	});
+
+	test.each([
+		"public",
+		"unversioned",
+		"unsupported version",
+	])("admins cannot edit a %s config as a full settings view", async (projection) => {
+		const { schemaVersion, ...unversioned } = config();
+		const publicView = {
+			revision: unversioned.revision,
+			status: unversioned.status,
+			values: unversioned.values,
+		};
+		seed(targetA, {
+			...extension(targetA),
+			config:
+				projection === "public"
+					? publicView
+					: projection === "unversioned"
+						? unversioned
+						: { ...unversioned, schemaVersion: schemaVersion + 1 },
+		});
+		await render();
+		expect(container.textContent).toContain("Saved extension");
+		expect(container.querySelectorAll("input, textarea, select").length).toBe(0);
+		expect(container.textContent).not.toContain(SECRET_PLACEHOLDER);
+		for (const key of [
+			saveKey,
+			"providerSettings.retained",
+			"providerSettings.rebind",
+			"providerSettings.delete",
+		]) {
+			expect(findButton(key)).toBeUndefined();
+		}
+		for (const write of [save, remove, rebind, retained]) {
+			expect(write).not.toHaveBeenCalled();
+		}
+		expect(confirm).not.toHaveBeenCalled();
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
 	test("core changes block extension writes and actions while preserving an existing draft", async () => {
 		await render(targetA, true);
 		expect(container.textContent).toContain(i18n.t("providerSettings.unsavedCore"));
@@ -477,12 +524,27 @@ describe("ProviderSettingsExtensions DOM interactions", () => {
 			expect(views.get(targetKey(targetA))?.extensions[0]?.config).toEqual(
 				views.get(targetKey(nextTarget))?.extensions[0]?.config,
 			);
+			expect(client.getQueryData(providerSettingsKeys.list(nextTarget))).toEqual(
+				views.get(targetKey(nextTarget)),
+			);
 			await render(targetA);
+			expect(list).not.toHaveBeenCalled();
 			await click(button(actionKey));
 			await until(
 				() => container.textContent?.includes("Action complete") === true,
 				"first target action result",
 			);
+			await until(
+				() =>
+					list.mock.calls.length === 1 &&
+					client.getQueryState(providerSettingsKeys.list(targetA))?.fetchStatus === "idle",
+				"action to finish refreshing the first target",
+			);
+			expect(list.mock.calls[0]?.[0]).toEqual(targetA);
+			expect(client.getQueryState(providerSettingsKeys.list(nextTarget))?.isInvalidated).toBe(
+				false,
+			);
+			const requestsAfterAction = list.mock.calls.length;
 			await typeInto(field("Extension label"), "Draft owned by first target");
 			await typeInto(field("API key"), "fixture-first-target-secret");
 			expect(button(actionKey).disabled).toBe(true);
@@ -493,7 +555,7 @@ describe("ProviderSettingsExtensions DOM interactions", () => {
 			expect(button(saveKey).disabled).toBe(true);
 			expect(button(actionKey).disabled).toBe(false);
 			expect(container.textContent).not.toContain("Action complete");
-			expect(list).not.toHaveBeenCalled();
+			expect(list).toHaveBeenCalledTimes(requestsAfterAction);
 			expect(save).not.toHaveBeenCalled();
 
 			await typeInto(field("Extension label"), "Draft owned by second target");

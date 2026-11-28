@@ -42,7 +42,7 @@ export function readProviderSettingsCoreContext(
 		tlsRejectUnauthorized: boolean | undefined;
 	let identity: unknown = [kind, id];
 	if (kind === "custom-api") {
-		const provider = settings.customApiProviders.find((value) => value.id === id);
+		const provider = settings.customApiProviders?.find((value) => value.id === id);
 		if (!provider) return unavailable();
 		const keyStore = getProviderKeyStore();
 		if (!keyStore.readable) return unavailable();
@@ -66,7 +66,7 @@ export function readProviderSettingsCoreContext(
 			tlsRejectUnauthorized ?? null,
 		];
 	} else if (kind === "nug") {
-		const provider = settings.nugProviders.find((value) => value.id === id);
+		const provider = settings.nugProviders?.find((value) => value.id === id);
 		if (!provider) return unavailable();
 		providerRoot = normalizeProviderSettingsRoot(provider.baseUrl);
 		providerKey = provider.apiKey;

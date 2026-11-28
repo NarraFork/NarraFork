@@ -237,6 +237,8 @@ export async function httpQuotaFixture(
 					...(queryOptions.cursor ? { cursor: queryOptions.cursor } : {}),
 				},
 				async (request, signal) => {
+					if (typeof request === "string" || !(signal instanceof AbortSignal))
+						throw new Error("HTTP fixture requires a legacy provider connection request");
 					try {
 						return await connection.request(request, principal, signal);
 					} catch (error) {
@@ -290,7 +292,12 @@ export async function archivedQuotaFixture(
 		approveSettings?: boolean;
 	} = {},
 ) {
-	const { mkdtemp, realpath, rm } = await import("node:fs/promises");
+	const { createHash } = await import("node:crypto");
+	const { mkdtemp, readFile, realpath, rm } = await import("node:fs/promises");
+	const { z } = await import("zod");
+	const { BuiltinPluginCatalog, builtinPluginCatalog } = await import(
+		"../../services/builtin-plugin-catalog"
+	);
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
 	const { PluginManager } = await import("../../services/plugin-manager");
@@ -383,7 +390,7 @@ export async function archivedQuotaFixture(
 	const setProviders = (value: CustomApiProviderConfig[]) => {
 		for (const provider of value) fixtureProviderIds.add(provider.id);
 		saveSettings({ ...settings, customApiProviders: value });
-		providers = settings.customApiProviders;
+		providers = required(settings.customApiProviders);
 		service.sync();
 	};
 	const prepareProviders = async (value: CustomApiProviderConfig[]) => {
@@ -391,12 +398,62 @@ export async function archivedQuotaFixture(
 		await platform.providerSettingsService.prepareQuotaMigrations();
 		service.sync();
 	};
-	await manager.install((await quotaTestPackage()).archivePath);
-	// Query fixtures explicitly act as an administrator; installation itself grants neither capability.
-	if (options.approveSettings !== false) await approveSettings();
-	await manager.enable(pluginId);
-	await manager.activate(pluginId);
-	service.start();
+	const built = await quotaTestPackage();
+	const artifact = z
+		.object({
+			pluginId: z.literal(pluginId),
+			version: z.string().min(1),
+			size: z
+				.number()
+				.int()
+				.positive()
+				.max(16 * 1024 * 1024),
+			sha256: z.string().regex(/^[a-f0-9]{64}$/),
+			packageHash: z.string().regex(/^[a-f0-9]{64}$/),
+		})
+		.parse(JSON.parse(await readFile(join(built.root, "provider-quota.asset.json"), "utf8")));
+	const bytes = await readFile(built.archivePath);
+	if (
+		bytes.byteLength !== artifact.size ||
+		createHash("sha256").update(bytes).digest("hex") !== artifact.sha256
+	)
+		throw new Error("Built quota fixture archive does not match its asset identity");
+	// Pin the test build before installation; the real migration still checks its exact package hash.
+	const catalog = new BuiltinPluginCatalog({
+		descriptors: [
+			{
+				pluginId,
+				version: artifact.version,
+				load: async (signal) => {
+					signal?.throwIfAborted();
+					return {
+						bytes: new Uint8Array(bytes),
+						sha256: artifact.sha256,
+						packageHash: artifact.packageHash,
+					};
+				},
+			},
+		],
+	});
+	const catalogLookup = spyOn(builtinPluginCatalog, "get").mockImplementation((id) =>
+		catalog.get(id),
+	);
+	try {
+		await manager.install(built.archivePath);
+		// Query fixtures explicitly act as an administrator; installation itself grants neither capability.
+		if (options.approveSettings !== false) await approveSettings();
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		service.start();
+	} catch (error) {
+		catalogLookup.mockRestore();
+		await manager.shutdown();
+		service.dispose();
+		connection.dispose();
+		platform.providerSettingsService.close();
+		await rm(root, { recursive: true, force: true });
+		throw error;
+	}
 	return {
 		root,
 		directory,
@@ -449,9 +506,10 @@ export async function archivedQuotaFixture(
 					service.dispose();
 					connection.dispose();
 					platform.providerSettingsService.close();
+					catalogLookup.mockRestore();
 					for (const providerId of fixtureProviderIds) {
 						forgetQuotaSettingsProjection(providerId);
-						if (!savedProviders.some(({ id }) => id === providerId)) {
+						if (!savedProviders?.some(({ id }) => id === providerId)) {
 							getProviderKeyStore().removeProvider(providerId);
 							getProviderKeyStore().removeProvider(quotaKeyOwner(providerId));
 						}
