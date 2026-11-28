@@ -239,6 +239,103 @@ describe("output content lifecycle", () => {
 	});
 });
 
+describe("Responses text item metadata", () => {
+	test("late phase patches one completed part without copying the last item's phase or text", () => {
+		const content = new OutputContentAccumulator();
+		const first = { blockId: "comment/0", outputIndex: 0 };
+		const part0 = { blockId: "partial/0", outputIndex: 2 };
+		const part1 = { blockId: "partial/1", outputIndex: 2 };
+		const final = { blockId: "final/0", outputIndex: 3 };
+		blocks(content.textMetadata({ openai: { itemId: "comment", contentIndex: 0 } }, first));
+		const identity = content.append("text", "commentary", first);
+		blocks(content.boundary({ kind: "text", phase: "complete", ...first }));
+		blocks(content.beforeExternal("call", 1));
+		for (const [index, lane] of [part0, part1].entries()) {
+			blocks(content.begin("text", lane));
+			content.append("text", `partial ${index}`, lane);
+			blocks(
+				content.textMetadata(
+					{ openai: { itemId: "partial", contentIndex: index, phase: "partial_answer" } },
+					lane,
+				),
+			);
+		}
+		blocks(content.begin("text", final));
+		content.append("text", "final", final);
+		blocks(
+			content.textMetadata(
+				{ openai: { itemId: "final", contentIndex: 0, phase: "final_answer" } },
+				final,
+			),
+		);
+		blocks(content.flush());
+		const late = blocks(content.textMetadata({ openai: { phase: "commentary" } }, first));
+		expect(late).toHaveLength(1);
+		expect(late[0]).toMatchObject({
+			id: identity.blockId,
+			text: "commentary",
+			completed: true,
+			providerMetadata: { openai: { itemId: "comment", contentIndex: 0, phase: "commentary" } },
+		});
+		expect(blocks(content.textMetadata({ openai: { phase: "commentary" } }, first))).toEqual([]);
+		expect(blocks(content.flush())).toEqual([]);
+		const ordered = content.orderedContent([
+			{ type: "tool_use", toolUseId: "call", name: "Read", input: {}, outputIndex: 1 },
+		]);
+		expect(ordered.map((block) => block.type)).toEqual([
+			"text",
+			"tool_use",
+			"text",
+			"text",
+			"text",
+		]);
+		expect(
+			ordered.filter((block) => block.type === "text").map((block) => block.providerMetadata),
+		).toEqual([
+			{ openai: { itemId: "comment", contentIndex: 0, phase: "commentary" } },
+			{ openai: { itemId: "partial", contentIndex: 0, phase: "partial_answer" } },
+			{ openai: { itemId: "partial", contentIndex: 1, phase: "partial_answer" } },
+			{ openai: { itemId: "final", contentIndex: 0, phase: "final_answer" } },
+		]);
+		// A final_answer message is not a stream completion signal.
+		expect(ordered.at(-1)).toMatchObject({ completed: false });
+		expect(content.finalizeText().text).toBe("commentarypartial 0partial 1final");
+	});
+
+	test("repeated metadata after a checkpoint does not persist every delta", () => {
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "native/0", outputIndex: 0 };
+		const metadata = {
+			openai: { itemId: "native", contentIndex: 0, phase: "commentary" as const },
+		};
+		content.append("text", "prefix", lane);
+		blocks(content.textMetadata(metadata, lane));
+		blocks(content.flush());
+		for (let index = 0; index < 10; index++) {
+			content.append("text", ".", lane);
+			expect(blocks(content.textMetadata(metadata, lane))).toEqual([]);
+		}
+		expect(blocks(content.flush())).toMatchObject([{ text: "prefix.........." }]);
+	});
+
+	test("metadata-first empty parts retain identity and retries discard their phases", () => {
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "native/0", outputIndex: 0 };
+		blocks(content.textMetadata({ openai: { itemId: "native", contentIndex: 0 } }, lane));
+		expect(blocks(content.flush())[0]).toMatchObject({
+			text: "",
+			providerMetadata: { openai: { itemId: "native", contentIndex: 0 } },
+			completed: false,
+		});
+		const streamed = content.append("text", "body", lane);
+		expect(blocks(content.flush())[0]).toMatchObject({ id: streamed.blockId, text: "body" });
+		expect(content.orderedContent()).toHaveLength(1);
+		content.reset();
+		content.append("text", "legacy", lane);
+		expect(content.orderedContent()[0]).not.toHaveProperty("providerMetadata");
+	});
+});
+
 describe("unindexed metadata before and after content", () => {
 	test("unindexed citations use turn coordinates across text→tool→text", () => {
 		const content = new OutputContentAccumulator();

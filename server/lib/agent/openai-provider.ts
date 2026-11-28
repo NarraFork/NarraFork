@@ -1,5 +1,6 @@
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
+import type { TextProviderMetadata } from "@shared/agent-protocol/types";
 import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import {
@@ -21,8 +22,27 @@ import type { OpenAIProviderConfig } from "../settings";
 import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractOpenAIUsage } from "../usage-tracking";
-import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
-import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import {
+	applyExplicitUserAgent,
+	getHttpCodexUserAgent,
+	getHttpUserAgent,
+	mergeExtraHeaders,
+	resolveClientFingerprint,
+	resolveExplicitUserAgent,
+	stripResponsesLiteHeader,
+} from "../user-agent";
+import {
+	applyCodexInstructionsInput,
+	applyCodexStableRequestFields,
+	createCodexRequestIdentity,
+} from "./codex-request";
+import {
+	createProviderTurnContext,
+	extractCodexTurnStateFromEvent,
+	getCodexTurnState,
+	type ProviderTurnContext,
+	redactCodexTurnStateInJsonText,
+} from "./codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -59,6 +79,7 @@ import {
 	supportsNativeMediaProtocolInput,
 	visitNativeMedia,
 } from "./native-media";
+import { isOutputRefusalEvent, openAIRefusalFor } from "./openai-refusal";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import {
 	type NeutralTurn,
@@ -85,12 +106,13 @@ import {
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { createRequestBodyEncoder, stringifyRequestBody } from "./request-json";
-import { parseJsonTextWithBody } from "./response-body";
+import { parseJsonTextWithBody, readResponseTextWithLimit } from "./response-body";
 import {
 	openAIChatResponseFormat,
 	openAIResponsesTextFormat,
 	structuredResult,
 } from "./response-format";
+import { readSseFrames } from "./sse-frames";
 import {
 	isStructuredOutputRejection,
 	modelLacksNativeStructuredOutput,
@@ -118,19 +140,52 @@ import { orderUserContent } from "./user-content-order";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
+// Public API endpoints use the current Chat schema, regardless of model alias.
+// A legacy relay serving an opaque model is not automatically on that contract.
+function isPublicOpenAIBase(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.protocol === "https:" &&
+			!url.port &&
+			/^(?:[a-z]{2}\.)?api\.openai\.com$/.test(url.hostname) &&
+			/^\/(?:v1\/?)?$/.test(url.pathname)
+		);
+	} catch {
+		return false;
+	}
+}
+
+function usesModernChatCap(model: string): boolean {
+	const wireModel = parseModelId(model).model.replace(/^openai[:/]/i, "");
+	return /^(?:o[1-9]\d*|(?:chatgpt|gpt)-[56])(?:[.-]|$)/i.test(wireModel);
+}
 export function applyOpenAIModelMetadata(
 	body: Record<string, unknown>,
 	model: string,
 	apiMode: OpenAIApiMode,
-	requested?: number,
+	requested: number | undefined,
+	baseUrl: string,
 ): void {
 	const metadata = effectiveModelProfile(model);
-	// Codex endpoints (including NUG Codex) do not accept max_output_tokens.
-	// Ordinary Responses and Chat Completions retain the configured output ceiling.
+	// Chat and Responses spell the same budget differently. The Codex backend
+	// does not accept either field. Never increase a requested cap to fit a minimum.
 	if (apiMode !== "codex") {
 		const limit = resolveOutputTokenLimit(metadata, requested);
-		if (limit !== undefined)
-			body[apiMode === "completions" ? "max_tokens" : "max_output_tokens"] = limit;
+		if (limit !== undefined) {
+			const publicApi = isPublicOpenAIBase(baseUrl);
+			if (apiMode === "responses") {
+				if (publicApi && limit < 16)
+					throw new RangeError(
+						`OpenAI Responses requires max_output_tokens >= 16; the effective ceiling is ${limit}.`,
+					);
+				body.max_output_tokens = limit;
+			} else {
+				const field =
+					publicApi || usesModernChatCap(model) ? "max_completion_tokens" : "max_tokens";
+				body[field] = limit;
+			}
+		}
 	}
 	if (metadata.reasoning?.supported === false) {
 		delete body.reasoning;
@@ -452,9 +507,6 @@ const OPENAI_IDENTITY: Record<string, string> = {
 // Codex models (gpt-5.x-codex) use a specialized prompt inspired by OpenCode's codex_header.txt.
 // This prompt emphasizes concise, action-oriented behavior with minimal formatting.
 
-export const CODEX_DEFAULT_INSTRUCTIONS =
-	"You are NarraFork Narrator. Follow the user's request and answer concisely.";
-
 const CODEX_IDENTITY: Record<string, string> = {
 	en: `You are NarraFork Narrator, an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more.
 
@@ -539,6 +591,9 @@ interface ResponsesFunctionCallOutputMessage {
 
 export interface OAIMessage {
 	role: "system" | "developer" | "user" | "assistant" | "tool";
+	/** Native Responses assistant message identity and continuation phase. */
+	id?: string;
+	phase?: NonNullable<TextProviderMetadata["openai"]>["phase"];
 	content?: string | OAIContentPart[] | null;
 	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
 	tools?: OAITool[];
@@ -596,6 +651,7 @@ type ResponsesReasoningBlock = {
 interface OAIDelta {
 	role?: string;
 	content?: string | null;
+	refusal?: string | null;
 	tool_calls?: Array<{
 		index: number;
 		id?: string;
@@ -608,7 +664,12 @@ interface OAIStreamChunk {
 	id?: string;
 	/** Native Responses output position when a gateway uses the legacy envelope. */
 	output_index?: number;
-	choices?: Array<{ index: number; delta: OAIDelta; finish_reason?: string | null }>;
+	choices?: Array<{
+		index: number;
+		delta?: OAIDelta;
+		message?: OAIDelta;
+		finish_reason?: string | null;
+	}>;
 	usage?: {
 		prompt_tokens?: number;
 		completion_tokens?: number;
@@ -772,10 +833,19 @@ export class OpenAIProvider implements ProviderAdapter {
 		const proxy = this.proxy
 			? applyProxyExemptions(this.proxy, target)
 			: resolveProxyForUrl(target, this.config.proxy);
-		return runProviderTransport(this.transport, input, init, (target, options) =>
-			fetchWithNetworkDiagnostics(target, options, {
-				proxy,
-				redactText: this.transport?.redactText,
+		return runProviderTransport(
+			this.transport,
+			input,
+			init,
+			(target, options) =>
+				fetchWithNetworkDiagnostics(target, options, {
+					proxy,
+					redactText: this.transport?.redactText,
+				}),
+			resolveExplicitUserAgent({
+				mode: this.config.userAgentMode,
+				custom: this.config.customUserAgent,
+				extraHeaders: this.config.extraHeaders,
 			}),
 		);
 	}
@@ -986,6 +1056,10 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		this.assertMediaInput(params.model, [params.media, params.history, params.toolResults]);
+		if (this.apiMode === "codex" && !params.turnContext) {
+			// Isolated direct calls still share one turn across WS → HTTP fallback.
+			params = { ...params, turnContext: createProviderTurnContext() };
+		}
 		// Use WebSocket mode for codex if enabled
 		if (this.useWebSocket) {
 			yield* this.chatCodexWebSocket(params);
@@ -1049,14 +1123,15 @@ export class OpenAIProvider implements ProviderAdapter {
 			// Responses API & Codex: POST /responses
 			endpoint = `${baseUrl}/responses`;
 
-			const responsesInput = buildResponsesInput(
-				messages,
-				{
-					strict: hasCredentialBoundReasoning(model),
-					currentSource: this.getActiveReasoningSource(),
-				},
-				this.apiMode,
-			);
+			const { instructions, input } = partitionResponsesMessages(messages);
+			const replay = {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			};
+			const responsesInput =
+				this.apiMode === "codex"
+					? convertHistoryToResponsesApi(input, replay)
+					: buildResponsesInput(messages, replay);
 
 			// Codex CLI sets store based on endpoint: false for standard OpenAI/ChatGPT
 			// endpoints, true only for Azure OpenAI. Since we use the ChatGPT backend
@@ -1065,6 +1140,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			// previous_response_id is unsupported — always send full history.
 			body = { model, input: responsesInput, stream: true, store: false };
 
+			if (this.apiMode === "codex" && instructions) body.instructions = instructions;
 			if (tools.length > 0) body.tools = tools;
 
 			// Codex: inject native server-side tools only when the selected model supports them.
@@ -1090,8 +1166,12 @@ export class OpenAIProvider implements ProviderAdapter {
 						diagnosticTransportIdentity(params),
 						this.codexInstallationId(),
 					),
+					instructionsConversationId: params.diagnosticFork ? params.conversationId : undefined,
 					reasoningEffort: normalizedCodexReasoningEffort,
 				});
+				if (params.turnContext) {
+					(body.client_metadata as Record<string, string>).turn_id = params.turnContext.id;
+				}
 			} else {
 				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):
 				// send the effort hint too. These used to get nothing at all, so
@@ -1141,36 +1221,48 @@ export class OpenAIProvider implements ProviderAdapter {
 			// OpenAI's prompt cache is per-machine; load-balanced relays need a stable routing key (codex sets its own).
 			body.prompt_cache_key = params.conversationId;
 		}
-		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
-		const requestHeaders = this.buildHeaders(apiKey, diagnosticTransportIdentity(params));
-
-		// x-codex-turn-state is per-turn: the server hands it back on the first
-		// response of a turn and expects it replayed on every later request of
-		// that same turn (here: the strip-and-retry attempts below). codex-rs
-		// keeps it in a per-turn OnceLock and sends it as an HTTP header on this
-		// transport; the websocket path carries it in client_metadata instead
-		// (see applyTurnStateToRequest in codex-websocket.ts).
-		let turnState: string | null = null;
-
-		// One strip-and-retry for endpoints that reject an optional request field
-		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
-		// before any stream event has been yielded — after that the consumer has
-		// already seen partial output and a silent re-send would duplicate it.
+		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens, baseUrl);
+		// Only optional fields can be omitted, and only before any visible output.
+		// Output ceilings are never removed just to make a failed request succeed.
 		const encodeBody = createRequestBodyEncoder();
 		const encodeDump = createNativeMediaDumpEncoder();
 		for (let attempt = 0; ; attempt++) {
-			if (turnState && this.apiMode === "codex") {
-				requestHeaders["x-codex-turn-state"] = turnState;
+			const requestHeaders = this.buildHeaders(apiKey, diagnosticTransportIdentity(params));
+			const turnState =
+				this.apiMode === "codex"
+					? getCodexTurnState(params.turnContext, {
+							baseUrl: endpoint,
+							credentialId: this.config.id,
+							headers: requestHeaders,
+						})
+					: undefined;
+			if (turnState?.value) {
+				mergeExtraHeaders(requestHeaders, { "x-codex-turn-state": turnState.value }, "User-Agent");
 			}
 			await reportInputCharacters(params, body);
 			const bodyText = await encodeBody(body, params.signal);
-			params.requestDump?.beginResponseAttempt({
-				transport: "http",
-				method: "POST",
-				url: endpoint,
-				headers: sanitizeHeaders(requestHeaders),
-				bodyText: await encodeDump(body, bodyText, params.signal),
-			});
+			if (params.requestDump) {
+				// Keep the wire object intact and preserve the bounded worker encoder:
+				// only the small Codex metadata root differs in the evidence body.
+				const dumpBody =
+					this.apiMode === "codex" && params.turnContext
+						? {
+								...body,
+								client_metadata: {
+									...(body.client_metadata as Record<string, string>),
+									turn_id: "[REDACTED]",
+								},
+							}
+						: body;
+				const dumpText = dumpBody === body ? bodyText : await encodeBody(dumpBody, params.signal);
+				params.requestDump.beginResponseAttempt({
+					transport: "http",
+					method: "POST",
+					url: endpoint,
+					headers: sanitizeHeaders(requestHeaders),
+					bodyText: await encodeDump(dumpBody, dumpText, params.signal),
+				});
+			}
 
 			params.diagnosticFork?.validateCredential?.();
 			params.onRequestStart?.();
@@ -1190,9 +1282,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Capture the turn's sticky-routing token before status handling so
 			// even a non-2xx first response can seed the retried request.
-			if (this.apiMode === "codex" && !turnState) {
-				turnState = response.headers.get("x-codex-turn-state");
-			}
+			turnState?.capture(response.headers.get("x-codex-turn-state"));
 
 			params.streamProgress?.onHeaders(response.status);
 			params.requestDump?.setResponseMeta({
@@ -1209,9 +1299,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
 				throw error;
 			}
+			// Codex metadata frames contain an opaque routing token. Record decoded,
+			// redacted SSE frames instead of tapping the raw bytes before parsing.
+			const frameRecording =
+				this.apiMode === "codex" && response.ok ? params.requestDump : undefined;
 			const capture = captureResponseStream(
 				response.body,
-				params.requestDump,
+				frameRecording ? undefined : params.requestDump,
 				params.streamProgress,
 			);
 			let yieldedEvent = false;
@@ -1233,13 +1327,19 @@ export class OpenAIProvider implements ProviderAdapter {
 					throw error;
 				}
 				if (usesResponsesEndpoint(this.apiMode)) {
-					for await (const evt of _parseResponsesAPIStream(capture.stream)) {
+					for await (const evt of _parseResponsesAPIStream(capture.stream, {
+						drainUntilEof: this.config.drainUntilEof,
+						onCodexTurnState: turnState?.capture,
+						frameRecording,
+						signal: params.signal,
+					})) {
 						// A field-rejection can arrive as HTTP 200 + SSE error. Throw before
 						// any consumer-visible event so the outer strip-and-retry can run;
 						// after content starts, a silent re-send would duplicate output.
 						if (
 							!yieldedEvent &&
 							evt.invalidState &&
+							evt.invalidState.reason !== "refusal" &&
 							parseUnsupportedParameter(evt.invalidState.message)
 						) {
 							throw new ProviderInvalidStateError(
@@ -1252,7 +1352,10 @@ export class OpenAIProvider implements ProviderAdapter {
 						yield stampReasoningSource(evt, this.getActiveReasoningSource());
 					}
 				} else {
-					for await (const evt of this.parseSSEStreamWithDetection(capture.stream)) {
+					for await (const evt of parseSSEStream(capture.stream, {
+						drainUntilEof: this.config.drainUntilEof,
+						signal: params.signal,
+					})) {
 						yieldedEvent = true;
 						yield evt;
 					}
@@ -1271,21 +1374,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			} finally {
 				capture.finish();
 			}
-		}
-	}
-
-	/**
-	 * Wrap parseSSEStream to detect Responses API format from Codex gateways.
-	 * Only relevant for "codex" mode — completions mode ignores the marker.
-	 */
-	private async *parseSSEStreamWithDetection(
-		body: ReadableStream<Uint8Array>,
-	): AsyncGenerator<ParsedStreamEvent> {
-		for await (const evt of parseSSEStream(body)) {
-			if (evt._responsesApi && this.apiMode === "codex") {
-				logger.debug("Codex gateway confirmed Responses API format");
-			}
-			yield evt;
 		}
 	}
 
@@ -1340,6 +1428,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			options?.responseFormat && !useNativeFormat
 				? withSchemaInstruction(systemInstruction, options.responseFormat)
 				: systemInstruction;
+		const codexIdentity =
+			this.apiMode === "codex"
+				? createCodexRequestIdentity(undefined, this.codexInstallationId())
+				: undefined;
+		const turnContext = codexIdentity ? createProviderTurnContext() : undefined;
 		/** Learn from a native attempt that came back without structure. */
 		const learnFrom = (result: GenerateMetaResult): GenerateMetaResult => {
 			if (useNativeFormat && result.responseFormatDegraded && !result.outputTruncated) {
@@ -1366,7 +1459,13 @@ export class OpenAIProvider implements ProviderAdapter {
 						delete textOptions.format;
 						if (Object.keys(textOptions).length === 0) delete body.text;
 					}
-					body.input = responsesTextInput(text, fallbackInstruction, this.apiMode);
+					if (codexIdentity) {
+						body.instructions = fallbackInstruction;
+						// Replace the stable Codex prefix without disturbing its turn identity.
+						applyCodexInstructionsInput(body, codexIdentity);
+					} else {
+						body.input = responsesTextInput(text, fallbackInstruction, this.apiMode);
+					}
 				} else {
 					delete body.response_format;
 					body.messages = [
@@ -1419,10 +1518,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: responsesTextInput(text, instruction, this.apiMode),
 				store: false,
 			};
-			const codexIdentity =
-				this.apiMode === "codex"
-					? createCodexRequestIdentity(undefined, this.codexInstallationId())
-					: undefined;
+			if (codexIdentity && instruction) body.instructions = instruction;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1433,7 +1529,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			} else {
 				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
-			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens, baseUrl);
 			// The Responses API carries the output constraint as `text.format`,
 			// not `response_format`. Merge rather than assign so a future
 			// `text.verbosity` survives.
@@ -1446,10 +1542,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				};
 			}
 			const conversationId = codexIdentity?.conversationId;
-			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
-			// request of the SAME turn and must replay the token the first
-			// response handed back (codex-rs sends it as an HTTP header here).
-			const turnState: { value: string | null } = { value: null };
+			if (turnContext) {
+				(body.client_metadata as Record<string, string>).turn_id = turnContext.id;
+			}
 			const result = await requestWithFallback(body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1458,7 +1553,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
-					turnState,
+					turnContext,
 				),
 			);
 			return learnFrom(result);
@@ -1477,7 +1572,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			stream_options: { include_usage: true },
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
-		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens, baseUrl);
 		if (useNativeFormat && options?.responseFormat) {
 			body.response_format = openAIChatResponseFormat(options.responseFormat);
 		}
@@ -1525,12 +1620,16 @@ export class OpenAIProvider implements ProviderAdapter {
 			const body: Record<string, unknown> = {
 				model: bareModel,
 				input: responsesTextInput(`${reminder}\n\n${content}`, systemInstruction, this.apiMode),
+				...(this.apiMode === "codex" && systemInstruction
+					? { instructions: systemInstruction }
+					: {}),
 				store: false,
 			};
 			const codexIdentity =
 				this.apiMode === "codex"
 					? createCodexRequestIdentity(undefined, this.codexInstallationId())
 					: undefined;
+			const turnContext = codexIdentity ? createProviderTurnContext() : undefined;
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1541,12 +1640,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			} else {
 				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
-			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens, baseUrl);
 			const conversationId = codexIdentity?.conversationId;
-			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
-			// request of the SAME turn and must replay the token the first
-			// response handed back (codex-rs sends it as an HTTP header here).
-			const turnState: { value: string | null } = { value: null };
+			if (turnContext) {
+				(body.client_metadata as Record<string, string>).turn_id = turnContext.id;
+			}
 			return withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
@@ -1555,7 +1653,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					options?.signal,
 					options,
 					conversationId,
-					turnState,
+					turnContext,
 				),
 			);
 		}
@@ -1571,7 +1669,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			stream_options: { include_usage: true },
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
-		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens, baseUrl);
 		return withUnsupportedParameterFallback(model, body, (retryBody) =>
 			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
 		);
@@ -1584,14 +1682,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		signal?: AbortSignal,
 		options?: GenerateOptions,
 		conversationId?: string,
-		turnState?: { value: string | null },
+		turnContext?: ProviderTurnContext,
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
 		}
 		const headers = this.buildHeaders(apiKey, conversationId);
-		if (turnState?.value && this.apiMode === "codex") {
-			headers["x-codex-turn-state"] = turnState.value;
+		const turnState =
+			this.apiMode === "codex"
+				? getCodexTurnState(turnContext, {
+						baseUrl: `${baseUrl}/responses`,
+						credentialId: this.config.id,
+						headers,
+					})
+				: undefined;
+		if (turnState?.value) {
+			mergeExtraHeaders(headers, { "x-codex-turn-state": turnState.value }, "User-Agent");
 		}
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
@@ -1601,9 +1707,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		// Capture the turn's sticky-routing token before status handling so even
 		// a non-2xx first response can seed the retried request.
-		if (turnState && this.apiMode === "codex" && !turnState.value) {
-			turnState.value = response.headers.get("x-codex-turn-state");
-		}
+		turnState?.capture(response.headers.get("x-codex-turn-state"));
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			throw createOpenAIApiError(response, errText);
@@ -1612,17 +1716,20 @@ export class OpenAIProvider implements ProviderAdapter {
 		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 		const looksJson = contentType.includes("application/json");
 		if (looksJson) {
-			const raw = await response.text();
+			const raw = await readResponseTextWithLimit(response);
 			const json = parseResponsesJson(raw);
 			const text = extractResponsesText(json.output);
 			// Reuse stream error precedence: a policy/API failure is not a truncation.
-			const invalid = parseResponsesAPIEvent({ response: json }, new Map(), new Map()).find(
-				(event) => event.invalidState,
-			)?.invalidState;
+			const invalid = parseResponsesAPIEvent(
+				{ type: "response.completed", response: json },
+				new Map(),
+				new Map(),
+			).find((event) => event.invalidState)?.invalidState;
 			const outputTruncated = !!text && !!invalid && isCompletionLimitReason(invalid.reason);
 			if (invalid && !outputTruncated) {
 				throw new ProviderInvalidStateError(invalid.reason, invalid.message, {
 					diagnostics: invalid.diagnostics,
+					usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 				});
 			}
 			if (text) await options?.onTextDelta?.(text);
@@ -1641,7 +1748,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		let outputTruncated = false;
-		for await (const evt of _parseResponsesAPIStream(response.body)) {
+		for await (const evt of _parseResponsesAPIStream(response.body, {
+			drainUntilEof: this.config.drainUntilEof,
+			onCodexTurnState: turnState?.capture,
+			signal,
+		})) {
 			if (evt.text) {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
@@ -1655,8 +1766,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
-					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
-					{ diagnostics: evt.invalidState.diagnostics },
+					evt.invalidState.reason === "refusal"
+						? evt.invalidState.message
+						: `OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
+					{ diagnostics: evt.invalidState.diagnostics, usage },
 				);
 			}
 		}
@@ -1692,9 +1805,12 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 		if (contentType.includes("application/json")) {
-			const raw = await response.text();
+			const raw = await readResponseTextWithLimit(response);
 			const json = parseJsonWithPreview<{
-				choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+				choices?: Array<{
+					message?: { content?: string | null; refusal?: string | null };
+					finish_reason?: string;
+				}>;
 				error?: unknown;
 				usage?: {
 					prompt_tokens?: number;
@@ -1708,6 +1824,15 @@ export class OpenAIProvider implements ProviderAdapter {
 			const error = parseUpstreamErrorEnvelope(json);
 			if (error) {
 				throw new ProviderInvalidStateError(error.code ?? "api_error", error.message);
+			}
+			const refusal = openAIRefusalFor(json);
+			refusal.chat(json.choices?.[0]);
+			if (refusal.seen) {
+				const invalid = refusal.event().invalidState;
+				throw new ProviderInvalidStateError(invalid.reason, invalid.message, {
+					diagnostics: invalid.diagnostics,
+					usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				});
 			}
 			const outputTruncated = !!finishReason && isCompletionLimitReason(finishReason);
 			if (
@@ -1737,7 +1862,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		let outputTruncated = false;
-		for await (const evt of parseSSEStream(response.body)) {
+		for await (const evt of parseSSEStream(response.body, { ...this.config, signal })) {
 			if (evt.text) {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
@@ -1751,8 +1876,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
-					`OpenAI Chat Completions stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
-					{ diagnostics: evt.invalidState.diagnostics },
+					evt.invalidState.reason === "refusal"
+						? evt.invalidState.message
+						: `OpenAI Chat Completions stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
+					{ diagnostics: evt.invalidState.diagnostics, usage },
 				);
 			}
 		}
@@ -1816,19 +1943,37 @@ export class OpenAIProvider implements ProviderAdapter {
 		// OpenCode Go serves both OpenAI shapes (/zen/go/v1/responses and
 		// /chat/completions) and reads session identity only from its own header,
 		// so it has to be added here rather than carried by the request body.
-		Object.assign(
+		mergeExtraHeaders(
 			headers,
 			buildOpencodeSessionHeader({
 				baseUrl: this.config.baseUrl,
 				conversationId,
 				extraHeaders: this.config.extraHeaders,
 			}),
+			"User-Agent",
 		);
-		// Emulated codex headers + user-configured extra headers (user wins).
-		Object.assign(headers, fingerprint.headers);
+		// Fingerprint/user overrides win over defaults, regardless of header casing.
+		mergeExtraHeaders(headers, fingerprint.headers, "User-Agent");
 		// Runtime-dynamic headers last (e.g. the NUG client-relay channel id,
 		// which rotates on every relay reconnect and must be read per request).
-		Object.assign(headers, this.config.dynamicHeaders?.() ?? {});
+		mergeExtraHeaders(headers, this.config.dynamicHeaders?.(), "User-Agent");
+		applyExplicitUserAgent(
+			headers,
+			{
+				mode: this.config.userAgentMode,
+				custom: this.config.customUserAgent,
+				extraHeaders: this.config.extraHeaders,
+			},
+			"User-Agent",
+			fingerprint.userAgent,
+		);
+		stripResponsesLiteHeader(headers);
+		if (this.apiMode === "codex") {
+			// Routing state is owned by the current turn and credential, not extraHeaders.
+			for (const key of Object.keys(headers)) {
+				if (key.toLowerCase() === "x-codex-turn-state") delete headers[key];
+			}
+		}
 		return headers;
 	}
 
@@ -1863,6 +2008,19 @@ export class OpenAIProvider implements ProviderAdapter {
 			params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId;
 		const conversationId = diagnosticTransportIdentity(params);
 		const fingerprint = this.resolveFingerprint(conversationId);
+		const extraHeaders = { ...fingerprint.headers };
+		mergeExtraHeaders(extraHeaders, this.config.dynamicHeaders?.(), "User-Agent");
+		applyExplicitUserAgent(
+			extraHeaders,
+			{
+				mode: this.config.userAgentMode,
+				custom: this.config.customUserAgent,
+				extraHeaders: this.config.extraHeaders,
+			},
+			"User-Agent",
+			fingerprint.userAgent,
+		);
+		stripResponsesLiteHeader(extraHeaders);
 
 		try {
 			await reportInputCharacters(params, request);
@@ -1875,6 +2033,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				proxy: this.proxy,
 				sessionKey,
 				conversationId,
+				turnContext: params.turnContext,
 				narratorId: params.diagnosticFork ? sessionKey : params.stickySessionKey,
 				credentialId: this.config.id,
 				model: params.model,
@@ -1884,7 +2043,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				ephemeralSession: params.diagnostic,
 				validateBeforeDispatch: params.diagnosticFork?.validateCredential,
 				userAgent: fingerprint.userAgent,
-				extraHeaders: fingerprint.headers,
+				extraHeaders,
 				requestDump: params.requestDump,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
@@ -1926,19 +2085,17 @@ export class OpenAIProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
+		const { instructions, input } = partitionResponsesMessages(messages);
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: buildResponsesInput(
-				messages,
-				{
-					strict: hasCredentialBoundReasoning(model),
-					currentSource: this.getActiveReasoningSource(),
-				},
-				"codex",
-			),
+			input: convertHistoryToResponsesApi(input, {
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: this.getActiveReasoningSource(),
+			}),
 			stream: true,
 			store: false,
 		};
+		if (instructions) request.instructions = instructions;
 		const tools =
 			params.diagnostic && !params.diagnosticFork
 				? []
@@ -1955,13 +2112,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				diagnosticTransportIdentity(params),
 				this.codexInstallationId(),
 			),
+			instructionsConversationId: params.diagnosticFork ? params.conversationId : undefined,
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
+		if (params.turnContext) {
+			(request.client_metadata as Record<string, string>).turn_id = params.turnContext.id;
+		}
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
 
-		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		applyOpenAIModelMetadata(
+			request,
+			params.model,
+			"codex",
+			params.maxOutputTokens,
+			this.config.baseUrl || defaultBaseUrl("codex"),
+		);
 		appendDiagnosticOpenAIInput(request, params, true);
 		if (params.diagnosticFork) request.prompt_cache_key = params.conversationId;
 		return request;
@@ -2195,10 +2362,14 @@ export function stampReasoningSource(
  */
 async function* _parseResponsesAPIStream(
 	body: ReadableStream<Uint8Array>,
+	options: {
+		drainUntilEof?: boolean;
+		onCodexTurnState?: (value: string | null) => void;
+		frameRecording?: ChatParams["requestDump"];
+		signal?: AbortSignal;
+	} = {},
 ): AsyncGenerator<ParsedStreamEvent> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	let lineCount = 0;
+	let frameCount = 0;
 	let sawResponsesEvent = false;
 	let completed = false;
 	let completionLimited = false;
@@ -2207,10 +2378,9 @@ async function* _parseResponsesAPIStream(
 
 	// Tool call accumulators keyed by output_index (matches OpenAI SSE structure)
 	const toolAccum = new Map<number, ResponsesToolAccum>();
+	const refusal = openAIRefusalFor(toolAccum);
 	// Reasoning item accumulators keyed by output_index
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
-	// Track SSE event: type for gateway-injected events
-	let currentEventType = "";
 
 	const parsePayload = (payload: string, eventType: string): ParsedStreamEvent[] => {
 		if (!payload || payload === "[DONE]") return [];
@@ -2221,7 +2391,7 @@ async function* _parseResponsesAPIStream(
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				lastParseError = {
 					error: "SSE data was not a JSON object",
-					preview: payload.slice(0, 300),
+					preview: redactCodexTurnStateInJsonText(payload.slice(0, 300)),
 				};
 				return [];
 			}
@@ -2229,7 +2399,7 @@ async function* _parseResponsesAPIStream(
 		} catch (err) {
 			lastParseError = {
 				error: err instanceof Error ? err.message : String(err),
-				preview: payload.slice(0, 300),
+				preview: redactCodexTurnStateInJsonText(payload.slice(0, 300)),
 			};
 			return [];
 		}
@@ -2248,11 +2418,14 @@ async function* _parseResponsesAPIStream(
 		if (
 			eventType &&
 			typeof data.type !== "string" &&
-			(eventType.startsWith("response.") || eventType === "error")
+			(eventType.startsWith("response.") ||
+				eventType === "codex.response.metadata" ||
+				eventType === "error")
 		) {
 			data.type = eventType;
 		}
 
+		options.onCodexTurnState?.(extractCodexTurnStateFromEvent(data));
 		const chunk = data as ResponsesAPIChunk;
 		const type = chunk.type;
 		if (typeof type === "string" && (type.startsWith("response.") || type === "error")) {
@@ -2260,97 +2433,80 @@ async function* _parseResponsesAPIStream(
 		}
 		const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
 		for (const evt of events) {
-			if (!evt.invalidState) continue;
+			if (!evt.invalidState || isOutputRefusalEvent(evt)) continue;
 			// Output limits end generation, not accounting: relays can still send usage.
 			if (isCompletionLimitReason(evt.invalidState.reason)) completionLimited = true;
 			else terminalError = true;
 		}
-		if (type === "response.completed") completed = true;
-		return events;
+		// parseResponsesAPIEvent has finalized tools and accounting before return.
+		if (type === "response.completed" && !terminalError && !completionLimited) completed = true;
+		// NUG can append metering even after completion; emit refusal once after it.
+		return events.filter((evt) => !isOutputRefusalEvent(evt));
 	};
 
-	const reader = body.getReader();
+	let reachedEof = false;
+	options.frameRecording?.setResponseMeta({ bodyRecording: "redacted_sse_frames" });
 	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed) {
-					currentEventType = "";
-					continue;
-				}
-				// Track SSE event: lines for gateway-injected events
-				if (trimmed.startsWith("event:")) {
-					currentEventType = trimmed.slice(6).trim();
-					continue;
-				}
-				if (!trimmed.startsWith("data:")) continue;
-
-				if (lineCount < 5) {
-					logger.debug("Responses API SSE line", {
-						lineIndex: lineCount,
-						preview: trimmed.slice(0, 300),
-					});
-				}
-				lineCount++;
-
-				const payload = trimmed.slice(5).trimStart();
-				const eventType = currentEventType;
-				currentEventType = "";
-				const events = parsePayload(payload, eventType);
-				for (const evt of events) {
-					yield evt;
-				}
-				if (terminalError) return;
+		for await (const frame of readSseFrames(body)) {
+			const safePayload = options.frameRecording
+				? redactCodexTurnStateInJsonText(frame.data)
+				: undefined;
+			if (safePayload !== undefined) {
+				const eventLine = frame.event ? `event: ${frame.event}\n` : "";
+				options.frameRecording?.appendResponseText(
+					`${eventLine}data: ${safePayload.replaceAll("\n", "\ndata: ")}\n\n`,
+				);
+			}
+			if (frameCount < 5) {
+				logger.debug("Responses API SSE frame", {
+					frameIndex: frameCount,
+					preview: (safePayload ?? redactCodexTurnStateInJsonText(frame.data.slice(0, 300))).slice(
+						0,
+						300,
+					),
+				});
+			}
+			frameCount++;
+			for (const evt of parsePayload(frame.data, frame.event)) yield evt;
+			// Breaking/returning closes readSseFrames, which cancels the upstream reader.
+			// Only the explicit NUG adapter opts into trailing metering until EOF.
+			if (terminalError) return;
+			if (completed && !options.drainUntilEof) {
+				if (refusal.seen) yield refusal.event();
+				return;
 			}
 		}
-		// Process remaining buffer
-		if (buffer.trim()?.startsWith("data:")) {
-			const trimmed = buffer.trim();
-			const payload = trimmed.slice(5).trimStart();
-			const events = parsePayload(payload, currentEventType);
-			for (const evt of events) {
-				yield evt;
-			}
-		}
-		if (terminalError || completionLimited) return;
-		if (!completed) {
-			const parseDetail = lastParseError
-				? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
-				: sawResponsesEvent
-					? ""
-					: " No Responses API events were parsed from the stream.";
-			yield {
-				invalidState: {
-					reason: "stream_closed_before_response_completed",
-					message: `Responses API stream closed before response.completed.${parseDetail}`,
-				},
-			};
+		reachedEof = true;
+		if (terminalError) return;
+		if (refusal.seen) {
+			yield refusal.event();
 			return;
 		}
-		// Flush any un-emitted tool calls only after a completed response. Otherwise
-		// a truncated stream could execute a half-written tool call and hide the real failure.
-		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				acc.emitted = true;
-				yield {
-					toolUseChunk: {
-						toolUseId: acc.callId,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				};
-			}
-		}
+		if (completionLimited || completed) return;
+		const parseDetail = lastParseError
+			? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
+			: sawResponsesEvent
+				? ""
+				: " No Responses API events were parsed from the stream.";
+		yield {
+			invalidState: {
+				reason: "stream_closed_before_response_completed",
+				message: `Responses API stream closed before response.completed.${parseDetail}`,
+			},
+		};
+	} catch (error) {
+		// A closed transport after model output must not replay a refused prompt.
+		if (
+			!refusal.seen ||
+			options.signal?.aborted ||
+			(error instanceof Error && error.name === "AbortError")
+		)
+			throw error;
+		yield refusal.event();
 	} finally {
-		reader.releaseLock();
+		options.frameRecording?.finishResponseCapture(
+			reachedEof || (completed && !options.drainUntilEof),
+		);
 	}
 }
 
@@ -2368,6 +2524,8 @@ export interface ResponsesAPIChunk {
 	arguments?: string;
 	/** Present on *.done events that carry the full accumulated text. */
 	text?: string;
+	/** Authoritative refusal body on response.refusal.done. */
+	refusal?: string;
 	output_index?: number;
 	content_index?: number;
 	/** Internal alias resolved from item_id/output_index for this stream. */
@@ -2479,10 +2637,37 @@ export interface ResponsesReasoningAccum {
 	completed?: boolean;
 }
 
-interface ResponsesTextLane {
+type ResponsesMessagePhase = NonNullable<TextProviderMetadata["openai"]>["phase"];
+
+function responsesMessagePhase(value: unknown): ResponsesMessagePhase {
+	return value === "commentary" || value === "partial_answer" || value === "final_answer"
+		? value
+		: undefined;
+}
+
+interface ResponsesItemIdentity {
+	key: string | number;
 	outputIndex?: number;
+	itemId?: string;
+	phase?: ResponsesMessagePhase;
+}
+
+interface ResponsesTextLane {
+	item: ResponsesItemIdentity;
+	contentIndex: number;
 	length: number;
 	completed?: boolean;
+}
+
+function responsesTextMetadata(lane: ResponsesTextLane): TextProviderMetadata | undefined {
+	if (!lane.item.itemId && !lane.item.phase) return undefined;
+	return {
+		openai: {
+			...(lane.item.itemId ? { itemId: lane.item.itemId } : {}),
+			contentIndex: lane.contentIndex,
+			...(lane.item.phase ? { phase: lane.item.phase } : {}),
+		},
+	};
 }
 
 // Keyed by the caller-owned, per-response accumulator (also used by Codex WS).
@@ -2491,7 +2676,7 @@ const responsesContentState = new WeakMap<
 	Map<number, ResponsesToolAccum>,
 	{
 		textLanes: Map<string, ResponsesTextLane>;
-		items: Map<string, { key: string | number; outputIndex?: number }>;
+		items: Map<string, ResponsesItemIdentity>;
 	}
 >();
 
@@ -2651,6 +2836,8 @@ export function parseResponsesAPIEvent(
 ): ParsedStreamEvent[] {
 	const type = chunk.type;
 	const payload = chunk as unknown as Record<string, unknown>;
+	const refusal = openAIRefusalFor(toolAccum);
+	refusal.responses(chunk);
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
@@ -2688,6 +2875,12 @@ export function parseResponsesAPIEvent(
 						? "failed"
 						: undefined;
 	if (failureState || envelope || type === "error") {
+		// A generation cutoff must not turn a received content refusal into a
+		// continuation. Actual response/error envelopes still outrank its output.
+		if (failureState === "incomplete" && !responseError && !envelope && refusal.seen) {
+			results.push(refusal.event());
+			return results;
+		}
 		const incompleteReason =
 			failureState === "incomplete" &&
 			typeof chunk.response?.incomplete_details?.reason === "string"
@@ -2756,6 +2949,13 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 
+	// Retain usage, but no new tool or ordinary text may execute after an explicit
+	// refusal. Transports defer this verdict until accounting has been delivered.
+	if (refusal.seen) {
+		if (type === "response.completed") results.push(refusal.event());
+		return results;
+	}
+
 	// ── Response created: capture response ID for previous_response_id chaining ──
 	if (type === "response.created" && chunk.response?.id) {
 		logger.debug("Responses API response created", { responseId: chunk.response.id });
@@ -2772,14 +2972,31 @@ export function parseResponsesAPIEvent(
 	const itemId = chunk.item_id ?? chunk.item?.id;
 	const indexAlias = chunk.output_index == null ? undefined : `index:${chunk.output_index}`;
 	const idAlias = typeof itemId === "string" ? `id:${itemId}` : undefined;
-	const identity = (idAlias ? items.get(idAlias) : undefined) ??
+	const identity: ResponsesItemIdentity = (idAlias ? items.get(idAlias) : undefined) ??
 		(indexAlias ? items.get(indexAlias) : undefined) ?? {
 			key: chunk.output_index ?? itemId ?? "unknown",
 			outputIndex: chunk.output_index,
 		};
+	const previousItemId = identity.itemId;
+	const previousPhase = identity.phase;
 	if (chunk.output_index != null) identity.outputIndex = chunk.output_index;
+	if (typeof itemId === "string" && itemId) identity.itemId = itemId;
+	const messagePhase = responsesMessagePhase(chunk.item?.phase);
+	if (messagePhase) identity.phase = messagePhase;
 	if (indexAlias) items.set(indexAlias, identity);
 	if (idAlias) items.set(idAlias, identity);
+	// Item identity/phase may arrive after individual parts have completed. Patch
+	// every known part, without interpreting final_answer as a lifecycle boundary.
+	if (identity.itemId !== previousItemId || identity.phase !== previousPhase) {
+		for (const [blockId, lane] of textLanes) {
+			if (lane.item !== identity) continue;
+			results.push({
+				textMetadata: responsesTextMetadata(lane),
+				textBlockId: blockId,
+				textOutputIndex: identity.outputIndex,
+			});
+		}
+	}
 	chunk = {
 		...chunk,
 		_contentItemKey: identity.key,
@@ -2787,17 +3004,31 @@ export function parseResponsesAPIEvent(
 	};
 	const emitText = (partChunk: ResponsesAPIChunk, text: string, delta: boolean) => {
 		const blockId = responsesBlockId(partChunk, "text");
-		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		const lane = textLanes.get(blockId) ?? {
+			item: identity,
+			contentIndex: partChunk.content_index ?? 0,
+			length: 0,
+		};
 		textLanes.set(blockId, lane);
 		const suffix = delta ? text : text.slice(lane.length);
 		if (suffix && !lane.completed) {
 			lane.length += suffix.length;
-			results.push({ text: suffix, textOutputIndex: partChunk.output_index, textBlockId: blockId });
+			const textMetadata = responsesTextMetadata(lane);
+			results.push({
+				text: suffix,
+				textOutputIndex: partChunk.output_index,
+				textBlockId: blockId,
+				...(textMetadata ? { textMetadata } : {}),
+			});
 		}
 	};
 	const textBoundary = (partChunk: ResponsesAPIChunk, phase: "checkpoint" | "complete") => {
 		const blockId = responsesBlockId(partChunk, "text");
-		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		const lane = textLanes.get(blockId) ?? {
+			item: identity,
+			contentIndex: partChunk.content_index ?? 0,
+			length: 0,
+		};
 		if (lane.completed) return;
 		textLanes.set(blockId, lane);
 		if (phase === "complete") lane.completed = true;
@@ -2871,18 +3102,14 @@ export function parseResponsesAPIEvent(
 			}
 			// Some relays omit content on item.done; finalize already-observed lanes too.
 			for (const [blockId, lane] of textLanes) {
-				if (
-					!lane.completed &&
-					chunk.output_index != null &&
-					lane.outputIndex === chunk.output_index
-				) {
+				if (!lane.completed && lane.item === identity) {
 					lane.completed = true;
 					results.push({
 						contentBoundary: {
 							kind: "text",
 							phase: "complete",
 							blockId,
-							outputIndex: lane.outputIndex,
+							outputIndex: lane.item.outputIndex,
 						},
 					});
 				}
@@ -3386,7 +3613,7 @@ export function parseResponsesAPIEvent(
 						kind: "text",
 						phase: "complete",
 						blockId,
-						outputIndex: lane.outputIndex,
+						outputIndex: lane.item.outputIndex,
 					},
 				});
 			}
@@ -3403,6 +3630,11 @@ export function parseResponsesAPIEvent(
 				});
 				acc.emitted = true;
 			}
+		}
+		// Only an explicit native boolean controls continuation. Message phase and
+		// response.completed alone say nothing about whether the logical turn ends.
+		if (typeof chunk.response?.end_turn === "boolean") {
+			results.push({ endTurn: chunk.response.end_turn });
 		}
 		// Note: usage is already extracted at the top of this function
 		return results;
@@ -3425,77 +3657,177 @@ interface ToolAccumEntry {
 	args?: string;
 	inputStream?: ToolInputStream;
 	emitted: boolean;
+	/** Standard Chat indices share completed tombstones with compatible envelopes. */
+	chat?: boolean;
+	identityPublished?: boolean;
+	bufferedFragments?: number;
+	/** A cutoff/filter cannot finalize a metadata-only call as empty arguments. */
+	abandoned?: boolean;
+}
+
+// Bound tool slots and arguments waiting for their upstream identity.
+const MAX_CHAT_TOOL_SLOTS = 128;
+const MAX_UNPUBLISHED_ARGUMENT_CHARS = 32 * 1024 * 1024;
+const MAX_UNPUBLISHED_ARGUMENT_FRAGMENTS = 65536;
+
+function invalidChatToolCall(message: string): ParsedStreamEvent {
+	return {
+		invalidState: {
+			reason: "invalid_tool_call",
+			message,
+			diagnostics: parseErrorDiagnostics(
+				{ reason: "invalid_tool_call", message, retryable: false, resumable: false },
+				{ source: "parser", phase: "tool_call_identity", reason: "invalid_tool_call", message },
+			),
+		},
+	};
+}
+
+function updateChatToolCall(
+	call: NonNullable<OAIDelta["tool_calls"]>[number],
+	outputIndex: number | undefined,
+	tools: Map<number, ToolAccumEntry>,
+): ParsedStreamEvent[] {
+	if (!call || typeof call !== "object" || Array.isArray(call))
+		return [invalidChatToolCall("Chat Completions returned an invalid tool call delta.")];
+	const slot = call.index;
+	if (!Number.isSafeInteger(slot) || slot < 0 || slot >= MAX_CHAT_TOOL_SLOTS)
+		return [invalidChatToolCall("Chat Completions returned an invalid tool call index.")];
+	if (call.type !== undefined && call.type !== "function")
+		return [invalidChatToolCall("Chat Completions returned an unsupported tool call type.")];
+	const id = call.id;
+	const name = call.function?.name;
+	const delta = call.function?.arguments;
+	if (
+		(id != null && (typeof id !== "string" || id.length > 1024)) ||
+		(name != null && (typeof name !== "string" || name.length > 64)) ||
+		(delta != null && typeof delta !== "string")
+	)
+		return [
+			invalidChatToolCall(
+				"Chat Completions returned invalid tool call identity or argument fields.",
+			),
+		];
+	let acc = tools.get(slot);
+	if (!acc) {
+		acc = { id: "", name: "", chat: true, emitted: false, outputIndex };
+		tools.set(slot, acc);
+	}
+	const nextId = id?.trim() ? id : undefined;
+	const nextName = name?.trim() ? name : undefined;
+	if (
+		(nextId && acc.id && nextId !== acc.id) ||
+		(acc.identityPublished && nextName && nextName !== acc.name)
+	)
+		return [
+			invalidChatToolCall(`Chat tool call at index ${slot} changed its established identity.`),
+		];
+	if (acc.emitted || acc.abandoned) return [];
+	if (nextId) acc.id = nextId;
+	if (nextName) acc.name = nextName;
+	if (acc.id && [...tools.values()].some((other) => other !== acc && other.id === acc.id))
+		return [invalidChatToolCall("Chat Completions reused a tool call ID at different indices.")];
+	if (delta) {
+		if (!acc.id || !acc.name) {
+			acc.bufferedFragments = (acc.bufferedFragments ?? 0) + 1;
+			let chars = delta.length;
+			let fragments = 0;
+			for (const pending of tools.values()) {
+				if (!pending.chat || pending.identityPublished) continue;
+				chars += pending.inputStream?.totalChars ?? 0;
+				fragments += pending.bufferedFragments ?? 0;
+			}
+			if (chars > MAX_UNPUBLISHED_ARGUMENT_CHARS || fragments > MAX_UNPUBLISHED_ARGUMENT_FRAGMENTS)
+				return [
+					invalidChatToolCall("Unidentified Chat tool arguments exceeded the buffer budget."),
+				];
+		}
+		toolInputStreamFor(acc).feed(delta);
+	}
+	if (!acc.id || !acc.name) return [];
+	const stream = toolInputStreamFor(acc);
+	const complete = stream.hasCompleteInput();
+	if (acc.identityPublished && !delta && !complete) return [];
+	// Publish buffered arguments once, after both identity fields become available.
+	const input = acc.identityPublished
+		? delta
+		: stream.totalChars
+			? stream.materializeRaw()
+			: undefined;
+	acc.identityPublished = true;
+	acc.bufferedFragments = 0;
+	if (complete) {
+		acc.emitted = true;
+		acc.inputStream = undefined;
+		acc.args = undefined;
+	}
+	return [
+		{
+			toolUseChunk: {
+				toolUseId: acc.id,
+				name: acc.name,
+				input,
+				stop: complete,
+				outputIndex: acc.outputIndex,
+			},
+		},
+	];
 }
 
 async function* parseSSEStream(
 	body: ReadableStream<Uint8Array>,
+	options: { drainUntilEof?: boolean; signal?: AbortSignal } = {},
 ): AsyncGenerator<ParsedStreamEvent> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	// Accumulate tool call chunks by index
 	const toolAccum = new Map<number, ToolAccumEntry>();
-	let lineCount = 0;
-	// Track SSE event: type for gateway-injected events
-	let currentEventType = "";
-
-	const reader = body.getReader();
+	const refusal = openAIRefusalFor(toolAccum);
+	let frameCount = 0;
 	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				// Track SSE event: lines for gateway-injected events
-				if (line.startsWith("event:")) {
-					currentEventType = line.slice(6).trim();
-					continue;
-				}
-				// Log first few SSE lines for debugging
-				if (lineCount < 5 && line.trim() && line.startsWith("data: ")) {
-					logger.debug("OpenAI SSE line", {
-						lineIndex: lineCount,
-						preview: line.slice(0, 300),
-					});
-				}
-				lineCount++;
-				const events = parseSSELine(line, toolAccum, currentEventType);
-				currentEventType = "";
-				for (const evt of events) {
-					yield evt;
-				}
+		for await (const frame of readSseFrames(body)) {
+			if (frameCount < 5) {
+				logger.debug("OpenAI SSE frame", {
+					frameIndex: frameCount,
+					preview: frame.data.slice(0, 300),
+				});
 			}
+			frameCount++;
+			// Final usage follows finish_reason. NUG may append metering after [DONE].
+			if (frame.data.trim() === "[DONE]" && !options.drainUntilEof) break;
+			const events = parseSSEPayload(frame.data, toolAccum, frame.event);
+			for (const evt of events) yield evt;
+			// Real API failures retain priority, even when refusal text preceded them.
+			if (
+				events.some((evt) => evt.invalidState && !isCompletionLimitReason(evt.invalidState.reason))
+			)
+				return;
 		}
-		// Process any remaining data in the buffer after stream ends
-		if (buffer.trim()) {
-			const events = parseSSELine(buffer, toolAccum, "");
-			for (const evt of events) {
-				yield evt;
-			}
-		}
-		// Flush any remaining accumulated tool calls that weren't emitted
-		// (e.g. stream ended without a finish_reason chunk)
-		const remaining = flushToolAccum(toolAccum);
-		if (remaining) yield remaining;
-	} finally {
-		reader.releaseLock();
+	} catch (error) {
+		if (
+			!refusal.seen ||
+			options.signal?.aborted ||
+			(error instanceof Error && error.name === "AbortError")
+		)
+			throw error;
+		// A broken body after an explicit refusal is not an empty-response replay.
+		yield refusal.event();
+		return;
 	}
+	if (refusal.seen) {
+		yield refusal.event();
+		return;
+	}
+	// Keep compatible relay EOF flushing, including explicit empty-call handling.
+	const remaining = flushToolAccum(toolAccum);
+	if (remaining) yield remaining;
 }
 
-/** Drain un-emitted tool calls from the accumulator into a ParsedStreamEvent. */
+/** EOF is not a native empty-call completion. Identity is required for every path. */
 function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent | null {
 	const toolUses: AgentToolUse[] = [];
-	for (const [, acc] of toolAccum) {
-		if (acc.emitted) continue; // already yielded via toolUseChunk
-		if (!acc.id) {
-			logger.error("OpenAI tool call missing ID from stream", { toolName: acc.name });
-			continue;
-		}
+	for (const acc of toolAccum.values()) {
+		if (acc.emitted || acc.abandoned) continue;
+		if (!acc.id || !acc.name)
+			return invalidChatToolCall("The tool stream ended without both ID and name.");
 		const inputStream = toolInputStreamFor(acc);
-		// EOF without a native completion is not equivalent to an explicit empty call.
 		const input = inputStream.totalChars === 0 ? { _raw: "" } : inputStream.finish();
 		if (input != null && typeof input === "object" && "_raw" in input) {
 			logger.warn("Failed to parse OpenAI tool arguments", {
@@ -3503,29 +3835,46 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 				argsLength: inputStream.totalChars,
 			});
 		}
-		toolUses.push({
-			toolUseId: acc.id,
-			name: acc.name,
-			input,
-			outputIndex: acc.outputIndex,
-		});
+		toolUses.push({ toolUseId: acc.id, name: acc.name, input, outputIndex: acc.outputIndex });
+		acc.emitted = true;
 	}
 	toolAccum.clear();
 	return toolUses.length > 0 ? { toolUses } : null;
 }
 
-function parseSSELine(
-	line: string,
+function completeChatToolCalls(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent[] {
+	const pending = [...toolAccum.values()].filter((acc) => !acc.emitted && !acc.abandoned);
+	// Validate the whole batch before publishing any completion.
+	if (pending.some((acc) => !acc.id || !acc.name)) {
+		return [invalidChatToolCall("The tool stream ended a call without both ID and name.")];
+	}
+	return pending.map((acc) => {
+		acc.emitted = true;
+		acc.inputStream = undefined;
+		acc.args = undefined;
+		return {
+			toolUseChunk: {
+				toolUseId: acc.id,
+				name: acc.name,
+				stop: true,
+				outputIndex: acc.outputIndex,
+			},
+		};
+	});
+}
+
+function parseSSEPayload(
+	payload: string,
 	toolAccum: Map<number, ToolAccumEntry>,
 	eventType?: string,
 ): ParsedStreamEvent[] {
-	const trimmed = line.trim();
-	if (!trimmed || trimmed === "data: [DONE]") return [];
-	if (!trimmed.startsWith("data: ")) return [];
+	if (!payload || payload.trim() === "[DONE]") return [];
 
 	let data: Record<string, unknown>;
 	try {
-		data = JSON.parse(trimmed.slice(6));
+		const parsed: unknown = JSON.parse(payload);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+		data = parsed as Record<string, unknown>;
 	} catch {
 		return [];
 	}
@@ -3538,22 +3887,17 @@ function parseSSELine(
 	const gwEvt = parseGatewayDataEvent(data);
 	if (gwEvt) return [gwEvt];
 
+	if (eventType === "error" && typeof data.type !== "string") data.type = "error";
 	const chunk = data as OAIStreamChunk;
 
-	// Handle error objects embedded in stream chunks
-	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
-	if (chunk.error) {
-		// `chunk.error.message` is absent when the payload used `detail`/`description`, or
-		// when `error` is itself the message string. Recovering the real text matters more
-		// than the shape it arrived in — the placeholder below tells the user nothing.
-		const envelope = parseUpstreamErrorEnvelope(data);
-		const msg = chunk.error.message || envelope?.message || "Unknown OpenAI API error";
-		const reason = String(chunk.error.code ?? chunk.error.type ?? envelope?.code ?? "api_error");
-		const statusCode =
-			chunk.error.statusCode ??
-			chunk.error.status_code ??
-			(typeof chunk.error.code === "number" ? chunk.error.code : undefined);
+	// Preserve bare, string-valued and event:-only error envelopes after framing.
+	const envelope = parseUpstreamErrorEnvelope(data);
+	if (envelope) {
+		const msg = envelope.message || "Unknown OpenAI API error";
+		const reason = envelope.code ?? "api_error";
+		const statusCode = envelope.statusCode;
 		return [
+			...(chunk.usage ? [{ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) }] : []),
 			{
 				invalidState: {
 					reason,
@@ -3570,6 +3914,16 @@ function parseSSELine(
 				},
 			},
 		];
+	}
+
+	const refusal = openAIRefusalFor(toolAccum);
+	refusal.responses(data as ResponsesAPIChunk);
+	if (!data.type && chunk.response?.status === "completed") {
+		refusal.responses({ ...data, type: "response.completed" });
+	}
+	if (refusal.seen && !chunk.choices?.length) {
+		const usage = chunk.usage ?? chunk.response?.usage;
+		return usage ? [{ usage: openAIUsageToParsedUsage(usage, toolAccum) }] : [];
 	}
 
 	// Usage-only chunk (sent when stream_options.include_usage is true).
@@ -3670,23 +4024,12 @@ function parseSSELine(
 			for (const [index, item] of chunk.response.output.entries()) {
 				if (!item || typeof item !== "object") continue;
 				const completed = completeCompatibleTool(item, index, toolAccum);
+				if (completed?.invalidState) return [completed];
 				if (completed) results.push(completed);
 			}
 		}
-		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				results.push({
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				});
-				acc.emitted = true;
-			}
-		}
-		return results;
+		const remaining = completeChatToolCalls(toolAccum);
+		return remaining.some((event) => event.invalidState) ? remaining : results.concat(remaining);
 	}
 
 	// ── Standard Chat Completions format below ──
@@ -3699,7 +4042,8 @@ function parseSSELine(
 	if (chunk.usage) {
 		results.push({ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) });
 	}
-	const result: ParsedStreamEvent = {};
+	refusal.chat(choice);
+	if (refusal.seen) return results;
 
 	// A chunk may contain all three lanes. Publish content before any tool can
 	// start executing, and keep reasoning before visible text within the chunk.
@@ -3722,60 +4066,26 @@ function parseSSELine(
 	if (typeof reasoning === "string" && reasoning) results.push({ reasoning });
 	if (delta?.content) results.push({ text: delta.content });
 
-	// Tool call deltas — emit as toolUseChunk for early execution support
+	// Argument fragments may precede identity. Do not expose a nameless/id-less
+	// call to the host, which may begin streaming edits as soon as it gets fields.
 	if (delta?.tool_calls) {
-		for (const tc of delta.tool_calls) {
-			const idx = tc.index;
-
-			// First chunk for this tool call — initialize accumulator
-			if (tc.id && !toolAccum.has(idx)) {
-				const id = tc.id;
-				const name = tc.function?.name ?? "";
-				toolAccum.set(idx, { id, name, inputStream: new ToolInputStream(), emitted: false });
-				logger.debug("OpenAI tool call started", { toolCallId: id, toolName: name, index: idx });
-				// Emit initial chunk so the loop knows the tool name early
-				results.push({
-					toolUseChunk: {
-						toolUseId: id,
-						name,
-						input: undefined,
-						stop: false,
-						outputIndex: chunk.output_index,
-					},
-				});
-			}
-
-			const acc = toolAccum.get(idx);
-			if (acc && !acc.emitted) {
-				if (tc.function?.arguments) {
-					toolInputStreamFor(acc).feed(tc.function.arguments);
-					// Emit argument delta (include name for consumer convenience)
-					results.push({
-						toolUseChunk: {
-							toolUseId: acc.id,
-							name: acc.name,
-							input: tc.function.arguments,
-							stop: false,
-						},
-					});
-
-					// Early completion: if accumulated args form valid JSON, emit stop
-					// immediately so the agent loop can start executing the tool while
-					// the rest of the stream (other tool calls / text) is still arriving.
-					if (toolInputStreamFor(acc).hasCompleteInput()) {
-						results.push({
-							toolUseChunk: {
-								toolUseId: acc.id,
-								name: acc.name,
-								stop: true,
-								outputIndex: acc.outputIndex,
-							},
-						});
-						acc.emitted = true;
-					}
-				}
-			}
+		if (!Array.isArray(delta.tool_calls) || delta.tool_calls.length > MAX_CHAT_TOOL_SLOTS) {
+			results.push(
+				invalidChatToolCall("Chat Completions returned too many tool deltas in one chunk."),
+			);
+			return results;
 		}
+		const updates: ParsedStreamEvent[] = [];
+		for (const call of delta.tool_calls) {
+			const next = updateChatToolCall(call, chunk.output_index, toolAccum);
+			const invalid = next.find((event) => event.invalidState);
+			if (invalid) {
+				results.push(invalid);
+				return results;
+			}
+			updates.push(...next);
+		}
+		results.push(...updates);
 	}
 
 	// On any finish_reason, finalize
@@ -3784,96 +4094,64 @@ function parseSSELine(
 			finishReason: choice.finish_reason,
 			accumulatedToolCalls: toolAccum.size,
 		});
-		// Emit stop for any tool calls that haven't been early-emitted yet
-		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				results.push({
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				});
-				acc.emitted = true;
-			}
+		if (choice.finish_reason === "tool_calls" || choice.finish_reason === "stop") {
+			return results.concat(completeChatToolCalls(toolAccum));
 		}
-
-		// Also emit as flat toolUses for consumers that don't handle toolUseChunk
-		const flushed = flushToolAccum(toolAccum);
-		if (flushed) {
-			Object.assign(result, flushed);
+		// Truncation/filtering does not prove that an absent arguments field means {}.
+		for (const acc of toolAccum.values()) {
+			if (acc.emitted) continue;
+			acc.abandoned = true;
+			acc.inputStream = undefined;
+			acc.args = undefined;
 		}
-
-		// Map non-normal finish reasons to invalidState
-		switch (choice.finish_reason) {
-			case "stop":
-			case "tool_calls":
-				// Normal completion — no action needed
+		let reason = choice.finish_reason;
+		let message: string;
+		switch (reason) {
+			case "length":
+				reason = "max_tokens";
+				message = "Response truncated: model reached maximum token limit.";
 				break;
-			case "length": {
-				const message = "Response truncated: model reached maximum token limit.";
-				result.invalidState = {
-					reason: "max_tokens",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "max_tokens", message },
-						{ source: "provider", phase: "finish_reason", reason: "max_tokens", message },
-					),
-				};
+			case "content_filter":
+				message = "Response blocked by content filter.";
 				break;
-			}
-			case "content_filter": {
-				const message = "Response blocked by content filter.";
-				result.invalidState = {
-					reason: "content_filter",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "content_filter", message },
-						{ source: "provider", phase: "finish_reason", reason: "content_filter", message },
-					),
-				};
+			case "model_context_window_exceeded":
+				message = "The model has reached its context window limit.";
 				break;
-			}
-			case "model_context_window_exceeded": {
-				const message = "The model has reached its context window limit.";
-				result.invalidState = {
-					reason: "model_context_window_exceeded",
-					message,
-					diagnostics: parseErrorDiagnostics(
-						{ reason: "model_context_window_exceeded", message },
-						{
-							source: "provider",
-							phase: "finish_reason",
-							reason: "model_context_window_exceeded",
-							message,
-						},
-					),
-				};
-				break;
-			}
 			default:
-				logger.warn("Unknown OpenAI finish reason", { finishReason: choice.finish_reason });
+				logger.warn("Unknown OpenAI finish reason", { finishReason: reason });
+				return results;
 		}
-	}
-
-	if (result.text || result.toolUses || result.invalidState || result.reasoning) {
-		results.push(result);
+		results.push({
+			invalidState: {
+				reason,
+				message,
+				diagnostics: parseErrorDiagnostics(
+					{ reason, message },
+					{ source: "provider", phase: "finish_reason", reason, message },
+				),
+			},
+		});
 	}
 	return results;
 }
 
 // ── Responses API helpers ──
 
-/** Final-only compatibility envelopes still carry full arguments and establish Responses mode. */
+/** A compatible native completion may supply identity after earlier Chat deltas. */
 function completeCompatibleTool(
 	item: NonNullable<OAIStreamChunk["item"]>,
 	outputIndex: number | undefined,
 	toolAccum: Map<number, ToolAccumEntry>,
 ): ParsedStreamEvent | undefined {
 	if (!item.call_id) return undefined;
+	if (
+		typeof item.call_id !== "string" ||
+		item.call_id.length > 1024 ||
+		(item.name != null && (typeof item.name !== "string" || item.name.length > 64))
+	)
+		return invalidChatToolCall("A compatible tool completion returned invalid identity fields.");
 	let acc = findAccByCallId(toolAccum, item.call_id);
-	if (!acc && item.name) {
+	if (!acc && item.name?.trim()) {
 		acc = {
 			id: item.call_id,
 			name: item.name,
@@ -3883,14 +4161,34 @@ function completeCompatibleTool(
 		};
 		toolAccum.set(responsesApiSlot(acc.id, toolAccum), acc);
 	}
-	if (!acc || acc.emitted) return undefined;
+	if (acc?.emitted || acc?.abandoned) return undefined;
+	if (acc?.identityPublished && item.name?.trim() && acc.name !== item.name)
+		return invalidChatToolCall("A compatible tool completion changed its announced name.");
+	if (acc && item.name?.trim()) acc.name = item.name;
+	if (!acc?.id || !acc.name)
+		return invalidChatToolCall("A compatible tool completion is missing ID or name.");
+	// A yet-unpublished Chat buffer was never delivered as argument deltas. Use
+	// a real snapshot here even when it is equal to the producer's own buffer.
+	const input =
+		acc.chat && !acc.identityPublished
+			? {
+					finalInput:
+						typeof item.arguments === "string"
+							? item.arguments
+							: toolInputStreamFor(acc).materializeRaw(),
+				}
+			: finalToolInput(acc, item.arguments);
 	acc.emitted = true;
+	if (acc.chat) {
+		acc.inputStream = undefined;
+		acc.args = undefined;
+	}
 	return {
 		toolUseChunk: {
 			toolUseId: acc.id,
 			name: acc.name,
 			stop: true,
-			...finalToolInput(acc, item.arguments),
+			...input,
 			outputIndex: acc.outputIndex,
 		},
 		_responsesApi: true,
@@ -3915,7 +4213,14 @@ function findActiveResponsesAcc(
 ): ToolAccumEntry | undefined {
 	let latest: ToolAccumEntry | undefined;
 	for (const [, acc] of toolAccum) {
-		if (!acc.emitted) latest = acc;
+		if (
+			!acc.emitted &&
+			!acc.abandoned &&
+			acc.id &&
+			acc.name &&
+			(!acc.chat || acc.identityPublished)
+		)
+			latest = acc;
 	}
 	return latest;
 }
@@ -4214,6 +4519,30 @@ function isResponsesInputItem(message: unknown): boolean {
 	return (message as { type?: unknown }).type === "additional_tools";
 }
 
+/** Lift string base instructions only. Typed developer messages and additional_tools
+ * stay in input, in order. HTTP and both Codex WebSocket paths share this projection. */
+export function partitionResponsesMessages(messages: readonly OAIMessage[]): {
+	instructions: string;
+	input: OAIMessage[];
+} {
+	const instructions: string[] = [];
+	const input: OAIMessage[] = [];
+	for (const message of messages) {
+		if (
+			(message.role === "developer" || message.role === "system") &&
+			typeof message.content === "string" &&
+			!isResponsesInputItem(message)
+		) {
+			if (message.content.length) instructions.push(message.content);
+			continue;
+		}
+		if (message.role === "assistant" && !message.tool_calls?.length && !message.content?.length)
+			continue;
+		input.push(message);
+	}
+	return { instructions: instructions.join("\n\n"), input };
+}
+
 function responsesDeveloperMessage(text: string): OAIMessage {
 	return { role: "developer", content: [{ type: "input_text", text }] };
 }
@@ -4223,42 +4552,39 @@ function responsesTextInput(
 	instruction: string | undefined,
 	mode: OpenAIApiMode,
 ): OAIMessage[] {
-	const prefix = instruction || (mode === "codex" ? CODEX_DEFAULT_INSTRUCTIONS : "");
+	// Codex uses applyCodexInstructionsInput to give its nonempty prefix a stable ID.
 	const user: OAIMessage = { role: "user", content: text };
-	return prefix ? [responsesDeveloperMessage(prefix), user] : [user];
+	return instruction && mode !== "codex" ? [responsesDeveloperMessage(instruction), user] : [user];
 }
 
 export function buildResponsesInput(
-	messages: OAIMessage[],
+	messages: readonly OAIMessage[],
 	options: ReasoningReplayOptions,
-	mode: OpenAIApiMode,
 ): OAIMessage[] {
-	// Reusable instructions must be in the input prefix to be eligible for caching.
+	// Keep upstream's cacheable instruction prefix, but do not drop typed developer items
+	// or manufacture instructions when the caller supplied none.
 	const prefix: OAIMessage[] = [];
-	const history: OAIMessage[] = [];
 	for (const msg of messages) {
-		if (!isResponsesInputItem(msg) && (msg.role === "system" || msg.role === "developer")) {
-			if (typeof msg.content === "string" && msg.content) {
-				const item = responsesDeveloperMessage(msg.content);
-				prefix.push(isRuntimeSystemMessage(msg) ? markRuntimeSystemMessage(item) : item);
-			}
-			continue;
+		if (
+			!isResponsesInputItem(msg) &&
+			(msg.role === "system" || msg.role === "developer") &&
+			typeof msg.content === "string" &&
+			msg.content
+		) {
+			const item = responsesDeveloperMessage(msg.content);
+			prefix.push(isRuntimeSystemMessage(msg) ? markRuntimeSystemMessage(item) : item);
 		}
-		// Responses rejects assistant messages without content or tool calls.
-		if (msg.role === "assistant" && !msg.tool_calls?.length && !msg.content?.length) continue;
-		history.push(msg);
 	}
-	if (prefix.length === 0 && mode === "codex") {
-		prefix.push(markRuntimeSystemMessage(responsesDeveloperMessage(CODEX_DEFAULT_INSTRUCTIONS)));
-	}
-	return prefix.concat(convertHistoryToResponsesApi(history, options));
+	return prefix.concat(
+		convertHistoryToResponsesApi(partitionResponsesMessages(messages).input, options),
+	);
 }
 
 /**
  * Second projection stage for the Responses API: neutral turns → input items.
  *
- * Assistant message items carry no id: the send path rebuilds them without one, so an
- * id here would never reach the wire. Reasoning and image generation items keep theirs.
+ * Native assistant text preserves each item's id, phase and content-part boundaries.
+ * Legacy text keeps the neutral grouping; a response-level UUID is not an item id.
  */
 function responsesWireHistory(
 	turns: readonly NeutralTurn[],
@@ -4300,14 +4626,51 @@ function responsesWireHistory(
 			continue;
 		}
 		const texts: string[] = [];
+		let nativeText:
+			| {
+					key: string;
+					itemId?: string;
+					phase?: ResponsesMessagePhase;
+					parts: Map<number, string>;
+			  }
+			| undefined;
 		const flushText = () => {
 			const text = texts.join("\n").trim();
 			texts.length = 0;
 			if (text) history.push(assistantText(text));
+			if (nativeText) {
+				history.push({
+					role: "assistant",
+					...(nativeText.itemId ? { id: nativeText.itemId } : {}),
+					...(nativeText.phase ? { phase: nativeText.phase } : {}),
+					content: [...nativeText.parts.entries()]
+						.sort(([a], [b]) => a - b)
+						.map(([, text]) => ({ type: "output_text" as const, text })),
+				});
+				nativeText = undefined;
+			}
 		};
 		for (const item of turn.items) {
 			if (item.kind === "text") {
-				texts.push(item.text);
+				const metadata = item.providerMetadata?.openai;
+				if (metadata) {
+					const itemId = typeof metadata.itemId === "string" ? metadata.itemId : undefined;
+					const phase = responsesMessagePhase(metadata.phase);
+					const key = itemId || item.blockId;
+					if (nativeText?.key !== key || nativeText?.phase !== phase) flushText();
+					nativeText ??= { key, itemId, phase, parts: new Map() };
+					const contentIndex =
+						Number.isSafeInteger(metadata.contentIndex) && (metadata.contentIndex as number) >= 0
+							? (metadata.contentIndex as number)
+							: 0;
+					nativeText.parts.set(
+						contentIndex,
+						(nativeText.parts.get(contentIndex) ?? "") + item.text,
+					);
+				} else {
+					if (nativeText) flushText();
+					texts.push(item.text);
+				}
 				continue;
 			}
 			flushText();
@@ -4566,6 +4929,11 @@ export function convertHistoryToResponsesApi(
 	for (const msg of messages) {
 		// biome-ignore lint/suspicious/noExplicitAny: Responses API uses different message shapes
 		const m = msg as any;
+		const phase = responsesMessagePhase(m.phase);
+		const assistantMetadata = {
+			...(typeof m.id === "string" && m.id ? { id: m.id } : {}),
+			...(phase ? { phase } : {}),
+		};
 
 		if (m.role === "system") {
 			result.push({ role: "developer", content: m.content } as unknown as OAIMessage);
@@ -4623,7 +4991,7 @@ export function convertHistoryToResponsesApi(
 			const content =
 				typeof m.content === "string" ? [{ type: "output_text", text: m.content }] : m.content;
 			if (content) {
-				result.push({ role: "assistant", content } as unknown as OAIMessage);
+				result.push({ role: "assistant", ...assistantMetadata, content } as unknown as OAIMessage);
 			}
 
 			// 3. Output function_call items
@@ -4657,12 +5025,13 @@ export function convertHistoryToResponsesApi(
 				if (!merged) continue;
 				result.push({
 					role: "assistant",
+					...assistantMetadata,
 					content: [{ type: "output_text", text: merged }],
 				} as unknown as OAIMessage);
 				continue;
 			}
 			if (Array.isArray(content) && content.length > 0) {
-				result.push({ role: "assistant", content } as unknown as OAIMessage);
+				result.push({ role: "assistant", ...assistantMetadata, content } as unknown as OAIMessage);
 			} else if (fallback) {
 				result.push({
 					role: "assistant",

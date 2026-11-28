@@ -48,7 +48,7 @@ keywords:
   - api_conversation_id
   - model_history_revision
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 上下文与压缩
 
@@ -64,6 +64,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 压缩流式进度：`compact-live-state.ts` 在内存里按消息缓存输出/思考文本，总量上限 200k 字符、单个增量上限 32k 字符。
 - 摘要生成：`narrator-context.ts:narratorContext.generateContextSummary` 取“上次压缩以来”的模型历史，已有 `contextSummary` 时一并带入，避免更早的内容丢失；compressed 分叉用同一个摘要（见 [分叉](fork.md)）。
 - 上下文占用统计：`narrator-context-composition.ts:getNarratorContextComposition` 按类别（system / summary / tools / 历史各段）汇总字符数，`freezeNarratorContextComposition` 在每次请求时冻结输入字符计数，`storeNarratorContextUsage` 存用量快照。历史读取在 `context-composition-history.ts` 中分批并让出事件循环（`CONTEXT_COMPOSITION_LIMITS`：批 64、切片 4ms、响应 256KiB），单次扫描最多 4096 段；PG 后端不可用时返回 503 `CONTEXT_COMPOSITION_UNAVAILABLE`。
+- 请求字符计数跟随实际正文中的指令来源：普通 Responses 的可缓存 developer input 保留运行时标记；Codex 将字符串 instructions 移入稳定 input 前缀时由 `markInstructionsInput` 用 WeakMap 保存来源。固定运行时前缀计为 system，拼入的历史 system 部分计为 other，标记不进入线上 JSON 或持久历史（`input-characters.ts`；`input-characters.test.ts`、`provider-input-characters.test.ts`）。
 - ContextAsk：`context-ask-service.ts:contextAskService` 用摘要模型对另一叙述者的历史做分块 map/reduce 回答问题，并发上限 4、输出上限 16000 字符、历史最多 `CONTEXT_ASK_HISTORY_MESSAGE_LIMIT`=400 条。
 
 - 触发阈值：按模型上下文窗口分档——大于 `LARGE_CONTEXT_BOUNDARY`（600000）为 large，否则 standard；阈值取 `settings.agent.contextThresholds[tier]`，缺省 `DEFAULT_CONTEXT_THRESHOLDS`（standard 95%、large 75%）（`lib/settings/provider.ts:getContextThresholds`、`shared/context-thresholds.ts`）。`context_usage` 事件把 `compactStart` 发给前端，并调用 `hooks.onContextUsage`；真正的触发判断在 `narrator-session.ts:buildContextManagementHooks`（测试 `context-usage-compact-guard.test.ts` 注入固定阈值）。

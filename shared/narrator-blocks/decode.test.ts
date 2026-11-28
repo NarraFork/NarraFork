@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { encodeToolOutput } from "../agent-protocol/tool-output";
+import type { TextProviderMetadata } from "../agent-protocol/types";
 import { historyClearedText } from "../storage-retention";
 import { type DecodableMessage, decodeLegacyContent, splitToolInput } from "./decode";
 import { isModelVisible } from "./types";
@@ -588,4 +589,50 @@ describe("splitToolInput", () => {
 		).toEqual({ input: { a: 1 }, thoughtSignature: "s", thoughtSignatureSource: "g" });
 		expect(splitToolInput("not json")).toEqual({ input: {} });
 	});
+});
+
+test("assistant text keeps per-item and per-part continuation metadata independently of lifecycle", () => {
+	const metadata: TextProviderMetadata[] = [
+		{ openai: { itemId: "msg-comment", contentIndex: 0, phase: "commentary" } },
+		{ openai: { itemId: "msg-partial", contentIndex: 0, phase: "partial_answer" } },
+		{ openai: { itemId: "msg-final", contentIndex: 0, phase: "final_answer" } },
+		{ openai: { itemId: "msg-final", contentIndex: 1, phase: "final_answer" } },
+	];
+	const contentJson = metadata.map((providerMetadata, index) => ({
+		type: "text",
+		text: `part-${index}`,
+		completed: index !== 1,
+		providerMetadata,
+	}));
+	const envelope = decodeLegacyContent(
+		row({ role: "assistant", messageUuid: "legacy-row-id", contentJson }),
+	);
+	expect(envelope.blocks.map((block) => block.phase)).toEqual(["done", "aborted", "done", "done"]);
+	const parts = envelope.blocks.flatMap((block) =>
+		block.kind === "output" ? block.payload.parts.filter((part) => part.type === "text") : [],
+	);
+	expect(parts.map((part) => part.providerMetadata)).toEqual(metadata);
+	expect(parts.map((part) => part.text)).toEqual(["part-0", "part-1", "part-2", "part-3"]);
+	expect(contentJson.map((part) => part.providerMetadata)).toEqual(metadata);
+});
+
+test("input text does not inherit assistant-only continuation metadata", () => {
+	const envelope = decodeLegacyContent(
+		row({
+			contentJson: [
+				{
+					type: "text",
+					text: "user-owned input",
+					providerMetadata: { openai: { itemId: "not-an-assistant-item", phase: "final_answer" } },
+				},
+			],
+		}),
+	);
+	expect(envelope.blocks[0]).toMatchObject({
+		kind: "input",
+		payload: { parts: [{ type: "text", text: "user-owned input" }] },
+	});
+	const block = envelope.blocks[0];
+	if (block.kind !== "input") throw new Error("Expected input block");
+	expect(block.payload.parts[0]).not.toHaveProperty("providerMetadata");
 });

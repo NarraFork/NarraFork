@@ -22,6 +22,7 @@ import { parseModelId, settings } from "../settings";
 import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import { createProviderTurnContext } from "./codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -29,14 +30,16 @@ import {
 	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
+import { ProviderInvalidStateError } from "./error-handling";
 import {
 	appendDiagnosticOpenAIInput,
 	applyOpenAIModelMetadata,
-	buildResponsesInput,
+	convertHistoryToResponsesApi,
 	diagnosticTransportIdentity,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
+	partitionResponsesMessages,
 	resolveCodexRequestReasoningEffort,
 	stampReasoningSource,
 	withCodexNativeTools,
@@ -73,6 +76,16 @@ function getCodexProviderErrorMessage(err: unknown): string {
 
 export function isCodexProviderExpected101WebSocketFailure(err: unknown): boolean {
 	return /Expected\s+101\s+status\s+code/i.test(getCodexProviderErrorMessage(err));
+}
+
+function isExplicitRefusalError(err: unknown): boolean {
+	return err instanceof ProviderInvalidStateError && err.reason === "refusal";
+}
+
+/** Content verdicts say nothing about the credential's health. */
+function isContentVerdict(event: ParsedStreamEvent): boolean {
+	const reason = event.invalidState?.reason;
+	return reason === "refusal" || isPolicyViolationCode(reason);
 }
 
 function classifyCodexError(
@@ -191,7 +204,7 @@ export class CodexProvider implements ProviderAdapter {
 
 		return new OpenAIProvider(
 			{
-				id: "codex",
+				id: ctx.id,
 				name: "Codex",
 				prefix: "codex",
 				apiKey: ctx.token, // OAuth/PAT access token (empty for agent identity)
@@ -364,6 +377,7 @@ export class CodexProvider implements ProviderAdapter {
 		maxAttempts: number,
 		operation: string,
 	): Promise<boolean> {
+		if (isExplicitRefusalError(err)) return false;
 		const { classified, hasMore } = await this.reportCallError(ctx, err);
 		const shouldRetry =
 			classified.type === "quota_exhausted" &&
@@ -404,6 +418,7 @@ export class CodexProvider implements ProviderAdapter {
 				this.manager.reportSuccess(ctx.id);
 				return result;
 			} catch (err) {
+				if (isExplicitRefusalError(err)) throw err;
 				lastError = err;
 				attempt++;
 				if (attempt < maxAttempts && (await this.tryRecoverAgentIdentityTask(ctx, err))) {
@@ -496,6 +511,9 @@ export class CodexProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
+		// Temporary adapters, credential retries and HTTP fallback all belong to this call.
+		// Never let direct callers accidentally inherit a preceding call's turn token.
+		params = { ...params, turnContext: params.turnContext ?? createProviderTurnContext() };
 		if (params.diagnostic) {
 			yield* this.chatDiagnostic(params);
 			return;
@@ -517,7 +535,6 @@ export class CodexProvider implements ProviderAdapter {
 			const provider = this.createProvider(ctx);
 			const chatParams: ChatParams = {
 				...params,
-				// The account is the credential; the inner adapter only knows "codex".
 				onRequestStart: () =>
 					params.onRequestStart?.({
 						credentialId: ctx.id,
@@ -526,25 +543,21 @@ export class CodexProvider implements ProviderAdapter {
 					}),
 			};
 			let hasStreamedEvents = false;
-			let sawPolicyViolation = false;
+			let sawContentVerdict = false;
 
 			try {
 				for await (const event of provider.chat(chatParams)) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-					// A policy-violation terminal event says nothing about credential
-					// health — count it as neither success nor failure.
-					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+					sawContentVerdict ||= isContentVerdict(event);
 					// Inject credentialId into the event
 					yield { ...event, credentialId: ctx.id };
 				}
-				if (!sawPolicyViolation) {
+				if (!sawContentVerdict) {
 					this.manager.reportSuccess(ctx.id);
 				}
 				return;
 			} catch (err) {
-				if (params.signal.aborted) {
-					throw err;
-				}
+				if (params.signal.aborted || isExplicitRefusalError(err)) throw err;
 				lastError = err;
 				attempt++;
 
@@ -651,13 +664,8 @@ export class CodexProvider implements ProviderAdapter {
 		while (attempt < maxAttempts) {
 			const ctx = await this.getContext(params.stickySessionKey);
 			this.refreshUsageOnUse(ctx.id);
-			const provider = this.createProvider(ctx);
-			const chatParams: ChatParams = {
-				...params,
-				onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
-			};
 			let hasStreamedEvents = false;
-			let sawPolicyViolation = false;
+			let sawContentVerdict = false;
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params, ctx.credential);
@@ -678,6 +686,7 @@ export class CodexProvider implements ProviderAdapter {
 					sessionKey:
 						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,
+					turnContext: params.turnContext,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
 					model: params.model,
@@ -689,23 +698,19 @@ export class CodexProvider implements ProviderAdapter {
 					requestDump: params.requestDump,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-					// Same neutrality rule as the SSE path: a policy violation is a
-					// content verdict, not a credential-health signal.
-					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+					sawContentVerdict ||= isContentVerdict(event);
 					// The WebSocket path bypasses OpenAIProvider.chat(), so tag encrypted
 					// reasoning credentials with the "codex" identity here — without it,
 					// the strict replay check on the next turn cannot prove ownership
 					// and would drop the credential.
 					yield { ...stampReasoningSource(event, "codex"), credentialId: ctx.id };
 				}
-				if (!sawPolicyViolation) {
+				if (!sawContentVerdict) {
 					this.manager.reportSuccess(ctx.id);
 				}
 				return;
 			} catch (err) {
-				if (params.signal.aborted) {
-					throw err;
-				}
+				if (params.signal.aborted || isExplicitRefusalError(err)) throw err;
 
 				// The transport already exhausted its own reconnect budget for this error and
 				// classified it as retryable. Surface it unchanged: routing it through the
@@ -725,36 +730,6 @@ export class CodexProvider implements ProviderAdapter {
 				}
 
 				const expected101Decision = await this.resolveExpected101WebSocketFailure(ctx, err);
-				if (expected101Decision === "retry_sse") {
-					try {
-						for await (const event of provider.chat(chatParams)) {
-							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
-							yield { ...event, credentialId: ctx.id };
-						}
-						if (!sawPolicyViolation) {
-							this.manager.reportSuccess(ctx.id);
-						}
-						return;
-					} catch (fallbackErr) {
-						if (params.signal.aborted) throw fallbackErr;
-						lastError = fallbackErr;
-						attempt++;
-						if (
-							await this.shouldRetryAfterFallbackError(
-								ctx,
-								fallbackErr,
-								hasStreamedEvents,
-								attempt,
-								maxAttempts,
-								"chat",
-							)
-						) {
-							continue;
-						}
-						throw fallbackErr;
-					}
-				}
 				if (expected101Decision === "credential_unavailable") {
 					lastError = err;
 					attempt++;
@@ -771,19 +746,24 @@ export class CodexProvider implements ProviderAdapter {
 					throw err;
 				}
 
-				if (err instanceof CodexWebSocketFallbackError) {
-					logger.warn("Codex Responses WebSocket unavailable, falling back to SSE", {
-						credentialId: ctx.id,
-						status: err.status,
-						error: err.message,
-					});
+				if (expected101Decision === "retry_sse" || err instanceof CodexWebSocketFallbackError) {
+					if (expected101Decision !== "retry_sse" && err instanceof CodexWebSocketFallbackError) {
+						logger.warn("Codex Responses WebSocket unavailable, falling back to SSE", {
+							credentialId: ctx.id,
+							status: err.status,
+							error: err.message,
+						});
+					}
 					try {
-						for await (const event of provider.chat(chatParams)) {
+						for await (const event of this.createProvider(ctx).chat({
+							...params,
+							onRequestStart: () => params.onRequestStart?.({ credentialId: ctx.id }),
+						})) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+							sawContentVerdict ||= isContentVerdict(event);
 							yield { ...event, credentialId: ctx.id };
 						}
-						if (!sawPolicyViolation) {
+						if (!sawContentVerdict) {
 							this.manager.reportSuccess(ctx.id);
 						}
 						return;
@@ -893,22 +873,21 @@ export class CodexProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
+		const { instructions, input } = partitionResponsesMessages(messages);
+
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: buildResponsesInput(
-				messages,
-				{
-					// Codex runs official gpt/codex ids → credential-strict replay. The
-					// reasoning source identity is the "codex" prefix shared by every
-					// provider instance this class creates.
-					strict: hasCredentialBoundReasoning(model),
-					currentSource: "codex",
-				},
-				"codex",
-			),
+			input: convertHistoryToResponsesApi(input, {
+				// Codex runs official gpt/codex ids → credential-strict replay. The
+				// reasoning source identity is the "codex" prefix shared by every
+				// provider instance this class creates.
+				strict: hasCredentialBoundReasoning(model),
+				currentSource: "codex",
+			}),
 			stream: true,
 			store: false,
 		};
+		if (instructions) request.instructions = instructions;
 		const tools =
 			params.diagnostic && !params.diagnosticFork
 				? []
@@ -925,13 +904,20 @@ export class CodexProvider implements ProviderAdapter {
 				diagnosticTransportIdentity(params),
 				codexInstallationId(credential),
 			),
+			instructionsConversationId: params.diagnosticFork ? params.conversationId : undefined,
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}
 
-		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		applyOpenAIModelMetadata(
+			request,
+			params.model,
+			"codex",
+			params.maxOutputTokens,
+			CODEX_BASE_URL,
+		);
 		appendDiagnosticOpenAIInput(request, params, true);
 		if (params.diagnosticFork) request.prompt_cache_key = params.conversationId;
 		return request;

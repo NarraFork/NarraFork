@@ -113,6 +113,20 @@ export interface ReasoningProviderMetadata {
 	signatureSource?: string;
 }
 
+// === Text continuation metadata ===
+
+/** Provider-native assistant item metadata; not the streaming content lifecycle. */
+export interface TextProviderMetadata {
+	openai?: {
+		/** Responses message item identity, distinct from the response/message UUID. */
+		itemId?: string;
+		/** Index of this text part inside the Responses message item. */
+		contentIndex?: number;
+		/** Message phase is replayed verbatim; final_answer does not complete a stream/turn. */
+		phase?: "commentary" | "partial_answer" | "final_answer";
+	};
+}
+
 // === Tool use ===
 
 export interface AgentToolUse {
@@ -249,6 +263,8 @@ export interface ParsedStreamEvent {
 	};
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;
+	/** Item/part metadata for this text lane; may arrive alone after its text was saved. */
+	textMetadata?: TextProviderMetadata;
 	toolUses?: AgentToolUse[];
 	messageId?: string;
 	conversationId?: string;
@@ -366,6 +382,8 @@ export interface ParsedStreamEvent {
 	_responsesApi?: boolean;
 	/** Stop reason from message_delta (Anthropic) or finish_reason (OpenAI) */
 	stopReason?: string;
+	/** Successful response completion explicitly requiring (false) or ending (true) a follow-up. */
+	endTurn?: boolean;
 	/** Upstream socket closed and the turn should end quietly without surfacing an error. */
 	silentDisconnect?: boolean;
 }

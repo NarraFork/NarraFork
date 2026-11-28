@@ -33,7 +33,7 @@ keywords:
   - decodeBlockPage
   - assembledBodyLengthSql
 status: draft
-verified_at: 776dbf07e
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 块存储
 
@@ -41,6 +41,7 @@ verified_at: 776dbf07e
 
 ## 关键规则
 - `narrator_blocks`：kind 为 input/output/reasoning/tool/context，phase 为 open/done/aborted/failed（`schema.ts:narratorBlocks`）。一个非 assistant 信封只有一个块（input 或 context），assistant 步骤里每个 provider item 一个块；`ordinal` 在条目打开时分配，可有空洞但不重排；`aborted` 只能用于 output/reasoning，input 必为 done；tool 块有 `wireId`（线上调用 id），其余没有。
+- 输出文本 `TextPart.providerMetadata.openai` 保留 Responses 的 `itemId`、`contentIndex` 与 `phase`；旧 JSON 块解码到块协议时一并携带，块存储与重放不能只保留 text。上游 `phase` 的 commentary / partial_answer / final_answer 是消息语义，不替代存储块的 open/done 等生命周期（`shared/narrator-blocks/types.ts`、`decode.ts`；`decode.test.ts`、`storage.test.ts`）。
 - 一个信封的块行与 `content_json` 由 `narrator-block-sync.ts:syncEnvelope` 保持一致，行 id 在重写中保持稳定。同步模式 `streaming` / `sealed` / `keep`。
 - 新信封格式：`newEnvelopeFormat()` 在 `settings.narratorBlocks.write` 关闭或没有块表时返回 1，否则启动同步扫描并返回 2。`rowsOnlyWrites()` 仅在 SQLite 且 `compactJson`、`write`、`read` 都开时为真，此时新块格式正文只存在块行里（rows-only）。
 - 同步队列已核对实现：触发器把块格式信封的变更写入 `narrator_block_sync_queue`；写事务开头 `syncQueueMark()` 取队列最大 rowid，结束前 `flushQueuedSince(mark)` 同步并删除此后新入队的条目（`narrator-block-sync.ts`，`seq-floor-tx.ts:dbTransactionWithSeqFloor` 调用）；定时 `runSweep` → `drainQueue` 在限时预算内清其余积压。触发器本身的 SQL 未逐条核对。

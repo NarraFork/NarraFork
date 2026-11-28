@@ -19,14 +19,19 @@ import {
 	parseModelId,
 	resolveModelContextWindow,
 } from "../settings";
-import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
-	mergeExtraHeaders,
+	resolveExplicitUserAgent,
 	resolveHttpUserAgent,
 } from "../user-agent";
+import {
+	ANTHROPIC_PUBLIC_BASE_URL,
+	ANTHROPIC_PUBLIC_VERSION,
+	finishAnthropicHeaders,
+	projectAnthropicPublicBlock,
+} from "./anthropic-api-version";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
@@ -65,6 +70,7 @@ import {
 import { stringifyRequestBody } from "./request-json";
 import { parseJsonResponseWithBody } from "./response-body";
 import { extractReasoningSummary, parseToolArguments } from "./response-format";
+import { readSseFrames } from "./sse-frames";
 import type { StreamProgress } from "./stream-progress";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingStrategy, ToolLoadingTarget } from "./tool-loading";
@@ -88,8 +94,9 @@ const WEB_SEARCH_MAX_TOKENS = 8192;
  * request-level set, and per-attempt pushes inside the retry closure), not from
  * a single capture: the CLI decides each flag PER MODEL, so a fixed string
  * necessarily claims betas the real client would not send for the model in hand.
- * Each entry below repeats the upstream predicate it is gated on. All nine were
- * re-checked against 2.1.251's beta registry — none was renamed or retired.
+ * The model predicates retain the audited 2.1.251 baseline and have not all
+ * been re-audited against 2.1.330. The previously inspected 2.1.325 bundle marked
+ * mid-conversation-system as GA, so that obsolete header remains omitted.
  *
  * Flags the CLI can also send but NarraFork never earns are omitted, because a
  * beta declares a capability the client must actually implement:
@@ -130,8 +137,8 @@ function buildAnthropicBetaFlags(model: string): string {
 	flags.push("context-management-2025-06-27");
 	// `_mr` — pushed for every first-party request.
 	flags.push("prompt-caching-scope-2026-01-05");
-	// `mRn(e)` — see supportsMidConversationSystem (Opus 4.7 is excluded).
-	if (supportsMidConversationSystem(model)) flags.push("mid-conversation-system-2026-04-07");
+	// mid-conversation-system is GA in 2.1.325. Keep the existing model gate
+	// in supportsMidConversationSystem, but do not advertise the retired beta.
 	// `EZb` — pushed only for models that accept `output_config.effort`; built-in
 	// family exclusions and the user's blocklist can both withhold it.
 	if (supportsEffort(model)) flags.push("effort-2025-11-24");
@@ -148,9 +155,6 @@ const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11
 
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
-
-/** Default Anthropic API base URL (includes /v1 path). */
-const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
 /**
  * Process-wide cache of base URLs that have been resolved to need a `/v1`
@@ -326,20 +330,31 @@ const STAINLESS_ARCH =
 				? "x86"
 				: `other:${process.arch}`;
 
-function clearLegacyCacheMarkers(
+// Only visit wire content, after role normalization (also covers fresh tool results).
+// Clone changed blocks, not media, schemas or the caller's whole history.
+function prepareWireBlocks(
 	messages: AnthropicMessage[],
 	tools: Array<Record<string, unknown>> | undefined,
+	publicBody: boolean,
 ): void {
-	for (const tool of tools ?? []) {
-		delete tool.cache_control;
-	}
+	for (const tool of tools ?? []) delete tool.cache_control;
 	for (const message of messages) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content) {
-			if (block && typeof block === "object") {
-				delete (block as Record<string, unknown>).cache_control;
+		const parts = message.content;
+		let changed: AnthropicContentPart[] | undefined;
+		for (const [index, original] of parts.entries()) {
+			if (!original || typeof original !== "object") continue;
+			let part = publicBody ? projectAnthropicPublicBlock(message.role, original) : original;
+			if ("cache_control" in part) {
+				const { cache_control: _old, ...rest } = part;
+				part = rest;
+			}
+			if (part !== original) {
+				changed ??= parts.slice();
+				changed[index] = part;
 			}
 		}
+		if (changed) message.content = changed;
 	}
 }
 
@@ -379,7 +394,8 @@ function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
 			block.type === "tool_result" ||
 			isToolChangePart(block)
 		) {
-			Object.assign(block, CACHE_CONTROL);
+			message.content = message.content.slice();
+			message.content[blockIndex] = { ...block, ...CACHE_CONTROL };
 			return;
 		}
 	}
@@ -581,17 +597,16 @@ function acceptsTemperature(model: string): boolean {
 }
 
 /**
- * Whether a model accepts mid-conversation `role: "system"` messages, i.e.
- * whether the `mid-conversation-system-2026-04-07` beta may be declared.
+ * Whether a model accepts mid-conversation `role: "system"` messages.
+ * The old beta is GA in 2.1.325; that alone does not expand model support.
  *
  * Mirrors `claude-cli` 2.1.251's own gate, which names Opus 4.0–4.7, Sonnet
  * 4.0–4.6 and Haiku 4.5 as unsupported and leaves Opus 4.8+, Sonnet 5+, Haiku 5+
  * and Fable/Mythos on the supported side. Opus 4.7 is the one in-scope
  * exclusion, so this gate cannot collapse into "is this a modern Claude".
  *
- * This is not just a header decision: when the beta is absent upstream stops
- * emitting `api_system` turns altogether, so the caller must downgrade those
- * messages instead (see `chat`).
+ * Keep this audited capability gate independently from beta headers: callers
+ * must downgrade system messages on unsupported models (see `chat`).
  */
 function supportsMidConversationSystem(model: string): boolean {
 	const parsed = parseClaudeModel(model);
@@ -829,7 +844,24 @@ interface ToolAccumEntry {
 	name: string;
 	args?: string;
 	inputStream?: ToolInputStream;
+	/** Relay snapshot, used only if not a single input_json_delta arrives. */
+	initialInput?: Record<string, unknown>;
 	emitted: boolean;
+}
+
+function finishAnthropicToolInput(acc: ToolAccumEntry): ParsedStreamEvent {
+	acc.emitted = true;
+	const finalInput = acc.initialInput === undefined ? undefined : JSON.stringify(acc.initialInput);
+	acc.initialInput = undefined;
+	return {
+		toolUseChunk: {
+			toolUseId: acc.id,
+			name: acc.name,
+			stop: true,
+			outputIndex: acc.outputIndex,
+			...(finalInput === undefined ? {} : { finalInput }),
+		},
+	};
 }
 
 /** Accumulator for server-side tool calls (web_search). */
@@ -1290,11 +1322,20 @@ export class AnthropicProvider implements ProviderAdapter {
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return runProviderTransport(this.transport, input, init, (target, options) =>
-			fetchWithNetworkDiagnostics(target, options, {
-				proxy,
-				redactText: this.transport?.redactText,
-				tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+		return runProviderTransport(
+			this.transport,
+			input,
+			init,
+			(target, options) =>
+				fetchWithNetworkDiagnostics(target, options, {
+					proxy,
+					redactText: this.transport?.redactText,
+					tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+				}),
+			resolveExplicitUserAgent({
+				mode: this.config.userAgentMode,
+				custom: this.config.customUserAgent,
+				extraHeaders: this.config.extraHeaders,
 			}),
 		);
 	}
@@ -1327,7 +1368,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		const headers: Record<string, string> = {
 			Accept: accept,
 			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
 		};
 		if (isOfficial) {
 			headers.Authorization = `Bearer ${apiKey}`;
@@ -1345,13 +1385,13 @@ export class AnthropicProvider implements ProviderAdapter {
 			headers["X-Stainless-Arch"] = STAINLESS_ARCH;
 			headers["X-Stainless-Lang"] = "js";
 			headers["X-Stainless-OS"] = STAINLESS_OS;
-			// The `anthropic-sdk-typescript` version bundled into `claude-cli`
-			// 2.1.251, read from the SDK's own `VERSION` constant. The SDK reports
-			// it verbatim, so a stale value here is a version the CLI never shipped.
-			headers["X-Stainless-Package-Version"] = "0.112.1";
+			// Verified in the 2.1.325 bundle's Stainless VERSION/runtime helpers.
+			// Its node-compatible branch reports the running process, not a fixed
+			// Node version from a previous CLI build (Bun also takes this branch).
+			headers["X-Stainless-Package-Version"] = "0.128.0";
 			headers["X-Stainless-Retry-Count"] = "0";
 			headers["X-Stainless-Runtime"] = "node";
-			headers["X-Stainless-Runtime-Version"] = "v26.3.0";
+			headers["X-Stainless-Runtime-Version"] = process.version;
 			headers["X-Stainless-Timeout"] = "600";
 		} else {
 			headers["x-api-key"] = apiKey;
@@ -1379,7 +1419,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial && !headers["x-api-key"] && isOpencodeEndpoint(this.config.baseUrl)) {
 			headers["x-api-key"] = apiKey;
 		}
-		return this.applyExtraHeaders(headers);
+		return finishAnthropicHeaders(headers, this.config, "user-agent");
 	}
 
 	/**
@@ -1444,14 +1484,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		};
 	}
 
-	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
-		// `"user-agent"` is the casing buildRequestHeaders writes above; passing it
-		// keeps an operator override on that one key instead of leaving a second
-		// differently-cased key that fetch would comma-join onto it.
-		mergeExtraHeaders(headers, this.config.extraHeaders, "user-agent");
-		return headers;
-	}
-
 	/**
 	 * Resolve the User-Agent for this provider.
 	 *
@@ -1471,7 +1503,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	private getBaseUrl(): string {
 		if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
-		const normalized = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+		const normalized = (this.config.baseUrl || ANTHROPIC_PUBLIC_BASE_URL).replace(/\/+$/, "");
 		// Honor a prior process-wide /v1 resolution for this base URL (unless the
 		// user changed settings since, which bumps the revision).
 		if (!AnthropicProvider.hasV1Suffix(normalized)) {
@@ -1703,26 +1735,35 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const isOfficial = !!this.config.officialApi;
 		const model = parseModelId(params.model).model;
+		const sessionId = params.diagnosticFork ? params.transportSessionKey : params.conversationId;
+		const reqHeaders = this.buildRequestHeaders(
+			apiKey,
+			isOfficial,
+			model,
+			"application/json",
+			sessionId,
+		);
+		const publicBody = reqHeaders["anthropic-version"] === ANTHROPIC_PUBLIC_VERSION;
 		// Strict models (Claude families, gpt/o-series) mint server-bound reasoning
 		// credentials; an uncredentialed thinking block must be dropped for them.
 		// Every relay model keeps its plain-text reasoning instead — with an empty
 		// signature where the wire schema demands one.
 		const strictReasoning = hasCredentialBoundReasoning(model);
-		// A mid-conversation `role: "system"` turn is only legal while the
-		// `mid-conversation-system-2026-04-07` beta is declared, and that beta is
-		// itself model-gated (see supportsMidConversationSystem). Upstream handles
-		// the unsupported case by not emitting `api_system` turns at all; here the
-		// equivalent is the downgrade the compatible path already performs, so a
-		// model without the capability never receives a message role it will reject.
+		// GA removes the beta header, not this model capability check. Preserve the
+		// audited downgrade so unsupported models never receive an illegal role.
 		const midConversationSystem = isOfficial && supportsMidConversationSystem(model);
 		// Tool changes are exempt: they exist only because the selected tool loading
 		// strategy targets mid-conversation system messages, and as user content they
 		// would be rejected outright.
-		const history = (params.history as AnthropicMessage[]).map((message) =>
-			!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
-				? { ...message, role: "user" as const }
-				: message,
-		);
+		// A request may rewrite a message's content during reasoning/role normalization;
+		// the caller can reuse the same history with a different API version.
+		const history = (params.history as AnthropicMessage[]).map((message) => ({
+			...message,
+			role:
+				!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
+					? ("user" as const)
+					: message.role,
+		}));
 		const tools = params.tools as AnthropicTool[];
 
 		// Extract system prompt from the marker message
@@ -1885,7 +1926,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// final cacheable block of the final message, whatever its role (see
 		// applyFinalCacheBreakpoint — trailing system and tool_result-only turns
 		// are marked too).
-		clearLegacyCacheMarkers(messages, cachedTools);
+		prepareWireBlocks(messages, cachedTools, publicBody);
 		if (isOfficial) {
 			applyFinalCacheBreakpoint(messages);
 		}
@@ -1928,12 +1969,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.thinking = thinkingConfig;
 		}
 
-		// Temperature: upstream sends it only when thinking is off AND the model
-		// still accepts the parameter (`!Za && wHo(d)`). Every Claude in the
-		// supported range rejects it, so the previous unconditional
-		// `temperature: 1` was a 400 on exactly the newest models. Only third-party
-		// relay ids, which `wHo` says nothing about, still receive it.
-		if (!thinkingEnabled && acceptsTemperature(model)) {
+		// No sampling parameters are legal on 2026-10-21, even for an opaque model id.
+		// An explicitly older API or gateway retains its existing model-specific behavior.
+		if (!publicBody && !thinkingEnabled && acceptsTemperature(model)) {
 			body.temperature = 1;
 		}
 
@@ -1972,7 +2010,6 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.tools = cachedTools;
 		}
 
-		const sessionId = params.diagnosticFork ? params.transportSessionKey : params.conversationId;
 		const requestMetadata = this.buildRequestMetadata(isOfficial, params.metadata, sessionId);
 		if (requestMetadata) body.metadata = requestMetadata;
 
@@ -1980,13 +2017,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		assertModelInputModalities(params.model, body);
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		const reqHeaders = this.buildRequestHeaders(
-			apiKey,
-			isOfficial,
-			model,
-			"application/json",
-			sessionId,
-		);
 		const toolBeta = toolLoadingBetaFlag(params.toolLoadingStrategy);
 		if (toolBeta) {
 			const declared = reqHeaders["anthropic-beta"];
@@ -2240,15 +2270,15 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * One-shot server-side web search, mirroring the Claude CLI's WebSearch side
-	 * request. This is the ONLY code site that declares `web_search_20250305`:
-	 * the main conversation request never carries it, so the cached prefix is
-	 * byte-identical whether or not search is used.
+	 * One-shot server-side web search. This is the ONLY code site that declares
+	 * `web_search_20250305`: the main conversation request never carries it, so
+	 * the cached prefix is byte-identical whether or not search is used.
 	 *
-	 * Request shape (CLI parity):
+	 * Current compatibility shape, not a complete 2.1.330 wire transcription:
 	 *   - no function tools — only the server search tool
 	 *   - forced `tool_choice: {type:"tool", name:"web_search"}`
-	 *   - no `thinking`
+	 *   - omit `thinking`; the newer internal mechanical/disabled config's wire
+	 *     mapping is not yet verified, so internal-only flags are never forwarded
 	 *   - zero `cache_control` breakpoints anywhere (short-lived request; a
 	 *     breakpoint would pay the cache-write cost without ever being read)
 	 */
@@ -2259,6 +2289,9 @@ export class AnthropicProvider implements ProviderAdapter {
 		blockedDomains?: string[];
 		signal?: AbortSignal;
 	}): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
+		if (params.allowedDomains?.length && params.blockedDomains?.length) {
+			throw new Error("Anthropic web search cannot combine allowedDomains and blockedDomains.");
+		}
 		const metadataModel = params.model.startsWith(`${this.config.prefix}:`)
 			? params.model
 			: `${this.config.prefix}:${params.model}`;
@@ -2334,8 +2367,6 @@ export class AnthropicProvider implements ProviderAdapter {
 async function collectWebSearchStream(
 	body: ReadableStream<Uint8Array>,
 ): Promise<{ text: string; sources: Array<{ title?: string; url?: string }> }> {
-	const decoder = new TextDecoder();
-	let buffer = "";
 	const textByIndex = new Map<number, string>();
 	const sources: Array<{ title?: string; url?: string }> = [];
 	const seenUrls = new Set<string>();
@@ -2380,34 +2411,18 @@ async function collectWebSearchStream(
 		}
 	};
 
-	const reader = body.getReader();
-	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed.startsWith("data:")) continue;
-				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
-				let data: AnthropicStreamEvent;
-				try {
-					data = JSON.parse(jsonStr) as AnthropicStreamEvent;
-				} catch {
-					continue;
-				}
-				handleEvent(data);
-			}
+	for await (const frame of readSseFrames(body)) {
+		let data: AnthropicStreamEvent;
+		try {
+			data = JSON.parse(frame.data) as AnthropicStreamEvent;
+		} catch {
+			continue;
 		}
-	} catch (err) {
-		// Bailing mid-stream (SSE error event, timeout, parse failure) leaves the
-		// HTTP response open; cancel it so the connection is released immediately.
-		await reader.cancel().catch(() => {});
-		throw err;
-	} finally {
-		reader.releaseLock();
+		if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+		if (frame.event === "error" && typeof data.type !== "string") data.type = "error";
+		// Keep consumption outside the JSON catch: channel errors must propagate,
+		// including an error in the final unterminated SSE frame.
+		handleEvent(data);
 	}
 
 	const text = [...textByIndex.entries()]
@@ -2434,9 +2449,7 @@ export async function* parseAnthropicSSEStream(
 	body: ReadableStream<Uint8Array>,
 	contextWindow?: number | null,
 ): AsyncGenerator<ParsedStreamEvent> {
-	const decoder = new TextDecoder();
-	let buffer = "";
-	let lineCount = 0;
+	let frameCount = 0;
 
 	// Tool call accumulators keyed by content block index
 	const toolAccum = new Map<number, ToolAccumEntry>();
@@ -2445,148 +2458,85 @@ export async function* parseAnthropicSSEStream(
 	const serverToolAccum = new Map<number, ServerToolAccumEntry>();
 	const usageAccum = createAnthropicUsageAccum();
 
-	// Stream integrity tracking
 	let receivedMessageStart = false;
 	let receivedAnyContentBlock = false;
-	// Track SSE event: type for gateway-injected events
-	let currentEventType = "";
+	// Do not stop at message_stop: NUG appends metering/usage/gateway events.
+	for await (const frame of readSseFrames(body)) {
+		if (frameCount < 5) {
+			logger.debug("Anthropic SSE frame", {
+				frameIndex: frameCount,
+				preview: frame.data.slice(0, 300),
+			});
+		}
+		frameCount++;
 
-	const reader = body.getReader();
-	try {
-		while (true) {
-			const { done, value } = await readWithTimeout(reader);
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
+		let data: Record<string, unknown>;
+		try {
+			data = JSON.parse(frame.data);
+		} catch {
+			continue;
+		}
+		if (!data || typeof data !== "object" || Array.isArray(data)) continue;
 
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				// Track SSE event: lines for gateway-injected events
-				if (trimmed.startsWith("event:")) {
-					currentEventType = trimmed.slice(6).trim();
-					continue;
-				}
-				// Support both "data: {...}" (standard SSE) and "data:{...}" (no space)
-				if (!trimmed.startsWith("data:")) continue;
-
-				if (lineCount < 5) {
-					logger.debug("Anthropic SSE line", {
-						lineIndex: lineCount,
-						preview: trimmed.slice(0, 300),
-					});
-				}
-				lineCount++;
-
-				// Extract JSON payload: skip "data: " or "data:"
-				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
-
-				let data: Record<string, unknown>;
-				try {
-					data = JSON.parse(jsonStr);
-				} catch {
-					currentEventType = "";
-					continue;
-				}
-
-				// Gateway-injected events: check SSE event: type first, then data-embedded type
-				if (currentEventType && isGatewayEventType(currentEventType)) {
-					const gwEvt = parseGatewaySSEEvent(currentEventType, data);
-					currentEventType = "";
-					if (gwEvt) {
-						yield gwEvt;
-						continue;
-					}
-				}
-				const sseEventName = currentEventType;
-				currentEventType = "";
-				const gwEvt = parseGatewayDataEvent(data);
-				if (gwEvt) {
-					yield gwEvt;
-					continue;
-				}
-
-				// Some relays/gateways send an error as `event: error` whose data
-				// payload lacks a `type` field. Backfill it so extractAnthropicStreamError
-				// recognizes the error instead of dropping it (which would surface to the
-				// user as a misleading empty response). Mirrors the Responses parser.
-				if (sseEventName === "error" && typeof data.type !== "string") {
-					data.type = "error";
-				}
-
-				const event = data as unknown as AnthropicStreamEvent;
-
-				// Track stream integrity
-				if (event.type === "message_start") receivedMessageStart = true;
-				if (event.type === "content_block_start") receivedAnyContentBlock = true;
-
-				const events = parseAnthropicEvent(
-					event,
-					toolAccum,
-					thinkingAccum,
-					redactedThinkingAccum,
-					serverToolAccum,
-					usageAccum,
-					contextWindow,
-				);
-				for (const evt of events) {
-					yield evt;
-				}
+		// Gateway-injected events: event name first, then the embedded type.
+		if (frame.event && isGatewayEventType(frame.event)) {
+			const gwEvt = parseGatewaySSEEvent(frame.event, data);
+			if (gwEvt) {
+				yield gwEvt;
+				continue;
 			}
 		}
-
-		// Process remaining buffer
-		const remaining = buffer.trim();
-		if (remaining.startsWith("data:")) {
-			try {
-				const jsonStr = remaining.startsWith("data: ") ? remaining.slice(6) : remaining.slice(5);
-				const event = JSON.parse(jsonStr);
-
-				if (event.type === "message_start") receivedMessageStart = true;
-				if (event.type === "content_block_start") receivedAnyContentBlock = true;
-
-				const events = parseAnthropicEvent(
-					event,
-					toolAccum,
-					thinkingAccum,
-					redactedThinkingAccum,
-					serverToolAccum,
-					usageAccum,
-					contextWindow,
-				);
-				for (const evt of events) {
-					yield evt;
-				}
-			} catch {
-				// ignore
-			}
+		const gwEvt = parseGatewayDataEvent(data);
+		if (gwEvt) {
+			yield gwEvt;
+			continue;
 		}
+		// Relays may omit the payload type even for an explicit error event.
+		if (frame.event === "error" && typeof data.type !== "string") data.type = "error";
+		const event = data as unknown as AnthropicStreamEvent;
+		if (event.type === "message_start") receivedMessageStart = true;
+		if (event.type === "content_block_start") receivedAnyContentBlock = true;
 
-		// Stream integrity checks
-		if (!receivedMessageStart) {
-			logger.warn("Anthropic SSE stream ended without message_start event");
-		} else if (!receivedAnyContentBlock) {
-			logger.warn("Anthropic SSE stream had message_start but no content blocks");
-		}
+		// Parsing and downstream consumption are deliberately outside the JSON
+		// catch, so EOF residual frames have the same error semantics as any other.
+		yield* parseAnthropicEvent(
+			event,
+			toolAccum,
+			thinkingAccum,
+			redactedThinkingAccum,
+			serverToolAccum,
+			usageAccum,
+			contextWindow,
+		);
+	}
 
-		// Flush un-emitted tool calls
-		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				acc.emitted = true;
-				yield {
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				};
-			}
+	if (!receivedMessageStart) {
+		logger.warn("Anthropic SSE stream ended without message_start event");
+	} else if (!receivedAnyContentBlock) {
+		logger.warn("Anthropic SSE stream had message_start but no content blocks");
+	}
+	for (const [, acc] of toolAccum) {
+		if (acc.emitted) continue;
+		if (acc.initialInput !== undefined) {
+			// A start snapshot is not a completion signal. Do not turn a truncated
+			// zero-delta stream into an executable call (even when input is {}).
+			const reason = "incomplete_tool_input";
+			const message = `Anthropic stream ended before tool ${acc.name} (${acc.id}) completed.`;
+			yield {
+				invalidState: {
+					reason,
+					message,
+					diagnostics: parseErrorDiagnostics(
+						{ reason, message },
+						{ source: "provider", phase: "sse_stream", reason, message },
+					),
+				},
+			};
+			continue;
 		}
-	} finally {
-		reader.releaseLock();
+		// Preserve the pre-existing partial-delta EOF flush, without substituting
+		// any initial snapshot for truncated streamed arguments.
+		yield finishAnthropicToolInput(acc);
 	}
 }
 
@@ -2712,6 +2662,10 @@ export function parseAnthropicEvent(
 				id: block.id,
 				name: block.name,
 				inputStream: new ToolInputStream(),
+				initialInput:
+					block.input && typeof block.input === "object" && !Array.isArray(block.input)
+						? block.input
+						: undefined,
 				emitted: false,
 				outputIndex: idx,
 			});
@@ -2863,6 +2817,9 @@ export function parseAnthropicEvent(
 
 			const acc = toolAccum.get(idx);
 			if (acc && !acc.emitted) {
+				// Any delta (even empty or malformed) wins over the initial snapshot.
+				// Never conceal truncated streamed arguments with a relay's placeholder.
+				acc.initialInput = undefined;
 				toolInputStreamFor(acc).feed(event.delta.partial_json);
 				const results: ParsedStreamEvent[] = [
 					{
@@ -2877,15 +2834,7 @@ export function parseAnthropicEvent(
 				];
 				// Early completion if args form valid JSON
 				if (toolInputStreamFor(acc).hasCompleteInput()) {
-					results.push({
-						toolUseChunk: {
-							toolUseId: acc.id,
-							name: acc.name,
-							stop: true,
-							outputIndex: acc.outputIndex,
-						},
-					});
-					acc.emitted = true;
+					results.push(finishAnthropicToolInput(acc));
 				}
 				return results;
 			}
@@ -2902,19 +2851,7 @@ export function parseAnthropicEvent(
 	if (type === "content_block_stop") {
 		const idx = event.index ?? 0;
 		const acc = toolAccum.get(idx);
-		if (acc && !acc.emitted) {
-			acc.emitted = true;
-			return [
-				{
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				},
-			];
-		}
+		if (acc && !acc.emitted) return [finishAnthropicToolInput(acc)];
 		// Thinking block stop — emit signature as reasoning metadata
 		const thinkAcc = thinkingAccum.get(idx);
 		if (thinkAcc) {
@@ -2964,18 +2901,12 @@ export function parseAnthropicEvent(
 	if (type === "message_delta") {
 		const results: ParsedStreamEvent[] = [];
 
-		// Flush un-emitted tool calls
+		// Initial snapshots need a normal completion, not a usage-only delta or a
+		// truncated/refused message. Existing streamed-input flushing stays intact.
+		const normalStop = ["tool_use", "end_turn"].includes(event.delta?.stop_reason ?? "");
 		for (const [, acc] of toolAccum) {
-			if (!acc.emitted) {
-				results.push({
-					toolUseChunk: {
-						toolUseId: acc.id,
-						name: acc.name,
-						stop: true,
-						outputIndex: acc.outputIndex,
-					},
-				});
-				acc.emitted = true;
+			if (!acc.emitted && (acc.initialInput === undefined || normalStop)) {
+				results.push(finishAnthropicToolInput(acc));
 			}
 		}
 

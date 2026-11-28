@@ -51,7 +51,7 @@ keywords:
   - 渠道健康
   - relay-status
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 网关类提供商
 
@@ -64,7 +64,8 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - NUG 路由 `/api/nug`：模型列表与 `/relay-status`、渠道健康、账单订单、登录与 OAuth（`routes/nug.ts`）；网关事件在 `gateway-events.ts`。NUG 模型缓存与刷新见 [模型目录与来源](../model-catalog/sourcing.md)。
 - TokenDance：`/api/tokendance/*`（OAuth 开始/完成/取消/恢复、连接、模型刷新、支付会话、余额）；恢复动作 `top_up_balance` / `reauthorize_api_key` / `api_key_quota` 由前端 `tokendance-recovery.ts` 转成对话框事件，只认自家诊断（`shared/tokendance.ts`、`services/tokendance-service.ts`）。
 - CommandCode：`/api/commandcode/{status,usage,models/refresh}`；凭据取设置页 API key，缺省回退 CLI 的 `~/.commandcode/auth.json`（`commandcode-manager.ts`）；按模型选 Anthropic 或 OpenAI 端点。
-- OpenCode Go 的 `x-opencode-session` 路由头让同一会话落到同一上游以命中缓存，按主机判断是否 OpenCode 网关（`opencode-session.ts`）。
+- OpenCode Go 的 `x-opencode-session` 路由头让同一会话落到同一上游以命中缓存，按主机判断是否 OpenCode 网关；只有非空的显式头才阻止生成默认会话头，空值保留默认路由（`opencode-session.ts`）。
+- NUG 的 OpenAI/Codex 委托显式设置 `drainUntilEof: true`，在 `response.completed` / `[DONE]` 后继续接收网关计费与额度事件；Anthropic 解析器也继续读取 `message_stop` 后的尾部。普通 OpenAI 连接仍按原生完成标记结束，不能把 NUG 尾部行为推广给全部连接。
 - 逐模型协议切换集合里 tokendance 取目录声明、CommandCode 除 `gemini-compatible` 外全部、NUG 不可切换，见 [适配器与历史构造](adapters.md)。
 
 ## 从哪读起

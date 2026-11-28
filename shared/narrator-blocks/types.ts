@@ -13,6 +13,7 @@
  * Pure types: no server imports, so clients and plugins can share them.
  */
 
+import type { TextProviderMetadata } from "../agent-protocol/types";
 import type { TextCitation } from "../citations";
 import type { FileReference } from "../file-reference";
 import type { MessageOrigin } from "../message-origin";
@@ -38,6 +39,8 @@ export type BlockPhase = "open" | "done" | "aborted" | "failed";
 export interface TextPart {
 	type: "text";
 	text: string;
+	/** Output only: provider-native replay metadata for this text part, not block phase. */
+	providerMetadata?: TextProviderMetadata;
 	/** Citations in the coordinates of `text`. */
 	citations?: TextCitation[];
 	/** Reasoning only: which channel of the item the segment came from. */

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { CanonicalEnvelope } from "@shared/narrator-blocks/types";
 import { z } from "zod";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
@@ -14,6 +15,7 @@ import {
 	parseResponsesAPIEvent,
 } from "../openai-provider";
 import { OutputContentAccumulator } from "../output-content";
+import { toTurns } from "../projection/turns";
 import type { DbMessage } from "../provider";
 import type { ContentBlock, ReasoningProviderMetadata } from "../types";
 
@@ -94,6 +96,218 @@ function makeUserMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 		...overrides,
 	};
 }
+
+describe("native Responses message phase continuation", () => {
+	test("neutral projection keeps per-part metadata without changing output lifecycle", () => {
+		const envelope: CanonicalEnvelope = {
+			id: "native-step",
+			role: "assistant",
+			parentToolUseId: null,
+			blocks: [
+				{
+					id: "native-output",
+					kind: "output",
+					ordinal: 0,
+					phase: "done",
+					payload: {
+						parts: [
+							{
+								type: "text",
+								text: " first ",
+								providerMetadata: {
+									openai: { itemId: "msg_a", contentIndex: 0, phase: "commentary" },
+								},
+							},
+							{
+								type: "text",
+								text: "second",
+								providerMetadata: {
+									openai: { itemId: "msg_a", contentIndex: 1, phase: "commentary" },
+								},
+							},
+							{
+								type: "text",
+								text: "answer",
+								providerMetadata: {
+									openai: { itemId: "msg_b", contentIndex: 0, phase: "final_answer" },
+								},
+							},
+						],
+					},
+				},
+			],
+		};
+		const original = JSON.stringify(envelope);
+		const turn = toTurns([envelope], { strict: true }).turns[0];
+		expect(turn.kind).toBe("assistant");
+		if (turn.kind !== "assistant") throw new Error("Expected an assistant projection");
+		expect(turn.items).toHaveLength(3);
+		expect(turn.items.map((item) => item.kind === "text" && item.providerMetadata?.openai)).toEqual(
+			[
+				{ itemId: "msg_a", contentIndex: 0, phase: "commentary" },
+				{ itemId: "msg_a", contentIndex: 1, phase: "commentary" },
+				{ itemId: "msg_b", contentIndex: 0, phase: "final_answer" },
+			],
+		);
+		expect(JSON.stringify(envelope)).toBe(original);
+	});
+
+	test("neutral legacy parts still concatenate without inserted separators", () => {
+		const envelope: CanonicalEnvelope = {
+			id: "legacy-step",
+			role: "assistant",
+			parentToolUseId: null,
+			blocks: [
+				{
+					id: "legacy-output",
+					kind: "output",
+					ordinal: 0,
+					phase: "done",
+					payload: {
+						parts: [
+							{ type: "text", text: "one " },
+							{ type: "text", text: "two" },
+						],
+					},
+				},
+			],
+		};
+		const turn = toTurns([envelope], { strict: true }).turns[0];
+		expect(turn.kind === "assistant" && turn.items).toEqual([
+			{ kind: "text", blockId: "legacy-output", text: "one two" },
+		]);
+	});
+
+	test("interleaved item/part metadata and late phase survive live and stored replay", async () => {
+		const tools = new Map();
+		const reasoning = new Map();
+		const content = new OutputContentAccumulator();
+		const frames = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "message", role: "assistant", id: "msg_a", phase: "commentary" },
+			},
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: " first " },
+			{ type: "response.output_text.delta", output_index: 0, content_index: 1, delta: "second" },
+			{ type: "response.output_text.delta", item_id: "msg_b", content_index: 0, delta: "answer" },
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "message", role: "assistant", id: "msg_b", phase: "final_answer" },
+			},
+			{
+				type: "response.output_item.done",
+				item: { type: "message", role: "assistant", id: "msg_a", phase: "partial_answer" },
+			},
+			{ type: "response.completed", response: { status: "completed", end_turn: false } },
+		];
+		const events = frames.flatMap((frame) => parseResponsesAPIEvent(frame, tools, reasoning));
+		const late = events.filter((event) => event.textMetadata?.openai?.phase === "partial_answer");
+		expect(late.map((event) => event.textMetadata?.openai?.contentIndex)).toEqual([0, 1]);
+		expect(
+			events.flatMap((event) => (event.contentBoundary ? [event.contentBoundary.outputIndex] : [])),
+		).toEqual([0, 0, 1]);
+		expect(events.filter((event) => event.endTurn !== undefined)).toEqual([{ endTurn: false }]);
+		for (const event of events) {
+			const lane = { blockId: event.textBlockId, outputIndex: event.textOutputIndex };
+			if (event.text != null) content.append("text", event.text, lane);
+			if (event.textMetadata) [...content.textMetadata(event.textMetadata, lane)];
+			if (event.contentBoundary) [...content.boundary(event.contentBoundary)];
+		}
+		const blocks = content.orderedContent();
+		expect(blocks).toHaveLength(3);
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history = await liveHistory(provider, blocks, "gpt-5");
+		const stored = await provider.buildHistory(
+			[
+				makeAssistantMessage({
+					messageUuid: "must-not-spread",
+					contentJson: JSON.parse(JSON.stringify(blocks)),
+				}),
+			],
+			"gpt-5",
+		);
+		const expected: OAIMessage[] = [
+			{
+				role: "assistant",
+				id: "msg_a",
+				phase: "partial_answer",
+				content: [
+					{ type: "output_text", text: " first " },
+					{ type: "output_text", text: "second" },
+				],
+			},
+			{
+				role: "assistant",
+				id: "msg_b",
+				phase: "final_answer",
+				content: [{ type: "output_text", text: "answer" }],
+			},
+		];
+		expect(history).toEqual(expected);
+		expect(stored.history).toEqual(expected);
+		expect(convertHistoryToResponsesApi(history as OAIMessage[])).toEqual(expected);
+	});
+
+	test("phase is message metadata, never response completion", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "message", role: "assistant", id: "msg_final", phase: "final_answer" },
+			},
+			new Map(),
+			new Map(),
+		);
+		expect(events.some((event) => event.endTurn !== undefined || event.contentBoundary)).toBe(
+			false,
+		);
+	});
+
+	for (const endTurn of [true, false, undefined, "false", 0]) {
+		test(`end_turn=${String(endTurn)} is boolean-only and never drops tools`, () => {
+			const events = parseResponsesAPIEvent(
+				{
+					type: "response.completed",
+					response: {
+						status: "completed",
+						end_turn: endTurn,
+						output: [{ type: "function_call", call_id: "call_1", name: "Read", arguments: "{}" }],
+					},
+				},
+				new Map(),
+				new Map(),
+			);
+			expect(events.find((event) => event.toolUseChunk?.stop)?.toolUseChunk).toMatchObject({
+				toolUseId: "call_1",
+				stop: true,
+			});
+			expect(events.find((event) => event.endTurn !== undefined)?.endTurn).toBe(
+				typeof endTurn === "boolean" ? endTurn : undefined,
+			);
+		});
+	}
+
+	test("legacy text keeps neutral grouping without spreading a response-level UUID", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const blocks: ContentBlock[] = [
+			{ type: "text", text: "one" },
+			{ type: "text", text: "two" },
+		];
+		const live = await liveHistory(provider, blocks, "gpt-5");
+		const stored = await provider.buildHistory(
+			[makeAssistantMessage({ messageUuid: "legacy-msg", contentJson: blocks })],
+			"gpt-5",
+		);
+		const expected: OAIMessage[] = [
+			{ role: "assistant", content: [{ type: "output_text", text: "one\ntwo" }] },
+		];
+		expect(live).toEqual(expected);
+		expect(stored.history).toEqual(expected);
+		expect(convertHistoryToResponsesApi(stored.history as OAIMessage[])).toEqual(expected);
+	});
+});
 
 describe("native Responses reasoning continuation", () => {
 	for (const variant of [
@@ -1449,9 +1663,9 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		const historyJson = JSON.stringify(result.history);
-		// A user item, not developer: the request's instructions must not change with history.
+		// Saved-path context stays an input item; it must not change the root instructions.
 		expect(historyJson).not.toContain('"role":"developer"');
-		expect(historyJson).toContain(savedPath);
+		expect(historyJson).toContain(JSON.stringify(savedPath).slice(1, -1));
 		expect(historyJson).toContain('"type":"image_generation_call"');
 		expect(historyJson).toContain('"id":"ig_saved"');
 		expect(historyJson).toContain('"revised_prompt":"a saved blue square"');

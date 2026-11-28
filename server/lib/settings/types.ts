@@ -190,9 +190,12 @@ export interface OpenAIProviderConfig {
 	 * Internal: per-request dynamic headers, called at request-build time so
 	 * values that change at runtime (e.g. the NUG client-relay channel id,
 	 * which rotates on every reconnect) are always current. Merged after
-	 * extraHeaders, so dynamic values win. Not persisted in settings.
+	 * extraHeaders, so dynamic values win except over an explicit operator User-Agent.
+	 * Not persisted in settings.
 	 */
 	dynamicHeaders?: () => Record<string, string>;
+	/** Internal: NUG sends trailing metering after native completion; not persisted in settings. */
+	drainUntilEof?: boolean;
 	/** Which User-Agent to present on outbound requests. Absent = narrafork UA default. */
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */

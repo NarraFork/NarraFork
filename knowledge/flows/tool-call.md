@@ -28,7 +28,7 @@ keywords:
   - 审批卡片
   - PreToolUse
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 一次工具调用
 
@@ -48,7 +48,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 11. 结果整理：输出超限由 `truncateOutput` 截断（工具自己已截断的原样放行），再经 `annotateToolOutput` 加注；得到 `ToolExecResult`（输出、`isError`、`durationMs`）。
 12. 回写：`loop.ts` 产出 `tool_result`；`processEvent` 先 `validateToolCallBinding` 校验，把输出与状态写进 `narrator_tool_calls` 与 tool_result 消息，再广播。工具长输出期间的 `tool_output` / `tool_progress` 只广播不落库。
 13. 前端：`useNarratorWS` 收到 `permission_request`、`tool_result` 等帧，更新工具卡片与审批卡片。见 [数据获取与实时同步](../frontend/data-flow.md)、[工具卡片](../frontend/narrator-ui/tool-cards.md)。
-14. 下一轮：本轮所有 tool_result 就绪后，`loop.ts` 带着它们请求模型，回到 [一轮对话](turn.md) 的步骤 9。
+14. 下一轮：本轮所有 tool_result 就绪后，`loop.ts` 带着它们请求模型，保留同一 `turnContext`，回到 [一轮对话](turn.md) 的步骤 9；收到结构化 refusal 则只排空已启动调用，不启动剩余队列，按失败收尾。
 
 ## 改它时
 - 新增一个工具：`tools/index.ts` 注册（core 或 `OPTIONAL_TOOLS`）、`narrator-permission.ts` 里它的权限分类（`ALWAYS_ALLOW_TOOLS` / `READ_ONLY_TOOLS` / `WRITE_TOOLS` / `ALWAYS_ASK_TOOLS` 等集合）、`shared/tool-parallel-groups.ts` 里它能否并行、工具自己的 `execute`、前端的工具卡片（`frontend/components/narrator/tool-call/`）与 i18n；若是路由类（碰设备文件）还要接 `withDeviceParam` 与执行目标冻结。

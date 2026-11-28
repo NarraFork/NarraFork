@@ -398,9 +398,19 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 			options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 			expect(await options.config.hasPendingWake?.()).toBe(false);
 			for (const step of [
-				{ parts: [{ text: "mailbox update" }], mailbox: true, before: false, after: true },
+				{
+					parts: [{ text: "mailbox update" }],
+					mailbox: true,
+					before: false,
+					after: true,
+				},
 				{ parts: [], mailbox: false, before: true, after: true },
-				{ parts: [{ text: "ordinary guidance" }], mailbox: false, before: true, after: false },
+				{
+					parts: [{ text: "ordinary guidance" }],
+					mailbox: false,
+					before: true,
+					after: false,
+				},
 			]) {
 				drain.mockResolvedValueOnce({
 					text: step.parts.map((part) => part.text).join("\n"),
@@ -411,8 +421,13 @@ describe("reasoning-only idle uses the real runtime's work and input provenance"
 				const input = await options.config.getAfterToolsInjections?.();
 				if (!input || typeof input === "string") throw new Error("Expected structured drain input");
 				expect(await options.config.hasPendingWake?.()).toBe(step.before);
+				const previousTurn = options.config.turnContext;
 				await input.onConsumed?.();
 				expect(await options.config.hasPendingWake?.()).toBe(step.after);
+				// Notices and agent messages do not begin a new logical user turn.
+				expect(options.config.turnContext).toBe(previousTurn);
+				await input.onConsumed?.();
+				expect(options.config.turnContext).toBe(previousTurn);
 				// Provider retries re-adopt the same packet, but do not repeat onConsumed.
 				options.config.onModelInputConsumed?.(options.history.built ?? [], options.userText);
 				expect(await options.config.hasPendingWake?.()).toBe(step.after);
@@ -572,8 +587,12 @@ describe("provider retry policy is identical through the real primary and child 
 				activeNarrators.set(id, active);
 				const owner = tryClaimExecution(id, "run");
 				if (!owner) throw new Error("Missing retry owner");
-				const calls: Array<{ packet: string; conversation: string; reset: boolean | undefined }> =
-					[];
+				const calls: Array<{
+					packet: string;
+					conversation: string;
+					reset: boolean | undefined;
+					turnContext: ExecuteLoopOptions["config"]["turnContext"];
+				}> = [];
 				spyOn(executor, "executeAgentLoop").mockImplementation(
 					async (options: ExecuteLoopOptions) => {
 						const runtimePolicy = options.config.runtimePolicy;
@@ -589,6 +608,7 @@ describe("provider retry policy is identical through the real primary and child 
 							}),
 							conversation: options.config.conversationId,
 							reset: options.config.resetUpstreamSessionOnFirstRequest,
+							turnContext: options.config.turnContext,
 						});
 						if (calls.length > 2) throw new Error("Unexpected extra retry or continuation");
 						return calls.length === 1
@@ -620,6 +640,8 @@ describe("provider retry policy is identical through the real primary and child 
 				if (mode === "responses") {
 					// Recovery must keep conversationId so prompt_cache_key stays stable.
 					expect(calls[1].conversation).toBe(calls[0].conversation);
+					expect(calls[0].turnContext?.id).toBeTruthy();
+					expect(calls[1].turnContext).toBe(calls[0].turnContext);
 					expect(calls[1].reset).toBe(true);
 					expect(outcome.finalText).toBe("finished");
 				} else {
@@ -633,8 +655,207 @@ describe("provider retry policy is identical through the real primary and child 
 				expect(rows.filter((row) => row.role === "sys" && row.contentText === marker)).toHaveLength(
 					1,
 				);
-			});
+			}, 30_000);
 		}
+	}
+});
+
+describe("logical provider turns through real prefix rebuilds", () => {
+	for (const kind of ["primary", "subagent"] as const) {
+		test(`${kind}: adopting a buffered user input replaces the turn once, then retry keeps it`, async () => {
+			const { id, active, owner, run } = await reasoningIdleFixture(kind);
+			const { enqueueBufferedMessage } = await import("../narrator-buffer");
+			const contexts: ExecuteLoopOptions["config"]["turnContext"][] = [];
+			const packets: string[] = [];
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				contexts.push(options.config.turnContext);
+				packets.push(JSON.stringify(options.history.built));
+				if (contexts.length === 1) {
+					expect((await enqueueBufferedMessage(id, "fresh independent user input")).ok).toBe(true);
+				} else if (contexts.length === 2) {
+					return {
+						finalText: "",
+						hasError: false,
+						shouldUpdateTitle: false,
+						silentDisconnect: true,
+					};
+				}
+				if (contexts.length > 3) throw new Error("Unexpected additional provider pass");
+				return {
+					finalText: "finished",
+					hasError: false,
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+				};
+			});
+			spyOn(recovery, "handleTransientError").mockResolvedValue({ shouldRetry: true, delayMs: 0 });
+			const outcome = await runAgentLoopUnlocked(active, owner, "initial input", undefined, run);
+			expect(outcome.hasError).toBe(false);
+			expect(contexts).toHaveLength(3);
+			expect(contexts[0]?.id).toBeTruthy();
+			expect(contexts[1]).not.toBe(contexts[0]);
+			expect(contexts[2]).toBe(contexts[1]);
+			expect(packets[1].split("fresh independent user input")).toHaveLength(2);
+			expect(packets[2]).toBe(packets[1]);
+		}, 30_000);
+
+		test(`${kind}: late per-part phase survives storage and a cached prefix rebuild`, async () => {
+			const { id, model, prefix, active, owner, run } = await reasoningIdleFixture(kind);
+			const { OutputContentAccumulator } = await import("../../lib/agent/output-content");
+			const { processEvent } = await import("../narrator-event-handler");
+			const content = new OutputContentAccumulator();
+			const ctx: import("../narrator-event-handler").EventHandlerContext = {
+				narratorId: id,
+				broadcastTargetId: id,
+				conversationId: active.conversationId,
+				...(kind === "subagent" ? { parentToolUseId: "origin-tool" } : {}),
+				provider: prefix,
+				model,
+				getPartialMessageId: () => active._partialMessageId,
+				setPartialMessageId: (value) => {
+					active._partialMessageId = value;
+				},
+				getTokenUsage: () => undefined,
+				getContextUsagePct: () => undefined,
+				getMeterUsage: () => undefined,
+				getMeterUnit: () => undefined,
+				setTokenUsage: () => {},
+				setContextUsagePct: () => {},
+				setMeterData: () => {},
+			};
+			const persist = async (events: Iterable<import("../../lib/agent/types").AgentEvent>) => {
+				for (const event of events) await processEvent(event, ctx);
+			};
+			const lanes = [
+				{
+					blockId: "comment/0",
+					outputIndex: 0,
+					itemId: "comment",
+					contentIndex: 0,
+					text: "commentary",
+					phase: "commentary" as const,
+				},
+				{
+					blockId: "partial/0",
+					outputIndex: 1,
+					itemId: "partial",
+					contentIndex: 0,
+					text: "part zero",
+					phase: "partial_answer" as const,
+				},
+				{
+					blockId: "partial/1",
+					outputIndex: 1,
+					itemId: "partial",
+					contentIndex: 1,
+					text: "part one",
+					phase: "partial_answer" as const,
+				},
+				{
+					blockId: "final/0",
+					outputIndex: 2,
+					itemId: "final",
+					contentIndex: 0,
+					text: "final answer",
+					phase: "final_answer" as const,
+				},
+			];
+			for (const lane of lanes) {
+				content.append("text", lane.text, lane);
+				await persist(
+					content.textMetadata(
+						{ openai: { itemId: lane.itemId, contentIndex: lane.contentIndex } },
+						lane,
+					),
+				);
+			}
+			await persist(content.flush());
+			const messageId = active._partialMessageId as string;
+			const packets: ExecuteLoopOptions["history"][] = [];
+			const contexts: ExecuteLoopOptions["config"]["turnContext"][] = [];
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				packets.push(structuredClone(options.history));
+				contexts.push(options.config.turnContext);
+				if (packets.length === 1) {
+					for (const lane of lanes)
+						await persist(content.textMetadata({ openai: { phase: lane.phase } }, lane));
+					await processEvent(
+						{
+							type: "assistant_message",
+							text: content.finalizeText().text,
+							toolUses: [],
+							messageId: "do-not-spread",
+						},
+						ctx,
+					);
+					return {
+						finalText: "",
+						hasError: false,
+						shouldUpdateTitle: false,
+						silentDisconnect: true,
+					};
+				}
+				if (packets.length > 2) throw new Error("Unexpected additional phase-replay pass");
+				return {
+					finalText: "finished",
+					hasError: false,
+					shouldUpdateTitle: false,
+					completedNaturally: true,
+					completedAssistantTurn: true,
+				};
+			});
+			spyOn(recovery, "handleTransientError").mockResolvedValue({ shouldRetry: true, delayMs: 0 });
+			const outcome = await runAgentLoopUnlocked(active, owner, "", undefined, run);
+			expect(outcome.hasError).toBe(false);
+			expect(packets).toHaveLength(2);
+			expect(contexts[1]).toBe(contexts[0]);
+			const before = packets[0].rows.find((row) => row.id === messageId)?.contentJson;
+			const after = packets[1].rows.find((row) => row.id === messageId)?.contentJson;
+			expect(JSON.stringify(before)).not.toContain('"phase"');
+			const stored = readTestMessageContent<unknown>(sqlite, messageId);
+			expect(after).toEqual(stored);
+			expect(stored).toMatchObject(
+				lanes.map((lane) => ({
+					type: "text",
+					text: lane.text,
+					providerMetadata: {
+						openai: { itemId: lane.itemId, contentIndex: lane.contentIndex, phase: lane.phase },
+					},
+				})),
+			);
+			const { convertHistoryToResponsesApi } = await import("../../lib/agent/openai-provider");
+			const replay = convertHistoryToResponsesApi(
+				packets[1].built as import("../../lib/agent/openai-provider").OAIMessage[],
+			);
+			expect(
+				replay.filter(
+					(item) => "id" in item && ["comment", "partial", "final"].includes(item.id as string),
+				),
+			).toEqual([
+				{
+					role: "assistant",
+					id: "comment",
+					phase: "commentary",
+					content: [{ type: "output_text", text: "commentary" }],
+				},
+				{
+					role: "assistant",
+					id: "partial",
+					phase: "partial_answer",
+					content: [
+						{ type: "output_text", text: "part zero" },
+						{ type: "output_text", text: "part one" },
+					],
+				},
+				{
+					role: "assistant",
+					id: "final",
+					phase: "final_answer",
+					content: [{ type: "output_text", text: "final answer" }],
+				},
+			]);
+		}, 30_000);
 	}
 });
 

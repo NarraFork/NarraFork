@@ -30,7 +30,7 @@ keywords:
   - 工具名规则
   - tool-load-markers
 status: draft
-verified_at: 9400a828b
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 工具体系
 
@@ -38,6 +38,7 @@ verified_at: 9400a828b
 
 ## 关键规则
 - 注册：`tools/index.ts` 在模块末尾调用 `registerCoreTools`，注册 `core` 与 `optional` 两个 provider。provider 的工具是惰性实体化的（首次 `get/all` 才调用 `tools()`），避免循环导入时读到未初始化的绑定；显式 `register` 的工具优先于 provider 里的同名工具；每次变更递增 `revision`（`tool-registry.ts`）。
+- 工具 JSON Schema 的 `required` 由 `tool-registry.ts:missingToolInput` 静态分析 Zod 声明，不用 `parse(undefined)` 探测，因此不执行 preprocess/refinement/transform。`optional`、`default` 可缺省，单纯 `nullable` 仍必填；union 按首个可缺省分支、pipe 按输入与输出声明传播缺省语义。回归在 `tools/__tests__/tools.test.ts` 与 `provider-tool-schema.test.ts`。
 - 名称必须符合 `^[a-zA-Z0-9_-]+$`（OpenAI/Anthropic/Gemini 交集）；shell 工具在所有平台都叫 `Bash`，旧别名 `Shell` 在 `get` 中回退到 `Bash`，精确匹配优先（`tool-name.ts`、`ToolRegistry.get`）。MCP 与插件工具的名称在生成处规范化。
 - core 包括 ToolSearch、Bash、Read/Write/Edit/Glob/Grep、StructView/StructSed、WebSearch/WebFetch、计划模式、子代理（`agentTool`，线上名 `Agent`）、Stop/Watch/Send、Team、Skill、知识库与大纲读取、设备/目录/worktree 切换，以及各类反思确认工具（danger/exit-plan/task）。
 - `OPTIONAL_TOOLS` 是默认不加载的集合：Eval、Terminal、ShareFile、GenUI、ImageGen、Notification、Recall、Browser、ForkNarrator、ScheduledTask、各种 *Admin 工具、知识库编辑、Pack、PluginInstall、OutlineEdit、Pipeline 工具等（`tools/index.ts:OPTIONAL_TOOLS`）。

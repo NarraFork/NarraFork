@@ -3,23 +3,10 @@ import { deriveCodexWindowId } from "./agent/codex-request";
 import { APP_VERSION } from "./version";
 
 export const ORIGINATOR = "narrafork";
-/**
- * Claude Code CLI version mimicked by the "claude-code" User-Agent mode.
- *
- * Must stay in sync with the `cc_version` reported in the Anthropic billing
- * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
- * User-Agent and billing block disagree does not match any real CLI release.
- *
- * Transcribed from the `VERSION` constant embedded in the official
- * `claude-cli` 2.1.251 binary. The npm package stopped shipping `cli.js`
- * around 2.1.227 and now only wraps a per-platform native executable, so this
- * value is verified against strings extracted from that binary rather than
- * from readable package sources.
- */
-export const CLAUDE_CLI_VERSION = "2.1.251";
-// Managed Codex client version used only for outbound protocol emulation.
-// Keep the User-Agent prefix/suffix and originator aligned when updating it.
-const CODEX_CLI_VERSION = "0.159.2";
+// Managed identity pins; the Claude billing cc_version shares this value.
+export const CLAUDE_CLI_VERSION = "2.1.330";
+// Keep both Codex UA version positions and originator aligned.
+export const CODEX_CLI_VERSION = "0.171.0";
 export const ORIGINATOR_CODEX = "codex-tui";
 
 /**
@@ -203,36 +190,42 @@ export function sanitizeUserAgent(userAgent: string): string {
 }
 
 /**
- * Merge `extraHeaders` into `headers`, keeping the User-Agent to ONE key.
- *
- * WHY: a plain header object is case-SENSITIVE, HTTP header names are not. The
- * providers write opposite casings (`openai-provider` → `"User-Agent"`,
- * `anthropic-provider` → `"user-agent"`), so an operator whose `extraHeaders`
- * used the other casing did not override the UA — both keys survived and `fetch`
- * COMMA-JOINED them:
- *
- *   user-agent: NarraFork-Custom/7.7, injected/1.0
- *
- * which is neither value and matches no real client. Measured, not theorised.
- *
- * Precedence is unchanged from before: `extraHeaders` still wins, because it is
- * the operator typing a literal string. Only the casing dependence is removed.
- *
- * @param userAgentKey The casing the calling provider uses for its own UA key,
- *   so an override lands on that key instead of creating a second one.
+ * Merge HTTP header layers without retaining differently-cased duplicates.
+ * The later non-empty value wins, including within a single supplied layer.
+ * Preserve the first spelling for callers that inspect the record; User-Agent
+ * always uses the caller's spelling and is sanitized. Empty overrides keep the
+ * default (they do not mean deletion).
  */
 export function mergeExtraHeaders(
 	headers: Record<string, string>,
 	extraHeaders: Record<string, string> | undefined,
 	userAgentKey: string,
 ): void {
+	const names = new Map<string, string>();
+	for (const [key, value] of Object.entries(headers)) {
+		const lower = key.toLowerCase();
+		const name = lower === "user-agent" ? userAgentKey : (names.get(lower) ?? key);
+		if (name !== key) delete headers[key];
+		Object.defineProperty(headers, name, {
+			value: lower === "user-agent" ? sanitizeUserAgent(value) : value,
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
+		names.set(lower, name);
+	}
 	for (const [key, value] of Object.entries(extraHeaders ?? {})) {
 		if (!value) continue;
-		if (key.toLowerCase() === "user-agent") {
-			headers[userAgentKey] = sanitizeUserAgent(value);
-			continue;
-		}
-		headers[key] = value;
+		const lower = key.toLowerCase();
+		if (lower === "user-agent" && !value.trim()) continue;
+		const name = lower === "user-agent" ? userAgentKey : (names.get(lower) ?? key);
+		Object.defineProperty(headers, name, {
+			value: lower === "user-agent" ? sanitizeUserAgent(value.trim()) : value,
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
+		names.set(lower, name);
 	}
 }
 
@@ -278,23 +271,22 @@ export function getHttpCodexUserAgent(): string {
  * header is not an identity marker at all — it is one half of a request contract
  * driven by the per-model `ModelInfo.use_responses_lite` flag, which upstream
  * publishes in its model catalog. When that flag is set, codex-rs/core/src/client.rs
- * simultaneously (a) sends the header, (b) omits top-level `instructions` and
- * `tools` entirely, (c) splices an `additional_tools` item plus a developer
- * instructions message to the front of `input`, and (d) forces
- * `parallel_tool_calls: false`. Upstream validates the pairing and rejects the
+ * sends the header, moves `tools` into an `additional_tools` input item, and
+ * forces `parallel_tool_calls: false`. In 0.171.0, NONEMPTY base instructions
+ * are a developer input prefix in BOTH lite and non-lite requests; empty
+ * instructions produce no prefix. Upstream validates the tools/header pairing and rejects the
  * header whenever `tools` carries anything but function/custom/client-executed
  * search tools:
  *
  *   "X-OpenAI-Internal-Codex-Responses-Lite only supports function tools,
  *    custom tools, and client-executed tool search."
  *
- * NarraFork emits the classic non-lite body (top-level instructions + tools,
- * including the hosted `web_search`/`image_generation` tools), so claiming lite
- * produced a request no real client emits and hard-failed any endpoint that
- * enforces the pairing. Non-lite is the universally accepted shape and is what
- * real Codex sends for every model whose catalog entry leaves the flag false, so
- * the header is dropped rather than the tools. {@link stripResponsesLiteHeader}
- * enforces this on every outbound header map, and the codex parity tests pin it.
+ * NarraFork implements the non-lite branch with top-level tools, including
+ * hosted `web_search`/`image_generation`, and a nonempty developer instruction prefix.
+ * Claiming lite would violate that pairing. Upstream still supports non-lite;
+ * this does not guarantee every model supports it. The opt-in is dropped rather
+ * than silently deleting tools. {@link stripResponsesLiteHeader} enforces this
+ * on outbound header maps, and the codex parity tests pin it.
  *
  * Also omitted: x-codex-installation-id as a direct header. codex-rs only puts
  * the installation id in the request body's `client_metadata` (and inside the
@@ -389,14 +381,55 @@ export function resolveHttpUserAgent(options: {
 	}
 }
 
+interface UserAgentSelection {
+	mode?: UserAgentMode;
+	custom?: string;
+	extraHeaders?: Record<string, string>;
+}
+
+/** Only a real operator choice pins UA. Blank custom/header values keep defaults.
+ * selected is the already-resolved fingerprint value, avoiding duplicate OS lookup. */
+export function resolveExplicitUserAgent(
+	options: UserAgentSelection,
+	selected?: string,
+): string | undefined {
+	let extra: string | undefined;
+	for (const [name, value] of Object.entries(options.extraHeaders ?? {})) {
+		if (name.toLowerCase() === "user-agent" && typeof value === "string" && value.trim())
+			extra = value.trim();
+	}
+	if (extra !== undefined) return sanitizeUserAgent(extra);
+	if (!options.mode || (options.mode === "custom" && !options.custom?.trim())) return undefined;
+	if (
+		options.mode !== "custom" &&
+		options.mode !== "narrafork" &&
+		options.mode !== "codex" &&
+		options.mode !== "claude-code"
+	)
+		return undefined;
+	return sanitizeUserAgent(selected ?? resolveHttpUserAgent({ ...options, fallback: "" }));
+}
+
+/** Apply after dynamic defaults; all other headers retain their existing priority. */
+export function applyExplicitUserAgent(
+	headers: Record<string, string>,
+	selection: UserAgentSelection,
+	userAgentKey: string,
+	selected?: string,
+): void {
+	const explicit = resolveExplicitUserAgent(selection, selected);
+	if (explicit !== undefined)
+		mergeExtraHeaders(headers, { [userAgentKey]: explicit }, userAgentKey);
+}
+
 /**
  * Resolve the effective client fingerprint (User-Agent + request headers) for a
  * provider request.
  *
  * Header precedence (later wins):
  *   1. Codex client headers — emitted whenever `installationId` is supplied.
- *   2. User-configured `extraHeaders` — always applied last so operators can
- *      override or clear any emitted header.
+ *   2. User-configured non-empty `extraHeaders` override defaults without
+ *      case-sensitive duplicates. Empty values leave the default unchanged.
  *
  * Passing `installationId` is what opts a caller into the Codex header set, so
  * non-codex providers never leak codex-specific identifiers.
@@ -433,5 +466,5 @@ export function resolveClientFingerprint(options: {
 	// operator override replaces that key instead of adding a second one.
 	mergeExtraHeaders(headers, options.extraHeaders, "User-Agent");
 	stripResponsesLiteHeader(headers);
-	return { userAgent, headers };
+	return { userAgent: headers["User-Agent"] ?? userAgent, headers };
 }

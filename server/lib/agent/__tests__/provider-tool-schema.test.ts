@@ -151,6 +151,32 @@ describe("raw tool schema wire boundaries", () => {
 		},
 	];
 	for (const adapter of adapters) {
+		test(`${adapter.name}: generated declarations require only the caller's inputs`, () => {
+			const parameters = z.object({
+				query: z.string(),
+				limit: z.number().default(3),
+				cursor: z.preprocess((v) => v, z.string().optional()),
+			});
+			const definition: ResolvedToolDefinition = {
+				name: "Fixture",
+				description: "Schema fixture",
+				parameters,
+				execute: async () => ({ output: "unused" }),
+			};
+			const wire = JSON.parse(JSON.stringify(adapter.provider.formatTools([definition])));
+			expect(wire).toEqual([
+				adapter.declaration({
+					type: "object",
+					properties: {
+						query: { type: "string" },
+						limit: { type: "number", default: 3 },
+						cursor: { type: "string" },
+					},
+					additionalProperties: false,
+					required: ["query"],
+				}),
+			]);
+		});
 		for (const [name, fixture] of fixtures) {
 			test(`${adapter.name}: ${name} is preserved without mutating the catalog`, () => {
 				const source = freezeDeep(structuredClone(fixture));

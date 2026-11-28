@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	applyCodexInstructionsInput,
 	applyCodexStableRequestFields,
 	createCodexRequestIdentity,
 	deriveCodexWindowId,
@@ -60,6 +61,80 @@ describe("createCodexRequestIdentity", () => {
 	});
 });
 
+describe("applyCodexInstructionsInput", () => {
+	const identity = createCodexRequestIdentity("prefix-session");
+	function request(instructions = "runtime instructions") {
+		return {
+			instructions,
+			input: [{ role: "user", content: "hi" }],
+			tools: [{ type: "web_search" }, { type: "function", name: "Read" }],
+		} as Record<string, unknown>;
+	}
+
+	test("prepends input_text once without removing hosted or function tools", () => {
+		const body = request();
+		const tools = body.tools;
+		applyCodexInstructionsInput(body, identity);
+		const first = JSON.stringify(body);
+		applyCodexInstructionsInput(body, identity);
+		expect(JSON.stringify(body)).toBe(first);
+		expect(body.instructions).toBeUndefined();
+		expect(body.tools).toBe(tools);
+		expect(body.input).toHaveLength(2);
+		expect((body.input as unknown[])[0]).toMatchObject({
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: "runtime instructions" }],
+		});
+	});
+
+	test("empty base instructions do not invent a message or discard other input", () => {
+		const body = request("");
+		const items = [
+			{ type: "additional_tools", role: "developer", tools: [] },
+			{ role: "user", content: "hi" },
+		];
+		body.input = items;
+		applyCodexInstructionsInput(body, identity);
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual(items);
+		body.instructions = "actual base instructions";
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toHaveLength(3);
+		// An explicit empty replacement removes only our previously generated prefix.
+		body.instructions = "";
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toEqual(items);
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toEqual(items);
+	});
+
+	test("rebuilds stable IDs across retry/restoration and replaces an existing prefix", () => {
+		const body = request();
+		const rebuilt = request();
+		applyCodexInstructionsInput(body, identity);
+		applyCodexInstructionsInput(rebuilt, createCodexRequestIdentity("prefix-session"));
+		expect(body).toEqual(rebuilt);
+		const restored = JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
+		restored.instructions = "runtime instructions";
+		applyCodexInstructionsInput(restored, identity);
+		expect(restored).toEqual(body);
+	});
+
+	test("changed session or instructions cannot match a previous incremental prefix", () => {
+		const body = request();
+		applyCodexInstructionsInput(body, identity);
+		const oldPrefix = (body.input as unknown[])[0];
+		body.instructions = "changed instructions";
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toHaveLength(2);
+		expect((body.input as unknown[])[0]).not.toEqual(oldPrefix);
+		const other = request();
+		applyCodexInstructionsInput(other, createCodexRequestIdentity("another-session"));
+		expect((other.input as unknown[])[0]).not.toEqual(oldPrefix);
+	});
+});
+
 describe("applyCodexStableRequestFields", () => {
 	test("applies the full stable field set", () => {
 		const body: Record<string, unknown> = { model: "gpt-5.3-codex", stream: true };
@@ -109,8 +184,16 @@ describe("applyCodexStableRequestFields", () => {
 		});
 
 		expect(body.model).toBe("gpt-5.3-codex");
-		expect(body.instructions).toBe("caller instructions");
-		expect(body.input).toEqual([{ role: "user", content: "hi" }]);
+		expect(body.instructions).toBeUndefined();
+		expect(body.input).toEqual([
+			{
+				type: "message",
+				id: expect.stringMatching(/^msg_nf_instructions_[a-f0-9]+_[a-f0-9]+$/),
+				role: "developer",
+				content: [{ type: "input_text", text: "caller instructions" }],
+			},
+			{ role: "user", content: "hi" },
+		]);
 		expect(body.parallel_tool_calls).toBe(true);
 	});
 

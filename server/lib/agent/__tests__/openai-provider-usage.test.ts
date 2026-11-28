@@ -25,6 +25,88 @@ const providerConfig = {
 	defaultModel: "gpt-5",
 };
 
+function openSseResponse(frames: string, cancel?: () => void): Response {
+	return new Response(
+		new ReadableStream<Uint8Array>(
+			{
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(frames));
+				},
+				pull() {
+					throw new Error("read after terminal frame");
+				},
+				cancel,
+			},
+			{ highWaterMark: 0 },
+		),
+		{ headers: { "content-type": "text/event-stream" } },
+	);
+}
+
+describe("OpenAI framed stream termination", () => {
+	for (const apiMode of ["responses", "codex", "completions"] as const) {
+		test(`${apiMode} completes and cancels a body that does not close`, async () => {
+			let cancellations = 0;
+			const responses = apiMode !== "completions";
+			const frames = responses
+				? 'event: response.output_text.delta\rdata:{\rdata: "delta":"ok"\rdata: }\r\r' +
+					'event: response.completed\rdata:{"response":{"status":"completed","usage":{"input_tokens":11,"output_tokens":2}}}\r\r'
+				: 'data:{\r\ndata: "choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]\r\ndata: }\r\n\r\n' +
+					'data:{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2}}\r\n\r\ndata:[DONE]\r\n\r\n';
+			setOutboundFetchOverrideForTest(async () =>
+				openSseResponse(`\uFEFF${frames}`, () => cancellations++),
+			);
+			const provider = new OpenAIProvider({ ...providerConfig, apiMode });
+			const result = await provider.generateWithMeta("prompt", "openai:gpt-5");
+			expect(result.text).toBe("ok");
+			expect(result.usage).toMatchObject({ inputTokens: 11, outputTokens: 2 });
+			expect(cancellations).toBe(1);
+			const events: ParsedStreamEvent[] = [];
+			for await (const event of provider.chat(chatParams())) events.push(event);
+			expect(events.find((event) => event.usage)?.usage).toMatchObject({
+				inputTokens: 11,
+				completionTokens: 2,
+			});
+			expect(events.map((event) => event.text ?? "").join("")).toBe("ok");
+			expect(cancellations).toBe(2);
+		});
+
+		for (const drainUntilEof of [false, true]) {
+			test(`${apiMode} trailing metering requires explicit drainUntilEof=${drainUntilEof}`, async () => {
+				const terminal =
+					apiMode === "completions"
+						? 'data:{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata:[DONE]\n\n'
+						: 'data:{"type":"response.completed","response":{"status":"completed"}}\n\n';
+				globalThis.fetch = (async () =>
+					new Response(`${terminal}event: meteringEvent\ndata:{\ndata:"usage":12.5\ndata:}\n\n`, {
+						headers: { "content-type": "text/event-stream" },
+					})) as unknown as typeof fetch;
+				const provider = new OpenAIProvider({ ...providerConfig, apiMode, drainUntilEof });
+				const events: ParsedStreamEvent[] = [];
+				for await (const event of provider.chat(chatParams())) events.push(event);
+				expect(events.find((event) => event.metering)?.metering?.usage).toBe(
+					drainUntilEof ? 12.5 : undefined,
+				);
+			});
+		}
+	}
+
+	test("Responses completion flushes pending tools before canceling", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			openSseResponse(
+				'data:{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}\n\n' +
+					'data:{"type":"response.completed","response":{"status":"completed"}}\n\n',
+			),
+		);
+		const events: ParsedStreamEvent[] = [];
+		for await (const event of new OpenAIProvider({ ...providerConfig, apiMode: "responses" }).chat(
+			chatParams(),
+		))
+			events.push(event);
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+	});
+});
+
 describe("OpenAI raw usage normalization", () => {
 	for (const total of [100, 60, 20, 0]) {
 		for (const protocol of ["responses", "completions"] as const) {

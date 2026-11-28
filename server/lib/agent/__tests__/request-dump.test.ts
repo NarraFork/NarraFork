@@ -361,6 +361,12 @@ describe("incremental response capture", () => {
 });
 
 describe("sanitizeHeaders", () => {
+	test("fully redacts Codex turn-state rather than preserving token prefixes", () => {
+		expect(sanitizeHeaders({ "X-Codex-Turn-State": "opaque-routing-secret" })).toEqual({
+			"X-Codex-Turn-State": "[REDACTED]",
+		});
+	});
+
 	test("masks provider API-key headers, including Gemini's x-goog-api-key", () => {
 		const masked = sanitizeHeaders({
 			authorization: "Bearer sk-super-secret-token",

@@ -255,6 +255,8 @@ export class NugProvider implements ProviderAdapter {
 					{
 						...delegateBase,
 						baseUrl: `${this.baseUrl}/v1`,
+						// NUG appends metering/gateway events after native completion.
+						drainUntilEof: true,
 						apiMode:
 							meta.channelType === "codex"
 								? "codex"

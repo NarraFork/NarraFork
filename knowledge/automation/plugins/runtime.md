@@ -39,7 +39,7 @@ keywords:
   - plugin-storage
   - Job Object
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 插件运行时
 
@@ -50,11 +50,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 安装只落盘并登记，不启动：`finishInstalledPackage` 把 `desiredState` 置为 `disabled`，之后需 enable/activate。同一 `pluginId` 装入不同哈希即视为升级：先撤销旧授权、停旧运行时，再校验信任策略（`plugin-manager.ts`）。
 - 内置插件同走清单校验与生命周期，只是没有安装步骤，首次初始化时默认 `enabled`，之后显式 disable 保持有效；编译版先把内置包写回磁盘再读（`builtin-plugins/registry.ts`、`materialize.ts`）。
 - 清单：`engine.runtime` 为 bun/node/python/binary，`engine.runner` 为 `local-process`（默认）或 `podman`；`server` 声明入口、stdio 传输、`narrafork.rpc/1`，`startupTimeoutMs`（默认 15s）与 `activationTimeoutMs`（默认 30s）被映射为运行时的握手与激活超时（`manifest.ts`、`plugin-manager.ts:defaultRuntimeOptions`）。
-- 本地运行器：子进程只继承白名单环境变量（PATH、LANG 与若干 `NF_PLUGIN_*`）；POSIX 上用 `/bin/sh ulimit` 套 CPU 300s、虚拟内存 1GiB，Windows 无此限制（manager 对 win32 显式放行无限制运行）。进程启动超时 15s，空闲超时 5 分钟（`LocalProcessRunner`），RPC 15s、排空 5s、关停 5s（`PluginRuntime` 默认）。空闲超时到期后的链路（`PluginRuntime.timeout("idle")`、`RuntimeSupervisor.handleFailure`）：
-  - 先 `emitError`（错误码 `IDLE_TIMEOUT`，`phase: "idle"`，`retryable`），再 `kill`。
-  - 该错误经 `onError` 到 `handleProcessError`，状态变为 `failed`。
-  - `IDLE_TIMEOUT` 不属于隔离（quarantine）条件（隔离只看 stdout 阶段错误、`HELLO_*`、`STDOUT_LIMIT`、`INVALID_JSON_RPC`、`PROCESS_EXIT`），所以监督者按退避排定重启。
-  - 这次重启计入重启预算（窗口内次数与总次数上限）；预算耗尽才隔离（`restart budget exhausted`）。
+- 本地运行器：子进程只继承白名单环境变量（PATH、LANG 与若干 `NF_PLUGIN_*`）；POSIX 上用 `/bin/sh ulimit` 套 CPU 300s、虚拟内存 1GiB，Windows 无此限制（manager 对 win32 显式放行无限制运行）。进程启动超时 15s，普通插件空闲超时 5 分钟；声明提供商贡献的插件由 `PluginManager.defaultRuntimeOptions` 提高到 6 小时。RPC 15s、排空 5s、关停 5s（`PluginRuntime` 默认）。
+- 宿主空闲回收：本地进程尚存活时，`LocalProcessHandleImpl.timeout("idle")` 先经 `onIdleTimeout` 标记当前 generation，再发 `IDLE_TIMEOUT` 并结束进程。`PluginRuntime` 收尾为 `stopped`，不触发 `onCrash` 或监督重启；下次按需激活再起新 generation。激活期间发生回收也按实际诊断状态记录，不能把没有进程的插件写成 active。
+- 根进程已退出而子进程仍占着 stdio 时，空闲计时器不会标记为正常回收，传输错误仍进入失败恢复路径。
+- `restartCount` 由 `PluginRuntime.restart` 显式增加，并从持久状态带入新实例；按需启动仅增加 generation，不再用 `generation - 1` 推算重启次数。
 - `local-process` 不提供网络或文件系统隔离；清单里的 `permissions.network/filesystem/process` 在宿主代码里没有任何读取方，只是声明，不是沙箱（`manifest.ts` 注释，全仓搜索确认）。需要隔离用下面的 Podman 运行器。
 - 编译版没有系统 Bun：用自身可执行文件加 `--plugin-runtime-worker <入口>` 启动插件，该模式在加载 main 之前分支，不开数据库、不抢实例锁（`plugin-runtime-worker.ts`）；源码运行直接 `bun <入口>`。
 - 监督（`RuntimeSupervisor`）：崩溃/失败后指数退避重启（100ms 起，上限 30s，±10% 抖动）；60s 窗口内超过 3 次或 15 分钟内超过 10 次进入 `quarantine`；stdout 协议错误（`INVALID_JSON_RPC`、`STDOUT_LIMIT`、握手类错误、`PROCESS_EXIT`）直接隔离。隔离后的调用见[授权与密钥](permissions-secrets.md)。
@@ -76,7 +75,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 改清单 `engine`/`server` 字段：`lib/plugins/manifest.ts`（zod `.strict()`，加字段要同步所有消费方）、`plugin-manager.ts:defaultRuntimeOptions`、内置包 `builtin-plugins/registry.ts` 的清单一起；协议版本改动要同步 `lib/plugins/protocol.ts`。
 - 改超时/重启预算：`plugin-runtime.ts` 的 `PluginRuntime` 默认值与 `RuntimeSupervisor` 参数；`plugin-health.test.ts`、`plugin-process-runner.test.ts`、`plugin-podman-runner.test.ts`、`plugin-upgrade-coordinator.test.ts`（`server/services/__tests__/`）断言具体行为；Windows 启动器有 `windows-plugin-launcher.compiled.test.ts`。
 - 改 Podman 参数：只读根、`--network none`、`--cap-drop ALL`、`no-new-privileges` 与摘要必填是安全不变量，不能回退到本地执行。
-- 不变量：安装只落盘、不启动；编译版插件用自身可执行文件启动且不开数据库；`IDLE_TIMEOUT` 走重启预算而不是直接隔离。
+- 不变量：安装只落盘、不启动；编译版插件用自身可执行文件启动且不开数据库；宿主主动空闲回收不计崩溃与重启，根进程已退出的传输故障仍走恢复；按需唤醒不增加 `restartCount`。
 
 ## 相关
 - [插件系统](index.md)

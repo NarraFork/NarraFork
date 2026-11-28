@@ -5,6 +5,7 @@ import {
 	rememberModelTraceRequest,
 	requireModelTraceAnchor,
 } from "../modeltrace-request";
+import type { OAIMessage } from "../openai-provider";
 import type { ChatParams, ProviderAdapter } from "../provider";
 
 const websocket = { ...(await import("../codex-websocket")) };
@@ -109,10 +110,13 @@ test("fork keeps the complete Codex input and cache key, but replaces socket and
 	const original = captured;
 	await drain(provider, fork(provider, parent));
 	const diagnostic = captured;
-	expect(original?.request.input[0]).toEqual({
+	const expectedPrefix = {
+		type: "message",
+		id: expect.stringMatching(/^msg_nf_instructions_/),
 		role: "developer",
 		content: [{ type: "input_text", text: "original instructions" }],
-	});
+	} satisfies OAIMessage & { type: "message" };
+	expect(original?.request.input[0]).toEqual(expectedPrefix);
 	expect(JSON.stringify(original?.request.input)).toContain("dGVzdA==");
 	expect(diagnostic?.request.tools).toEqual(original?.request.tools);
 	expect(diagnostic?.request.input).toEqual([

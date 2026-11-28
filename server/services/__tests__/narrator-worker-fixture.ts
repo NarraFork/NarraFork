@@ -6,7 +6,7 @@ import { testEnvironment } from "../../../tests/preload";
 import { getTestDb } from "../../../tests/setup";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
-import { runReadTask, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
+import { closeReadDatabase, runReadTask, shutdownDbWorkerPool } from "../../lib/db-worker/pool";
 
 /** Per-file isolated schema; strict Worker reads observe committed WAL pages. */
 export function getNarratorWorkerTestDb() {
@@ -33,8 +33,11 @@ export function getNarratorWorkerTestDb() {
 		closing ??= (async () => {
 			// A failed probe still needs the same acknowledged handle cleanup.
 			await ready.catch(() => {});
+			// Close this database's admission before retiring its native Worker handles.
+			await closeReadDatabase(path);
 			await shutdownDbWorkerPool();
-			sqlite.close();
+			// Finalize Drizzle statements now; deferred disposal holds file locks on Windows.
+			sqlite.close(true);
 			rmSync(directory, { recursive: true, force: true });
 		})();
 		return closing;

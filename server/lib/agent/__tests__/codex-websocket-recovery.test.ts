@@ -11,18 +11,23 @@
  * Each server below speaks the subset of the protocol the transport reads:
  * `response.created` → optional content → `response.completed`.
  */
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { settings } from "../../settings";
+import { createProviderTurnContext } from "../codex-turn-state";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketRetryableError,
 	clearCodexResponsesWebSocketSessions,
+	type StreamCodexResponsesWebSocketOptions,
 	streamCodexResponsesWebSocket,
 } from "../codex-websocket";
 import { diagnosticsFromError } from "../error-diagnostics";
 import { isRetryableError, ProviderInvalidStateError } from "../error-handling";
-import { CODEX_DEFAULT_INSTRUCTIONS, OpenAIProvider } from "../openai-provider";
+import { LoopTranscript } from "../loop-transcript";
+import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
 import { ApiRequestDumpCollector } from "../request-dump";
 
@@ -149,37 +154,29 @@ function userMessage(text: string) {
 	return { role: "user", content: [{ type: "input_text", text }] };
 }
 
-const defaultDeveloperPrefix = {
-	role: "developer",
-	content: [{ type: "input_text", text: CODEX_DEFAULT_INSTRUCTIONS }],
-};
-
 async function runStream(
 	server: TestServer,
-	overrides: {
-		sessionKey?: string;
+	overrides: Partial<StreamCodexResponsesWebSocketOptions> & {
 		input?: string[];
-		requestDump?: ApiRequestDumpCollector;
-		request?: CodexResponsesRequestBody;
-		signal?: AbortSignal;
 	} = {},
 ): Promise<ParsedStreamEvent[]> {
 	const events: ParsedStreamEvent[] = [];
+	const { input, ...options } = overrides;
 	for await (const event of streamCodexResponsesWebSocket({
 		baseUrl: server.baseUrl,
 		apiKey: "sk-test",
-		requestDump: overrides.requestDump,
-		sessionKey: overrides.sessionKey ?? "narrator-1",
+		sessionKey: "narrator-1",
 		conversationId: "conv-1",
 		credentialId: "cred-1",
 		model: "gpt-5.3-codex",
-		request: overrides.request ?? {
+		request: {
 			model: "gpt-5.3-codex",
-			input: (overrides.input ?? ["hello"]).map(userMessage) as never,
+			input: (input ?? ["hello"]).map(userMessage) as never,
 			stream: true,
 			instructions: "base",
 		},
-		signal: overrides.signal ?? new AbortController().signal,
+		signal: new AbortController().signal,
+		...options,
 	})) {
 		events.push(event);
 	}
@@ -331,6 +328,170 @@ test("abort during large preparation dispatches nothing and leaves the session r
 	expect(collectText(await runStream(activeServer))).toBe("ok");
 	expect(activeServer.requests).toHaveLength(1);
 	expect(activeServer.requests[0].body.previous_response_id).toBeUndefined();
+});
+
+test("revoked diagnostics credentials never open a socket or send a request", async () => {
+	activeServer = startServer(({ send }) => {
+		for (const frame of completedFrames("after-revocation", "ok")) send(frame);
+	});
+	const denied = new Error("diagnostics credential revoked");
+	await expect(
+		runStream(activeServer, {
+			ephemeralSession: true,
+			validateBeforeDispatch: () => {
+				throw denied;
+			},
+		}),
+	).rejects.toBe(denied);
+	expect(activeServer.connectionCount()).toBe(0);
+	expect(activeServer.requests).toHaveLength(0);
+	expect(collectText(await runStream(activeServer))).toBe("ok");
+});
+
+test("diagnostics revocation during socket replacement prevents the next handshake", async () => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	await runStream(activeServer, { userAgent: "client/1" });
+	const { default: WebSocket } = await import("ws");
+	const originalClose = WebSocket.prototype.close;
+	let revoked = false;
+	const close = spyOn(WebSocket.prototype, "close").mockImplementation(function (
+		this: InstanceType<typeof WebSocket>,
+		...args
+	) {
+		revoked = true;
+		Reflect.apply(originalClose, this, args);
+	});
+	try {
+		await expect(
+			runStream(activeServer, {
+				userAgent: "client/2",
+				validateBeforeDispatch: () => {
+					if (revoked) throw new Error("diagnostics credential revoked during close");
+				},
+			}),
+		).rejects.toThrow("diagnostics credential revoked during close");
+		expect(revoked).toBe(true);
+		expect(activeServer.connectionCount()).toBe(1);
+		expect(activeServer.requests).toHaveLength(1);
+	} finally {
+		close.mockRestore();
+	}
+	await runStream(activeServer, { userAgent: "client/2" });
+	expect(activeServer.requests[1]?.body.previous_response_id).toBeUndefined();
+});
+
+test.each([
+	false,
+	true,
+])("diagnostics revocation in the prepared-request observer prevents send (reused=%s)", async (reused) => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	if (reused) await runStream(activeServer);
+	let revoked = false;
+	await expect(
+		runStream(activeServer, {
+			input: ["hello", "revoked"],
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked before send");
+			},
+			onRequestPrepared: () => {
+				revoked = true;
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked before send");
+	expect(revoked).toBe(true);
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(reused ? 1 : 0);
+	await runStream(activeServer, { input: ["hello", "fresh"] });
+	expect(activeServer.connectionCount()).toBe(2);
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBeUndefined();
+});
+
+test("diagnostics revocation at upgrade is checked after async body and evidence encoding", async () => {
+	activeServer = startServer(({ send }) => {
+		for (const frame of completedFrames("unexpected-send")) send(frame);
+	});
+	let revoked = false;
+	const frames: RecordingFrame[] = [];
+	const recording = liveRecording(frames);
+	recording.frame = (frame) => {
+		frames.push(frame);
+		if (frame.type === "websocket.upgrade") revoked = true;
+	};
+	await expect(
+		runStream(activeServer, {
+			input: ["large body ".repeat(128 * 1024)],
+			requestDump: new ApiRequestDumpCollector(recording),
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked during upgrade");
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked during upgrade");
+	expect(revoked).toBe(true);
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(0);
+	expect(frames.some((frame) => frame.direction === "request")).toBe(false);
+});
+
+test("diagnostics revocation after a recoverable failure prevents reconnect and resend", async () => {
+	let revoked = false;
+	activeServer = startServer(({ send }) => {
+		revoked = true;
+		send(CONNECTION_LIMIT_FRAME);
+	});
+	await expect(
+		runStream(activeServer, {
+			ephemeralSession: true,
+			validateBeforeDispatch: () => {
+				if (revoked) throw new Error("diagnostics credential revoked before retry");
+			},
+		}),
+	).rejects.toThrow("diagnostics credential revoked before retry");
+	expect(activeServer.connectionCount()).toBe(1);
+	expect(activeServer.requests).toHaveLength(1);
+});
+
+test.each([
+	false,
+	true,
+])("explicit ephemeral sessions leave shared cache and response chains untouched (cached=%s)", async (cached) => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	if (cached) await runStream(activeServer, { input: ["hello"] });
+	const { default: WebSocket } = await import("ws");
+	const originalSend = WebSocket.prototype.send;
+	let ephemeralSocket: InstanceType<typeof WebSocket> | undefined;
+	const send = spyOn(WebSocket.prototype, "send").mockImplementation(function (
+		this: InstanceType<typeof WebSocket>,
+		...args
+	) {
+		ephemeralSocket = this;
+		Reflect.apply(originalSend, this, args);
+	});
+	try {
+		await runStream(activeServer, {
+			input: ["diagnostics probe"],
+			ephemeralSession: true,
+			resetSessionBeforeRequest: true,
+		});
+		expect(ephemeralSocket?.readyState).toBe(WebSocket.CLOSED);
+	} finally {
+		send.mockRestore();
+	}
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBeUndefined();
+	await runStream(activeServer, { input: ["hello", "continue"] });
+	expect(activeServer.connectionCount()).toBe(2);
+	expect(activeServer.requests.at(-1)?.connectionIndex).toBe(cached ? 0 : 1);
+	expect(activeServer.requests.at(-1)?.body.previous_response_id).toBe(
+		cached ? "resp-0" : undefined,
+	);
+	expect(activeServer.requests.at(-1)?.body.input).toEqual(
+		(cached ? ["continue"] : ["hello", "continue"]).map(userMessage),
+	);
 });
 
 test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incoming message boundaries", async () => {
@@ -487,7 +648,9 @@ async function runChat(
 	const events: ParsedStreamEvent[] = [];
 	let error: unknown;
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), 2_000);
+	// Request preparation imports/model metadata can exceed 2s under Windows CI load.
+	// Keep a finite fixture watchdog without confusing scheduler delay for a WS error.
+	const timer = setTimeout(() => controller.abort(), 8_000);
 	try {
 		for await (const event of provider.chat({
 			conversationId: "conv-chat-recovery",
@@ -821,8 +984,9 @@ test("captures turn state from a metadata event and replays it on later requests
 	});
 	activeServer = server;
 
-	await runStream(server, { input: ["first"] });
-	await runStream(server, { input: ["first", "second"] });
+	const turnContext = createProviderTurnContext();
+	await runStream(server, { input: ["first"], turnContext });
+	await runStream(server, { input: ["first", "second"], turnContext });
 
 	expect(server.requests).toHaveLength(2);
 	// The token only exists after the first response, so the first request cannot
@@ -831,6 +995,253 @@ test("captures turn state from a metadata event and replays it on later requests
 	expect(first?.["x-codex-turn-state"]).toBeUndefined();
 	const second = server.requests[1]?.body.client_metadata as Record<string, string> | undefined;
 	expect(second?.["x-codex-turn-state"]).toBe("ts-1");
+});
+
+test("WS evidence redacts incoming tokens and outgoing turn identity without changing wire payloads", async () => {
+	const token = 'private-"token\\suffix';
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(token));
+		for (const frame of completedFrames(`resp-${requestIndex}`, "visible content")) send(frame);
+	});
+	activeServer = server;
+	const turnContext = createProviderTurnContext();
+	const frames: RecordingFrame[] = [];
+	const log: RecordingEntry[] = [];
+	const requestDump = new ApiRequestDumpCollector(liveRecording(frames, log));
+	await runStream(server, { input: ["first"], turnContext, requestDump });
+	await runStream(server, { input: ["first", "tool-result"], turnContext, requestDump });
+	expect(requestTurnState(server, 1)).toBe(token);
+	expect(server.requests[1]?.body.client_metadata).toMatchObject({ turn_id: turnContext.id });
+	const evidence = JSON.stringify(log);
+	expect(evidence).not.toContain("private-");
+	expect(evidence).not.toContain(turnContext.id);
+	expect(evidence).toContain("visible content");
+	const outgoing = frames.filter((frame) => frame.direction === "request");
+	expect(JSON.parse(String(outgoing[1]?.text)).client_metadata).toEqual({
+		turn_id: "[REDACTED]",
+		"x-codex-turn-state": "[REDACTED]",
+	});
+});
+
+test("a new logical turn drops its token without dropping a healthy socket or response chain", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`, "ok")) send(frame);
+	});
+	activeServer = server;
+	const firstTurn = createProviderTurnContext();
+	await runStream(server, { input: ["first"], turnContext: firstTurn });
+	await runStream(server, { input: ["first", "tool-result"], turnContext: firstTurn });
+	const nextTurn = createProviderTurnContext();
+	await runStream(server, { input: ["first", "tool-result", "next-user"], turnContext: nextTurn });
+	await runStream(server, {
+		input: ["first", "tool-result", "next-user", "continuation"],
+		turnContext: nextTurn,
+	});
+	await runStream(server, { input: ["isolated-direct-call"] });
+	await runStream(server, { input: ["isolated-direct-call", "another-direct-call"] });
+	expect(server.connectionCount()).toBe(1);
+	expect(requestTurnState(server, 1)).toBe("sticky-0");
+	expect(requestTurnState(server, 2)).toBeUndefined();
+	expect(requestTurnState(server, 3)).toBe("sticky-2");
+	expect(requestTurnState(server, 4)).toBeUndefined();
+	expect(requestTurnState(server, 5)).toBeUndefined();
+	expect(server.requests[2]?.body.previous_response_id).toBe("resp-1");
+	expect(server.requests[0]?.body.client_metadata).toMatchObject({ turn_id: firstTurn.id });
+	expect(server.requests[2]?.body.client_metadata).toMatchObject({ turn_id: nextTurn.id });
+});
+
+test("final handshake headers govern reuse; non-auth changes retain the same turn lock", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	const turnContext = createProviderTurnContext();
+	const send = (overrides: Partial<StreamCodexResponsesWebSocketOptions>) =>
+		runStream(server, {
+			turnContext,
+			input: Array.from({ length: server.requests.length + 1 }, (_, i) => `input-${i}`),
+			...overrides,
+		});
+	await send({ userAgent: "client/1", extraHeaders: { "X-Marker": "one", originator: "origin" } });
+	await send({ userAgent: "client/1", extraHeaders: { ORIGINATOR: "origin", "x-marker": "one" } });
+	expect(server.connectionCount()).toBe(1);
+	expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+	await send({ userAgent: "client/2", extraHeaders: { originator: "origin", "x-marker": "one" } });
+	expect(server.connectionCount()).toBe(2);
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(requestTurnState(server, 2)).toBe("sticky-0");
+	expect(server.handshakes[1]?.get("user-agent")).toBe("client/2");
+	await send({ userAgent: "client/2", extraHeaders: { originator: "origin", "x-marker": "two" } });
+	expect(server.connectionCount()).toBe(3);
+	expect(requestTurnState(server, 3)).toBe("sticky-0");
+	await send({
+		apiKey: "refreshed-token",
+		userAgent: "client/2",
+		extraHeaders: { originator: "origin", "x-marker": "two" },
+	});
+	expect(server.connectionCount()).toBe(4);
+	expect(server.requests[4]?.body.previous_response_id).toBeUndefined();
+	expect(server.handshakes[3]?.get("authorization")).toBe("Bearer refreshed-token");
+	expect(requestTurnState(server, 4)).toBeUndefined();
+	await send({ apiKey: "ignored", extraHeaders: { authorization: "AgentAssertion actual-auth" } });
+	expect(server.connectionCount()).toBe(5);
+	expect(server.handshakes[4]?.get("authorization")).toBe("AgentAssertion actual-auth");
+	expect(requestTurnState(server, 5)).toBeUndefined();
+	await send({
+		apiKey: "also-ignored",
+		extraHeaders: { AUTHORIZATION: "AgentAssertion actual-auth" },
+	});
+	expect(server.connectionCount()).toBe(5);
+	expect(requestTurnState(server, 6)).toBe("sticky-5");
+	expect(server.requests[6]?.body.previous_response_id).toBe("resp-5");
+});
+
+test("proxy exemptions govern both the selected agent and cached handshake identity", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	const target = "codex-proxy-routing.invalid";
+	const baseUrl = server.baseUrl.replace("127.0.0.1", target);
+	const savedProxy = settings.proxy;
+	const proxies: Array<string | undefined> = [];
+	const websocketModule = { ...(await import("ws")) };
+	const RealWebSocket = websocketModule.default;
+	// Bun's ws implementation uses native WebSocket, bypassing node:http.request.
+	// Observe the final transport options at the shared constructor boundary, then
+	// use the real client against this local server; no DNS or external proxy runs.
+	class LocalWebSocket extends RealWebSocket {
+		constructor(url: string, options: import("ws").ClientOptions) {
+			expect(new URL(url).hostname).toBe(target);
+			proxies.push(options.agent instanceof HttpsProxyAgent ? options.agent.proxy.href : undefined);
+			super(url.replace(target, "127.0.0.1"), { ...options, agent: undefined });
+		}
+	}
+	mock.module("ws", () => ({ ...websocketModule, default: LocalWebSocket }));
+	const turnContext = createProviderTurnContext();
+	const send = (proxy: string) =>
+		runStream(server, {
+			baseUrl,
+			proxy,
+			turnContext,
+			input: Array.from({ length: server.requests.length + 1 }, (_, index) => `input-${index}`),
+		});
+	const firstProxy = "http://user:first@proxy.invalid:8080/";
+	const nextProxy = "http://user:next@proxy.invalid:8080/";
+	try {
+		settings.proxy = {
+			mode: "direct",
+			noProxyRules: [{ match: "wildcard", pattern: target }],
+		};
+		await send(firstProxy);
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined]);
+		expect(server.connectionCount()).toBe(1);
+		expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+		settings.proxy = { mode: "direct", noProxyRules: [] };
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined, nextProxy]);
+		expect(server.connectionCount()).toBe(2);
+		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+		expect(requestTurnState(server, 2)).toBe("sticky-0");
+		await send(nextProxy);
+		expect(server.requests[3]?.body.previous_response_id).toBe("resp-2");
+		settings.proxy = {
+			mode: "direct",
+			noProxyRules: [{ match: "wildcard", pattern: target }],
+		};
+		await send(nextProxy);
+		expect(proxies).toEqual([undefined, nextProxy, undefined]);
+		expect(server.connectionCount()).toBe(3);
+		expect(server.requests[4]?.body.previous_response_id).toBeUndefined();
+		expect(requestTurnState(server, 4)).toBe("sticky-0");
+	} finally {
+		mock.module("ws", () => websocketModule);
+		settings.proxy = savedProxy;
+	}
+});
+
+test("credential and endpoint changes cannot reuse a preceding turn token or response chain", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`owner-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	const turnContext = createProviderTurnContext();
+	await runStream(server, { turnContext, input: ["first"] });
+	await runStream(server, {
+		turnContext,
+		input: ["first", "second"],
+		credentialId: "other-credential",
+	});
+	expect(requestTurnState(server, 1)).toBeUndefined();
+	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+	await runStream(server, {
+		turnContext,
+		input: ["endpoint-switch"],
+		credentialId: "other-credential",
+		baseUrl: server.baseUrl.replace("/backend-api/codex", "/relay/codex"),
+	});
+	expect(requestTurnState(server, 2)).toBeUndefined();
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	await runStream(server, { turnContext, input: ["back-to-initial"] });
+	expect(requestTurnState(server, 3)).toBeUndefined();
+	expect(server.requests[3]?.body.previous_response_id).toBeUndefined();
+	expect(server.connectionCount()).toBe(3);
+});
+
+test("completed function-call output survives provider replay as an incremental WS baseline", async () => {
+	const nativeCall = {
+		id: "fc-native-1",
+		type: "function_call",
+		status: "completed",
+		name: "lookup",
+		call_id: "call-native-1",
+		arguments: '{"path":"src/index.ts"}',
+	};
+	const server = startServer(({ requestIndex, send }) => {
+		if (requestIndex === 0) {
+			send(JSON.stringify({ type: "response.created", response: { id: "resp-call-1" } }));
+			send(
+				JSON.stringify({ type: "response.output_item.done", output_index: 0, item: nativeCall }),
+			);
+			send(JSON.stringify({ type: "response.completed", response: { id: "resp-call-1" } }));
+		} else for (const frame of completedFrames(`resp-${requestIndex}`, "done")) send(frame);
+	});
+	activeServer = server;
+	const provider = createChatProvider(server);
+	const turnContext = createProviderTurnContext();
+	const first = await runChat(provider, { turnContext });
+	expect(first.error).toBeUndefined();
+	const completedCall = first.events.find((event) => event.toolUseChunk?.stop)?.toolUseChunk;
+	expect(completedCall).toMatchObject({ toolUseId: nativeCall.call_id, name: nativeCall.name });
+	if (!completedCall?.name) throw new Error("Expected a completed native function call");
+	const transcript = new LoopTranscript();
+	transcript.appendInput("hello");
+	transcript.appendStep([
+		{
+			type: "tool_use",
+			toolUseId: completedCall.toolUseId,
+			name: completedCall.name,
+			input: JSON.parse(completedCall.finalInput ?? completedCall.input ?? "{}"),
+		},
+	]);
+	transcript.settleTool(nativeCall.call_id, { output: "found file" });
+	const { history } = await provider.buildHistory(transcript.rows, "gpt-5.3-codex");
+	const second = await runChat(provider, { turnContext, history, content: "" });
+	expect(second.error).toBeUndefined();
+	expect(server.connectionCount()).toBe(1);
+	expect(server.requests[1]?.body.previous_response_id).toBe("resp-call-1");
+	expect(server.requests[1]?.body.input).toEqual([
+		{
+			type: "function_call_output",
+			call_id: nativeCall.call_id,
+			output: "found file",
+		},
+	]);
 });
 
 test("the request dump records the original request, not a recovery resend", async () => {
@@ -868,6 +1279,52 @@ test("the request dump records the original request, not a recovery resend", asy
 	expect(dumped).toHaveLength(1);
 });
 
+test("resumable recovery preserves an explicit developer prefix and its stable identity", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		if (requestIndex === 0) {
+			send(turnStateFrame());
+			send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+			send(CONNECTION_LIMIT_FRAME);
+			return;
+		}
+		for (const frame of completedFrames("resp-resumed", "continued")) send(frame);
+	});
+	activeServer = server;
+	const provider = createChatProvider(server);
+	const turnContext = createProviderTurnContext();
+	const instructions = { role: "system", content: "Follow the repository instructions." };
+	const first = await runChat(provider, { history: [instructions], turnContext });
+	expect(first.error).toMatchObject({ resumable: true });
+	expect(collectText(first.events)).toBe("partial");
+	const developerPrefix = (server.requests[0]?.body.input as unknown[])[0];
+	expect(developerPrefix).toMatchObject({
+		type: "message",
+		id: expect.stringMatching(/^msg_nf_instructions_/),
+		role: "developer",
+		content: [{ type: "input_text", text: instructions.content }],
+	});
+	const history = [
+		userMessage("hello"),
+		{ role: "assistant", content: [{ type: "output_text", text: "partial" }] },
+	];
+	const second = await runChat(provider, {
+		history: [instructions, ...history],
+		content: "continue",
+		turnContext,
+	});
+	expect(second.error).toBeUndefined();
+	expect(collectText(second.events)).toBe("continued");
+	expect(server.requests).toHaveLength(2);
+	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+	expect(server.requests[1]?.body.instructions).toBeUndefined();
+	expect(server.requests[1]?.body.input).toEqual([
+		developerPrefix,
+		...history,
+		userMessage("continue"),
+	]);
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
+});
+
 const recoverableErrors = [
 	{ code: "websocket_connection_limit_reached", frame: CONNECTION_LIMIT_FRAME },
 	{ code: "previous_response_not_found", frame: PREVIOUS_RESPONSE_MISSING_FRAME },
@@ -893,8 +1350,9 @@ for (const { code, frame } of recoverableErrors) {
 		});
 		activeServer = server;
 		const provider = createChatProvider(server);
+		const turnContext = createProviderTurnContext();
 
-		const first = await runChat(provider);
+		const first = await runChat(provider, { turnContext });
 		expect(collectText(first.events)).toBe("partial");
 		expect(first.error).toBeInstanceOf(CodexWebSocketRetryableError);
 		expect(first.error).toMatchObject({ code, retryable: true, resumable: true });
@@ -907,18 +1365,15 @@ for (const { code, frame } of recoverableErrors) {
 			userMessage("hello"),
 			{ role: "assistant", content: [{ type: "output_text", text: "partial" }] },
 		];
-		const second = await runChat(provider, { history, content: "continue" });
+		const second = await runChat(provider, { history, content: "continue", turnContext });
 		expect(second.error).toBeUndefined();
 		expect(collectText(second.events)).toBe("continued");
 		expect(server.requests).toHaveLength(2);
 		expect(server.connectionCount()).toBe(2);
 		expect(server.requests[1]?.connectionIndex).toBe(1);
 		expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[1]?.body.input).toEqual([
-			defaultDeveloperPrefix,
-			...history,
-			userMessage("continue"),
-		]);
+		// Missing base instructions must not invent a developer prefix on replay.
+		expect(server.requests[1]?.body.input).toEqual([...history, userMessage("continue")]);
 		expect(requestTurnState(server, 0)).toBeUndefined();
 		expect(requestTurnState(server, 1)).toBe("sticky-1");
 		// WS routing state rides response.create.client_metadata, NOT handshake
@@ -930,7 +1385,7 @@ for (const { code, frame } of recoverableErrors) {
 		}
 	});
 
-	test(`preserves the latest sticky token across chat calls after exhausted ${code} retries`, async () => {
+	test(`preserves the first sticky token across same-turn chat calls after exhausted ${code} retries`, async () => {
 		const server = startServer(({ requestIndex, send }) => {
 			if (requestIndex < 2) {
 				send(turnStateFrame(`sticky-${requestIndex + 1}`));
@@ -941,22 +1396,23 @@ for (const { code, frame } of recoverableErrors) {
 		});
 		activeServer = server;
 		const provider = createChatProvider(server);
+		const turnContext = createProviderTurnContext();
 
-		const first = await runChat(provider);
+		const first = await runChat(provider, { turnContext });
 		expect(collectText(first.events)).toBe("");
 		expect(first.error).toBeInstanceOf(CodexWebSocketRetryableError);
 		expect(first.error).toMatchObject({ code, retryable: true, resumable: false });
 		expect(server.requests).toHaveLength(2);
 		expect(requestTurnState(server, 1)).toBe("sticky-1");
 
-		const second = await runChat(provider);
+		const second = await runChat(provider, { turnContext });
 		expect(second.error).toBeUndefined();
 		expect(collectText(second.events)).toBe("retried");
 		expect(server.requests).toHaveLength(3);
 		expect(server.requests[2]?.connectionIndex).toBe(2);
 		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
 		expect(server.requests[2]?.body.input).toEqual(server.requests[0]?.body.input);
-		expect(requestTurnState(server, 2)).toBe("sticky-2");
+		expect(requestTurnState(server, 2)).toBe("sticky-1");
 	});
 
 	test(`abort during ${code} cleanup still clears sticky state before the next chat`, async () => {
@@ -1069,7 +1525,7 @@ test("normal abort still clears sticky state before the next chat", async () => 
 	expect(requestTurnState(server, 1)).toBeUndefined();
 });
 
-test("an explicit upstream reset clears the sticky token retained for resumable chat recovery", async () => {
+test("an explicit upstream reset discards the chain, not the logical turn's sticky token", async () => {
 	const server = startServer(({ requestIndex, send }) => {
 		if (requestIndex === 0) {
 			send(turnStateFrame());
@@ -1082,16 +1538,17 @@ test("an explicit upstream reset clears the sticky token retained for resumable 
 	activeServer = server;
 	const provider = createChatProvider(server);
 
-	const first = await runChat(provider);
+	const turnContext = createProviderTurnContext();
+	const first = await runChat(provider, { turnContext });
 	expect(first.error).toBeInstanceOf(CodexWebSocketRetryableError);
 	expect(first.error).toMatchObject({ resumable: true });
-	const second = await runChat(provider, { resetUpstreamSession: true });
+	const second = await runChat(provider, { resetUpstreamSession: true, turnContext });
 	expect(second.error).toBeUndefined();
 	expect(collectText(second.events)).toBe("fresh");
 	expect(server.requests).toHaveLength(2);
 	expect(server.requests[1]?.connectionIndex).toBe(1);
 	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-	expect(requestTurnState(server, 1)).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 });
 
 const CYBER_POLICY_FRAME = JSON.stringify({
@@ -1148,103 +1605,107 @@ test.each([
 	["response.completed", "cyber_policy"],
 	["response.incomplete", "content_filter"],
 	["response.incomplete", "max_output_tokens"],
-])("discards the chain when the consumer immediately breaks on invalidState (%s: %s)", async (delivery, reason) => {
-	const server = startServer(({ requestIndex, send, close }) => {
-		if (requestIndex === 1) {
-			if (delivery === "error frame") {
-				send(CYBER_POLICY_FRAME);
-			} else if (delivery === "close reason") {
-				// Keep this valid JSON within the RFC 6455 close-reason limit so it
-				// exercises the structured close branch, not the truncated fallback.
-				close(1008, JSON.stringify({ error: { code: reason, message: "blocked" } }));
-			} else if (delivery === "truncated close reason") {
-				const truncated = CYBER_POLICY_FRAME.slice(0, 123);
-				expect(() => JSON.parse(truncated)).toThrow();
-				close(1008, truncated);
-			} else {
-				send(
-					JSON.stringify({
-						type: delivery,
-						response: {
-							id: "resp-rejected",
-							...(delivery !== "response.incomplete"
-								? { status: "failed", error: { code: reason, message: "blocked" } }
-								: { incomplete_details: { reason } }),
-						},
-					}),
-				);
-			}
-			return;
-		}
-		if (requestIndex === 0) send(turnStateFrame());
-		for (const frame of completedFrames(`resp-${requestIndex}`, "ok")) send(frame);
-	});
-	activeServer = server;
-	const provider = createChatProvider(server);
-	const { default: WebSocket } = await import("ws");
-	// Inspect the real client's state, not a delayed server-side close callback.
-	let sendingClient: InstanceType<typeof WebSocket> | undefined;
-	const originalSend = WebSocket.prototype.send;
-	const sendSpy = spyOn(WebSocket.prototype, "send").mockImplementation(function (
-		this: InstanceType<typeof WebSocket>,
-		...args
-	) {
-		sendingClient = this;
-		Reflect.apply(originalSend, this, args);
-	});
-	let clientClosedAtInvalidState = false;
-	try {
-		const first = await runChat(provider);
-		expect(first.error).toBeUndefined();
-		expect(collectText(first.events)).toBe("ok");
-
-		const rejected = await runChat(
-			provider,
-			{ history: [userMessage("hello")], content: "blocked" },
-			(event) => {
-				if (event.invalidState) {
-					clientClosedAtInvalidState = sendingClient?.readyState === WebSocket.CLOSED;
-					// The real agent loop returns here. Draining the generator would
-					// execute cleanup AFTER yield and hide the leaked socket/chain.
-					return "break";
+])(
+	"discards the chain when the consumer immediately breaks on invalidState (%s: %s)",
+	async (delivery, reason) => {
+		const server = startServer(({ requestIndex, send, close }) => {
+			if (requestIndex === 1) {
+				if (delivery === "error frame") {
+					send(CYBER_POLICY_FRAME);
+				} else if (delivery === "close reason") {
+					// Keep this valid JSON within the RFC 6455 close-reason limit so it
+					// exercises the structured close branch, not the truncated fallback.
+					close(1008, JSON.stringify({ error: { code: reason, message: "blocked" } }));
+				} else if (delivery === "truncated close reason") {
+					const truncated = CYBER_POLICY_FRAME.slice(0, 123);
+					expect(() => JSON.parse(truncated)).toThrow();
+					close(1008, truncated);
+				} else {
+					send(
+						JSON.stringify({
+							type: delivery,
+							response: {
+								id: "resp-rejected",
+								...(delivery !== "response.incomplete"
+									? { status: "failed", error: { code: reason, message: "blocked" } }
+									: { incomplete_details: { reason } }),
+							},
+						}),
+					);
 				}
-			},
-		);
-		expect(rejected.error).toBeUndefined();
-		expect(rejected.events.filter((event) => event.invalidState)).toHaveLength(1);
-		expect(rejected.events.find((event) => event.invalidState)?.invalidState?.reason).toBe(reason);
-		// No replay, reconnect, or fallback within the rejected chat. Its request
-		// really continued a successful response; there is stale state to discard.
-		expect(server.requests).toHaveLength(2);
-		expect(server.connectionCount()).toBe(1);
-		expect(server.requests[1]?.connectionIndex).toBe(0);
-		expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
-		expect(server.requests[1]?.body.input).toEqual([userMessage("blocked")]);
+				return;
+			}
+			if (requestIndex === 0) send(turnStateFrame());
+			for (const frame of completedFrames(`resp-${requestIndex}`, "ok")) send(frame);
+		});
+		activeServer = server;
+		const provider = createChatProvider(server);
+		const { default: WebSocket } = await import("ws");
+		// Inspect the real client's state, not a delayed server-side close callback.
+		let sendingClient: InstanceType<typeof WebSocket> | undefined;
+		const originalSend = WebSocket.prototype.send;
+		const sendSpy = spyOn(WebSocket.prototype, "send").mockImplementation(function (
+			this: InstanceType<typeof WebSocket>,
+			...args
+		) {
+			sendingClient = this;
+			Reflect.apply(originalSend, this, args);
+		});
+		let clientClosedAtInvalidState = false;
+		const turnContext = createProviderTurnContext();
+		try {
+			const first = await runChat(provider, { turnContext });
+			expect(first.error).toBeUndefined();
+			expect(collectText(first.events)).toBe("ok");
 
-		const history = [userMessage("hello"), userMessage("blocked")];
-		const next = await runChat(provider, { history, content: "next" });
-		expect(next.error).toBeUndefined();
-		expect(collectText(next.events)).toBe("ok");
-		expect(server.requests).toHaveLength(3);
-		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[2]?.body.input).toEqual([
-			defaultDeveloperPrefix,
-			...history,
-			userMessage("next"),
-		]);
-		expect(server.requests[2]?.connectionIndex).toBe(1);
-		expect(server.connectionCount()).toBe(2);
-		expect(clientClosedAtInvalidState).toBe(true);
-		// Only the connection-scoped response chain is discarded. Sticky routing
-		// and the credential identity retain their existing semantics.
-		expect(requestTurnState(server, 2)).toBe("sticky-1");
-		for (const headers of server.handshakes) {
-			expect(headers.get("authorization")).toBe("Bearer sk-local-test-only");
+			const rejected = await runChat(
+				provider,
+				{ history: [userMessage("hello")], content: "blocked", turnContext },
+				(event) => {
+					if (event.invalidState) {
+						clientClosedAtInvalidState = sendingClient?.readyState === WebSocket.CLOSED;
+						// The real agent loop returns here. Draining the generator would
+						// execute cleanup AFTER yield and hide the leaked socket/chain.
+						return "break";
+					}
+				},
+			);
+			expect(rejected.error).toBeUndefined();
+			expect(rejected.events.filter((event) => event.invalidState)).toHaveLength(1);
+			expect(rejected.events.find((event) => event.invalidState)?.invalidState?.reason).toBe(
+				reason,
+			);
+			// No replay, reconnect, or fallback within the rejected chat. Its request
+			// really continued a successful response; there is stale state to discard.
+			expect(server.requests).toHaveLength(2);
+			expect(server.connectionCount()).toBe(1);
+			expect(server.requests[1]?.connectionIndex).toBe(0);
+			expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+			expect(server.requests[1]?.body.input).toEqual([userMessage("blocked")]);
+
+			const history = [userMessage("hello"), userMessage("blocked")];
+			const next = await runChat(provider, { history, content: "next", turnContext });
+			expect(next.error).toBeUndefined();
+			expect(collectText(next.events)).toBe("ok");
+			expect(server.requests).toHaveLength(3);
+			expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+			// A cleared response chain replays the real history, not default instructions.
+			expect(server.requests[2]?.body.input).toEqual([...history, userMessage("next")]);
+			expect(server.requests[2]?.connectionIndex).toBe(1);
+			expect(server.connectionCount()).toBe(2);
+			expect(clientClosedAtInvalidState).toBe(true);
+			// Only the connection-scoped response chain is discarded. Sticky routing
+			// and the credential identity retain their existing semantics.
+			expect(requestTurnState(server, 2)).toBe("sticky-1");
+			for (const headers of server.handshakes) {
+				expect(headers.get("authorization")).toBe("Bearer sk-local-test-only");
+			}
+		} finally {
+			sendSpy.mockRestore();
 		}
-	} finally {
-		sendSpy.mockRestore();
-	}
-});
+	},
+	20_000,
+);
 
 test("a nested request on a busy session runs on an ephemeral socket without touching the parent chain", async () => {
 	// Reflection gates run a nested request under the SAME sticky key while the
@@ -1303,4 +1764,66 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	expect(server.requests[2]?.connectionIndex).toBe(0);
 	expect(server.requests[2]?.body.previous_response_id).toBe("resp-0");
 	expect(server.connectionCount()).toBe(2);
+});
+
+test("explicit provider UA governs WS reuse without replacing dynamic auth or the logical turn lock", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	let dynamicRead = 0;
+	const config = {
+		id: "codex-ws-recovery",
+		name: "Final UA WS probe",
+		prefix: "codex-ws-recovery",
+		apiKey: "sk-local-test-only",
+		baseUrl: server.baseUrl,
+		defaultModel: "gpt-5.3-codex",
+		apiMode: "codex" as const,
+		codexWebSocket: true,
+		codexWebSearch: false,
+		codexImageGeneration: false,
+		userAgentMode: "custom" as const,
+		customUserAgent: "selected/1",
+		extraHeaders: { authorization: "Bearer static", "x-channel": "stale" } as Record<
+			string,
+			string
+		>,
+		dynamicHeaders: () => ({
+			"USER-AGENT": `dynamic/${++dynamicRead}`,
+			Authorization: "Bearer dynamic",
+			"X-Channel": "latest",
+		}),
+	};
+	const provider = new OpenAIProvider(config);
+	const turnContext = createProviderTurnContext();
+	for (let i = 0; i < 4; i++) {
+		if (i === 2) config.customUserAgent = "selected/2";
+		if (i === 3) config.extraHeaders["uSeR-aGeNt"] = " operator/3 ";
+		const result = await runChat(provider, {
+			turnContext,
+			content: `input-${i}`,
+			history: Array.from({ length: i }, (_, j) => ({ role: "user", content: `input-${j}` })),
+		});
+		expect(result.error).toBeUndefined();
+		expect(result.events.some((event) => event.invalidState)).toBe(false);
+	}
+	// Changing only a dynamic default UA does not alter the actual handshake.
+	expect(server.handshakes.map((headers) => headers.get("user-agent"))).toEqual([
+		"selected/1",
+		"selected/2",
+		"operator/3",
+	]);
+	expect(server.connectionCount()).toBe(3);
+	expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(server.requests[3]?.body.previous_response_id).toBeUndefined();
+	for (const headers of server.handshakes) {
+		expect(headers.get("authorization")).toBe("Bearer dynamic");
+		expect(headers.get("x-channel")).toBe("latest");
+	}
+	// UA changes reopen the socket, but must not replace the authentication-owned token.
+	expect(requestTurnState(server, 0)).toBeUndefined();
+	for (let i = 1; i < 4; i++) expect(requestTurnState(server, i)).toBe("sticky-0");
 });

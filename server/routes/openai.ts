@@ -23,6 +23,15 @@ import {
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
 import { getServiceTemplate } from "../lib/sourcing/templates";
+import {
+	applyExplicitUserAgent,
+	getHttpCodexUserAgent,
+	getHttpUserAgent,
+	mergeExtraHeaders,
+	originatorForUserAgentMode,
+	resolveClientFingerprint,
+	stripResponsesLiteHeader,
+} from "../lib/user-agent";
 
 export const openaiRoutes = new Hono();
 
@@ -267,23 +276,37 @@ export async function fetchOpenaiModels(
 		return { models: getBuiltinCodexModels().map((id) => ({ id })) };
 	}
 
-	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
-	// The catalog is a request to the same gateway as inference, and OpenCode
-	// announced that requests without a session header may start erroring — an
-	// empty model dropdown is how that would surface here.
-	// Match inference precedence: derive a session only when the operator did not
-	// supply one, then apply configured headers so that override reaches `/models` too.
-	Object.assign(
-		headers,
-		buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
-		config.extraHeaders,
-	);
+	const fingerprint = resolveClientFingerprint({
+		mode: config.userAgentMode,
+		custom: config.customUserAgent,
+		fallback: config.apiMode === "codex" ? getHttpCodexUserAgent() : getHttpUserAgent(),
+		extraHeaders: config.extraHeaders,
+	});
+	const headers: Record<string, string> = {
+		Authorization: config.authorizationHeader?.trim() || `Bearer ${apiKey}`,
+		"User-Agent": fingerprint.userAgent,
+		...buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
+	};
 	if (config.apiMode === "codex") {
-		headers.originator = "narrafork";
+		headers.originator = originatorForUserAgentMode(config.userAgentMode);
 		if (config.codexAccountId && isOfficialCodexDomain(baseUrl)) {
 			headers["ChatGPT-Account-Id"] = config.codexAccountId;
 		}
 	}
+	// Catalog and inference must honor the same explicit identity overrides.
+	mergeExtraHeaders(headers, fingerprint.headers, "User-Agent");
+	mergeExtraHeaders(headers, config.dynamicHeaders?.(), "User-Agent");
+	applyExplicitUserAgent(
+		headers,
+		{
+			mode: config.userAgentMode,
+			custom: config.customUserAgent,
+			extraHeaders: config.extraHeaders,
+		},
+		"User-Agent",
+		fingerprint.userAgent,
+	);
+	stripResponsesLiteHeader(headers);
 	const candidates = buildModelsUrls(baseUrl);
 	const errors: string[] = [];
 

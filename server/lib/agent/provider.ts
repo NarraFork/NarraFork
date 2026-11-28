@@ -42,6 +42,7 @@ import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../token
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
+import type { ProviderTurnContext } from "./codex-turn-state";
 import { buildCommandCodeProvider } from "./commandcode-provider";
 import { reportCredentialId } from "./credential-report";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
@@ -100,6 +101,8 @@ export interface ChatParams extends ProtocolChatParams {
 	stickySessionKey?: string;
 	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
 	transportSessionKey?: string;
+	/** In-memory logical user turn, shared by tool continuations and recovery passes. */
+	turnContext?: ProviderTurnContext;
 	/** Diagnostic calls are never allowed to run upstream-hosted tools. */
 	diagnostic?: boolean;
 	/** Opt-in adapters append this after projecting the unchanged anchor request. */

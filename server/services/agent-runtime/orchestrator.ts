@@ -20,6 +20,7 @@ import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent";
 import { analyzeShellCommand } from "../../lib/agent/bash-analyze";
+import { createProviderTurnContext } from "../../lib/agent/codex-turn-state";
 import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { projectFileReferenceText } from "../../lib/agent/file-reference-projection";
 import {
@@ -837,6 +838,7 @@ export async function runAgentLoopUnlocked(
 					}
 					return "break";
 				}
+				runState.turnContext = createProviderTurnContext();
 				active._continuationSuppressed = false;
 				active._continuationStallCount = 0;
 				active._continuationStallKey = undefined;
@@ -923,6 +925,8 @@ export async function runAgentLoopUnlocked(
 				parentToolUseId: placement?.parentToolUseId,
 			});
 			pendingBufferedDelivery = undefined;
+			// Only a newly adopted user input replaces this run's logical provider turn.
+			runState.turnContext = createProviderTurnContext();
 			// A human's own input establishes the execution principal of what follows.
 			await adoptHumanPrincipal(buffered.createdBy);
 			await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
@@ -2033,6 +2037,10 @@ export async function runAgentLoopUnlocked(
 				beforeProviderRequest: async () => {
 					await ensureConversationIdentityPersisted(narratorId, active);
 				},
+				// Retain one turn lock across retries, compact/history rebuilds and tool passes.
+				get turnContext() {
+					return runState.turnContext;
+				},
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
@@ -2273,10 +2281,13 @@ export async function runAgentLoopUnlocked(
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, placement);
+					let consumed = false;
 					return {
 						...input,
 						onConsumed: async () => {
+							if (consumed) return;
 							await input.onConsumed();
+							consumed = true;
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can

@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, mock, test } from "bun:test";
+import type { ParsedStreamEvent as ParsedEvent } from "../provider";
 
 // anthropic-provider → usage-tracking → @server/db opens the runtime database and
 // runs migrations on import. This suite only exercises pure SSE/JSON parsers; stub
@@ -13,13 +14,6 @@ mock.module("../../db", () => ({
 	sqlite: {},
 	activeDatabaseBackend: "sqlite" as const,
 }));
-
-type ParsedEvent = {
-	invalidState?: { reason: string; message: string };
-	text?: string;
-	messageId?: string;
-	usage?: unknown;
-};
 
 type ParseAnthropicEventFn = (
 	event: unknown,
@@ -422,6 +416,154 @@ describe("Anthropic lightweight partial output regression", () => {
 });
 
 describe("parseAnthropicSSEStream end-to-end error surfacing", () => {
+	test.each([
+		"block",
+		"message",
+	])("initial tool input remains intact after normal %s completion", async (completion) => {
+		const input = { file_path: "x", content: "初始内容", options: { recursive: true } };
+		const frames = [
+			{ type: "message_start", message: { id: "msg-initial" } },
+			{
+				type: "content_block_start",
+				index: 2,
+				content_block: { type: "tool_use", id: "initial", name: "Write", input },
+			},
+			...(completion === "block" ? [{ type: "content_block_stop", index: 2 }] : []),
+			{ type: "message_delta", delta: { stop_reason: "tool_use" } },
+			{ type: "message_stop" },
+		];
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream(frames.map((frame) => `data:${JSON.stringify(frame)}\n\n`).join("")),
+			),
+		);
+		expect(events.filter((event) => Object.hasOwn(event, "toolUseChunk"))).toEqual([
+			{
+				toolUseChunk: {
+					toolUseId: "initial",
+					name: "Write",
+					input: undefined,
+					stop: false,
+					outputIndex: 2,
+				},
+			},
+			{
+				toolUseChunk: {
+					toolUseId: "initial",
+					name: "Write",
+					stop: true,
+					outputIndex: 2,
+					finalInput: JSON.stringify(input),
+				},
+			},
+		]);
+	});
+
+	test.each([
+		"eof",
+		"usage-only",
+		"max_tokens",
+		"refusal",
+	])("initial tool input cannot convert %s into successful completion", async (termination) => {
+		const frames = [
+			{ type: "message_start", message: { id: "msg-truncated" } },
+			{
+				type: "content_block_start",
+				index: 0,
+				content_block: {
+					type: "tool_use",
+					id: "truncated-initial",
+					name: "Write",
+					input: { file_path: "x", content: "not yet complete" },
+				},
+			},
+			...(termination === "eof"
+				? []
+				: [
+						{
+							type: "message_delta",
+							delta: termination === "usage-only" ? {} : { stop_reason: termination },
+							usage: { output_tokens: 2 },
+						},
+					]),
+		];
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream(frames.map((frame) => `data:${JSON.stringify(frame)}\n\n`).join("")),
+			),
+		);
+		expect(events).not.toContainEqual({
+			toolUseChunk: expect.objectContaining({ stop: true }),
+		});
+		expect(events).toContainEqual({
+			invalidState: expect.objectContaining({ reason: "incomplete_tool_input" }),
+		});
+	});
+
+	test("multiline JSON and EOF-only errors retain their event name", async () => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream('event:error\rdata:{\rdata:"message":"EOF backend failure"\rdata:}'),
+			),
+		);
+		expect(events[0]?.invalidState?.message).toBe("EOF backend failure");
+	});
+
+	test("legacy adjacent JSON data lines still stream independently", async () => {
+		const events = await collect(
+			parseAnthropicSSEStream(
+				sseStream(
+					'data:{"type":"message_start","message":{"id":"legacy"}}\n' +
+						'data:{"type":"content_block_delta","delta":{"type":"text_delta","text":"old relay"}}\n',
+				),
+			),
+		);
+		expect(events.some((event) => event.messageId === "legacy")).toBe(true);
+		expect(events.some((event) => event.text === "old relay")).toBe(true);
+	});
+
+	test("a throwing generation callback propagates and cancels its reader", async () => {
+		let cancellations = 0;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						'data:{"type":"content_block_delta","delta":{"type":"text_delta","text":"visible"}}\n\n',
+					),
+				);
+			},
+			cancel() {
+				cancellations++;
+			},
+		});
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(body, {
+				headers: { "content-type": "text/event-stream" },
+			})) as unknown as typeof fetch;
+		const failure = new Error("consumer callback failure");
+		try {
+			const provider = new AnthropicProvider({
+				id: "test-anthropic",
+				name: "Test Anthropic",
+				prefix: "anthropic",
+				apiKey: "test-key",
+				baseUrl: "https://example.com/v1",
+			});
+			await expect(
+				provider.generateWithMeta("prompt", "anthropic:claude-test", undefined, {
+					onTextDelta: () => {
+						throw failure;
+					},
+				}),
+			).rejects.toBe(failure);
+			expect(cancellations).toBe(1);
+			expect(body.locked).toBe(false);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("event: error with type-less data still surfaces invalidState", async () => {
 		// This is exactly the gateway's writeSSEError output shape before the fix:
 		// an `event: error` line with a data payload that has no `type` field.

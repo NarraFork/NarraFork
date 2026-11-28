@@ -1,4 +1,8 @@
-import type { ProviderTextCitation, ReasoningProviderMetadata } from "@shared/agent-protocol/types";
+import type {
+	ProviderTextCitation,
+	ReasoningProviderMetadata,
+	TextProviderMetadata,
+} from "@shared/agent-protocol/types";
 import { generateId } from "../id";
 import { finalizeAssistantTextWithCitations } from "./citation-stream";
 import type { AgentEvent, ContentBlock } from "./types";
@@ -20,6 +24,7 @@ interface Lane {
 	order: number;
 	text: string;
 	metadata?: ReasoningProviderMetadata;
+	textMetadata?: TextProviderMetadata;
 	citations: Map<string, ProviderTextCitation>;
 	revision: number;
 	publishedRevision: number;
@@ -202,6 +207,22 @@ export class OutputContentAccumulator {
 		if (lane.publishedRevision > 0) yield* this.publish(lane);
 	}
 
+	/** Message phase belongs to one native text part, never the latest response as a whole. */
+	*textMetadata(metadata: TextProviderMetadata, hint: ContentLane = {}): Generator<AgentEvent> {
+		const lane = this.resolve("text", hint, true);
+		const merged: TextProviderMetadata = {
+			...lane.textMetadata,
+			...(metadata.openai ? { openai: { ...lane.textMetadata?.openai, ...metadata.openai } } : {}),
+		};
+		if (JSON.stringify(merged) === JSON.stringify(lane.textMetadata)) return;
+		lane.textMetadata = merged;
+		lane.revision++;
+		this.dirty.add(lane);
+		// Parsers may repeat the same metadata on every delta. Only a real metadata
+		// update checkpoints immediately; ordinary text still drains at bounded boundaries.
+		if (lane.publishedRevision > 0) yield* this.publish(lane);
+	}
+
 	*addCitations(
 		citations: readonly ProviderTextCitation[],
 		hint: ContentLane = {},
@@ -333,13 +354,18 @@ export class OutputContentAccumulator {
 		return {
 			type: "text",
 			text: finalized.text,
+			...(lane.textMetadata ? { providerMetadata: lane.textMetadata } : {}),
 			...(finalized.citations.length ? { citations: finalized.citations } : {}),
 			...identity,
 		};
 	}
 
 	private *publish(lane: Lane): Generator<AgentEvent> {
-		if (lane.revision <= lane.publishedRevision || (!lane.text && !lane.metadata)) return;
+		if (
+			lane.revision <= lane.publishedRevision ||
+			(!lane.text && !lane.metadata && !lane.textMetadata)
+		)
+			return;
 		const block = this.snapshot(lane);
 		yield {
 			type: "block_complete",
@@ -386,7 +412,7 @@ export class OutputContentAccumulator {
 	/** Includes native credentials and block-local citation coordinates for replay. */
 	orderedContent(external: readonly ContentBlock[] = []): ContentBlock[] {
 		const entries = this.lanes
-			.filter((lane) => lane.text || lane.metadata)
+			.filter((lane) => lane.text || lane.metadata || lane.textMetadata)
 			.map((lane) => ({ block: this.snapshot(lane) as ContentBlock, order: lane.order }));
 		let redactedIndex = 0;
 		for (const [index, block] of external.entries()) {

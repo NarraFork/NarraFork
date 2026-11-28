@@ -108,6 +108,8 @@ import { PluginToolRegistry, type PluginToolRuntime } from "./plugin-tool-regist
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_TRUST_ARTIFACT_BYTES = 1024 * 1024;
 const HOST_API_VERSION = "1.0";
+// Provider plugins stay warm between model calls; an idle stop is reactivated on demand.
+const PROVIDER_IDLE_TIMEOUT_MS = 6 * 60 * 60_000;
 
 interface RuntimeLike {
 	state: string;
@@ -1987,9 +1989,12 @@ export class PluginManager {
 					}
 					await this.stateStore.updateState(pluginId, (current) => ({
 						...current,
-						runtimeState: "active",
+						// Report what the runtime actually settled into. A provider that the
+						// host idle budget reclaimed during activation must not be recorded
+						// as active while no process is running.
+						runtimeState: mapRuntimeState(diagnostics.state),
 						runtimeGeneration: Math.max(current.runtimeGeneration, diagnostics.generation),
-						restartCount: Math.max(current.restartCount, Math.max(0, diagnostics.generation - 1)),
+						restartCount: Math.max(current.restartCount, diagnostics.restartCount ?? 0),
 						consecutiveFailures: 0,
 						lastError: null,
 						updatedAt: this.timestamp(),
@@ -2080,6 +2085,11 @@ export class PluginManager {
 				...created,
 				runtimeId,
 				generation: nextGeneration - 1,
+				restartCount: Math.max(
+					state.restartCount,
+					existingDiagnostics?.restartCount ?? 0,
+					created.restartCount ?? 0,
+				),
 				installationId,
 				dispatcher: binding.dispatcher,
 			};
@@ -2436,6 +2446,9 @@ export class PluginManager {
 						),
 					}
 				: {}),
+			// Provider plugins are legitimately quiet between model calls. Keep their
+			// longer idle budget separate from the server-tool frame allowances.
+			...(hasProviders ? { idleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS } : {}),
 			hostApiVersion: HOST_API_VERSION,
 			grantedCapabilities: context.state.grants.capabilities,
 			activationReason: context.reason,
@@ -2643,7 +2656,9 @@ export class PluginManager {
 							...state,
 							runtimeState: mapRuntimeState(runtimeState),
 							runtimeGeneration: diagnostics.generation,
-							restartCount: Math.max(state.restartCount, Math.max(0, diagnostics.generation - 1)),
+							// Restart accounting must reflect supervisor-driven recoveries, not
+							// generation bumps caused by on-demand activation (idle wake-ups).
+							restartCount: Math.max(state.restartCount, diagnostics.restartCount ?? 0),
 							...(runtimeState === "active" ? { lastError: null, consecutiveFailures: 0 } : {}),
 							updatedAt: this.timestamp(),
 						}
@@ -2674,10 +2689,7 @@ export class PluginManager {
 						...state,
 						runtimeState: quarantine ? "quarantine" : "failed",
 						crashCount: state.crashCount + 1,
-						restartCount: Math.max(
-							state.restartCount,
-							Math.max(0, (diagnostics?.generation ?? 1) - 1),
-						),
+						restartCount: Math.max(state.restartCount, diagnostics?.restartCount ?? 0),
 						consecutiveFailures: state.consecutiveFailures + 1,
 						runtimeGeneration: Math.max(state.runtimeGeneration, diagnostics?.generation ?? 0),
 						lastError: pluginStateError(error, { phase, at: this.timestamp() }),

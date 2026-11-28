@@ -273,6 +273,8 @@ export interface InvalidStateClassification {
 export interface ProviderInvalidStateErrorOptions {
 	diagnostics?: ApiRequestDiagnostics;
 	providerRetryable?: boolean;
+	/** Accounting already received before a terminal generation verdict. */
+	usage?: import("../usage-tracking").UsageData | null;
 }
 
 /** Extract a human-readable message from any thrown value, including ErrorEvent objects. */
@@ -663,12 +665,14 @@ export class ProviderInvalidStateError extends Error {
 	readonly diagnostics?: ApiRequestDiagnostics;
 	readonly status?: number;
 	readonly code: string;
+	readonly usage?: import("../usage-tracking").UsageData | null;
 
 	constructor(reason: string, message: string, options: ProviderInvalidStateErrorOptions = {}) {
 		super(message);
 		this.name = "ProviderInvalidStateError";
 		this.reason = reason;
 		this.diagnostics = options.diagnostics;
+		this.usage = options.usage;
 		const classification = classifyInvalidState(
 			reason,
 			message,

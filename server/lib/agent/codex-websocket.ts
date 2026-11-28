@@ -19,6 +19,14 @@ import {
 	stripResponsesLiteHeader,
 } from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
+import {
+	type CodexTurnState,
+	extractCodexTurnStateFromEvent,
+	getCodexTurnState,
+	normalizedCodexHeaders,
+	type ProviderTurnContext,
+	redactCodexTurnStateInJsonText,
+} from "./codex-turn-state";
 import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { ProviderInvalidStateError } from "./error-handling";
 import { parseGatewayDataEvent } from "./gateway-events";
@@ -29,9 +37,10 @@ import {
 	type ResponsesReasoningAccum,
 	type ResponsesToolAccum,
 } from "./openai-provider";
+import { openAIRefusalFor } from "./openai-refusal";
 import type { ParsedStreamEvent } from "./provider";
 import { type ApiRequestDumpCollector, sanitizeHeaders } from "./request-dump";
-import { createRequestBodyEncoder, stringifyRequestBody } from "./request-json";
+import { createRequestBodyEncoder } from "./request-json";
 
 const RESPONSES_WS_BETA_HEADER = "responses_websockets=2026-02-06";
 const TURN_STATE_HEADER = "x-codex-turn-state";
@@ -154,7 +163,8 @@ interface CachedSession {
 	disabled: boolean;
 	lastRequest: RequestSignatureSnapshot | null;
 	lastCompleted: CompletedSignatureSnapshot | null;
-	turnState: string | null;
+	/** Digest only: never retain handshake credentials in session metadata. */
+	handshakeDigest: string | null;
 	busy: boolean;
 	lastUsedAt: number;
 }
@@ -187,6 +197,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	sessionKey: string;
 	/** Stable conversation/thread identity sent in headers and request metadata. */
 	conversationId: string;
+	/** Memory-only logical user turn; absent callers get an isolated request lock. */
+	turnContext?: ProviderTurnContext;
 	narratorId?: string;
 	credentialId: string;
 	model: string;
@@ -281,8 +293,49 @@ async function jsonSignature(text: string, signal?: AbortSignal): Promise<string
 	return hash.digest("hex");
 }
 
+/** Canonicalize only bounded shallow objects during the existing async/Worker JSON traversal. */
+function createSignatureEncoder() {
+	const normalized = new WeakMap<object, object>();
+	return createRequestBodyEncoder((value) => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== null && prototype !== Object.prototype) return value;
+		const previous = normalized.get(value);
+		if (previous) return previous;
+		const keys: string[] = [];
+		let keyCharacters = 0;
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			keys.push(key);
+			keyCharacters += key.length;
+			// Oversized shapes keep their original order: a conservative full resend
+			// is preferable to unbounded main-thread sorting or dropping unknown keys.
+			if (keys.length > 512 || keyCharacters > 16 * 1024) {
+				normalized.set(value, value);
+				return value;
+			}
+		}
+		const record: Record<string, unknown> = Object.create(null);
+		normalized.set(value, record);
+		for (const key of keys.sort()) record[key] = (value as Record<string, unknown>)[key];
+		return record;
+	});
+}
+
+function replayComparableItem(value: unknown): unknown {
+	const item = asRecord(value);
+	if (item?.type !== "function_call") return value;
+	// Completed output includes transport id/status that provider replay omits.
+	// Keep name/call_id/arguments/phase and every unknown field in both signatures.
+	const { id: _id, status: _status, ...semanticItem } = item;
+	return semanticItem;
+}
+
 async function itemSignature(value: unknown, signal?: AbortSignal): Promise<string> {
-	return jsonSignature(await stringifyRequestBody({ item: value }, signal), signal);
+	return jsonSignature(
+		await createSignatureEncoder()({ item: replayComparableItem(value) }, signal),
+		signal,
+	);
 }
 
 async function inputSignatures(input: readonly unknown[], signal?: AbortSignal): Promise<string[]> {
@@ -300,10 +353,12 @@ async function inputSignatures(input: readonly unknown[], signal?: AbortSignal):
 async function snapshotRequest(
 	request: CodexResponsesRequestBody,
 	signal?: AbortSignal,
-	encode = createRequestBodyEncoder(),
 ): Promise<RequestSignatureSnapshot> {
 	return {
-		properties: await jsonSignature(await encode(requestWithoutInput(request), signal), signal),
+		properties: await jsonSignature(
+			await createSignatureEncoder()({ properties: requestWithoutInput(request) }, signal),
+			signal,
+		),
 		input: await inputSignatures(request.input, signal),
 	};
 }
@@ -320,21 +375,7 @@ function isPrefixExtension(
 	return true;
 }
 
-/**
- * Project a request down to the fields that decide whether the previous
- * websocket response can be continued with `previous_response_id`.
- *
- * `input` is blanked because it is compared separately as a prefix extension,
- * and `client_metadata` is dropped entirely: it carries per-request runtime
- * values (notably `x-codex-turn-state`, which only exists after the first
- * response of a turn) that change between otherwise identical requests. Leaving
- * it in would make every request after the first look like a different request,
- * silently degrading continuation into full resends and losing the prompt cache.
- *
- * codex-rs draws the same line in `responses_request_properties_match`:
- * "request equality includes `input` and `client_metadata`, while websocket
- * reuse compares the input separately and ignores metadata."
- */
+/** Compare input separately and ignore volatile client metadata when continuing a response. */
 function requestWithoutInput(
 	request: CodexResponsesRequestBody,
 ): Omit<CodexResponsesRequestBody, "input"> & { input: [] } {
@@ -561,7 +602,7 @@ function createSessionState(): CachedSession {
 		disabled: false,
 		lastRequest: null,
 		lastCompleted: null,
-		turnState: null,
+		handshakeDigest: null,
 		busy: false,
 		lastUsedAt: Date.now(),
 	};
@@ -603,19 +644,7 @@ function isOfficialChatGPTDomain(baseUrl: string): boolean {
 	}
 }
 
-/**
- * Build the WebSocket handshake headers.
- *
- * Exported for tests: a typo or a wrong conditional here only shows up as a
- * silent fallback to HTTP, which is hard to diagnose from logs.
- *
- * Depends only on `options` — nothing session- or turn-scoped reaches the
- * handshake, matching codex-rs's `build_websocket_headers`, which takes no turn
- * state either. Anything learned mid-turn (the turn-state token) must travel in
- * the request body instead; see {@link applyTurnStateToRequest}.
- *
- * See docs/codex-websocket.md for the documented header contract.
- */
+/** Build conversation-scoped handshake headers; turn tokens travel in each request body. */
 export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 ): Record<string, string> {
@@ -640,24 +669,10 @@ export function buildHandshakeHeaders(
 	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
 		headers["ChatGPT-Account-Id"] = options.accountId;
 	}
-	// No x-codex-turn-state here. The token only exists after the first response of
-	// a turn, by which point this connection's handshake is long since sent — and the
-	// connection is reused for every later request in the turn, so a handshake header
-	// could never carry it. It travels in each response.create's client_metadata
-	// instead (see applyTurnStateToRequest). codex-rs makes the same split: its
-	// build_websocket_headers passes `/*turn_state*/ None` and puts the token in the
-	// websocket client_metadata, while the HTTP path sends it as a request header.
 	if (options.turnMetadata) {
 		headers[TURN_METADATA_HEADER] = options.turnMetadata;
 	}
-	// Client fingerprint (originator, session-id/thread-id, window id,
-	// user-configured headers) applied last so it overrides built-in defaults such as
-	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
-	// header names) is supplied here rather than hardcoded above.
-	//
-	// `"User-Agent"` matches the casing written above, so an operator UA override
-	// replaces that key rather than adding a second differently-cased one that the
-	// handshake would send alongside it.
+	// Final fingerprint overrides defaults with case-insensitive header merging.
 	mergeExtraHeaders(headers, options.extraHeaders, "User-Agent");
 	// extraHeaders is merged last, so it is also the one place that could put the
 	// lite opt-in back on the wire. Strip it for the same reason it is not set above.
@@ -665,29 +680,8 @@ export function buildHandshakeHeaders(
 	return headers;
 }
 
-/**
- * Read `x-codex-turn-state` out of a streamed metadata event.
- *
- * Both `response.metadata` and `codex.response.metadata` are accepted because the
- * gateway and the direct backend disagree on the prefix, and the header lookup is
- * case-insensitive — HTTP header names are, and matching only the lowercase form
- * would drop the token silently, degrading sticky routing with no error anywhere.
- *
- * Exported for tests: a miss here is invisible until same-turn requests start
- * landing on different backends.
- */
-export function extractTurnStateFromEvent(chunk: Record<string, unknown>): string | null {
-	const type = chunk.type;
-	if (type !== "response.metadata" && type !== "codex.response.metadata") return null;
-	const headers = asRecord(chunk.headers);
-	if (!headers) return null;
-	for (const [name, value] of Object.entries(headers)) {
-		if (name.toLowerCase() !== TURN_STATE_HEADER) continue;
-		if (typeof value === "string" && value) return value;
-		if (typeof value === "number") return String(value);
-	}
-	return null;
-}
+/** Shared metadata parser for HTTP and WS; retain the existing transport export. */
+export const extractTurnStateFromEvent = extractCodexTurnStateFromEvent;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -835,20 +829,7 @@ export async function buildCodexResponsesWebSocketRequest(
 	);
 }
 
-/**
- * Attach the turn's sticky-routing token to an outgoing `response.create`.
- *
- * The server hands `x-codex-turn-state` back on the first response of a turn and
- * expects it replayed on every later request of that same turn (retries,
- * incremental appends, continuations) so they land on the same backend. On this
- * transport it cannot ride a handshake header — the connection is established
- * before the token exists and is then reused — so it goes in the request body,
- * mirroring codex-rs's websocket path.
- *
- * Must run AFTER buildCodexResponsesWebSocketRequest: that function compares the
- * previous and current request to decide on continuation, and this key changes
- * between turns. Injecting first would defeat the comparison.
- */
+/** Attach the turn's routing token to each response.create without mutating shared metadata. */
 export function applyTurnStateToRequest(
 	websocketRequest: Record<string, unknown>,
 	turnState: string | null,
@@ -863,6 +844,7 @@ export function applyTurnStateToRequest(
 }
 
 async function closeSessionConnection(session: CachedSession): Promise<void> {
+	session.handshakeDigest = null;
 	if (session.connection) {
 		await session.connection.close();
 		session.connection = null;
@@ -870,10 +852,7 @@ async function closeSessionConnection(session: CachedSession): Promise<void> {
 }
 
 async function resetSession(session: CachedSession, disable = false): Promise<void> {
-	await closeSessionConnection(session);
-	session.lastRequest = null;
-	session.lastCompleted = null;
-	session.turnState = null;
+	await discardResponseChain(session);
 	session.disabled = disable;
 }
 
@@ -881,11 +860,9 @@ async function resetSession(session: CachedSession, disable = false): Promise<vo
  * Close the socket and forget the `previous_response_id` chain, keeping the
  * session entry itself alive.
  *
- * Distinct from {@link resetSession} only in that `turnState` survives: the
- * sticky-routing token belongs to the TURN, not to the connection, and upstream
- * expects it replayed on every request of that turn — including the ones sent
- * over a replacement socket after a reconnect. Clearing it on reconnect would
- * silently drop same-turn backend affinity.
+ * Unlike resetSession, this leaves the disabled flag alone. Neither operation
+ * owns turn-state: its OnceLock lives with the logical turn and survives socket
+ * resets, history rebuilds and same-turn HTTP fallback.
  */
 async function discardResponseChain(session: CachedSession): Promise<void> {
 	await closeSessionConnection(session);
@@ -906,10 +883,13 @@ function recordWebSocketMessage(
 	connectionId: string,
 	incoming: PendingFrame,
 ): void {
-	collector?.frame({
+	if (!collector) return;
+	const text =
+		incoming.type === "message" ? redactCodexTurnStateInJsonText(incoming.text) : undefined;
+	collector.frame({
 		direction: "response",
 		type: `websocket.${incoming.type}`,
-		text: incoming.type === "message" ? incoming.text : undefined,
+		text,
 		metadata: {
 			connectionId,
 			boundary: "websocket-message-not-network-frame",
@@ -917,15 +897,15 @@ function recordWebSocketMessage(
 			...(incoming.type === "error" ? { error: incoming.error.message } : {}),
 		},
 	});
-	if (incoming.type === "message") {
-		collector?.appendResponseText(incoming.text, false);
-		collector?.appendResponseText("\n", false);
+	if (text !== undefined) {
+		collector.appendResponseText(text, false);
+		collector.appendResponseText("\n", false);
 	} else if (incoming.type === "close") {
-		collector?.appendResponseText(
+		collector.appendResponseText(
 			`\n[websocket close ${incoming.code}] ${incoming.reason}\n`,
 			false,
 		);
-	} else collector?.setResponseError(incoming.error);
+	} else if (incoming.type === "error") collector.setResponseError(incoming.error);
 }
 
 class ReusableWebSocketConnection {
@@ -939,14 +919,16 @@ class ReusableWebSocketConnection {
 	/** Wall-clock time the upgrade completed, for the 60-minute lifetime cap. */
 	private connectedAt = 0;
 
-	constructor(
-		private readonly url: string,
-		private readonly headers: Record<string, string>,
-		private readonly proxy?: string,
-		private readonly onUpgrade?: (response: IncomingMessage) => void,
-	) {}
-
-	async connect(signal: AbortSignal): Promise<void> {
+	async connect(
+		signal: AbortSignal,
+		handshake: {
+			url: string;
+			headers: Record<string, string>;
+			proxy?: string;
+			validateBeforeDispatch?: () => void;
+			onUpgrade: (response: IncomingMessage) => void;
+		},
+	): Promise<void> {
 		const { default: WebSocketImpl } = await import("ws");
 		if (signal.aborted) {
 			throw createCodexWebSocketAbortError();
@@ -954,17 +936,15 @@ class ReusableWebSocketConnection {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			const wsOptions: { headers: Record<string, string>; agent?: boolean | HttpAgent } = {
-				headers: this.headers,
+				headers: handshake.headers,
 			};
-			// The proxy arrives already resolved (custom / system / inherited global);
-			// applying exemptions here keeps the WebSocket path consistent with the
-			// HTTP path: a target covered by `settings.proxy.noProxyRules` connects
-			// directly. `wss:` URLs parse, so the rules match on host/URL as usual.
-			const proxyUrl = this.proxy ? applyProxyExemptions(this.proxy, this.url) : undefined;
-			if (proxyUrl) {
-				wsOptions.agent = new HttpsProxyAgent(proxyUrl);
+			// Exemptions were resolved with the handshake digest. Use that same
+			// effective proxy so cache identity and the actual route cannot diverge.
+			if (handshake.proxy) {
+				wsOptions.agent = new HttpsProxyAgent(handshake.proxy);
 			}
-			const ws = new WebSocketImpl(this.url, wsOptions);
+			handshake.validateBeforeDispatch?.();
+			const ws = new WebSocketImpl(handshake.url, wsOptions);
 			this.ws = ws;
 
 			// A TCP connect that neither completes nor errors (silent drop by a proxy or
@@ -1018,10 +998,10 @@ class ReusableWebSocketConnection {
 			};
 
 			ws.once("upgrade", (response) => {
-				this.onUpgrade?.(response);
+				handshake.onUpgrade(response);
 			});
 			ws.once("unexpected-response", (_request, response) => {
-				this.onUpgrade?.(response);
+				handshake.onUpgrade(response);
 				const status = response.statusCode;
 				const message = `Codex WebSocket upgrade failed with status ${status ?? "unknown"}`;
 				finishReject(
@@ -1070,12 +1050,6 @@ class ReusableWebSocketConnection {
 
 	hasPendingFrames(): boolean {
 		return this.queue.length > 0;
-	}
-
-	isClosed(): boolean {
-		return (
-			!this.ws || this.ws.readyState === this.ws.CLOSED || this.ws.readyState === this.ws.CLOSING
-		);
 	}
 
 	/** True once this socket is old enough that upstream may retire it mid-response. */
@@ -1162,16 +1136,42 @@ class ReusableWebSocketConnection {
 	}
 }
 
+/** Fingerprint final wire settings without retaining plaintext authorization or proxy secrets. */
+export function codexWebSocketHandshakeDigest(
+	options: Pick<StreamCodexResponsesWebSocketOptions, "baseUrl" | "proxy">,
+	headers: Record<string, string>,
+): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				buildCodexResponsesWebSocketUrl(options.baseUrl),
+				options.proxy ? new URL(options.proxy).toString() : "",
+				normalizedCodexHeaders(headers),
+			]),
+		)
+		.digest("hex");
+}
+
 async function ensureConnection(
 	session: CachedSession,
 	options: StreamCodexResponsesWebSocketOptions,
-	handshakeHeaders?: Record<string, string>,
+	handshakeHeaders: Record<string, string>,
+	turnState: CodexTurnState,
 ): Promise<ReusableWebSocketConnection> {
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
 	options.validateBeforeDispatch?.();
+	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
+	// Resolve custom/system/global proxy exemptions before comparing the wire
+	// identity. Rule changes must replace a socket when its effective route changes.
+	const proxy = applyProxyExemptions(options.proxy, url);
+	const handshakeDigest = codexWebSocketHandshakeDigest(
+		{ baseUrl: options.baseUrl, proxy },
+		handshakeHeaders,
+	);
 	if (
+		session.handshakeDigest === handshakeDigest &&
 		session.connection?.isOpen() &&
 		!session.connection.isExpiring() &&
 		!session.connection.hasPendingFrames()
@@ -1186,22 +1186,20 @@ async function ensureConnection(
 		});
 		return connection;
 	}
-	// Any new socket invalidates the response chain. `previous_response_id` is
-	// connection-scoped upstream, which is precisely what `previous_response_not_found`
-	// reports — codex-rs draws the same line by calling `reset_websocket_session()`
-	// (clearing last_request/last_response) every time `websocket_connection()` decides
-	// it needs a new connection. Dropping the chain costs a full resend; keeping it
-	// costs a guaranteed round-trip failure first.
+	// A new socket cannot continue the old socket's previous_response_id chain.
 	await discardResponseChain(session);
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
-	const url = buildCodexResponsesWebSocketUrl(options.baseUrl);
-	const connection = new ReusableWebSocketConnection(
+	const connection = new ReusableWebSocketConnection();
+	connection.onFrame = (incoming) =>
+		recordWebSocketMessage(options.requestDump, connection.id, incoming);
+	await connection.connect(options.signal, {
 		url,
-		handshakeHeaders ?? buildHandshakeHeaders(options),
-		options.proxy,
-		(response) => {
+		headers: handshakeHeaders,
+		proxy,
+		validateBeforeDispatch: options.validateBeforeDispatch,
+		onUpgrade: (response) => {
 			connection.handshakeMeta = {
 				status: response.statusCode,
 				headers: sanitizeHeaders(response.headers),
@@ -1212,25 +1210,21 @@ async function ensureConnection(
 				type: response.statusCode === 101 ? "websocket.upgrade" : "websocket.upgrade_rejected",
 				metadata: { connectionId: connection.id, reused: false, ...connection.handshakeMeta },
 			});
-			const turnState = response.headers[TURN_STATE_HEADER];
-			if (response.statusCode === 101 && typeof turnState === "string" && turnState) {
-				session.turnState = turnState;
+			if (response.statusCode === 101) {
+				turnState.capture(response.headers[TURN_STATE_HEADER]);
 			}
 		},
-	);
-	connection.onFrame = (incoming) =>
-		recordWebSocketMessage(options.requestDump, connection.id, incoming);
-	await connection.connect(options.signal);
+	});
 	if (options.signal.aborted) {
 		await connection.close();
 		throw createCodexWebSocketAbortError();
 	}
 	session.connection = connection;
+	session.handshakeDigest = handshakeDigest;
 	logger.info("Codex Responses WebSocket connected", {
 		sessionKey: options.sessionKey,
 		credentialId: options.credentialId,
 		model: options.model,
-		url,
 	});
 	return connection;
 }
@@ -1272,24 +1266,29 @@ export async function* streamCodexResponsesWebSocket(
 	let toolAccum = new Map<number, ResponsesToolAccum>();
 	let reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 	let requestDispatched = false;
-	const resetAbortedSessionIfNeeded = async () => {
-		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
-			await resetSession(session, false);
-			connection = null;
-		}
-	};
+	async function* finishRefusal(): AsyncGenerator<ParsedStreamEvent> {
+		await discardResponseChain(session);
+		connection = null;
+		yield openAIRefusalFor(toolAccum).event();
+	}
 
 	try {
 		if (options.resetSessionBeforeRequest) {
 			await resetSession(session, false);
 		}
 		const encodeRequest = createRequestBodyEncoder();
-		const requestSnapshot = await snapshotRequest(request, options.signal, encodeRequest);
+		const encodeEvidence = options.requestDump ? createRequestBodyEncoder() : undefined;
+		const requestSnapshot = await snapshotRequest(request, options.signal);
 		let reconnectCount = 0;
 		let connectionLimitReconnects = 0;
 		let previousResponseRetries = 0;
 		let hasYieldedEvents = false;
 		const handshakeHeaders = buildHandshakeHeaders(options);
+		const turnState = getCodexTurnState(options.turnContext, {
+			baseUrl: options.baseUrl,
+			credentialId: options.credentialId,
+			headers: handshakeHeaders,
+		});
 		let requestReported = false;
 		const beginAttempt = () =>
 			options.requestDump?.beginResponseAttempt({
@@ -1300,16 +1299,7 @@ export async function* streamCodexResponsesWebSocket(
 			});
 		beginAttempt();
 
-		/**
-		 * Serialize the request against the session's CURRENT chain state.
-		 *
-		 * Rebuilt per dispatch rather than captured once, because every reconnect path
-		 * below drops the chain: a cached delta still carrying `previous_response_id`
-		 * would reference a response the new socket has never heard of, so the resend
-		 * that was supposed to recover the turn fails with `previous_response_not_found`
-		 * instead. Turn state is injected last (see applyTurnStateToRequest) since it is
-		 * only learned after the first response and must ride every later request.
-		 */
+		// Rebuild against the current chain after reconnects and attach the latest turn lock.
 		const buildRequestFrame = async (): Promise<{
 			body: Record<string, unknown>;
 			text: string;
@@ -1320,12 +1310,37 @@ export async function* streamCodexResponsesWebSocket(
 				session.lastRequest,
 				session.lastCompleted,
 			);
-			applyTurnStateToRequest(body, session.turnState);
+			if (options.turnContext) {
+				body.client_metadata = {
+					...(body.client_metadata as Record<string, unknown> | undefined),
+					turn_id: options.turnContext.id,
+				};
+			}
+			applyTurnStateToRequest(body, turnState.value);
 			return { body, text: await encodeRequest(body, options.signal) };
 		};
 
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = await buildRequestFrame();
+			options.signal.throwIfAborted();
+			// Only turn metadata is secret. Preserve user text and large input/tool
+			// fragments; use the same bounded Worker encoder for evidence, not a
+			// synchronous whole-body stringify or scan after transport preparation.
+			const metadata = asRecord(frame.body.client_metadata);
+			const evidenceMetadata = metadata ? { ...metadata } : undefined;
+			if (evidenceMetadata) {
+				for (const key of Object.keys(evidenceMetadata)) {
+					if (["x-codex-turn-state", "turn_id"].includes(key.toLowerCase())) {
+						evidenceMetadata[key] = "[REDACTED]";
+					}
+				}
+			}
+			const evidenceText = encodeEvidence
+				? await encodeEvidence(
+						metadata ? { ...frame.body, client_metadata: evidenceMetadata } : frame.body,
+						options.signal,
+					)
+				: frame.text;
 			options.signal.throwIfAborted();
 			options.validateBeforeDispatch?.();
 			options.requestDump?.setRequest(
@@ -1333,14 +1348,14 @@ export async function* streamCodexResponsesWebSocket(
 					transport: "websocket",
 					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
 					headers: sanitizeHeaders(handshakeHeaders),
-					bodyText: frame.text,
+					bodyText: evidenceText,
 				},
 				false,
 			);
 			options.requestDump?.frame({
 				direction: "request",
 				type: "websocket.message",
-				text: frame.text,
+				text: evidenceText,
 				metadata: { connectionId: connection?.id, boundary: "websocket-message-not-network-frame" },
 			});
 			// Preserve the legacy first-dispatch observer contract. The collector above
@@ -1353,21 +1368,14 @@ export async function* streamCodexResponsesWebSocket(
 					body: frame.body,
 				});
 			}
+			options.signal.throwIfAborted();
+			options.validateBeforeDispatch?.();
 			await connection?.send(frame.text);
 			requestDispatched = true;
 		};
 
-		/**
-		 * Rebuild the transport and resend, discarding anything the dead attempt left.
-		 *
-		 * Resetting the accumulators is not bookkeeping: `toolAccum` and `reasoningAccum`
-		 * are keyed by output index, so a half-written tool call from the abandoned
-		 * response would merge with the replacement response's index 0 and emit a tool
-		 * call whose arguments are two different JSON fragments concatenated.
-		 *
-		 * Returns false when the abort signal fired while reconnecting, so the caller
-		 * ends the stream instead of sending into a socket nobody is reading.
-		 */
+		// Reset output-index accumulators so retries cannot splice old tool/reasoning fragments.
+		// Return false if cancelled during reconnection.
 		const reconnectAndResend = async (): Promise<boolean> => {
 			options.requestDump?.finishResponseCapture(false);
 			await discardResponseChain(session);
@@ -1378,7 +1386,7 @@ export async function* streamCodexResponsesWebSocket(
 			toolAccum = new Map();
 			reasoningAccum = new Map();
 			touchSession(session);
-			connection = await ensureConnection(session, options, handshakeHeaders);
+			connection = await ensureConnection(session, options, handshakeHeaders, turnState);
 			if (options.signal.aborted) {
 				await resetSession(session, false);
 				return false;
@@ -1390,18 +1398,11 @@ export async function* streamCodexResponsesWebSocket(
 		/**
 		 * Recover from `websocket_connection_limit_reached`.
 		 *
-		 * Upstream retires a Responses WebSocket after 60 minutes and says so explicitly:
-		 * "Create a new websocket connection to continue." That instruction is always
-		 * actionable, so a reconnect is attempted regardless of whether output already
-		 * streamed — the previous code only reconnected when nothing had been yielded,
-		 * which meant the failure mode that actually happens in practice (the cap firing
-		 * mid-response on a long-lived narrator) was never recovered.
-		 *
-		 * When output DID already reach the client, the resend must not be silent: the
-		 * caller has persisted that partial turn, so recovery is surfaced as a resumable
-		 * error and the agent loop continues from the partial output rather than
-		 * duplicating it. Only a genuinely exhausted budget falls through to an error,
-		 * and that error is retryable so the loop still has a path forward.
+		 * Upstream retires a Responses WebSocket after 60 minutes. Before delivering
+		 * output, a bounded reconnect can resend the full request. Once output reaches
+		 * the caller, clear the connection-scoped chain and surface a resumable error;
+		 * the host must rebuild from its persisted partial turn to avoid replaying
+		 * text or tools. Exhausted pre-output recovery is also retryable.
 		 */
 		const handleConnectionLimitReached = async (detail: {
 			status?: number;
@@ -1479,7 +1480,7 @@ export async function* streamCodexResponsesWebSocket(
 			});
 		};
 
-		connection = await ensureConnection(session, options, handshakeHeaders);
+		connection = await ensureConnection(session, options, handshakeHeaders, turnState);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;
@@ -1502,6 +1503,10 @@ export async function* streamCodexResponsesWebSocket(
 					options.signal,
 				);
 			} catch (error) {
+				if (!options.signal.aborted && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				if (!isCodexWebSocketIdleTimeoutError(error)) {
 					throw error;
 				}
@@ -1546,6 +1551,10 @@ export async function* streamCodexResponsesWebSocket(
 				return;
 			}
 			if (frame.type === "error") {
+				if (!options.signal.aborted && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				throw frame.error;
 			}
 			if (frame.type === "close") {
@@ -1561,6 +1570,15 @@ export async function* streamCodexResponsesWebSocket(
 					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
 					const error = formatWrappedError(closeWrappedError);
 					const closeViolation = wrappedPolicyViolationCode(closeWrappedError);
+					if (
+						!closeViolation &&
+						openAIRefusalFor(toolAccum).seen &&
+						(isCodexWebSocketConnectionLimitError(closeWrappedError) ||
+							isCodexWebSocketPreviousResponseMissingError(closeWrappedError))
+					) {
+						yield* finishRefusal();
+						return;
+					}
 					if (closeViolation) {
 						// A policy verdict delivered on the close frame is a content refusal,
 						// not a transport failure. Emit it as a terminal invalidState (the
@@ -1634,6 +1652,10 @@ export async function* streamCodexResponsesWebSocket(
 				// it at 123 bytes. Salvage the error code before treating this as an
 				// anonymous disconnect; see findCodexRecoverableCloseCode.
 				const truncatedCode = findCodexRecoverableCloseCode(frame.reason);
+				if (truncatedCode && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				if (truncatedCode === CONNECTION_LIMIT_REACHED_CODE) {
 					const outcome = await handleConnectionLimitReached({
 						message: frame.reason.trim() || CONNECTION_LIMIT_REACHED_CODE,
@@ -1673,6 +1695,10 @@ export async function* streamCodexResponsesWebSocket(
 					return;
 				}
 
+				if (openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
@@ -1721,6 +1747,15 @@ export async function* streamCodexResponsesWebSocket(
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
 				const frameViolation = wrappedPolicyViolationCode(wrappedError);
+				if (
+					!frameViolation &&
+					openAIRefusalFor(toolAccum).seen &&
+					(isCodexWebSocketConnectionLimitError(wrappedError) ||
+						isCodexWebSocketPreviousResponseMissingError(wrappedError))
+				) {
+					yield* finishRefusal();
+					return;
+				}
 				if (frameViolation) {
 					// Same rule as the close-frame path: a policy verdict rides out as a
 					// terminal invalidState, never as a thrown error that retry
@@ -1784,23 +1819,15 @@ export async function* streamCodexResponsesWebSocket(
 				continue;
 			}
 
-			// Turn state arrives on a metadata EVENT, not only on the handshake response.
-			// The handshake header is the lesser source: it exists only on a brand-new
-			// connection, so a reused connection (the normal case for every request after
-			// the first in a turn) learned the token nowhere and dropped sticky routing.
-			const eventTurnState = extractTurnStateFromEvent(chunk as Record<string, unknown>);
-			if (eventTurnState) {
-				session.turnState = eventTurnState;
-			}
+			// Reused sockets learn the current turn token from metadata events.
+			turnState.capture(extractTurnStateFromEvent(chunk as Record<string, unknown>));
 
 			if (chunk.type === "response.created" && chunk.response?.id) {
 				responseId = String(chunk.response.id);
 			}
-			if (chunk.type === "response.output_item.done" && chunk.item) {
-				itemsAdded.push(await itemSignature(chunk.item, options.signal));
-			}
-
 			const parsedEvents = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+			const refusal = openAIRefusalFor(toolAccum);
+			hasYieldedEvents ||= refusal.seen;
 			if (parsedEvents.some((event) => event.invalidState)) {
 				// A relay may label an errored response "completed". The parsed failure
 				// outranks that label: never cache it as a successful continuation chain.
@@ -1811,6 +1838,9 @@ export async function* streamCodexResponsesWebSocket(
 				return;
 			}
 
+			if (!refusal.seen && chunk.type === "response.output_item.done" && chunk.item) {
+				itemsAdded.push(await itemSignature(chunk.item, options.signal));
+			}
 			for (const event of parsedEvents) {
 				hasYieldedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 				yield event;
@@ -1846,7 +1876,9 @@ export async function* streamCodexResponsesWebSocket(
 		options.requestDump?.finishResponseCapture(completed);
 		// An early-returning consumer must not leave unread frames for the next request.
 		if (!completed && connection) await discardResponseChain(session);
-		await resetAbortedSessionIfNeeded();
+		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
+			await resetSession(session, false);
+		}
 		if (ephemeral) {
 			// Never cached, so nothing else can reuse this socket: close it now instead of
 			// leaving it for the idle sweeper (which only walks the cache).
@@ -1854,16 +1886,12 @@ export async function* streamCodexResponsesWebSocket(
 		} else {
 			session.busy = false;
 			touchSession(session);
-			if (!completed && connection?.isClosed()) {
-				session.connection = null;
-			}
 			const canDiscardSession =
 				!completed &&
 				!session.disabled &&
 				session.connection === null &&
 				session.lastRequest === null &&
-				session.lastCompleted === null &&
-				session.turnState === null;
+				session.lastCompleted === null;
 			if (canDiscardSession) {
 				sessionCache.delete(cacheKey);
 				stopSessionCleanupTimerIfIdle();

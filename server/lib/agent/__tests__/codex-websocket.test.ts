@@ -6,6 +6,7 @@ import {
 	CodexWebSocketRetryableError,
 	type CompletedResponseSnapshot,
 	clearCodexResponsesWebSocketSessions,
+	codexWebSocketHandshakeDigest,
 	decidePrematureCodexReconnect,
 	extractTurnStateFromEvent,
 	hasRecentNarratorMessage,
@@ -67,6 +68,134 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(buildCodexResponsesWebSocketUrl("http://example.com/v1/responses")).toBe(
 			"ws://example.com/v1/responses",
 		);
+	});
+
+	test("handshake digest normalizes final headers and includes proxy credentials", () => {
+		const options = {
+			baseUrl: "https://relay.example/codex",
+			proxy: "http://user:one@proxy.example:8080",
+		};
+		const headers = { Authorization: "Bearer secret", "User-Agent": "test/1", "X-Marker": "yes" };
+		const digest = codexWebSocketHandshakeDigest(options, headers);
+		expect(digest).toHaveLength(64);
+		expect(digest).not.toContain("secret");
+		expect(
+			codexWebSocketHandshakeDigest(options, {
+				"x-marker": "yes",
+				"user-agent": "test/1",
+				authorization: "Bearer secret",
+			}),
+		).toBe(digest);
+		expect(
+			codexWebSocketHandshakeDigest(
+				{ ...options, proxy: "http://user:two@proxy.example:8080" },
+				headers,
+			),
+		).not.toBe(digest);
+		expect(
+			codexWebSocketHandshakeDigest(
+				{ ...options, baseUrl: "https://other.example/codex" },
+				headers,
+			),
+		).not.toBe(digest);
+	});
+
+	test("function-call projection ignores only native transport id/status and object key order", async () => {
+		const lastRequest = makeRequest([makeUserMessage("hello")]);
+		const nativeCall = {
+			type: "function_call",
+			id: "fc-1",
+			status: "completed",
+			name: "lookup",
+			call_id: "call-1",
+			arguments: '{"path":"src/index.ts"}',
+		};
+		const replay = {
+			call_id: "call-1",
+			arguments: nativeCall.arguments,
+			name: "lookup",
+			type: "function_call",
+		};
+		const result = { type: "function_call_output", call_id: "call-1", output: "found" };
+		const lastCompleted = makeCompleted("resp-call", [nativeCall]);
+		const nextRequest = makeRequest([...lastRequest.input, replay, result] as OAIMessage[]);
+		const incremental = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
+		expect(incremental.previous_response_id).toBe("resp-call");
+		expect(incremental.input).toEqual([result]);
+		for (const change of [
+			{ name: "different" },
+			{ call_id: "call-2" },
+			{ arguments: '{"path":"different"}' },
+			{ phase: "commentary" },
+			{ future_field: "unknown" },
+		]) {
+			const changed = makeRequest([
+				...lastRequest.input,
+				{ ...replay, ...change },
+				result,
+			] as OAIMessage[]);
+			const full = await buildCodexResponsesWebSocketRequest(changed, lastRequest, lastCompleted);
+			expect(full.previous_response_id).toBeUndefined();
+			expect(full.input).toEqual(changed.input);
+		}
+		for (const extra of [{ phase: "final_answer" }, { future_field: "native-extension" }]) {
+			const full = await buildCodexResponsesWebSocketRequest(
+				nextRequest,
+				lastRequest,
+				makeCompleted("resp-call", [{ ...nativeCall, ...extra }]),
+			);
+			expect(full.previous_response_id).toBeUndefined();
+		}
+	});
+
+	test("signature canonicalization preserves nested fields and never reorders arrays", async () => {
+		const oldItem = {
+			...makeUserMessage("hello"),
+			future_extension: { z: [1, 2], a: { right: true, left: "retained" } },
+		};
+		const reorderedItem = {
+			future_extension: { a: { left: "retained", right: true }, z: [1, 2] },
+			content: oldItem.content,
+			role: oldItem.role,
+		};
+		const lastRequest = makeRequest([oldItem]);
+		lastRequest.future_request = { z: { two: 2, one: 1 }, a: true };
+		const nextRequest = makeRequest([reorderedItem, makeUserMessage("next")]);
+		nextRequest.future_request = { a: true, z: { one: 1, two: 2 } };
+		const completed = makeCompleted("reordered", []);
+		const incremental = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			completed,
+		);
+		expect(incremental.previous_response_id).toBe("reordered");
+		expect(incremental.input).toEqual([makeUserMessage("next")]);
+		reorderedItem.future_extension.z = [2, 1];
+		const full = await buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, completed);
+		expect(full.previous_response_id).toBeUndefined();
+		expect(full.input).toEqual(nextRequest.input);
+	});
+
+	test("oversized key shapes retain every unknown field and fail safely on changed values", async () => {
+		const wide = Object.fromEntries(
+			Array.from({ length: 513 }, (_, index) => [`field_${index}`, index]),
+		);
+		const first = { ...makeUserMessage("hello"), wide };
+		const lastRequest = makeRequest([first]);
+		const changed = { ...first, wide: { ...wide, field_512: "changed" } };
+		const nextRequest = makeRequest([changed, makeUserMessage("next")]);
+		const full = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			makeCompleted("wide", []),
+		);
+		expect(full.previous_response_id).toBeUndefined();
+		expect(full.input).toEqual(nextRequest.input);
+		expect(Object.keys(wide)).toHaveLength(513);
 	});
 
 	test("reuses previous_response_id when input extends last request baseline", async () => {

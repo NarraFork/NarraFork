@@ -25,7 +25,7 @@ keywords:
   - POST /api/narrators/:id/messages
   - 流式输出
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 一轮对话
 
@@ -48,7 +48,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 10. 消费事件：`executeAgentLoop` 对每个事件调 `narrator-event-handler.ts:processEvent`：`stream_text` 等只广播；`block_complete`、`assistant_message`、`tool_result` 落库后再广播。落库失败：`block_complete` / `assistant_message` 抛 `CriticalEventPersistenceError` 中止，`tool_result` 则广播 `warning` 继续。
 11. 广播：`dualBroadcast` → `narrator-ws.ts:broadcastToNarrator` 发给订阅了该叙述者的 WebSocket 连接，同时向事件总线发 `narrator:message_broadcast`。见 [HTTP 与 WebSocket](../platform/http-ws.md)、[事件总线](../platform/event-bus.md)。
 12. 前端接收：`narratorWSManager` 单连接分发 → `useNarratorWS` 按 `type`（`message`、`user_message`、`stream_event`、`permission_request` 等）调回调更新面板。见 [数据获取与实时同步](../frontend/data-flow.md)。
-13. 分支，模型本轮带 tool_use：转 [一次工具调用](tool-call.md)，工具结果回到步骤 9 的下一轮；无 tool_use 则 `done`。
+13. 分支，模型本轮带 tool_use：转 [一次工具调用](tool-call.md)，工具结果回到步骤 9 的下一轮。无 tool_use 且原生 `end_turn: false` 时，已完成输出先写入统一 transcript，再回步骤 9；空中间响应不制造空 assistant 行。其余按正常结束路径收尾，文本 `phase` 不作停止信号。
 14. 分支，上下文占用超阈值：转 [一次上下文压缩](compaction.md)。
 15. 分支，请求出错：`executeAgentLoop` 把结果归类（上下文超长、可重试错误、余额不足、模型不可用、中断、最大轮数），orchestrator 据此调 `handleContextOverflow` / `handleTransientError` 或收尾。见 [中断与恢复](../narrator/recovery.md)。
    - 已被既有规则准入的新 pass（例如工作区重放、held 运行接收明确输入）才会在模型调用前清旧 `hadError`、`terminalStatus` 与 `finalText`；须仍存活、持有当前 owner、未取消，并成功写回 `working`（`unlessArchived`）。后续成功不继承旧错误；后续再失败则保留这一次的错误。

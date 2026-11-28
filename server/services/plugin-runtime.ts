@@ -477,6 +477,8 @@ export interface RunnerStartOptions {
 	onExit?: (exitCode: number) => void;
 	spawnTimeoutMs?: number;
 	idleTimeoutMs?: number;
+	/** Called before host idle reclamation, so it is not counted as a crash. */
+	onIdleTimeout?: () => void;
 	totalTimeoutMs?: number;
 	maxStderrBytes?: number;
 	maxStderrBytesPerSecond?: number;
@@ -693,6 +695,7 @@ interface LocalProcessHandleOptions extends RunnerStartOptions {
 	killProcessTree: boolean;
 	maxHeaderBytes?: number;
 	maxBodyBytes?: number;
+	/** Host-to-plugin budget; must not enlarge the stdout parser limit. */
 	maxOutboundBodyBytes?: number;
 }
 
@@ -725,6 +728,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 	private stderrWindowBytes = 0;
 	private closed = false;
 	private killed = false;
+	private processExited = false;
 	private termination?: Promise<void>;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private totalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -747,7 +751,12 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 		)
 			throw new RangeError("maxStderrBytesPerSecond must be a positive safe integer");
 		this.stderrRing = new ByteRingBuffer(options.stderrRingBytes);
-		// Parent PID exit alone is not a process-tree ACK: descendants can retain stdio/leases.
+		// Root PID exit and process-tree ACK are distinct: descendants can retain stdio/leases.
+		void process.exited
+			.then(() => {
+				this.processExited = true;
+			})
+			.catch(() => {});
 		this.worker = ownRunnerProcess(process, options.killProcessTree);
 		this.exited = this.worker.exited.then(async (exitCode) => {
 			await this.finalizeExit(exitCode);
@@ -1021,6 +1030,9 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			kind: "timeout",
 			retryable: true,
 		});
+		// A descendant can hold stdout open after the plugin exits. Keep that
+		// transport failure on the recovery path instead of marking it as idle.
+		if (kind === "idle" && !this.processExited) this.options.onIdleTimeout?.();
 		this.emitError(error);
 		this.kill(`${kind} timeout`);
 	}
@@ -1335,6 +1347,8 @@ export interface PluginRuntimeOptions {
 	env?: Record<string, string | undefined>;
 	runtimeId?: string;
 	generation?: number;
+	/** Persisted supervisor recovery count carried into a new runtime instance. */
+	restartCount?: number;
 	rpcProtocol?: string;
 	hostApiVersion?: string;
 	grantedCapabilities?: readonly string[];
@@ -1391,6 +1405,8 @@ export interface RuntimeDiagnostics {
 	stderr: string;
 	lastError?: { code?: string; message: string; phase?: string };
 	lateMessages: number;
+	/** Persisted recovery attempts; ordinary on-demand starts do not increment it. */
+	restartCount: number;
 	startedAt?: string;
 	stoppedAt?: string;
 }
@@ -1421,12 +1437,16 @@ export class PluginRuntime {
 	private lateMessages = 0;
 	private startedAt?: string;
 	private stoppedAt?: string;
+	/** Host-retired generation; its exit must not trigger supervisor recovery. */
+	private idleReclaimedGeneration?: number;
+	private _restarts: number;
 
 	constructor(options: PluginRuntimeOptions) {
 		this.pluginId = options.pluginId;
 		this.pluginVersion = options.pluginVersion ?? options.version;
 		this.runtimeId = options.runtimeId ?? `rt_${generateId(12)}`;
 		this._generation = options.generation ?? 0;
+		this._restarts = options.restartCount ?? 0;
 		this.options = options;
 		this.healthRegistry = options.healthRegistry ?? pluginHealthRegistry;
 		this.healthBreaker = this.healthRegistry.get(this.pluginId, undefined, "runtime");
@@ -1527,6 +1547,7 @@ export class PluginRuntime {
 		this.stoppedAt = undefined;
 		this.acceptingRequests = false;
 		this.negotiatedFeatures = [];
+		this.idleReclaimedGeneration = undefined;
 		this.setState("starting");
 		try {
 			this.handle = await this.runner.start({
@@ -1541,6 +1562,9 @@ export class PluginRuntime {
 				signal,
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
+				onIdleTimeout: () => {
+					if (generation === this.generation) this.idleReclaimedGeneration = generation;
+				},
 				totalTimeoutMs: this.options.totalTimeoutMs,
 				maxInboundBodyBytes: this.options.maxFrameBytes,
 				maxOutboundBodyBytes: this.options.maxOutboundFrameBytes ?? this.options.maxFrameBytes,
@@ -1679,11 +1703,14 @@ export class PluginRuntime {
 			});
 		} catch (error) {
 			const runtimeError = normalizeRuntimeError(error, "handshake");
-			this.recordHealth({
-				ok: false,
-				durationMs: Date.now() - operationStartedAt,
-				code: runtimeError.code,
-			});
+			const idleReclaimed = this.idleReclaimedGeneration === generation;
+			if (!idleReclaimed) {
+				this.recordHealth({
+					ok: false,
+					durationMs: Date.now() - operationStartedAt,
+					code: runtimeError.code,
+				});
+			}
 			this.lastError = runtimeError;
 			this.rejectAll(runtimeError);
 			this.clearSubscriptions();
@@ -1691,6 +1718,12 @@ export class PluginRuntime {
 				await this.handle.terminate("runtime start failed");
 			} else {
 				this.handle?.kill("runtime start failed");
+			}
+			if (idleReclaimed) {
+				this.acceptingRequests = false;
+				this.setState("stopped");
+				this.stoppedAt = new Date().toISOString();
+				return;
 			}
 			if ((this._state as RuntimeState) !== "quarantine") {
 				this.setState(
@@ -1707,6 +1740,7 @@ export class PluginRuntime {
 		if (this._state !== "stopped" && this._state !== "crashed" && this._state !== "failed") {
 			await this.shutdown();
 		}
+		this._restarts += 1;
 		await this.start(signal);
 	}
 
@@ -1922,6 +1956,7 @@ export class PluginRuntime {
 					}
 				: undefined,
 			lateMessages: this.lateMessages + (this.connection?.lateMessages ?? 0),
+			restartCount: this._restarts,
 			startedAt: this.startedAt,
 			stoppedAt: this.stoppedAt,
 		};
@@ -2005,6 +2040,14 @@ export class PluginRuntime {
 		return this.connection.createWaiter(predicate, timeoutMs, label);
 	}
 
+	// Host idle stops must not enter supervisor recovery.
+	private finishIdleReclaim(): void {
+		this.acceptingRequests = false;
+		this.clearSubscriptions();
+		if (this._state !== "draining") this.setState("stopped");
+		this.stoppedAt = new Date().toISOString();
+	}
+
 	private handleProcessError(error: Error, generation: number): void {
 		if (generation !== this.generation) return;
 		this.lastError =
@@ -2016,6 +2059,10 @@ export class PluginRuntime {
 					})
 				: normalizeRuntimeError(error, "transport");
 		this.rejectAll(this.lastError);
+		if (this.idleReclaimedGeneration === generation) {
+			this.finishIdleReclaim();
+			return;
+		}
 		if (this._state !== "draining" && this._state !== "stopped") this.setState("failed");
 	}
 
@@ -2026,6 +2073,10 @@ export class PluginRuntime {
 		}
 		if (this._state === "draining" || this._state === "stopped" || this._state === "quarantine")
 			return;
+		if (this.idleReclaimedGeneration === generation) {
+			this.finishIdleReclaim();
+			return;
+		}
 		const error = new PluginRuntimeError(`Plugin process exited with code ${exitCode}`, {
 			code: "PROCESS_EXIT",
 			kind: "transport",

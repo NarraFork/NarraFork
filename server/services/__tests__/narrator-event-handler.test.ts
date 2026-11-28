@@ -1028,6 +1028,176 @@ describe("queue snapshot clear", () => {
 	}
 });
 
+describe("Responses text metadata persistence", () => {
+	test("late phase updates its original contentJson part and survives finalization/reload", async () => {
+		const id = "responses-phase-persistence";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		try {
+			const { OutputContentAccumulator } = await import("../../lib/agent/output-content");
+			const content = new OutputContentAccumulator();
+			const persist = async (events: Iterable<import("../../lib/agent/types").AgentEvent>) => {
+				for (const event of events) await processEvent(event, ctx);
+			};
+			const comment = { blockId: "comment/0", outputIndex: 0 };
+			content.append("text", "commentary", comment);
+			await persist(
+				content.textMetadata({ openai: { itemId: "comment", contentIndex: 0 } }, comment),
+			);
+			await persist(content.beforeExternal("search", 1));
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "web_search", id: "search", query: "phase", outputIndex: 1 },
+				},
+				ctx,
+			);
+			for (const index of [0, 1]) {
+				const lane = { blockId: `partial/${index}`, outputIndex: 2 };
+				await persist(content.begin("text", lane));
+				content.append("text", `part ${index}`, lane);
+				await persist(
+					content.textMetadata(
+						{ openai: { itemId: "partial", contentIndex: index, phase: "partial_answer" } },
+						lane,
+					),
+				);
+			}
+			const final = { blockId: "final/0", outputIndex: 3 };
+			await persist(content.begin("text", final));
+			content.append("text", "final", final);
+			await persist(
+				content.textMetadata(
+					{ openai: { itemId: "final", contentIndex: 0, phase: "final_answer" } },
+					final,
+				),
+			);
+			await persist(content.flush());
+			await persist(content.textMetadata({ openai: { phase: "commentary" } }, comment));
+			const savedId = partialId as string;
+			const checkpoint = readTestMessageContent(sqlite, savedId);
+			expect(checkpoint).toMatchObject([
+				{
+					text: "commentary",
+					completed: false,
+					providerMetadata: { openai: { itemId: "comment", contentIndex: 0, phase: "commentary" } },
+				},
+				{ type: "web_search", id: "search" },
+				{
+					text: "part 0",
+					providerMetadata: {
+						openai: { itemId: "partial", contentIndex: 0, phase: "partial_answer" },
+					},
+				},
+				{
+					text: "part 1",
+					providerMetadata: {
+						openai: { itemId: "partial", contentIndex: 1, phase: "partial_answer" },
+					},
+				},
+				{
+					text: "final",
+					completed: false,
+					providerMetadata: { openai: { itemId: "final", contentIndex: 0, phase: "final_answer" } },
+				},
+			]);
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: content.finalizeText().text,
+					toolUses: [],
+					messageId: "last-message-uuid",
+				},
+				ctx,
+			);
+			const reloaded = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, savedId),
+			});
+			expect(reloaded?.messageUuid).toBe("last-message-uuid");
+			const stored = readTestMessageContent<{
+				type: string;
+				completed?: boolean;
+				providerMetadata?: unknown;
+			}>(sqlite, savedId);
+			expect(stored).toHaveLength(5);
+			expect(
+				stored.filter((block) => block.type === "text").map((block) => block.providerMetadata),
+			).toEqual(
+				content
+					.orderedContent()
+					.map((block) => (block.type === "text" ? block.providerMetadata : undefined)),
+			);
+			expect(
+				stored.filter((block) => block.type === "text").every((block) => block.completed),
+			).toBe(true);
+			const published = broadcastMessages.findLast(
+				(message) => (message as { type?: string }).type === "message",
+			) as { message: { contentJson: unknown } };
+			expect(published.message.contentJson).toEqual(stored);
+			if (!reloaded) throw new Error("Missing persisted response");
+			const { OpenAIProvider } = await import("../../lib/agent/openai-provider");
+			const provider = new OpenAIProvider({
+				id: "phase-replay",
+				name: "Phase replay",
+				prefix: "openai",
+				apiKey: "test-key",
+				baseUrl: "https://phase.test/v1",
+				defaultModel: "gpt-5",
+				apiMode: "responses",
+			});
+			const { buildAdapterHistory } = await import("../../lib/agent/history-build");
+			const rebuilt = await buildAdapterHistory(
+				provider,
+				[{ ...reloaded, role: "assistant", contentJson: stored }],
+				{ provider: "openai", model: "gpt-5" },
+			);
+			expect(rebuilt.history).toEqual([
+				{
+					role: "assistant",
+					id: "comment",
+					phase: "commentary",
+					content: [{ type: "output_text", text: "commentary" }],
+				},
+				{
+					type: "web_search_call",
+					status: "completed",
+					action: { type: "search", query: "phase" },
+				},
+				{
+					role: "assistant",
+					id: "partial",
+					phase: "partial_answer",
+					content: [
+						{ type: "output_text", text: "part 0" },
+						{ type: "output_text", text: "part 1" },
+					],
+				},
+				{
+					role: "assistant",
+					id: "final",
+					phase: "final_answer",
+					content: [{ type: "output_text", text: "final" }],
+				},
+			]);
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
+
 describe("assistant file-reference provenance", () => {
 	test("a subagent reconnect snapshot belongs to its own text context", async () => {
 		const ctx = {

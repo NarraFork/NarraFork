@@ -55,7 +55,7 @@ keywords:
   - CustomApiProviderSection
   - /providers/:id/models
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 设置页与路由
 
@@ -69,6 +69,9 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 草稿重放与保存见 `provider-settings-rebase.ts`、`provider-settings-save.ts`、`provider-create-flow.ts`。
 - 本机导入：`/api/provider-import/local/{detect,scan,resolve}`（管理员）扫描本机 claude、codex、opencode、deepseek-harness 的配置，`resolve` 一次最多 32 个 id（`local-provider-import.ts`、`shared/local-provider-import.ts`、`LocalProviderImport.tsx`）。
 - 模型列表路由：`/api/anthropic|openai|gemini|nug/models` 与 `/providers/:id/models(/refresh)` 缓存各连接发现的模型；其中 `GET /providers/:id/models` 经来源模板过滤缓存（`listCachedTemplateModels`，细节见 [模型目录与来源](../model-catalog/sourcing.md)），各路由文件在加载时用 `registerModelListReader` 登记自己的缓存读取器。NUG 另有的端点见 [网关类提供商](gateways.md)。
+- Anthropic 模型列表与 Messages 共用 `finishAnthropicHeaders`，版本 pin、显式 UA、额外头和 OpenCode 会话头规则一致；模型列表可尝试中转站不同 base 路径，host root 的成功不直接作为 Messages baseUrl 建议。
+- OpenAI 模型列表与推理使用相同的 UA 选择和不区分大小写的头合并，支持 `authorizationHeader`；动态头之后重新应用显式 UA，移除未实现的 Responses Lite 声明。`ChatGPT-Account-Id` 只在 Codex 模式且官方域名时默认加入。
+- 指纹表单的中英文 `fingerprintExtraHeadersDesc` 说明非空值覆盖、空值保留默认、显式 UA 优先；传输层认证等专用头和未支持能力仍受协议控制，不能把额外头理解成无条件覆盖所有传输字段。
 
 ## 从哪读起
 - 前端设置页入口：`frontend/routes/settings/providers.tsx`、`providers.add.tsx`、`routes/admin/providers.tsx`（TokenDance 回调路由 `providers.tokendance.callback.tsx` 见网关节点）。
@@ -77,7 +80,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 
 ## 改它时
 - 加一种提供商来源后，补 `shared/provider-readiness.ts` 的投影与前端 `provider-catalog.ts`、对应设置区块；来源注册规则见 [模型提供商](index.md)。
-- 改路由的模型缓存：保持加载时 `registerModelListReader` 登记，否则模板读不到列表。
+- 改路由的模型缓存：保持加载时 `registerModelListReader` 登记，否则模板读不到列表；`routes/__tests__/models-fallback.test.ts` 覆盖目录请求与推理请求的版本/UA/认证头一致性。
 - 改草稿保存：`provider-settings-rebase.ts` 与 `provider-settings-save.ts` 配套，同时覆盖新建流 `provider-create-flow.ts`。
 - 新增界面文案要同时加 `en` 与 `zh-CN` 的 locales。
 - 改本机导入：`resolve` 的 id 上限与管理员要求在 `routes/provider-import.ts`；扫描的新工具要同步 `shared/local-provider-import.ts`。

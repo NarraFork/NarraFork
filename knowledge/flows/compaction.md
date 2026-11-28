@@ -24,7 +24,7 @@ keywords:
   - 自动压缩
   - 上下文超长
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 一次上下文压缩
 
@@ -44,7 +44,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 7. 分支，成功：在叙述者的变更准入内 `finalizeCompactingMessage` 一个事务里把该引用置 `isCompact = 1`，写 `narrators.contextSummary`，清 `apiConversationId` 与上下文用量快照；随后重置上游会话、标记"历史压缩待应用"，广播 `message_updated`（带压缩后占用估算）与 `compact_done`。标记与摘要状态冲突时报 `COMPACT_FINALIZE_CONFLICT`。
 8. 分支，失败 / 取消 / 超时：标记被定为 failed（带原因）或还原，广播 `compact_failed`，`contextSummary` 不变。
 9. 之后的请求怎么读：`model-history-query.ts` 查最近一个 `is_compact = 1` 的 `seq` 作为游标，只读 `seq` 大于它、未被分段压缩隐藏、非 `disp` 的消息；摘要不在消息里，而是随 `contextSummary` 进入 `buildSystemPrompt`。见 [模型历史](../narrator/runtime/model-history.md)、[提示词与注入](../narrator/prompts.md)。
-10. 运行中的循环：下一次请求前，`rebuildRequestHistory` / `onBeforeTurn` 钩子重建历史与系统提示词（并 `clearActiveHistoryCompactPending`）；本轮已发出的请求不受影响。
+10. 运行中的循环：下一次请求前，`rebuildRequestHistory` / `onBeforeTurn` 钩子重建历史与系统提示词（并 `clearActiveHistoryCompactPending`）；本轮已发出的请求不受影响。同一运行的压缩/恢复 pass 继续读取 `runState.turnContext`，清会话身份或重建历史不会自行换成新用户轮次；见 [调度与执行](../narrator/runtime/orchestrator.md)。
 11. 排队消息：压缩期间用户输入只入队；每次压缩退出（成功、失败、取消、超时）都调 `drainQueuedMessagesAfterCompact` 重查队列并唤醒，见 [一轮对话](turn.md) 的排队分支。
 12. 撤回或编辑：`DELETE /:id/compact/:messageId` 只删本叙述者对该标记的引用；编辑摘要后 `refreshCompactContextPercentAfter` 重新测占用。
 

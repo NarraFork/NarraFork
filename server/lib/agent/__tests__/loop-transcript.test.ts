@@ -207,7 +207,7 @@ for (const [name, provider, model] of projectionProviders()) {
 }
 
 for (const apiMode of ["responses", "codex"] as const) {
-	test(`${apiMode}: outgoing instructions remain the baseline; update stays in input`, async () => {
+	test(`${apiMode}: outgoing baseline stays frozen; updates remain in input`, async () => {
 		const provider = new OpenAIProvider({ ...CONFIG, apiMode });
 		const requests: Array<{ input: unknown[] }> = [];
 		const originalFetch = globalThis.fetch;
@@ -252,12 +252,25 @@ for (const apiMode of ["responses", "codex"] as const) {
 			globalThis.fetch = originalFetch;
 		}
 		expect(requests).toHaveLength(3);
-		expect(requests[1]).not.toHaveProperty("instructions");
-		expect(requests[1].input[0]).toMatchObject({
-			role: "developer",
-			content: [{ type: "input_text", text: expect.stringContaining("frozen-baseline") }],
-		});
-		expect(JSON.stringify(requests[1].input[0])).not.toContain("<context_update>");
+		// Responses and Codex both carry the frozen prompt as one developer input item.
+		// Context updates must never change that item or create a second prompt lane.
+		for (const request of requests) expect(request).not.toHaveProperty("instructions");
+		expect(requests[1].input[0]).toEqual(requests[0].input[0]);
+		const baseline = requests[1].input[0] as {
+			type?: string;
+			role: string;
+			id?: string;
+			content: Array<{ type: string; text: string }>;
+		};
+		expect(baseline.role).toBe("developer");
+		expect(baseline.content).toHaveLength(1);
+		expect(baseline.content[0].type).toBe("input_text");
+		expect(baseline.content[0].text.split("frozen-baseline")).toHaveLength(2);
+		expect(JSON.stringify(baseline)).not.toContain("<context_update>");
+		if (apiMode === "codex") {
+			expect(baseline.type).toBe("message");
+			expect(baseline.id).toMatch(/^msg_nf_instructions_/);
+		}
 		expect(requests[1].input.slice(0, requests[0].input.length)).toEqual(requests[0].input);
 		expect(requests[1].input).toEqual(requests[2].input);
 		expect(JSON.stringify(requests[1].input).split("<context_update>")).toHaveLength(2);

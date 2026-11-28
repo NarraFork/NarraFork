@@ -168,7 +168,8 @@ function maskHeaderValue(value: string): string {
 	return `${value.slice(0, 4)}********${value.slice(-4)}`;
 }
 
-function jsonReplacer(_key: string, value: unknown): unknown {
+function jsonReplacer(key: string, value: unknown): unknown {
+	if (key === "turn_id" || key.toLowerCase() === "x-codex-turn-state") return "[redacted]";
 	if (value instanceof Error) {
 		return {
 			name: value.name,
@@ -193,7 +194,14 @@ export function sanitizeHeaders(
 			: Object.entries(headers).map(([key, value]) => [key, String(value)]);
 
 	return Object.fromEntries(
-		entries.map(([key, value]) => [key, isSensitiveHeader(key) ? maskHeaderValue(value) : value]),
+		entries.map(([key, value]) => [
+			key,
+			key.toLowerCase() === "x-codex-turn-state"
+				? "[REDACTED]"
+				: isSensitiveHeader(key)
+					? maskHeaderValue(value)
+					: value,
+		]),
 	);
 }
 

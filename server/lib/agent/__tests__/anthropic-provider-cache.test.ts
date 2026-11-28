@@ -252,7 +252,7 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(JSON.stringify(body)).not.toContain("cc_workload");
 		const beta = request.headers.get("anthropic-beta") ?? "";
 		expect(beta).toContain("prompt-caching-scope-2026-01-05");
-		expect(beta).toContain("mid-conversation-system-2026-04-07");
+		expect(beta).not.toContain("mid-conversation-system-2026-04-07");
 		expect(beta).toContain("context-management-2025-06-27");
 		// The fallback-credit lane is never armed here, so upstream would not
 		// declare its beta either.
@@ -291,8 +291,9 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 
 		// Stainless telemetry. The package version is the anthropic-sdk-typescript
 		// build bundled into the CLI, read from the SDK's own VERSION constant.
-		expect(request.headers.get("x-stainless-package-version")).toBe("0.112.1");
-		expect(request.headers.get("x-stainless-runtime-version")).toBe("v26.3.0");
+		expect(request.headers.get("x-stainless-package-version")).toBe("0.128.0");
+		expect(request.headers.get("x-stainless-runtime")).toBe("node");
+		expect(request.headers.get("x-stainless-runtime-version")).toBe(process.version);
 		expect(request.headers.get("x-app")).toBe("cli");
 		// The CLI mints a fresh UUID per official-API attempt and sends it here.
 		expect(request.headers.get("x-client-request-id")).toMatch(

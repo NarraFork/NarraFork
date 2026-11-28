@@ -12,6 +12,7 @@
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
+import { createProviderTurnContext } from "../codex-turn-state";
 import type { DbMessage, ProviderAdapter } from "../provider";
 import { markSenderProjected } from "../sender-projection";
 import { toolRegistry } from "../tool-registry";
@@ -23,8 +24,13 @@ let emittedTool = DECISION_TOOL_NAME;
 let decisions = 0;
 
 /** Requests the fake provider saw, in order. */
-let captured: Array<{ history: unknown[]; content: string; tools: unknown[]; identity: unknown }> =
-	[];
+let captured: Array<{
+	history: unknown[];
+	content: string;
+	tools: unknown[];
+	identity: unknown;
+	turnContext?: AgentConfig["turnContext"];
+}> = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) =>
@@ -44,6 +50,7 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		params.onRequestStart?.();
 		captured.push({
+			turnContext: params.turnContext,
 			history: JSON.parse(JSON.stringify(params.history)),
 			content: params.content,
 			tools: JSON.parse(JSON.stringify(params.tools)),
@@ -255,6 +262,28 @@ describe("reflection loop cacheable prefix", () => {
 			}
 		});
 	}
+
+	test("independent reflection calls never inherit the parent's logical turn context", async () => {
+		const parent = { ...parentConfig(), turnContext: createProviderTurnContext() };
+		captured = [];
+		for (const requestId of ["first", "second"]) {
+			await runReflectionLoop({
+				parentConfig: parent,
+				rows: parentRows(),
+				prompt: "reflect",
+				reflectionLoop: {
+					allowedTools: [DECISION_TOOL_NAME],
+					context: { kind: "taskReflection", requestId },
+				},
+			});
+		}
+		expect(captured).toHaveLength(2);
+		for (const request of captured) {
+			expect(request.turnContext).toBeDefined();
+			expect(request.turnContext).not.toBe(parent.turnContext);
+		}
+		expect(captured[0].turnContext).not.toBe(captured[1].turnContext);
+	});
 
 	test("injects the parent's system prompt exactly once", async () => {
 		captured = [];

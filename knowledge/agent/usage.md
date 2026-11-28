@@ -25,6 +25,9 @@ anchors:
   - server/lib/agent/estimate-json-tokens.ts
   - server/lib/agent/estimate-tokens.ts
   - server/lib/agent/request-dump.ts
+  - server/lib/agent/codex-turn-state.ts
+  - server/lib/agent/openai-provider.ts
+  - server/lib/agent/codex-websocket.ts
   - server/lib/agent/request-json-worker.ts
   - server/lib/agent/request-json.ts
   - server/lib/agent/request-url-tracker.ts
@@ -71,7 +74,7 @@ keywords:
   - credential-totals
   - unpricedRequestCount
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 用量与费用
 
@@ -86,7 +89,8 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - token 重算：用于把“旧的输入含缓存”的区间转成当前记账口径。`recalculateTokenCounters` 按协议扣减：anthropic 不扣；其他协议扣缓存读；openai 额外扣缓存写；任一计数非安全整数则跳过。每批 500 行、批超时 30s，按 `(created_at, id)` 游标分页，每批提交后才更新进度，取消不会撤销已提交批次，批间让出事件循环；作业在工作线程的 store 上执行，失败时已完成批次保留、重跑会跳过（`token-recalculation*.ts`）。同一时刻只有一个作业，范围用 UTC 日期。
 - 每凭证终身合计 `credential_usage_totals`（`credential-usage-totals.ts`）：按（提供商、凭证、模型）累加，由 `api-request-tracker.ts` 在明细插入成功后（重复完成不再记）调用 `recordCredentialUsage`，只记有用量且有凭证的请求；失败请求与来源未知的请求跳过。明细随叙述者删除，汇总不随之删；删除凭证才清（`deleteCredentialUsageTotals`，Codex 路由里调用），归档保留。费用是官方参考价，订阅制（如 Codex 套餐）只是等价消耗，`unpricedRequestCount` 记录无价格的请求数。读取走 `GET /api/usage-history/credential-totals?provider=`（Codex 另有 `/api/codex/credentials/usage-stats` 与 `/:id/usage-stats`）；`listProviderCredentialTotals` / `getCredentialUsageTotals` 是 async，在读 Worker 上执行（`executionPolicy: "worker-required"`，Worker 不可用即失败，不回主线程）。
 - 参考价（`model-pricing.ts`）取自模型卡，缺失或显式未知为 null，只有写明十进制 0 才算免费，不会改写 NUG 计费；非 token 维度（图片、音视频秒数、字符数、原生搜索次数）由 `reference-usage-cost.ts` 另行估算，只加不改 `usage-tracking.ts` 已记的 token。
-- 请求录制（`request-recorder*.ts`）：录制环（请求/响应字节窗口默认 16MiB/128MiB，`settings.requestEvidence` 的 `ringEnabled`、`ringRequestBytes`、`ringResponseBytes`、`autoPin: off|errors|all`）在工作线程里写盘，排队 ≤4MiB、记录 ≤2048 条、保存 ≤10000 条、归档 ≤512MiB、下载租约 120s 且同时最多 4 个。路由挂在 `/api/narrators/:id/request-recordings`（`POST /` 保存当前环、`GET /` 列出已保存（limit 1–100，默认 20）、`GET /requests/:requestId` 取详情、`POST /requests/:requestId` 保存指定请求、`DELETE /:saveId`、`GET /:saveId/download`，`routes/request-recordings.ts`，需登录）；元数据与 URL 会清洗，body 保留原样作证据。提供商侧的内存捕获在 `agent/request-dump.ts`（错误体前缀默认 1MB，硬上限 32MB）。
+- 请求录制（`request-recorder*.ts`）：录制环（请求/响应字节窗口默认 16MiB/128MiB，`settings.requestEvidence` 的 `ringEnabled`、`ringRequestBytes`、`ringResponseBytes`、`autoPin: off|errors|all`）在工作线程里写盘，排队 ≤4MiB、记录 ≤2048 条、保存 ≤10000 条、归档 ≤512MiB、下载租约 120s 且同时最多 4 个。路由挂在 `/api/narrators/:id/request-recordings`（`POST /` 保存当前环、`GET /` 列出已保存（limit 1–100，默认 20）、`GET /requests/:requestId` 取详情、`POST /requests/:requestId` 保存指定请求、`DELETE /:saveId`、`GET /:saveId/download`，`routes/request-recordings.ts`，需登录）；元数据与 URL 会清洗，正文通常保留，但 Codex 临时轮次身份另作脱敏。提供商侧的内存捕获在 `agent/request-dump.ts`（错误体前缀默认 1MB，硬上限 32MB）。
+- Codex 证据中的 `x-codex-turn-state` 头全值遮蔽，`request-dump.ts` 的结构化快照序列化也遮蔽 `turn_id` 与路由 token。HTTP/WS 请求只复制小型 `client_metadata` 脱敏后再交有界 Worker 编码；实际出站正文不变。成功 Codex HTTP 响应按解码后的 SSE 帧脱敏录制（`bodyRecording: redacted_sse_frames`），WS 按消息边界脱敏；保留普通用户文本，能识别大小写/Unicode 转义键和数字 token（`codex-turn-state.ts`、`openai-provider.ts`、`codex-websocket.ts`）。
 - 额度（余额/套餐窗口）不在这里：见 [供应商余额与额度](provider-quota.md)。
 - 实时输出速率：`output-stats.ts` 记录每个流式块的字符数，3 秒滑动窗口算 chars/sec，每秒向订阅的 WebSocket 客户端广播（`useOutputStats.ts` 消费）。
 - token 估算 `estimate-tokens.ts` 是保守的字符启发式（ASCII 约 0.3、CJK 约 0.6 token/字符，偏高估），`estimate-json-tokens.ts` 不物化整个 JSON 串就估算；仅用于显示与预算，不用于记账。
@@ -103,6 +107,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - schema 变更同步数据导入导出（`server/services/data-portability.ts`，`data-portability*.test.ts`）。
 - 重算作业只能在工作线程的 store 上跑，工作线程不可用时失败而不是回到主线程（`tests/worker-main-thread-fallback.guard.test.ts` 会扫描遗留的回退标识）。
 - 测试：`usage-daily.test.ts`、`usage-history-service.test.ts`、`token-recalculation*.test.ts`、`credential-usage-totals.test.ts`。
+- 改请求证据脱敏：同时检查 `agent/__tests__/request-dump.test.ts`、`codex-turn-state.test.ts`、`codex-websocket-recovery.test.ts`；不能把证据替换应用到实际线上正文，也不能通过脱敏重新串行化整个响应来改写普通用户文本。
 
 ## 相关
 - [供应商余额与额度](provider-quota.md)

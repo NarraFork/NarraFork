@@ -150,7 +150,7 @@ test("Responses strip-and-retry reuses the already serialized large tool fragmen
 		requests.push(JSON.parse(String(init?.body)));
 		dispatched = true;
 		if (requests.length === 1)
-			return new Response('{"detail":"Unsupported parameter: max_output_tokens"}', { status: 400 });
+			return new Response('{"detail":"Unsupported parameter: prompt_cache_key"}', { status: 400 });
 		return new Response('data: {"type":"response.completed","response":{"output":[]}}\n\n', {
 			headers: { "content-type": "text/event-stream" },
 		});
@@ -179,7 +179,9 @@ test("Responses strip-and-retry reuses the already serialized large tool fragmen
 	}
 	expect(requests).toHaveLength(2);
 	expect(requests[0].max_output_tokens).toBe(123);
-	expect(requests[1]).not.toHaveProperty("max_output_tokens");
+	expect(requests[1].max_output_tokens).toBe(123);
+	expect(requests[0].prompt_cache_key).toBe("retry-json");
+	expect(requests[1]).not.toHaveProperty("prompt_cache_key");
 	expect(dump.lastRequestBody()).toEqual(requests[1]);
 	expect(requests[1].tools).toEqual(requests[0].tools);
 	expect(requests[1].input).toEqual(requests[0].input);

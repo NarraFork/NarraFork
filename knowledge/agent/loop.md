@@ -58,11 +58,11 @@ keywords:
   - 首 token 超时
   - tool-output 截断
 status: draft
-verified_at: 878917e97
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # Agent Loop
 
-叙述者的一次响应由 `agentLoop`（异步生成器，产出 `AgentEvent`）驱动：按轮（turn）向模型发请求、流式解析、执行工具，直到模型不再调用工具或达到上限。它不负责持久化，持久化由宿主根据产出的事件完成。
+叙述者的一次响应由 `agentLoop`（异步生成器，产出 `AgentEvent`）驱动：按轮（turn）向模型发请求、流式解析、执行工具，直到既无工具调用也无显式续写要求，或达到上限。它不负责持久化，持久化由宿主根据产出的事件完成。
 
 ## 关键规则
 - 轮数上限取 `min(config.maxTurns ?? settings.agent.maxTurns, 搜索执行域剩余轮数)`，默认设置为 1000（`loop.ts:agentLoopInMetadataSnapshot`、`settings/defaults.ts`）。外层 `turnLoop` 每轮先检查 abort 和 guidance 信号。
@@ -73,6 +73,9 @@ verified_at: 878917e97
 - 反思循环（危险操作、ExitPlanMode、任务状态变更）由 `runReflectionLoop` 以嵌套的 `agentLoop` 运行，`maxTurns` 被钳在 1–2，复用父请求的行以保持缓存前缀。
 - 重试（`loop.ts` 的 `chatRetryCount` 循环）：仅无状态提供商在循环内重试同一次 `provider.chat()`；有状态模型（`usesStatefulModel`）或本轮已有图片生成时 `getMaxChatRetries()` 为 0，由外层运行时重放。重试次数来自 `config.maxTransientRetries`（-1 表示无限），退避上限默认 20s。是否可重试由 `error-handling.ts:isRetryableError` 判定：策略违规（policy violation）与 TokenDance 恢复动作一律不重试，排在自定义重试规则之前。
 - 空响应：默认最多重放 3 次；上游已确认服务过的 `usage_only` / `stop_without_content` 只重放 1 次（`loop.ts:maxEmptyResponseRetriesFor`）。畸形请求重放上限 2 次（`MAX_MALFORMED_REPLAYS`）。
+- 结构化 refusal（流内 `invalidState.reason === "refusal"` 或同原因的 `ProviderInvalidStateError`）直接收尾：排空已启动的工具结果、保存已有部分输出与请求用量，再发 `invalid_state`；不启动排队工具，不进入空响应、畸形请求或普通重试分支。辅助调用可通过错误的 `usage` 携带已经收到的计费数据。
+- 只有原生布尔 `end_turn: false` 要求无工具的成功响应继续下一次请求；循环把已有输出按正常 transcript 路径追加并增加 turnIndex，仍检查停止与轮数上限。无内容的中间响应不创建空 assistant 行，也不触发空响应或只推理重试。`phase: final_answer` 与 `response.completed` 本身不等于逻辑轮次结束；有工具时仍走工具结算。
+- `turnContext` 在同一逻辑用户轮次的工具续写与重试间保持；无宿主的直接循环创建一个 fallback，反思循环另建对象，不继承父路由 token。宿主采纳新输入时的轮换见 [调度与执行](../narrator/runtime/orchestrator.md)。
 - 按需计划反思：`executeToolAfterReflections` 在 ExitPlanMode 走「本次不反思」分支（且非反思循环内）时，把 `createPendingPlanReflectionRunner` 生成的运行器按 narrator + tool_use 注册到 `pending-plan-reflection.ts`，审批等待结束即注销（闭包持有本轮 `config`/`rows`）。
 - 运行器 `runPendingExitPlanReflection`：只用审批卡已解析的输入；无法形成决策时交回人工（`handOverExitPlanReflection`），不 fail-closed 驳回；等待先被人工决定或本轮中止时，`discardExitPlanReflection` 丢弃合成 gate、不落库覆盖真实记录；登记的 gate 带 `onDemand: true`，审查过程不写 `narrator_tool_calls` 行（那一行仍是人的待批审批），结论只经 `resolvePermission` 落到该行，详见[反思门](../security/tool-permissions/reflection.md)。
 - 辅助 AI 调用（摘要、标题、反思等）的重试次数被硬限在 10（`error-handling.ts:getAuxiliaryMaxRetries`）。
@@ -84,7 +87,7 @@ verified_at: 878917e97
 - `server/lib/agent/history-build.ts`、`loop-transcript.ts`：历史构造。
 - `server/lib/agent/__tests__/loop-*.test.ts`：按行为拆分的循环测试（重试、空响应、反思、并行预检、工具结算等）。
 - 流式与超时：`stream-progress.ts` 记录一次流式尝试的传输层进度，只用于说明卡在哪个阶段（`no_response_headers` / `headers_only` / `heartbeat_only` / `unparsed_data`），心跳不会延长任何计时器；`stream-timeout.ts`（实现在 `shared/stream-timeout.ts`）给读取加空闲超时与字节预算；`generate-first-token-timeout.ts` 只限制等首个输出的时间，不限整个生成；`stream-wakeups.ts:interleaveWakeups` 让循环在提供商事件之间也能处理中途启动的工具的结算。
-- 流内容整理：`output-content.ts` 按车道累积输出（原生标识只在请求内有效，`outputIndex` 只是顺序）；`tool-input-stream.ts` 按 UTF-16 偏移增量解码工具入参字段；`citation-stream.ts` / `strip-citation-markers.ts` 与 `shared/citations.ts` 处理助手文本的来源引用（结构化注释与旧的文本标记两种来源，送模型前剥离旧标记）；`tool-use-id-dedup.ts` 保证历史里 tool_use id 唯一且字符集合法（`^[a-zA-Z0-9_-]+$`，跨提供商重放不被拒）。
+- 流内容整理：`output-content.ts` 按车道累积输出（车道标识只在请求内有效，`outputIndex` 只是顺序）；Responses 原生 item/part/phase 另外放在文本 `providerMetadata` 中持久化重放，元数据晚到时只在真实变化后发布新修订；`tool-input-stream.ts` 按 UTF-16 偏移增量解码工具入参字段；`citation-stream.ts` / `strip-citation-markers.ts` 与 `shared/citations.ts` 处理助手文本的来源引用（结构化注释与旧的文本标记两种来源，送模型前剥离旧标记）；`tool-use-id-dedup.ts` 保证历史里 tool_use id 唯一且字符集合法（`^[a-zA-Z0-9_-]+$`，跨提供商重放不被拒）。
 - 重试相关：`retry-after.ts` 解析 `retry-after-ms`、`retry-after`、`ratelimit-reset`、`x-ratelimit-reset*` 等时间提示，只回答「何时可重试」，不判断是否瞬时；`abortable-sleep.ts` 是所有退避共用的可中断睡眠；`malformed-request.ts` 识别上游不透明的「请求畸形」并生成结构摘要；`error-diagnostics.ts` 与 `diagnostic-fetch.ts` 提供有界的错误诊断与连接密钥脱敏；`execution-timeout.ts` 里 0/缺省表示无墙钟期限，显式期限分块调度（单个 setTimeout 有 32 位上限）。
 - 工具输出截断：`truncate.ts` 默认最多 2000 行 / 50KB，超出的完整输出落到临时目录 `narrafork-tool-output`，并有启动清理。
 - 类型：`types.ts` 是 `AgentEvent`、`ApiError`、`ToolContext` 等宿主侧类型的汇集（协议部分的定义在 `shared/agent-protocol/types.ts`）。设置页 `frontend/components/settings/AgentSection.tsx` 编辑 `settings.agent` 的最大轮数等项。
@@ -96,7 +99,7 @@ verified_at: 878917e97
 - 改历史投影要同时看 `history-build.ts` 与各适配器的 `buildHistory`；`loop-transcript.ts` 的内存行必须与数据库行同形，不要另造一套历史构造。
 - 工具并行规则的单一来源是 `shared/tool-parallel-groups.ts`，改它要跑 `tool-execution-groups.test.ts` 与 `loop-*` 并行预检测试。
 - 任何新增的主线程长耗时（压缩、哈希、大 JSON 序列化）按仓库规则放工作线程，且工作线程失败不得回退主线程（`tests/worker-main-thread-fallback.guard.test.ts` 扫描遗留的回退标识）。
-- 测试：`agent/__tests__/loop-*.test.ts`、`tool-execution-groups.test.ts`、`tool-use-id-dedup.test.ts`、`error-handling.test.ts`、`retry-after.test.ts`。
+- 测试：`agent/__tests__/loop-*.test.ts`、`tool-execution-groups.test.ts`、`tool-use-id-dedup.test.ts`、`error-handling.test.ts`、`retry-after.test.ts`；同轮续写、拒绝终止和文本元数据重点看 `loop-content-persistence.test.ts`、`loop-provider-invalid-state.test.ts`、`loop-reflection-cache-prefix.test.ts`、`output-content.test.ts`。
 
 ## 相关
 - [模型提供商](providers/index.md)

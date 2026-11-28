@@ -1,8 +1,60 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { logger } from "../../logger";
-import { countInputCharacters, reportInputCharacters } from "../input-characters";
+import { applyCodexInstructionsInput, createCodexRequestIdentity } from "../codex-request";
+import {
+	countInputCharacters,
+	markRuntimeSystemMessage,
+	reportInputCharacters,
+} from "../input-characters";
 
 describe("complete logical input characters", () => {
+	for (const source of ["runtime-prefix", "empty", "historical-only"] as const) {
+		test(`Codex instruction migration preserves ${source} counts and composition`, async () => {
+			const runtime = markRuntimeSystemMessage({ role: "developer", content: "fixed" });
+			const historical = { role: "system", content: "historical" };
+			const history =
+				source === "runtime-prefix"
+					? [runtime, historical]
+					: source === "empty"
+						? []
+						: [historical];
+			const instructions =
+				source === "runtime-prefix"
+					? "fixed\n\nhistorical"
+					: source === "empty"
+						? ""
+						: "historical";
+			const body: Record<string, unknown> = {
+				instructions,
+				input: [{ role: "user", content: "question" }],
+				tools: [{ type: "function", name: "Read" }],
+			};
+			const counts: unknown[] = [];
+			const params = {
+				history,
+				signal: new AbortController().signal,
+				onInputCharacters(value: unknown) {
+					counts.push(value);
+				},
+			};
+			await reportInputCharacters(params, body);
+			applyCodexInstructionsInput(body, createCodexRequestIdentity("count-session"));
+			await reportInputCharacters(params, body);
+			expect(counts[1]).toEqual(counts[0]);
+			expect(counts[1]).toMatchObject({
+				systemChars: source === "runtime-prefix" ? 5 : 0,
+			});
+			expect(
+				(
+					await countInputCharacters(body, undefined, {
+						includeComposition: true,
+						instructionsFixedChars: 0,
+					})
+				)?.systemChars,
+			).toBe(0);
+		});
+	}
+
 	test("composition follows final wire text and protocol ownership in traversal order", async () => {
 		const wireText = 'line\n"quoted"😀';
 		const call = { name: "tool", arguments: { _text: wireText } };

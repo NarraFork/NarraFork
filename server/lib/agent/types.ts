@@ -15,6 +15,7 @@ import type {
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
+import type { ProviderTurnContext } from "./codex-turn-state";
 import type { PathFlavor } from "./execution/backend";
 import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
@@ -881,6 +882,7 @@ export type ContentBlock =
 	| {
 			type: "text";
 			text: string;
+			providerMetadata?: import("@shared/agent-protocol/types").TextProviderMetadata;
 			outputIndex?: number;
 			/** Display/persistence identity, never an upstream replay credential. */
 			id?: string;
@@ -1037,6 +1039,8 @@ export interface AgentHistoryReplacement {
 }
 
 export interface AgentConfig {
+	/** In-memory logical user turn. Retry/compact passes share it; independent inputs replace it. */
+	turnContext?: ProviderTurnContext;
 	/** Prepare and pin numeric classification within a bounded, cancellable pre-transport budget. */
 	freezeContextComposition?: (
 		counts: import("@shared/context-usage").ContextInputCharacters | null,

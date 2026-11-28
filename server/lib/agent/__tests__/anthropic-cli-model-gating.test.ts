@@ -11,8 +11,8 @@
  *
  *   - `temperature` is refused by every in-scope Claude, and only third-party
  *     relay ids still receive it.
- *   - `role: "system"` turns need `mid-conversation-system-2026-04-07`, which
- *     Opus 4.7 does not have, so the message must be downgraded there.
+ *   - `role: "system"` remains model-gated despite the retired GA beta header;
+ *     Opus 4.7 still needs the existing message downgrade.
  *   - the Claude Code beta is withheld from Haiku by name, and the 1M-context
  *     and effort betas track NarraFork's own capability answers.
  *
@@ -201,15 +201,15 @@ describe("the effort beta tracks the user's blocklist", () => {
 	});
 });
 
-describe("mid-conversation system messages track their beta", () => {
+describe("mid-conversation system capability stays gated after beta retirement", () => {
 	test.each([
 		"claude-opus-4-8",
 		"claude-opus-5",
 		"claude-sonnet-5",
 		"claude-mythos-5",
-	])("%s keeps the system role and declares the beta", async (model) => {
+	])("%s keeps the system role without the retired beta", async (model) => {
 		const { betas, body } = await send(model, "high", { midConversationSystem: true });
-		expect(betas).toContain("mid-conversation-system-2026-04-07");
+		expect(betas).not.toContain("mid-conversation-system-2026-04-07");
 		const messages = body.messages as WireMessage[];
 		expect(messages.some((message) => message.role === "system")).toBe(true);
 		expect(JSON.stringify(body)).toContain(MID_CONVERSATION_SYSTEM);

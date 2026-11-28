@@ -7,19 +7,22 @@
  *
  * Locks the outbound HTTP chat request against the shared stable contract.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import type { RecordingRequest, RequestRecording } from "@shared/request-recording";
+import { logger } from "../../logger";
+import type { OpenAIProviderConfig } from "../../settings";
 import { ORIGINATOR, ORIGINATOR_CODEX } from "../../user-agent";
-import { OpenAIProvider } from "../openai-provider";
+import { createProviderTurnContext } from "../codex-turn-state";
+import type { CodexResponsesRequestBody } from "../codex-websocket";
+import { type OAIMessage, OpenAIProvider } from "../openai-provider";
+import type { ChatParams } from "../provider";
+import { ApiRequestDumpCollector } from "../request-dump";
+import { StreamProgress } from "../stream-progress";
 
 type Captured = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
 
-async function captureChat(
-	overrides: {
-		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
-		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
-	} = {},
-): Promise<Captured> {
-	const provider = new OpenAIProvider({
+function createProvider(overrides: Partial<OpenAIProviderConfig> = {}) {
+	return new OpenAIProvider({
 		id: "codex",
 		name: "Codex",
 		prefix: "codex",
@@ -27,36 +30,35 @@ async function captureChat(
 		baseUrl: "https://chatgpt.com/backend-api/codex",
 		defaultModel: "gpt-5.3-codex",
 		apiMode: "codex",
+		...overrides,
+	});
+}
+
+async function captureChat(
+	overrides: {
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+		config?: Partial<OpenAIProviderConfig>;
+		chat?: Partial<ChatParams>;
+	} = {},
+): Promise<Captured> {
+	const provider = createProvider({
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: overrides.userAgentMode ?? "codex",
-		// biome-ignore lint/suspicious/noExplicitAny: test config subset
-	} as any);
+		...overrides.config,
+	});
 
 	let captured: Captured | undefined;
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-		const headers: Record<string, string> = {};
-		const raw = init?.headers;
-		if (raw instanceof Headers) {
-			raw.forEach((v, k) => {
-				headers[k.toLowerCase()] = v;
-			});
-		} else if (Array.isArray(raw)) {
-			for (const [k, v] of raw) headers[String(k).toLowerCase()] = String(v);
-		} else {
-			for (const [k, v] of Object.entries((raw ?? {}) as Record<string, string>)) {
-				headers[k.toLowerCase()] = v;
-			}
-		}
 		captured = {
 			url: String(input),
-			headers,
+			headers: Object.fromEntries(new Headers(init?.headers)),
 			body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
 		};
 		const sse = 'data: {"type":"response.completed","response":{"output":[]}}\n\n';
 		return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
-		// biome-ignore lint/suspicious/noExplicitAny: fetch stub
-	}) as any;
+	}) as typeof fetch;
 
 	try {
 		for await (const _event of provider.chat({
@@ -69,6 +71,7 @@ async function captureChat(
 			toolResults: [],
 			signal: new AbortController().signal,
 			reasoningEffort: overrides.reasoningEffort ?? "high",
+			...overrides.chat,
 		})) {
 			// Drain the stream so the request completes.
 		}
@@ -108,22 +111,269 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
+	/** Non-lite retains top-level tools; empty base instructions create no prefix. */
 	test("does not claim the responses-lite contract while sending a non-lite body", async () => {
 		const req = await captureChat();
-
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 		expect(req.body.tools).toBeDefined();
-		expect(req.body).not.toHaveProperty("instructions");
-		expect((req.body.input as unknown[])[0]).toMatchObject({
-			role: "developer",
-			content: [{ type: "input_text", text: expect.stringContaining("NarraFork Narrator") }],
+		expect(req.body.instructions).toBeUndefined();
+		expect(req.body.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+		]);
+	});
+
+	test("HTTP and WS share the same stable instruction prefix without losing tools", async () => {
+		const chat: Partial<ChatParams> = {
+			history: [
+				{ role: "developer", content: "runtime" },
+				{ role: "system", content: "old" },
+			],
+			tools: [{ type: "function", name: "Read", parameters: { type: "object" } }],
+		};
+		const req = await captureChat({ chat });
+		const provider = createProvider({ apiKey: "test", baseUrl: "https://example.invalid" });
+		const ws = (
+			provider as unknown as {
+				buildCodexWebSocketRequest(params: ChatParams): CodexResponsesRequestBody;
+			}
+		).buildCodexWebSocketRequest({
+			conversationId: "conv-http-1",
+			content: "hello",
+			model: "codex:gpt-5.3-codex",
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+			reasoningEffort: "high",
+			...chat,
 		});
+		expect(ws.instructions).toBeUndefined();
+		expect(ws.input).toEqual(req.body.input as OAIMessage[]);
+		expect(ws.tools).toEqual(req.body.tools);
+		expect(
+			(ws.input as Array<{ role?: string }>).filter((item) => item.role === "developer"),
+		).toHaveLength(1);
+	});
+
+	test("records split metadata frames without leaking turn tokens or changing business text", async () => {
+		const token = "private-routing-token-from-metadata";
+		const laterToken = "ignored-later-routing-token";
+		const text =
+			'正文中的 {"x-codex-turn-state":"public-example","turn_id":"user-text"} 不应脱敏。';
+		const turnContext = createProviderTurnContext();
+		const requests: RecordingRequest[] = [];
+		const metas: Record<string, unknown>[] = [];
+		const chunks: string[] = [];
+		const wireHeaders: Headers[] = [];
+		const wireBodies: Array<{ client_metadata?: { turn_id?: string } }> = [];
+		const recording: RequestRecording = {
+			requestId: "codex-redacted-sse",
+			request: (request) => requests.push(request),
+			responseMeta: (meta) => metas.push(meta),
+			responseChunk: (chunk) =>
+				chunks.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)),
+			frame: () => {},
+			pin: () => {},
+			finish: () => {},
+		};
+		const dump = new ApiRequestDumpCollector(recording);
+		const streamProgress = new StreamProgress();
+		const provider = createProvider();
+		const bytes = new TextEncoder().encode(
+			": keepalive\r\n\r\n" +
+				`event: response.metadata\ndata: ${JSON.stringify({ headers: { "X-Codex-Turn-State": token } })}\n\n` +
+				`data: ${JSON.stringify({ type: "response.metadata", headers: { "x-codex-turn-state": laterToken } })}\n\n` +
+				`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+				'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n',
+		);
+		let cancellations = 0;
+		const realFetch = globalThis.fetch;
+		const debug = spyOn(logger, "debug").mockImplementation(() => {});
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			wireHeaders.push(new Headers(init?.headers));
+			wireBodies.push(JSON.parse(String(init?.body)));
+			let offset = 0;
+			return new Response(
+				new ReadableStream<Uint8Array>(
+					{
+						pull(controller) {
+							if (offset >= bytes.length) throw new Error("read after response.completed");
+							controller.enqueue(bytes.subarray(offset, offset + 7));
+							offset += 7;
+						},
+						cancel() {
+							cancellations++;
+						},
+					},
+					{ highWaterMark: 0 },
+				),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		}) as unknown as typeof fetch;
+		try {
+			for (let attempt = 0; attempt < 2; attempt++) {
+				let output = "";
+				for await (const event of provider.chat({
+					conversationId: "redacted-http",
+					content: "hello",
+					model: "codex:gpt-5.3-codex",
+					cwd: process.cwd(),
+					history: [],
+					tools: [],
+					toolResults: [],
+					signal: new AbortController().signal,
+					turnContext,
+					requestDump: dump,
+					streamProgress,
+				}))
+					output += event.text ?? "";
+				expect(output).toBe(text);
+				expect(streamProgress.snapshot()).toMatchObject({
+					tracked: true,
+					statusCode: 200,
+					bytes: bytes.length,
+					heartbeats: 1,
+					dataLines: 5,
+				});
+			}
+			const evidence = JSON.stringify({ requests, metas, chunks, logs: debug.mock.calls });
+			expect(evidence).not.toContain(token);
+			expect(evidence).not.toContain(laterToken);
+			expect(evidence).not.toContain(turnContext.id);
+			expect(chunks.join("")).toContain(JSON.stringify(text));
+			expect(chunks.join("")).toContain('"X-Codex-Turn-State":"[REDACTED]"');
+			expect(wireHeaders[0].get("x-codex-turn-state")).toBeNull();
+			expect(wireHeaders[1].get("x-codex-turn-state")).toBe(token);
+			expect(wireBodies.map((body) => body.client_metadata?.turn_id)).toEqual([
+				turnContext.id,
+				turnContext.id,
+			]);
+			expect(requests[1].headers?.["x-codex-turn-state"]).toBe("[REDACTED]");
+			expect(Object.assign({}, ...metas)).toMatchObject({
+				bodyIncomplete: false,
+				bodyRecording: "redacted_sse_frames",
+			});
+			expect(cancellations).toBe(2);
+		} finally {
+			debug.mockRestore();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("incomplete metadata stays redacted in evidence and malformed-stream diagnostics", async () => {
+		const tokenPrefix = "unfinished-private-routing-token";
+		const chunks: string[] = [];
+		const metas: Record<string, unknown>[] = [];
+		const dump = new ApiRequestDumpCollector({
+			requestId: "codex-incomplete-metadata",
+			request: () => {},
+			responseMeta: (meta) => metas.push(meta),
+			responseChunk: (chunk) => chunks.push(String(chunk)),
+			frame: () => {},
+			pin: () => {},
+			finish: () => {},
+		});
+		const realFetch = globalThis.fetch;
+		const debug = spyOn(logger, "debug").mockImplementation(() => {});
+		globalThis.fetch = (async () =>
+			new Response(
+				`event: response.metadata\ndata: {"headers":{"x-codex-turn-state":"${tokenPrefix}`,
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+		try {
+			const provider = createProvider();
+			const events = [];
+			for await (const event of provider.chat({
+				conversationId: "incomplete-metadata",
+				content: "hello",
+				model: "codex:gpt-5.3-codex",
+				cwd: process.cwd(),
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+				requestDump: dump,
+			}))
+				events.push(event);
+			expect(
+				events.some(
+					(event) => event.invalidState?.reason === "stream_closed_before_response_completed",
+				),
+			).toBe(true);
+			expect(JSON.stringify({ chunks, metas, events, logs: debug.mock.calls })).not.toContain(
+				tokenPrefix,
+			);
+			expect(chunks.join("")).toContain("[REDACTED]");
+		} finally {
+			debug.mockRestore();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("native developer content and additional_tools stay in input without a synthetic prefix", async () => {
+		const developerItem = {
+			type: "message",
+			role: "developer",
+			id: "msg_supplied",
+			content: [{ type: "input_text", text: "supplied in position" }],
+		};
+		const toolsItem = {
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "Read", parameters: { type: "object" } }],
+		};
+		for (const apiMode of ["responses", "codex"] as const) {
+			const { body } = await captureChat({
+				config: { apiMode },
+				chat: { history: [developerItem, toolsItem] },
+			});
+			expect(body).not.toHaveProperty("instructions");
+			expect(body.input).toEqual([
+				developerItem,
+				toolsItem,
+				{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			]);
+		}
+	});
+
+	test("ordinary Responses keeps upstream's cacheable developer instruction prefix", async () => {
+		const req = await captureChat({
+			config: { apiMode: "responses" },
+			chat: { history: [{ role: "developer", content: "ordinary instructions" }] },
+		});
+		expect(req.body.instructions).toBeUndefined();
+		expect(req.body.input).toEqual([
+			{ role: "developer", content: [{ type: "input_text", text: "ordinary instructions" }] },
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+		]);
+	});
+
+	test("final headers apply case-insensitive fingerprint and dynamic overrides", async () => {
+		const req = await captureChat({
+			config: {
+				extraHeaders: {
+					"USER-AGENT": "static-client",
+					"content-type": "static/type",
+					authorization: "Bearer static",
+				},
+				dynamicHeaders: () => ({
+					"uSeR-aGeNt": "dynamic-client",
+					"CONTENT-TYPE": "dynamic/type",
+					Authorization: "Bearer dynamic",
+					"X-OpenAI-Internal-Codex-Responses-Lite": "true",
+				}),
+			},
+		});
+		expect(req.headers["user-agent"]).toBe("static-client");
+		expect(req.headers["content-type"]).toBe("dynamic/type");
+		expect(req.headers.authorization).toBe("Bearer dynamic");
+		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 	});
 
 	test("correlates the conversation identity across headers and body", async () => {
 		const req = await captureChat();
 		const clientMetadata = req.body.client_metadata as Record<string, string>;
-
 		expect(req.headers["session-id"]).toBe("conv-http-1");
 		expect(req.headers["thread-id"]).toBe("conv-http-1");
 		expect(req.body.prompt_cache_key).toBe("conv-http-1");

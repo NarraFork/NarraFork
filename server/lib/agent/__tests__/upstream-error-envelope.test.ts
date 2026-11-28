@@ -644,6 +644,84 @@ describe("end to end through a real SSE stream", () => {
 		expect(message).not.toContain("No Responses API events were parsed");
 	});
 
+	for (const apiMode of ["responses", "completions"] as const) {
+		test(`${apiMode} preserves event-only multiline error envelopes and cancels without flushing tools`, async () => {
+			let canceled = false;
+			const originalFetch = globalThis.fetch;
+			globalThis.fetch = (async () =>
+				new Response(
+					new ReadableStream<Uint8Array>(
+						{
+							start(controller) {
+								const tool =
+									apiMode === "responses"
+										? {
+												type: "response.output_item.added",
+												output_index: 0,
+												item: { type: "function_call", call_id: "pending", name: "Write" },
+											}
+										: {
+												choices: [
+													{
+														delta: {
+															tool_calls: [
+																{ index: 0, id: "pending", function: { name: "Write" } },
+															],
+														},
+													},
+												],
+											};
+								controller.enqueue(
+									new TextEncoder().encode(
+										`data:${JSON.stringify(tool)}\r\n\r\nevent:error\r\ndata:{"message":"failure from event header",\r\ndata:"statusCode":503}\r\n\r\n`,
+									),
+								);
+							},
+							pull() {
+								throw new Error("read after error frame");
+							},
+							cancel() {
+								canceled = true;
+							},
+						},
+						{ highWaterMark: 0 },
+					),
+					{ headers: { "content-type": "text/event-stream" } },
+				)) as unknown as typeof fetch;
+			try {
+				const provider = new OpenAIProvider({
+					id: "frame-error",
+					name: "frame-error",
+					prefix: "openai",
+					apiKey: "test",
+					baseUrl: "https://example.invalid",
+					defaultModel: "gpt-5",
+					apiMode,
+				});
+				const events: ParsedStreamEvent[] = [];
+				for await (const event of provider.chat({
+					conversationId: "frame-error",
+					content: "prompt",
+					model: "gpt-5",
+					cwd: ".",
+					history: [],
+					tools: [],
+					toolResults: [],
+					signal: new AbortController().signal,
+				}))
+					events.push(event);
+				expect(events.at(-1)?.invalidState).toMatchObject({
+					message: "failure from event header",
+					diagnostics: { statusCode: 503 },
+				});
+				expect(events.some((event) => event.toolUseChunk?.stop || event.toolUses)).toBe(false);
+				expect(canceled).toBe(true);
+			} finally {
+				globalThis.fetch = originalFetch;
+			}
+		});
+	}
+
 	test("a typed error frame still reaches the user unchanged", async () => {
 		const message = await failureTextFor(
 			'data: {"type":"error","error":{"message":"canonical failure","code":"server_error"}}\n\n',

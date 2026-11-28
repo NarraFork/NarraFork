@@ -91,8 +91,8 @@ export function buildOpencodeSessionHeader(options: {
 	extraHeaders?: Record<string, string>;
 }): Record<string, string> {
 	if (!isOpencodeEndpoint(options.baseUrl)) return {};
-	const alreadySet = Object.keys(options.extraHeaders ?? {}).some(
-		(key) => key.toLowerCase() === OPENCODE_SESSION_HEADER,
+	const alreadySet = Object.entries(options.extraHeaders ?? {}).some(
+		([key, value]) => key.toLowerCase() === OPENCODE_SESSION_HEADER && !!value,
 	);
 	if (alreadySet) return {};
 	const id = options.conversationId

@@ -1,6 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
+import {
+	ANTHROPIC_PUBLIC_BASE_URL,
+	finishAnthropicHeaders,
+} from "../lib/agent/anthropic-api-version";
+import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
 import {
 	captureModelOptionsArray,
@@ -20,6 +25,7 @@ import {
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
 import { getServiceTemplate } from "../lib/sourcing/templates";
+import { getHttpClaudeCliUserAgent, resolveHttpUserAgent } from "../lib/user-agent";
 
 export const anthropicRoutes = new Hono();
 
@@ -153,19 +159,13 @@ interface FetchAnthropicModelsResult {
 /**
  * Fetch the model list for an Anthropic-compatible provider.
  *
- * Background: the official Anthropic Messages API has **no model-list
- * endpoint** — `GET /v1/models` is an OpenAI convention. Third-party relays
- * that speak the Anthropic protocol therefore expose their model list at the
- * OpenAI-style `/v1/models` path, which often lives at the host root rather
- * than under the Anthropic messages base path. For example xiaomi serves
- * messages at `https://host/anthropic/v1` but its model list at
- * `https://host/v1/models`. Because of this we try a series of candidate base
- * URLs (including the host origin) until one returns a valid list.
+ * Anthropic exposes GET /v1/models. Some compatible relays expose it on a
+ * different base path from Messages, so keep the existing candidate order.
  */
 export async function fetchAnthropicModels(
 	config: AnthropicProviderConfig,
 ): Promise<FetchAnthropicModelsResult> {
-	const baseUrl = (config.baseUrl || "https://api.anthropic.com/v1").replace(/\/+$/, "");
+	const baseUrl = (config.baseUrl || ANTHROPIC_PUBLIC_BASE_URL).replace(/\/+$/, "");
 
 	if (!config.apiKey) {
 		throw new Error(`Anthropic API key not configured for provider "${config.name}"`);
@@ -173,13 +173,19 @@ export async function fetchAnthropicModels(
 
 	// Official API uses Bearer auth (Claude Code CLI protocol), proxy uses x-api-key
 	const headers: Record<string, string> = {
-		"anthropic-version": "2023-06-01",
+		"User-Agent": resolveHttpUserAgent({
+			mode: config.userAgentMode,
+			custom: config.customUserAgent,
+			fallback: getHttpClaudeCliUserAgent(),
+		}),
+		...buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
 	};
 	if (config.officialApi) {
 		headers.Authorization = `Bearer ${config.apiKey}`;
 	} else {
 		headers["x-api-key"] = config.apiKey;
 	}
+	finishAnthropicHeaders(headers, config, "User-Agent");
 
 	// Ordered list of candidate base URLs to try for the /models endpoint. The
 	// first entry is always the user-configured base URL, so its error (if any)
@@ -211,10 +217,8 @@ export async function fetchAnthropicModels(
 		}
 	}
 
-	// Host root + /v1 (and bare host root). Since the model list is an
-	// OpenAI-style endpoint (Anthropic has none), relays commonly serve it at
-	// `{origin}/v1/models` regardless of where the Anthropic messages base
-	// path points. NOT suggested as a messages baseUrl for the same reason.
+	// Some relays expose the catalog at the host root even if Messages is under
+	// a subpath. An origin-based success is not a safe Messages base URL suggestion.
 	try {
 		const origin = new URL(baseUrl).origin;
 		pushCandidate(`${origin}/v1`, false);

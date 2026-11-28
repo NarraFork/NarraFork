@@ -2230,6 +2230,7 @@ export async function processEvent(
 					type: "text",
 					text: block.text,
 					outputIndex: block.outputIndex,
+					...(block.providerMetadata ? { providerMetadata: block.providerMetadata } : {}),
 					...(textBlockId ? { id: textBlockId } : {}),
 					...(block.revision != null ? { revision: block.revision } : {}),
 					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),

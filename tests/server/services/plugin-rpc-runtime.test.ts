@@ -2,10 +2,13 @@ import { expect, test } from "bun:test";
 import type { JsonRpcEnvelope } from "../../../server/lib/plugins/protocol";
 import { PluginHostDispatcher } from "../../../server/services/plugin-host-dispatcher";
 import {
+	LocalProcessRunner,
 	type PluginProcessHandle,
 	type PluginRunner,
 	PluginRuntime,
+	PluginRuntimeError,
 	type RunnerStartOptions,
+	RuntimeSupervisor,
 } from "../../../server/services/plugin-runtime";
 
 class RuntimeHandle implements PluginProcessHandle {
@@ -19,9 +22,18 @@ class RuntimeHandle implements PluginProcessHandle {
 		this.resolveExit = resolve;
 	});
 
+	constructor(
+		private readonly pauseAt?: "hello" | "activate",
+		private readonly onPause?: () => void,
+	) {}
+
 	send(message: JsonRpcEnvelope): Promise<void> {
 		this.writes.push(message);
 		if (!("method" in message) || !("id" in message)) return Promise.resolve();
+		if (message.method === this.pauseAt) {
+			this.onPause?.();
+			return Promise.resolve();
+		}
 		const event =
 			message.method === "initialize"
 				? "initialized"
@@ -72,6 +84,10 @@ class RuntimeHandle implements PluginProcessHandle {
 		for (const handler of this.messageHandlers) handler(message);
 	}
 
+	emitError(error: Error): void {
+		for (const handler of this.errorHandlers) handler(error);
+	}
+
 	private finish(code: number): void {
 		if (this.exitedCode !== undefined) return;
 		this.exitedCode = code;
@@ -83,23 +99,28 @@ class RuntimeHandle implements PluginProcessHandle {
 class RuntimeRunner implements PluginRunner {
 	readonly handles: RuntimeHandle[] = [];
 	readonly starts: RunnerStartOptions[] = [];
+	readonly paused = Promise.withResolvers<void>();
+
+	constructor(private readonly pauseAt?: "hello" | "activate") {}
 
 	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		this.starts.push(options);
-		const handle = new RuntimeHandle();
+		const handle = new RuntimeHandle(this.pauseAt, () => this.paused.resolve());
 		this.handles.push(handle);
-		setTimeout(() =>
-			handle.emit({
-				jsonrpc: "2.0",
-				method: "hello",
-				params: {
-					pluginId: "com.example.runtime",
-					version: "1.0.0",
-					rpcProtocol: "narrafork.rpc/1",
-					features: ["host_api.requests"],
-				},
-			}),
-		);
+		if (this.pauseAt !== "hello") {
+			setTimeout(() =>
+				handle.emit({
+					jsonrpc: "2.0",
+					method: "hello",
+					params: {
+						pluginId: "com.example.runtime",
+						version: "1.0.0",
+						rpcProtocol: "narrafork.rpc/1",
+						features: ["host_api.requests"],
+					},
+				}),
+			);
+		}
 		return handle;
 	}
 }
@@ -206,4 +227,120 @@ test("PluginRuntime closes the bidirectional loop with an injected Host dispatch
 	expect(runtime.rpcConnection?.inboundActive.size).toBe(0);
 	await runtime.shutdown();
 	expect(closeCount).toBe(1);
+});
+
+test.each([
+	"hello",
+	"activate",
+] as const)("PluginRuntime keeps host idle reclamation during %s out of recovery", async (phase) => {
+	const runner = new RuntimeRunner(phase);
+	const supervisor = new RuntimeSupervisor();
+	const handshaking = Promise.withResolvers<void>();
+	const states: string[] = [];
+	try {
+		const starting = supervisor.start({
+			pluginId: "com.example.runtime",
+			pluginVersion: "1.0.0",
+			command: [process.execPath, "unused"],
+			cwd: process.cwd(),
+			runner,
+			onStateChange: (state) => {
+				states.push(state);
+				if (state === "handshaking") handshaking.resolve();
+			},
+		});
+		await handshaking.promise;
+		if (phase === "activate") await runner.paused.promise;
+		runner.starts[0].onIdleTimeout?.();
+		runner.handles[0].emitError(
+			new PluginRuntimeError("Plugin runtime idle timeout", {
+				code: "IDLE_TIMEOUT",
+				phase: "idle",
+				kind: "timeout",
+			}),
+		);
+		runner.handles[0].kill();
+		const runtime = await starting;
+		expect(runtime.state).toBe("stopped");
+		expect(states).not.toContain("failed");
+		expect(states).not.toContain("crashed");
+		expect(runtime.getDiagnostics().restartCount).toBe(0);
+		expect(runner.handles).toHaveLength(1);
+	} finally {
+		await supervisor.shutdown();
+	}
+});
+
+test("PluginRuntime continues persisted recovery counts across ordinary starts", async () => {
+	const runner = new RuntimeRunner();
+	const runtime = new PluginRuntime({
+		pluginId: "com.example.runtime",
+		pluginVersion: "1.0.0",
+		command: [process.execPath, "unused"],
+		cwd: process.cwd(),
+		runner,
+		restartCount: 3,
+		generation: 8,
+	});
+	try {
+		await runtime.start();
+		expect(runtime.getDiagnostics()).toMatchObject({ generation: 9, restartCount: 3 });
+		await runtime.restart();
+		expect(runtime.getDiagnostics()).toMatchObject({ generation: 10, restartCount: 4 });
+		await runtime.shutdown();
+		await runtime.start();
+		expect(runtime.getDiagnostics()).toMatchObject({ generation: 11, restartCount: 4 });
+	} finally {
+		await runtime.shutdown();
+	}
+});
+
+test("LocalProcessRunner preserves a real exit as a failure while stdout stays open", async () => {
+	const exited = Promise.withResolvers<number>();
+	const timeout = Promise.withResolvers<Error>();
+	let stdout!: ReadableStreamDefaultController<Uint8Array>;
+	let streamsClosed = false;
+	let idleReclaims = 0;
+	const closeStreams = () => {
+		if (streamsClosed) return;
+		streamsClosed = true;
+		stdout.close();
+	};
+	const runner = new LocalProcessRunner({
+		allowUnboundedResourceUsage: true,
+		killProcessTree: false,
+		spawn: () => ({
+			stdin: {},
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					stdout = controller;
+				},
+			}),
+			stderr: new ReadableStream<Uint8Array>({
+				start: (controller) => controller.close(),
+			}),
+			exited: exited.promise,
+			kill: closeStreams,
+		}),
+	});
+	const handle = await runner.start({
+		command: ["fixture"],
+		cwd: process.cwd(),
+		idleTimeoutMs: 20,
+		onIdleTimeout: () => {
+			idleReclaims += 1;
+		},
+		onError: (error) => timeout.resolve(error),
+	});
+	try {
+		exited.resolve(1);
+		await expect(timeout.promise).resolves.toMatchObject({ code: "IDLE_TIMEOUT" });
+		expect(idleReclaims).toBe(0);
+		// Latest main acknowledges the complete stdio drain, not root PID exit alone.
+		closeStreams();
+		expect(await handle.exited).toBe(1);
+	} finally {
+		closeStreams();
+		await handle.terminate?.("test cleanup");
+	}
 });

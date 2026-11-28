@@ -1,7 +1,4 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 /**
  * Regression tests for the model-list fallback logic on the provider "test"
@@ -22,6 +19,9 @@ type FetchAnthropicModels = (config: {
 	baseUrl?: string;
 	apiKey?: string;
 	officialApi?: boolean;
+	userAgentMode?: "custom" | "narrafork" | "codex" | "claude-code";
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
 }) => Promise<{ models: Array<{ id: string }>; resolvedBaseUrl?: string }>;
 type FetchOpenaiModels = (config: {
 	id: string;
@@ -29,25 +29,24 @@ type FetchOpenaiModels = (config: {
 	baseUrl?: string;
 	apiKey?: string;
 	apiMode?: string;
+	userAgentMode?: "custom" | "narrafork" | "codex" | "claude-code";
+	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	dynamicHeaders?: () => Record<string, string>;
 }) => Promise<{ models: Array<{ id: string }> }>;
 
 let buildModelsUrls: BuildModelsUrls;
 let fetchAnthropicModels: FetchAnthropicModels;
 let fetchOpenaiModels: FetchOpenaiModels;
-let testHome = "";
-let originalNarraforkHome: string | undefined;
 const originalFetch = globalThis.fetch;
 
 beforeAll(async () => {
-	// Both route modules transitively initialise the DB layer at import time,
-	// which resolves its data dir from NARRAFORK_HOME (NOT process.env.HOME —
-	// node's os.homedir() reads the system passwd entry, so overriding HOME would
-	// not isolate it). Point it at a fresh temp dir so the test uses its own empty
-	// SQLite file instead of contending for the real ~/.narrafork instance lock.
-	originalNarraforkHome = process.env.NARRAFORK_HOME;
-	testHome = mkdtempSync(join(tmpdir(), "narrafork-models-fallback-"));
-	process.env.NARRAFORK_HOME = testHome;
+	// Reuse the isolated home owned by tests/preload.ts. Creating a second DB
+	// here duplicates migrations and leaves its Windows watcher handles outside
+	// the standard test teardown.
+	if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME) {
+		throw new Error("Model catalog tests require the isolated tests/preload.ts environment");
+	}
 
 	const openaiMod = await import("../openai");
 	buildModelsUrls = openaiMod.buildModelsUrls as unknown as BuildModelsUrls;
@@ -58,9 +57,6 @@ beforeAll(async () => {
 
 afterAll(() => {
 	globalThis.fetch = originalFetch;
-	if (originalNarraforkHome === undefined) delete process.env.NARRAFORK_HOME;
-	else process.env.NARRAFORK_HOME = originalNarraforkHome;
-	if (testHome) rmSync(testHome, { recursive: true, force: true });
 });
 
 describe("buildModelsUrls (OpenAI) suggest-safety", () => {
@@ -216,4 +212,175 @@ describe("fetchAnthropicModels error aggregation", () => {
 		// Origin-based success is not a safe baseUrl suggestion.
 		expect(result.resolvedBaseUrl).toBeUndefined();
 	});
+});
+
+describe("model catalog identity reaches a real HTTP endpoint", () => {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
+		test(`${protocol} applies UA selection and case-insensitive explicit overrides`, async () => {
+			globalThis.fetch = originalFetch;
+			const captured: Headers[] = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return Response.json({ data: [{ id: "test-model" }] });
+				},
+			});
+			try {
+				const config = {
+					id: `catalog-${protocol}`,
+					name: "Catalog probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					apiMode: protocol === "anthropic" ? "completions" : protocol,
+					officialApi: true,
+				};
+				const fetchModels = protocol === "anthropic" ? fetchAnthropicModels : fetchOpenaiModels;
+				await fetchModels(config);
+				await fetchModels({
+					...config,
+					extraHeaders: {
+						"USER-AGENT": "override/2",
+						authorization: "Bearer operator",
+						Originator: "custom-originator",
+						"Anthropic-Version": "operator-version",
+					},
+				});
+				expect(captured).toHaveLength(2);
+				expect(captured[0]?.get("user-agent")).toBe("selected/1");
+				expect(captured[1]?.get("user-agent")).toBe("override/2");
+				expect(captured[1]?.get("authorization")).toBe("Bearer operator");
+				expect(captured[1]?.get("originator")).toBe("custom-originator");
+				expect(captured[1]?.get("anthropic-version")).toBe("operator-version");
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});
+
+describe("model catalog dynamic UA respects explicit selection", () => {
+	for (const apiMode of ["responses", "codex", "completions"]) {
+		test(`${apiMode}: only explicit UA overrides dynamic headers`, async () => {
+			globalThis.fetch = originalFetch;
+			const captured: Headers[] = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return Response.json({ data: [{ id: "test-model" }] });
+				},
+			});
+			try {
+				let channel = 0;
+				const config = {
+					id: "catalog-ua",
+					name: "Catalog UA probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					apiMode,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					extraHeaders: { authorization: "Bearer static" },
+					dynamicHeaders: () => ({
+						"USER-AGENT": "dynamic/3",
+						Authorization: "Bearer dynamic",
+						"X-Channel": `live-${++channel}`,
+					}),
+				};
+				await fetchOpenaiModels(config);
+				await fetchOpenaiModels({
+					...config,
+					extraHeaders: { "uSeR-aGeNt": " operator/2 ", authorization: "Bearer static" },
+				});
+				await fetchOpenaiModels({
+					...config,
+					userAgentMode: undefined,
+					customUserAgent: undefined,
+				});
+				expect(captured.map((headers) => headers.get("user-agent"))).toEqual([
+					"selected/1",
+					"operator/2",
+					"dynamic/3",
+				]);
+				expect(captured.map((headers) => headers.get("authorization"))).toEqual([
+					"Bearer dynamic",
+					"Bearer dynamic",
+					"Bearer dynamic",
+				]);
+				expect(captured.map((headers) => headers.get("x-channel"))).toEqual([
+					"live-1",
+					"live-2",
+					"live-3",
+				]);
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});
+
+describe("model catalog fallback keeps its final wire identity", () => {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
+		test(`${protocol}: configured 404 then /v1 discovery retains one UA and the authentication owner`, async () => {
+			globalThis.fetch = originalFetch;
+			const requests: Array<{ path: string; method: string; headers: Headers; raw: string }> = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					requests.push({
+						path: new URL(request.url).pathname,
+						method: request.method,
+						headers: request.headers,
+						raw: await request.text(),
+					});
+					if (requests.length === 1)
+						return Response.json({ error: { message: "Use /v1/models" } }, { status: 404 });
+					return Response.json({ data: [{ id: "wire-model" }] });
+				},
+			});
+			try {
+				const config = {
+					id: `catalog-fallback-${protocol}`,
+					name: "Local catalog fallback",
+					apiKey: "fake-catalog-key",
+					baseUrl: server.url.origin,
+					apiMode: protocol === "anthropic" ? "responses" : protocol,
+					officialApi: true,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					extraHeaders: { "uSeR-aGeNt": " operator/2 ", Authorization: "Bearer operator" },
+					dynamicHeaders: () => ({
+						"USER-AGENT": "dynamic/default",
+						authorization: "Bearer dynamic-owner",
+						"X-Channel": "current",
+					}),
+				};
+				const result = await (protocol === "anthropic"
+					? fetchAnthropicModels(config)
+					: fetchOpenaiModels(config));
+				expect(result.models.map((model) => model.id)).toEqual(["wire-model"]);
+				expect(requests.map((request) => request.path)).toEqual(["/models", "/v1/models"]);
+				for (const request of requests) {
+					expect(request.method).toBe("GET");
+					expect(request.raw).toBe("");
+					expect(request.headers.get("user-agent")).toBe("operator/2");
+					expect(
+						Array.from(request.headers.keys()).filter((key) => key === "user-agent"),
+					).toHaveLength(1);
+					expect(request.headers.get("authorization")).toBe(
+						protocol === "anthropic" ? "Bearer operator" : "Bearer dynamic-owner",
+					);
+					if (protocol !== "anthropic") expect(request.headers.get("x-channel")).toBe("current");
+				}
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
 });

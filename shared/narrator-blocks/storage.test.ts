@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { DecodableMessage } from "./decode";
-import { assembleContent, matchBlocks, splitEnvelope } from "./storage";
+import { assembleContent, isStateOnlyChange, matchBlocks, splitEnvelope } from "./storage";
 
 function message(
 	role: DecodableMessage["role"],
@@ -200,4 +200,45 @@ describe("matchBlocks", () => {
 		).toEqual([undefined]);
 		expect(matchBlocks([tool("c1")], [tool("c9")])).toEqual([undefined]);
 	});
+});
+
+test("text continuation metadata survives block storage and remains a payload change", () => {
+	const content = [
+		{
+			type: "text",
+			id: "native-part-0",
+			text: "first part",
+			revision: 1,
+			completed: true,
+			providerMetadata: {
+				openai: { itemId: "msg-native", contentIndex: 0, phase: "partial_answer" },
+			},
+		},
+		{
+			type: "text",
+			id: "native-part-1",
+			text: "second part",
+			revision: 1,
+			completed: true,
+			providerMetadata: {
+				openai: { itemId: "msg-native", contentIndex: 1, phase: "partial_answer" },
+			},
+		},
+	];
+	const rebuilt = assembleContent(rows(message("assistant", content)));
+	expect(rebuilt).toEqual(content);
+	const { envelope } = splitEnvelope(message("assistant", rebuilt));
+	expect(envelope.blocks).toMatchObject(
+		content.map((part) => ({
+			kind: "output",
+			payload: {
+				parts: [{ type: "text", text: part.text, providerMetadata: part.providerMetadata }],
+			},
+		})),
+	);
+	const finalPart = {
+		...content[0],
+		providerMetadata: { openai: { ...content[0].providerMetadata.openai, phase: "final_answer" } },
+	};
+	expect(isStateOnlyChange([content[0]], [finalPart])).toBe(false);
 });

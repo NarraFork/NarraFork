@@ -161,6 +161,91 @@ describe("main conversation request", () => {
 });
 
 describe("performWebSearch side request", () => {
+	test("rejects conflicting domain filters before sending a request", async () => {
+		installFetchCapture(SEARCH_SSE);
+		const provider = new AnthropicProvider(providerConfig());
+		await expect(
+			provider.performWebSearch({
+				model: MODEL,
+				query: "narrafork",
+				allowedDomains: ["allowed.example"],
+				blockedDomains: ["blocked.example"],
+			}),
+		).rejects.toThrow("cannot combine allowedDomains and blockedDomains");
+		expect(capturedRequests).toHaveLength(0);
+	});
+
+	test("an empty domain filter does not conflict with a nonempty filter", async () => {
+		installFetchCapture(SEARCH_SSE);
+		await new AnthropicProvider(providerConfig()).performWebSearch({
+			model: MODEL,
+			query: "narrafork",
+			allowedDomains: [],
+			blockedDomains: ["blocked.example"],
+		});
+		const tools = capturedRequests[0].body.tools as Array<Record<string, unknown>>;
+		expect(tools[0].allowed_domains).toBeUndefined();
+		expect(tools[0].blocked_domains).toEqual(["blocked.example"]);
+	});
+
+	test.each([
+		"\n",
+		"\r\n",
+		"\r",
+	])("search consumes multiline JSON and an EOF residual frame with %j", async (eol) => {
+		const data = {
+			type: "content_block_start",
+			index: 0,
+			content_block: {
+				type: "web_search_tool_result",
+				content: [{ title: "结果", url: "https://example.com" }],
+			},
+		};
+		installFetchCapture(
+			`event: content_block_start${eol}${JSON.stringify(data, null, 2)
+				.split("\n")
+				.map((line) => `data:${line}`)
+				.join(eol)}`,
+		);
+		await expect(
+			new AnthropicProvider(providerConfig()).performWebSearch({ model: MODEL, query: "test" }),
+		).resolves.toEqual({ text: "", sources: [{ title: "结果", url: "https://example.com" }] });
+	});
+
+	test("event-only errors survive without a payload type and cancel the stream", async () => {
+		let cancellations = 0;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode(
+						'event:error\rdata:{"message":\rdata:"search backend failed"}\r\r',
+					),
+				);
+			},
+			cancel() {
+				cancellations++;
+			},
+		});
+		globalThis.fetch = (async () =>
+			new Response(body, {
+				headers: { "content-type": "text/event-stream" },
+			})) as unknown as typeof fetch;
+		await expect(
+			new AnthropicProvider(providerConfig()).performWebSearch({ model: MODEL, query: "test" }),
+		).rejects.toThrow("search backend failed");
+		expect(cancellations).toBe(1);
+		expect(body.locked).toBe(false);
+	});
+
+	test("a web-search result error in the EOF residual frame is not swallowed", async () => {
+		installFetchCapture(
+			'data:{"type":"content_block_start","content_block":{"type":"web_search_tool_result","content":{"type":"web_search_tool_result_error","error_code":"unavailable-at-eof"}}}',
+		);
+		await expect(
+			new AnthropicProvider(providerConfig()).performWebSearch({ model: MODEL, query: "test" }),
+		).rejects.toThrow("unavailable-at-eof");
+	});
+
 	test.each([
 		"ok",
 		"See https://a.example",

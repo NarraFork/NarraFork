@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ToolRegistry } from "@server/lib/agent/tool-registry";
@@ -44,6 +44,7 @@ class FakeRuntime {
 			capabilities: [...(this.options.grantedCapabilities ?? [])],
 			stderr: "",
 			lateMessages: 0,
+			restartCount: 0,
 		};
 	}
 
@@ -185,7 +186,7 @@ afterEach(async () => {
 
 describe("C3 production plugin tool lifecycle", () => {
 	test("connects install → enable → activate → Agent tool → disable → uninstall", async () => {
-		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-c3-"));
+		const root = await realpath(await mkdtemp(join(tmpdir(), "narrafork-plugin-c3-")));
 		tempRoots.push(root);
 		const storeRoot = join(root, "plugins");
 		const stateStore = new PluginStateStore(storeRoot);

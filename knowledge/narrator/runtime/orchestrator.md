@@ -38,7 +38,7 @@ keywords:
   - 跟随父会话模型
   - RuntimePolicy
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: 15eb583b4a5b86d11cfc8037afcae4065e3a812b
 ---
 # 调度与执行
 
@@ -64,6 +64,8 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
   - 其余 → `completed`。
 - 失败状态按 pass 结算：`onErrorCleanup` 可提前置 `hadError` 并记录 `terminalStatus`；只有既有续跑规则已准入的新 pass（例如工作区重放、held 运行接收明确输入）到达模型调用前，才可清旧 `hadError`、`terminalStatus`、`finalText`。先检查 `active.alive`、当前 owner 与未取消的请求信号，成功写 `working`（`unlessArchived`）后再次检查；归档拒绝写入则中断，不清旧状态。新 pass 成功后不遗留旧诊断；新 pass 失败则按其自身错误收尾（`orchestrator.ts:runAgentLoopUnlocked`）。
 - 轮后的 `injection-drain` 只在 `hadError` 为 false 时排空注入并续跑；失败前排队的 Watch/agent 通知不能自行授权恢复。没有获准的新 pass 时，真实失败保留错误终态，`allowInboxWake` 为 false，排队输入保留。错误清理不扩大续跑来源，也不改变取消、held 本地 Stop 与整次运行取消的区别。
+- 提供商逻辑轮次：`createRuntimeRunState` 新建只在内存中的 `turnContext`，`AgentConfig` 通过 getter 读取当前对象。工具续写、重试、压缩及历史重建共用它；采纳新的用户输入时替换，进程重启不恢复。它与持久运行 id、会话 id、执行段身份分开；具体 Codex 路由隔离见 [Codex](../../agent/providers/codex.md)。
+- `getAfterToolsInjections` 返回的 `onConsumed` 在原消费回调成功后只执行一次，避免同一批注入重复结算；这条消费路径不会自行替换 `turnContext`。
 - 预算：上下文溢出重试 2 次（`MAX_CONTEXT_OVERFLOW_RETRIES`），回合中断重试 3 次，配额等待每次运行 3 次，`auto:` 源切换每次运行 3 次（`MAX_AUTO_SWITCHES_PER_RUN`）。
 - `auto:` 模型：等待不超过 15 分钟则等，否则切到另一个能服务同模型的来源；`<前缀>:<模型>` 不切换（`auto-forced-switch.ts`）。
 - 计划批准：响应仍在流式时只标记，等响应落定再压缩并中止；响应落定前结束则丢弃批准（`plan-approval-restart.ts`）。

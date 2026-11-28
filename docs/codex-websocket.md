@@ -40,15 +40,14 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
     真实 HTTP 头的是 remote-control 注册接口，不是 `/responses`。
   - 可选 `ChatGPT-Account-Id`（仅官方域名且提供了 accountId 时）
   - 可选 `x-codex-turn-metadata`（仅调用方显式传入时）
-  - 最后合并调用方的 `extraHeaders`，因此它可以覆盖上面任意一项
+  - 调用方非空 `extraHeaders` 按头名大小写无关覆盖默认值。非空 extraHeaders UA > 用户显式模式/custom UA > 动态或协议默认 UA；只有 UA 有这层最终优先级，动态认证与通道头的优先级不变。同名头不拼接，空白不清默认；传输专用字段与不支持的 lite opt-in 仍受协议约束
 - **握手头不含** `x-codex-turn-state`：该 token 要等一个 turn 的首个响应才拿到，而那时本连接的
   握手早已发出、且连接会被 turn 内后续请求复用，握手头结构上不可能承载它。它改走每个
   `response.create` 的 `client_metadata`（见 `applyTurnStateToRequest`），与 codex-rs 一致——
   上游 `build_websocket_headers` 显式传 `/*turn_state*/ None`，并在 WS 的 `client_metadata`
   里注入该 token；只有 HTTP 路径才把它作为请求头发送
-- 系统提示词作为 `input` 开头的 `developer` 消息发送，不写入顶层 `instructions`，以便缓存。官方客户端也在非 Lite 模式下使用这种布局。
-- **不发送** `x-openai-internal-codex-responses-lite`：官方客户端仅在模型目录设置 `ModelInfo.use_responses_lite` 时才发送此头，并把顶层工具改放到 `input` 中的 `additional_tools`，同时禁用并行工具调用。NarraFork 保留顶层 `tools`，以支持 `web_search` / `image_generation` 等 hosted 工具；`stripResponsesLiteHeader` 也会移除 `extraHeaders` 中的此头。
-- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`，包含稳定的 `client_metadata`、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: false`、`reasoning.summary: "auto"`（非 lite 形态省略 `reasoning.context`，与 codex-rs 0.159.2 一致）与 `text.verbosity: "low"`，`client_metadata` 含会话稳定的 `x-codex-window-id`，以及拿到 turn state 之后的 `x-codex-turn-state`
+- **不发送** `x-openai-internal-codex-responses-lite`：它是正文契约，不是身份标记。固定 Codex 0.171.0 的非 lite 分支保留顶层 `tools`；lite 分支改用 `additional_tools` input 项并禁用并行工具。两种分支仅在基础指令非空时生成 developer 前缀，不使用顶层 `instructions`。NarraFork 只实现非 lite，不声明 lite；最终出口移除额外头中的该 opt-in，不靠删除工具凑合法请求。这不保证每个模型都支持非 lite。
+- 请求体：`{ type: "response.create", ...ResponsesRequestBody }`。非空基础指令为稳定 ID 的 developer `input_text` 前缀；空指令不造前缀或默认 CLI 文本。保留顶层工具、`prompt_cache_key`、`tool_choice: "auto"`、`parallel_tool_calls: true`、`reasoning.summary: "auto"` 与 `text.verbosity: "low"`，非 lite 省略 `reasoning.context`，Codex 后端不发 `max_output_tokens`。`client_metadata` 保留安装/会话/window 身份，实际逻辑轮次存在时附加 `turn_id`，拿到本轮 token 后附加 `x-codex-turn-state`。
 - 增量续写复用判定（`requestWithoutInput`）**排除 `client_metadata`**：该字段带有随请求变化的运行时值
   （尤其是 `x-codex-turn-state`），若参与比较，首个响应之后的每个请求都会被判定为「不同请求」，
   从而静默退化成全量重发并丢失 prompt cache。codex-rs 的
@@ -64,10 +63,12 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 
 ## 已实现能力
 
-- 连接复用（按 session / credential / model 缓存）
+- 连接按 session / credential / model 缓存；复用前比较 URL、有效代理及最终握手头的规范化摘要。有效代理先应用 loopback、`NO_PROXY` 与 `settings.proxy.noProxyRules` 豁免，同一结果用于摘要和实际握手；路由变化重连，仍被豁免的代理配置变化不打断连接。UA、凭据或额外头变化会安全重连，不把凭据原文保存在身份摘要/缓存键中
+- `ephemeralSession` 使用独立连接，不读取、加入或淘汰共享连接缓存；同 key 的嵌套请求也保留独立 socket。`validateBeforeDispatch` 在复用检查、新握手建立和每次发送前校验诊断凭据，异步请求/证据编码或回调期间撤销会阻止发送
 - `previous_response_id` 增量续写
 - `response.output_item.done` 基线跟踪
-- `x-codex-turn-state` 回放（握手响应头 + `response.metadata` 事件两个来源）
+- `x-codex-turn-state` 来自握手/HTTP 响应头或 `response.metadata`，首个非空值锁定。按显式逻辑用户轮次和认证归属隔离，工具续写、同轮重试及 HTTP/WS 切换共享；独立新输入重置，UA 更新不清同轮 token
+- Responses assistant item 的 phase、item ID 与 content part 信息保存在现有内容 JSON 并回放。Codex 0.171.0 的 phase 有 `commentary` / `partial_answer` / `final_answer`，不能因公开 SDK 少列而删掉 Codex 的已证实值；也不能据此宣告所有公开 Responses 端点均支持这三值。只有明确的 `end_turn:false` 触发有界同轮续写，字段缺失保持旧行为
 - 426/404/405/501 等不支持场景自动禁用 WS 并回退 HTTP
 - 配额耗尽时继续沿用 Codex credential failover
 - 连接寿命上限主动回收 + `websocket_connection_limit_reached` / `previous_response_not_found` 自动恢复
@@ -82,13 +83,11 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 `websocket_connection_limit_reached`，消息原文是
 `Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.`
 
-两件事必须同时做对，缺一个就会把一次**必然可恢复**的事件变成终端错误：
+客户端同时保留以下安全边界，不能在已有输出后盲目重放：
 
 1. **主动回收（`CONNECTION_MAX_LIFETIME_MS` = 55 分钟）。** 在请求之间替换临近上限的连接，
    而不是等上游在响应中途拆链路。请求间重建不可见，响应中途重建会打断输出。
-2. **被动恢复必须重连，而不是只判断"有没有已输出内容"。** 早先的实现只在
-   `!hasYieldedEvents` 时重连，于是实践中真正会发生的场景——长时会话跑到一小时、
-   上限在响应中途触发——永远走不到重连分支。
+2. **被动恢复按已交付输出分流。** 尚未交付事件时，连接上限错误可在有界预算内重连，并清除旧响应链后全量重发。已有输出时，本传输返回可续写状态，让宿主沿真实历史处理下一次请求；不在当前流内回放已交付文本或工具。这个边界不因 UA 或版本号更新改变。
 
 ### 恢复时必须重建请求，不能沿用旧的 delta
 
