@@ -997,7 +997,8 @@ describe("RuntimeSupervisor", () => {
 				new Promise<PluginProcessHandle>((_resolve, reject) => {
 					entered();
 					if (!options.signal) throw new Error("missing runner cancellation signal");
-					expect(options.signal).toBe(controller.signal);
+					expect(options.signal).not.toBe(controller.signal);
+					expect(options.signal.aborted).toBe(false);
 					options.signal.addEventListener("abort", () => reject(options.signal?.reason), {
 						once: true,
 					});
@@ -1017,6 +1018,8 @@ describe("RuntimeSupervisor", () => {
 					kind: "transport",
 				}),
 			);
+			expect(start.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+			expect(start.mock.calls[0]?.[0].signal?.reason).toBe(controller.signal.reason);
 			expect(await result).toMatchObject({ code: "START_CANCELLED" });
 			expect(h.supervisor.get(baseRuntimeOptions.pluginId)?.state).toBe("stopped");
 			expect(h.scheduled()).toHaveLength(1);
@@ -1084,8 +1087,13 @@ describe("RuntimeSupervisor", () => {
 			const child = owned;
 			const pid = child?.pid;
 			if (!child || !pid) throw new Error("expected the test-owned child PID");
-			expect(start.mock.calls[0]?.[0].signal).toBe(controller.signal);
+			const startupSignal = start.mock.calls[0]?.[0].signal;
+			expect(startupSignal).toBeInstanceOf(AbortSignal);
+			expect(startupSignal).not.toBe(controller.signal);
+			expect(startupSignal?.aborted).toBe(false);
 			controller.abort(new Error("cancel test-owned child"));
+			expect(startupSignal?.aborted).toBe(true);
+			expect(startupSignal?.reason).toBe(controller.signal.reason);
 			release();
 			expect(await result).toMatchObject({ completed: false, error: expect.any(Error) });
 			await supervisor.shutdown();
