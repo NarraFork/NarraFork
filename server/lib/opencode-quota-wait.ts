@@ -4,7 +4,7 @@ import { isHardUsageLimitText } from "./agent/error-handling";
 import { parseRetryAfterMs } from "./agent/retry-after";
 import { logger } from "./logger";
 import {
-	getOpencodeCachedUsage,
+	getOpencodeUsageForSelection,
 	isOpencodeCustomApiProvider,
 	OPENCODE_USAGES_STALE_MS,
 	type OpencodeUsagePayload,
@@ -356,14 +356,18 @@ export async function resolveOpencodeQuotaTarget(
 	if (kind !== "quota") return planOpencodeRateLimitWait(headers, now, kind);
 
 	const messageText = refusalText(errorText, diagnostics);
-	const cached = getOpencodeCachedUsage(providerId);
+	const cached = getOpencodeUsageForSelection(providerId);
 	const planned = planOpencodeQuotaTarget({ messageText, headers, cached, now });
 	if (planned) return toResult(planned, now, providerId);
 
 	const stale = !cached?.fetchedAt || now - cached.fetchedAt >= OPENCODE_USAGES_STALE_MS;
 	if (stale) {
-		const refreshed = await refreshOpencodeUsage(providerId);
-		const fromUsage = selectOpencodeUsageResetTarget(refreshed, messageText, now);
+		await refreshOpencodeUsage(providerId);
+		const fromUsage = selectOpencodeUsageResetTarget(
+			getOpencodeUsageForSelection(providerId),
+			messageText,
+			now,
+		);
 		if (fromUsage) return toResult(fromUsage, now, providerId);
 	}
 

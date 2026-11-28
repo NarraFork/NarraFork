@@ -93,6 +93,12 @@ export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache |
 	const snapshot = id ? providerQuotaService.peekKey(id) : null;
 	return snapshot ? toOpencodeUsageCache(snapshot) : null;
 }
+/** Decision readers exclude display-only pre-plugin observations and retired identities. */
+export function getOpencodeUsageForSelection(providerId: string): OpencodeUsageCache | null {
+	const id = shownSubjectId(opencodeSubjects(), providerId);
+	const snapshot = id ? providerQuotaService.peekKeyForSelection(id) : null;
+	return snapshot ? toOpencodeUsageCache(snapshot) : null;
+}
 export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	const snapshots = providerQuotaService.keySnapshots();
 	return Object.fromEntries(

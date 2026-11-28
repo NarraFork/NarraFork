@@ -335,6 +335,7 @@ async function legacyBalance(c: QuotaSmokeContext, provider: string, remaining: 
 			? true
 			: undefined;
 	});
+	return unified ? "unified" : "legacy";
 }
 async function snapshot(c: QuotaSmokeContext, provider: string) {
 	return rows(
@@ -694,8 +695,12 @@ async function exercise(
 		verifyUpgradeKeyState(originalKeys, keys, migratedCredentials ? migratedPrimaryId : first);
 	};
 	await draftPrefs();
-	await legacyBalance(c, RELAY, 12.34);
-	await legacyBalance(c, SITE, 31.27);
+	const baselineQuotaApi = await legacyBalance(c, RELAY, 12.34);
+	insist(
+		(await legacyBalance(c, SITE, 31.27)) === baselineQuotaApi,
+		"Baseline quota APIs differ by target",
+	);
+	c.report.artifacts.baselineQuotaApi = baselineQuotaApi;
 	assertSiteCredentialIsolation(site.evidence().records);
 	c.check(c.stage);
 	if (choice === "disabled") {
@@ -768,7 +773,7 @@ async function exercise(
 		]);
 		await screenshot(page, c, "01-original-wallet", `/settings/providers?provider=${SITE}`, [
 			"Upgrade wallet",
-			"USD 31.27",
+			baselineQuotaApi === "unified" ? "31.27 USD" : "USD 31.27",
 		]);
 		c.check(c.stage);
 	}
@@ -954,7 +959,7 @@ async function exercise(
 		}
 		await screenshot(page, c, "02-upgraded-plugin", `/settings/plugins/${QUOTA}`, [QUOTA, "1.0.3"]);
 		await screenshot(page, c, "03-upgraded-wallet", `/settings/providers?provider=${SITE}`, [
-			"USD 42.56",
+			"42.56 USD",
 		]);
 		await page.waitForSelector('[data-testid="provider-settings-site-account"]');
 		await page.$eval('[data-testid="provider-settings-site-account"]', (element) =>

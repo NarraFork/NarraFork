@@ -166,6 +166,8 @@ interface Entry {
 	task?: Task;
 	cursor?: string;
 	sourceRevision?: string;
+	/** Frozen pre-plugin observations are display-only until a live supported response. */
+	legacyDisplayOnly?: true;
 	failures: number;
 	nextAllowedAt: number;
 	nextManualAt: number;
@@ -340,6 +342,7 @@ export class ProviderQuotaService {
 			return;
 		entry.cursor = undefined;
 		entry.sourceRevision = undefined;
+		entry.legacyDisplayOnly = undefined;
 		this.replace(entry, { data: null, sourceId: null, fetchedAt: 0, stale: true });
 	}
 
@@ -388,6 +391,7 @@ export class ProviderQuotaService {
 				if (!cached || !context.isCurrent?.()) continue;
 				entry.cursor = cached.cursor;
 				entry.sourceRevision = cached.sourceRevision;
+				entry.legacyDisplayOnly = cached.legacyDisplayOnly;
 				entry.nextAllowedAt = 0;
 				entry.needsWarmup = true;
 				this.replace(entry, {
@@ -518,6 +522,7 @@ export class ProviderQuotaService {
 				...(restoredSource && restored
 					? {
 							sourceRevision: restored.sourceRevision,
+							legacyDisplayOnly: restored.legacyDisplayOnly,
 							...(restored.cursor ? { cursor: restored.cursor } : {}),
 						}
 					: {}),
@@ -750,6 +755,7 @@ export class ProviderQuotaService {
 		const entry = this.entries.get(`key/${keyId}`) ?? this.entries.get(keyId);
 		if (
 			!entry?.connection.valid ||
+			entry.legacyDisplayOnly ||
 			!entry.snapshot.data ||
 			deterministicError(entry.snapshot.error) ||
 			entry.snapshot.fetchedAt <= 0 ||
@@ -989,6 +995,7 @@ export class ProviderQuotaService {
 			if (Buffer.byteLength(JSON.stringify(snapshot)) > QUOTA_MAX_SNAPSHOT_BYTES)
 				throw new ProviderQuotaError("invalid_response");
 			entry.cursor = result.cursor;
+			entry.legacyDisplayOnly = undefined;
 			entry.sourceRevision = selected.revision;
 			entry.failures = 0;
 			entry.nextAllowedAt =
@@ -1030,7 +1037,10 @@ export class ProviderQuotaService {
 					entry.snapshot.fetchedAt > 0 &&
 					this.now() - entry.snapshot.fetchedAt <=
 						(policy?.keepLastGoodMs ?? Number.POSITIVE_INFINITY);
-				if (!keep) this.options.persistence?.remove(connectionId(entry.connection));
+				if (!keep) {
+					entry.legacyDisplayOnly = undefined;
+					this.options.persistence?.remove(connectionId(entry.connection));
+				}
 				if (deterministicError(code)) {
 					entry.cursor = undefined;
 					entry.activityDue = undefined;

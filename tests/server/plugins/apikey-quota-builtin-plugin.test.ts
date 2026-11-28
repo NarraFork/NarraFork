@@ -75,7 +75,9 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 				.sort(),
 		).toEqual(["provider.connection.request", "quota.provide"]);
 	});
-	test("quota contributions register in the actual quota registry, with no provider.describe/tool detour", () => {
+	test("quota contributions register only after explicit settings grants, with no provider.describe/tool detour", async () => {
+		expect(fixture.platform.quotaRegistry.listSources()).toEqual([]);
+		await fixture.approveSettings();
 		expect(
 			fixture.platform.quotaRegistry
 				.listSources()
@@ -90,7 +92,6 @@ describe("Provider Quota is an ordinary archived plugin, not a retired builtin t
 		expect(fixture.supervisor.get(PLUGIN_ID)?.pid).toBeGreaterThan(0);
 	});
 	test("disable and re-enable persist through the normal manager state record", async () => {
-		await fixture.approveSettings();
 		expect((await fixture.manager.disable(PLUGIN_ID)).desiredState).toBe("disabled");
 		expect((await fixture.manager.getStatus(PLUGIN_ID))?.desiredState).toBe("disabled");
 		expect(fixture.platform.quotaRegistry.listSources()).toEqual([]);

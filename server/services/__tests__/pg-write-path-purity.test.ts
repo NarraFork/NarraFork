@@ -56,7 +56,14 @@ const FORBIDDEN_MARKERS = [
 	"INDEXED BY",
 	"PRAGMA busy_timeout",
 	"data_version",
-	"schema_version",
+] as const;
+
+// schema_version is also a portable plugin-settings column. Match the SQLite access
+// forms, including qualified/quoted PRAGMAs and the table-valued pragma function.
+const FORBIDDEN_PRAGMA_PATTERNS = [
+	/\bPRAGMA\s+(?:(?:\w+|"[^"]+"|`[^`]+`|\[[^\]]+\])\s*\.\s*)?["`[]?schema_version\b/i,
+	/\bpragma_schema_version\b/i,
+	/\.\s*pragma\s*\(/i,
 ] as const;
 
 /** Startup bootstrap symbols, same list `port-purity.test.ts` guards. */
@@ -78,12 +85,34 @@ async function bundle(relativePath: string): Promise<string> {
 	return await build.outputs[0].text();
 }
 
+describe("SQLite schema-version access detection", () => {
+	test.each([
+		'db.query("PRAGMA schema_version").get()',
+		'db.query("pragma main.schema_version").get()',
+		'db.query(`PRAGMA "main"."schema_version"`).get()',
+		'db.query("PRAGMA [main].[schema_version]").get()',
+		'db.query("SELECT schema_version FROM pragma_schema_version").get()',
+		'db.pragma("schema_version")',
+	])("rejects %s", (source) => {
+		expect(FORBIDDEN_PRAGMA_PATTERNS.some((pattern) => pattern.test(source))).toBe(true);
+	});
+
+	test("allows a portable column and its constraint", () => {
+		const source = `schemaVersion: integer("schema_version").notNull(),
+			check("ck_plugin_provider_settings_version", sql.raw('"schema_version" >= 1'))`;
+		for (const pattern of FORBIDDEN_PRAGMA_PATTERNS) expect(source).not.toMatch(pattern);
+	});
+});
+
 describe("the PostgreSQL write path never touches bun:sqlite", () => {
 	for (const [module, ownVocabulary] of PG_MODULES) {
 		test(`${module} bundles free of the SQLite driver, the raw-handle vocabulary and the bootstrap`, async () => {
 			const bundled = await bundle(module);
 			for (const marker of FORBIDDEN_MARKERS) {
 				expect(bundled, `${module} must not reach ${marker}`).not.toContain(marker);
+			}
+			for (const pattern of FORBIDDEN_PRAGMA_PATTERNS) {
+				expect(bundled, `${module} must not reach SQLite PRAGMAs`).not.toMatch(pattern);
 			}
 			for (const symbol of BOOTSTRAP_SYMBOLS) {
 				expect(bundled, `${module} must not reach the bootstrap symbol ${symbol}`).not.toContain(

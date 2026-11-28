@@ -1,4 +1,14 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	mock,
+	spyOn,
+	test,
+} from "bun:test";
 import { readFileSync } from "node:fs";
 import type { ProviderQuotaData, QuotaQueryResult } from "@shared/provider-quota";
 import { parseSub2ApiBalance, relayQuotaData } from "../../../plugins/provider-quota/src/relay";
@@ -18,6 +28,9 @@ import {
 import { getProviderKeyStore } from "../provider-keys";
 import { settings } from "../settings";
 import {
+	archivedQuotaFixture,
+	bindLegacyQuotaService,
+	closeQuotaTestPackage,
 	deferred,
 	httpQuotaFixture,
 	legacyQuotaFixture,
@@ -28,8 +41,10 @@ import {
 } from "./provider-quota-legacy-fixture";
 
 let fixture: ReturnType<typeof legacyQuotaFixture>;
+let testProviderId = "relay-test";
 const originalProxy = settings.proxy;
 beforeEach(() => {
+	testProviderId = "relay-test";
 	fixture = legacyQuotaFixture();
 });
 afterEach(() => {
@@ -100,7 +115,7 @@ describe("provider balance compatibility facade", () => {
 		expect(result.balance?.amounts[0]).not.toHaveProperty("id");
 	});
 
-	test("normalizing Sub2API windows retains every legacy amount and real subscription metadata", () => {
+	test("normalizing Sub2API windows retains finite limits and subscription metadata; zero means no cap", () => {
 		const balance = parseSub2ApiBalance({
 			mode: "unrestricted",
 			isValid: true,
@@ -123,13 +138,22 @@ describe("provider balance compatibility facade", () => {
 		const result = toProviderBalanceSnapshot(quotaSnapshot({ data }));
 		expect(result.status).toBe("supported");
 		expect(result.balance).toEqual(balance);
-		expect(result.balance?.amounts[2]).toEqual({
-			unit: "USD",
-			remaining: 0,
-			used: 0,
-			total: 0,
-			window: "monthly",
+		expect(result.balance?.amounts).toEqual([
+			{ unit: "USD", remaining: 9, used: 1, total: 10, window: "daily" },
+			{
+				unit: "USD",
+				remaining: 45,
+				used: 5,
+				total: 50,
+				window: "weekly",
+				windowStart: "2026-11-08T16:00:00.000Z",
+			},
+		]);
+		expect(result.balance).toMatchObject({
+			planName: "Plan",
+			expiresAt: "2026-12-31T16:00:00.000Z",
 		});
+		expect(data.windows.every((window) => window.remaining !== 0)).toBe(true);
 	});
 
 	test("legacy projection validates new semantic fields before its explicit DTO projection", () => {
@@ -173,35 +197,35 @@ describe("provider balance compatibility facade", () => {
 		settings.customApiProviders = [quotaConfig(), quotaConfig({ id: "second", prefix: "second" })];
 		const pending = deferred<QuotaQueryResult>();
 		fixture.query.mockImplementation(() => pending.promise);
-		const read = providerBalanceCache.read("relay-test");
-		expect(Object.keys(read)).toEqual(["relay-test"]);
+		const read = providerBalanceCache.read(testProviderId);
+		expect(Object.keys(read)).toEqual([testProviderId]);
 		expect(fixture.query).toHaveBeenCalledTimes(1);
-		expect(fixture.query.mock.calls[0]?.[1].providerId).toBe("relay-test");
+		expect(fixture.query.mock.calls[0]?.[1].providerId).toBe(testProviderId);
 		pending.resolve({ status: "supported", data: walletQuota, error: null });
-		await providerBalanceCache.request("relay-test");
-		expect(providerBalanceCache.peek("relay-test")?.balance?.amounts[0]?.remaining).toBe(12);
+		await providerBalanceCache.request(testProviderId);
+		expect(providerBalanceCache.peek(testProviderId)?.balance?.amounts[0]?.remaining).toBe(12);
 	});
 
 	test("all concurrent facade callers share the generic source job", async () => {
 		const pending = deferred<QuotaQueryResult>();
 		fixture.query.mockImplementation(() => pending.promise);
-		const first = providerBalanceCache.request("relay-test");
-		const second = providerBalanceCache.request("relay-test");
-		providerBalanceCache.read("relay-test");
+		const first = providerBalanceCache.request(testProviderId);
+		const second = providerBalanceCache.request(testProviderId);
+		providerBalanceCache.read(testProviderId);
 		expect(fixture.query).toHaveBeenCalledTimes(1);
 		pending.resolve({ status: "supported", data: walletQuota, error: null });
 		expect(await second).toEqual(await first);
 	});
 
 	test("refreshing keeps a supported balance from the same generation until a result arrives", async () => {
-		await providerBalanceCache.request("relay-test");
-		const before = providerBalanceCache.peek("relay-test");
+		await providerBalanceCache.request(testProviderId);
+		const before = providerBalanceCache.peek(testProviderId);
 		fixture.advance(10_000);
 		const pending = deferred<QuotaQueryResult>();
 		fixture.query.mockImplementation(() => pending.promise);
-		const refresh = providerBalanceCache.request("relay-test");
-		expect(fixture.service.peek("relay-test")?.status).toBe("probing");
-		expect(providerBalanceCache.peek("relay-test")).toMatchObject({
+		const refresh = providerBalanceCache.request(testProviderId);
+		expect(fixture.service.peek(testProviderId)?.status).toBe("probing");
+		expect(providerBalanceCache.peek(testProviderId)).toMatchObject({
 			generation: before?.generation,
 			status: "supported",
 			balance: before?.balance,
@@ -219,23 +243,23 @@ describe("provider balance compatibility facade", () => {
 	});
 
 	test("manual cooldown is shared with the generic endpoint and never a second timer", async () => {
-		await providerBalanceCache.request("relay-test");
-		expect(providerBalanceCache.manualRetryAfterMs("relay-test")).toBe(10_000);
-		await providerBalanceCache.request("relay-test");
+		await providerBalanceCache.request(testProviderId);
+		expect(providerBalanceCache.manualRetryAfterMs(testProviderId)).toBe(10_000);
+		await providerBalanceCache.request(testProviderId);
 		expect(fixture.query).toHaveBeenCalledTimes(1);
 		fixture.advance(10_000);
-		await providerBalanceCache.request("relay-test");
+		await providerBalanceCache.request(testProviderId);
 		expect(fixture.query).toHaveBeenCalledTimes(2);
 	});
 
 	test("retains a safe stale balance after errors and respects service retry cadence", async () => {
-		await providerBalanceCache.request("relay-test");
+		await providerBalanceCache.request(testProviderId);
 		fixture.advance(60_000);
 		fixture.query.mockRejectedValue(new Error("test-secret-key private upstream body"));
 		await fixture.service.refreshStale();
 		// refreshStale only schedules work; join the shared job before asserting its error.
-		await fixture.service.refresh("relay-test");
-		const stale = providerBalanceCache.peek("relay-test");
+		await fixture.service.refresh(testProviderId);
+		const stale = providerBalanceCache.peek(testProviderId);
 		expect(stale).toMatchObject({
 			status: "supported",
 			error: "request_failed",
@@ -247,14 +271,14 @@ describe("provider balance compatibility facade", () => {
 	});
 
 	test("unavailable sources do not expose a previous allowance or fetch through old adapters", async () => {
-		await providerBalanceCache.request("relay-test");
+		await providerBalanceCache.request(testProviderId);
 		fixture.revoke();
-		expect(providerBalanceCache.peek("relay-test")).toMatchObject({
+		expect(providerBalanceCache.peek(testProviderId)).toMatchObject({
 			status: "error",
 			error: "plugin_not_enabled",
 			balance: null,
 		});
-		await providerBalanceCache.request("relay-test");
+		await providerBalanceCache.request(testProviderId);
 		expect(fixture.query).toHaveBeenCalledTimes(1);
 	});
 
@@ -267,31 +291,31 @@ describe("provider balance compatibility facade", () => {
 		["extraHeaders", { "x-quota": "changed" }],
 	] as const) {
 		test(`${field} changes immediately invalidate the facade generation and balance`, async () => {
-			await providerBalanceCache.request("relay-test");
-			const generation = providerBalanceCache.generations()["relay-test"];
+			await providerBalanceCache.request(testProviderId);
+			const generation = providerBalanceCache.generations()[testProviderId];
 			settings.customApiProviders = [quotaConfig({ [field]: replacement })];
-			const snapshot = providerBalanceCache.peek("relay-test");
+			const snapshot = providerBalanceCache.peek(testProviderId);
 			expect(snapshot?.generation).not.toBe(generation);
 			expect(snapshot?.balance).toBeNull();
 		});
 	}
 
 	test("renames preserve opaque generations but account reuse never restores an earlier one", () => {
-		const generation = providerBalanceCache.generations()["relay-test"];
+		const generation = providerBalanceCache.generations()[testProviderId];
 		settings.customApiProviders = [quotaConfig({ name: "Renamed" })];
-		expect(providerBalanceCache.generations()["relay-test"]).toBe(generation);
+		expect(providerBalanceCache.generations()[testProviderId]).toBe(generation);
 		settings.customApiProviders = [quotaConfig({ apiKey: "second-key" })];
-		const second = providerBalanceCache.generations()["relay-test"];
+		const second = providerBalanceCache.generations()[testProviderId];
 		expect(second).not.toBe(generation);
 		settings.customApiProviders = [quotaConfig()];
-		expect(providerBalanceCache.generations()["relay-test"]).not.toBe(generation);
+		expect(providerBalanceCache.generations()[testProviderId]).not.toBe(generation);
 		expect(generation).not.toContain("test-secret-key");
 	});
 
 	test("disabled and removed IDs cannot be read or refreshed through the facade", async () => {
 		settings.customApiProviders = [quotaConfig({ disabled: true })];
-		expect(providerBalanceCache.peek("relay-test")).toBeNull();
-		expect(await providerBalanceCache.request("relay-test")).toBeNull();
+		expect(providerBalanceCache.peek(testProviderId)).toBeNull();
+		expect(await providerBalanceCache.request(testProviderId)).toBeNull();
 		settings.customApiProviders = [];
 		expect(providerBalanceCache.read()).toEqual({});
 		expect(fixture.query).not.toHaveBeenCalled();
@@ -336,15 +360,15 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 				: new Response(null, { status: 404 });
 		});
 		const [a, b] = await Promise.all([
-			providerBalanceCache.request("relay-test"),
-			providerBalanceCache.request("relay-test"),
+			providerBalanceCache.request(testProviderId),
+			providerBalanceCache.request(testProviderId),
 		]);
 		expect(a).toEqual(b);
 		expect(urls.at(-1)).toBe("https://relay.invalid/v1/v1/usage");
 		urls.length = 0;
 		fixture.advance(60000);
-		providerBalanceCache.read("relay-test");
-		await fixture.service.refresh("relay-test");
+		providerBalanceCache.read(testProviderId);
+		await fixture.service.refresh(testProviderId);
 		expect(urls).toEqual(["https://relay.invalid/v1/v1/usage"]);
 	});
 	test("unsupported is discovered once and reads do not probe inside the unsupported backoff", async () => {
@@ -353,7 +377,7 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 			calls++;
 			return new Response(null, { status: 404 });
 		});
-		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId)).toMatchObject({
 			status: "unsupported",
 			balance: null,
 		});
@@ -362,7 +386,7 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 		fixture.advance(60000);
 		providerBalanceCache.read();
 		expect(calls).toBe(count);
-		await providerBalanceCache.request("relay-test", "probe");
+		await providerBalanceCache.request(testProviderId, "probe");
 		expect(calls).toBeGreaterThan(count);
 	});
 	test("relay transient failure preserves last good value only inside the same ten-minute window", async () => {
@@ -372,17 +396,17 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 				? new Response(null, { status: 500 })
 				: Response.json({ mode: "unrestricted", isValid: true, unit: "USD", balance: 12 }),
 		);
-		const fresh = await providerBalanceCache.request("relay-test");
+		const fresh = await providerBalanceCache.request(testProviderId);
 		failed = true;
 		fixture.advance(60000);
-		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId, "refresh")).toMatchObject({
 			status: "supported",
 			error: "request_failed",
 			balance: fresh?.balance,
 			fetchedAt: fresh?.fetchedAt,
 		});
 		fixture.advance(540001);
-		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId, "refresh")).toMatchObject({
 			status: "error",
 			error: "request_failed",
 			balance: null,
@@ -426,7 +450,7 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 				return new Response(null, { status: 404 });
 			},
 		});
-		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId)).toMatchObject({
 			status: "supported",
 			adapter: "new-api",
 			balance: { amounts: [{ unit: "QUOTA", remaining: 500000, used: 100000, total: 600000 }] },
@@ -435,8 +459,55 @@ describe("upstream relay discovery lifecycle retained in the service", () => {
 });
 
 describe("site account credit through the quota service", () => {
+	let site: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+	let currentPersistence: NonNullable<Parameters<typeof httpQuotaFixture>[1]>["persistence"];
+	let siteNow = Date.now();
+	beforeAll(async () => {
+		site = await archivedQuotaFixture({
+			now: () => siteNow,
+			persistence: {
+				restore: (key, identity) => currentPersistence?.restore(key, identity),
+				save: (key, identity, value) => currentPersistence?.save(key, identity, value),
+				remove: (key) => currentPersistence?.remove(key),
+				flush: async () => {
+					await currentPersistence?.flush();
+				},
+			},
+		});
+	});
+	beforeEach(() => {
+		testProviderId = `site-${crypto.randomUUID().slice(0, 16)}`;
+		keyProviders.add(testProviderId);
+	});
+	const fixture = {
+		advance: (ms: number) => {
+			siteNow += ms;
+		},
+	};
+	async function replaceWithSite(
+		config: ReturnType<typeof quotaConfig>,
+		fetch: typeof outboundFetch,
+		persistence?: NonNullable<Parameters<typeof httpQuotaFixture>[1]>["persistence"],
+	) {
+		siteNow = Date.now();
+		currentPersistence = persistence;
+		site.setTestHttp(fetch);
+		bindLegacyQuotaService(site.service);
+		await site.prepareProviders([config]);
+		return { directory: site.directory, query: spyOn(site.platform.quotaRegistry, "query") };
+	}
+	afterEach(async () => {
+		site?.setProviders([]);
+		await currentPersistence?.flush();
+		currentPersistence = undefined;
+	});
+	afterAll(async () => {
+		await site?.close();
+		await closeQuotaTestPackage();
+	});
 	const config = () =>
 		quotaConfig({
+			id: testProviderId,
 			quotaSiteUrl: "https://site.invalid",
 			quotaAccessToken: "site-token",
 			quotaUserId: "42",
@@ -444,11 +515,11 @@ describe("site account credit through the quota service", () => {
 	const body = { success: true, data: { quota: 5_000_000, used_quota: 1_000_000, group: "vip" } };
 	test("queries the independent site root, reports USD and never sends the inference key", async () => {
 		const calls: Array<{ url: string; headers: Headers }> = [];
-		await replaceWithHttp(config(), async (url, init) => {
+		await replaceWithSite(config(), async (url, init) => {
 			calls.push({ url: String(url), headers: new Headers(init?.headers) });
 			return Response.json(body);
 		});
-		const snapshot = await providerBalanceCache.request("relay-test");
+		const snapshot = await providerBalanceCache.request(testProviderId);
 		expect(calls.map(({ url }) => url)).toEqual(["https://site.invalid/api/user/self"]);
 		expect(calls[0]?.headers.get("authorization")).toBe("Bearer site-token");
 		expect(calls[0]?.headers.get("new-api-user")).toBe("42");
@@ -466,20 +537,20 @@ describe("site account credit through the quota service", () => {
 	});
 	test("transient errors preserve credit for at most ten minutes, not indefinitely", async () => {
 		let failing = false;
-		await replaceWithHttp(config(), async () =>
+		await replaceWithSite(config(), async () =>
 			failing ? new Response(null, { status: 503 }) : Response.json(body),
 		);
-		const good = await providerBalanceCache.request("relay-test");
+		const good = await providerBalanceCache.request(testProviderId);
 		failing = true;
 		fixture.advance(60_000);
-		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId, "refresh")).toMatchObject({
 			status: "supported",
 			error: "request_failed",
 			balance: good?.balance,
 			fetchedAt: good?.fetchedAt,
 		});
 		fixture.advance(540_001);
-		expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId, "refresh")).toMatchObject({
 			status: "error",
 			error: "request_failed",
 			balance: null,
@@ -496,40 +567,40 @@ describe("site account credit through the quota service", () => {
 				parsePersistedProviderQuota,
 			);
 			let answer: Response | undefined;
-			const f = await replaceWithHttp(
+			const f = await replaceWithSite(
 				config(),
 				async () => answer ?? Response.json(body),
 				persistence,
 			);
-			await providerBalanceCache.request("relay-test");
+			await providerBalanceCache.request(testProviderId);
 			await persistence.flush();
-			const identity = required(f.directory.get("relay-test")).identity;
-			expect(persistence.restore("relay-test", identity)?.data).not.toBeNull();
+			const identity = required(f.directory.get(testProviderId)).identity;
+			expect(persistence.restore(testProviderId, identity)?.data).not.toBeNull();
 			answer = payload === null ? new Response(null, { status }) : Response.json(payload);
 			fixture.advance(60_000);
-			expect(await providerBalanceCache.request("relay-test", "refresh")).toMatchObject({
+			expect(await providerBalanceCache.request(testProviderId, "refresh")).toMatchObject({
 				status: "error",
 				error: code,
 				balance: null,
 			});
 			await persistence.flush();
-			expect(persistence.restore("relay-test", identity)).toBeUndefined();
+			expect(persistence.restore(testProviderId, identity)).toBeUndefined();
 			const requests = f.query.mock.calls.length;
 			fixture.advance(120_000);
 			providerBalanceCache.read();
 			expect(f.query).toHaveBeenCalledTimes(requests);
 			answer = new Response(null, { status: 503 });
 			fixture.advance(60_000);
-			expect((await providerBalanceCache.request("relay-test", "refresh"))?.balance).toBeNull();
+			expect((await providerBalanceCache.request(testProviderId, "refresh"))?.balance).toBeNull();
 		});
 	}
 	test("partial site configuration fails immediately without falling back to key discovery", async () => {
 		let calls = 0;
-		await replaceWithHttp({ ...config(), quotaUserId: "" }, async () => {
+		await replaceWithSite({ ...config(), quotaUserId: "" }, async () => {
 			calls++;
 			return Response.json(body);
 		});
-		expect(await providerBalanceCache.request("relay-test")).toMatchObject({
+		expect(await providerBalanceCache.request(testProviderId)).toMatchObject({
 			error: "invalid_configuration",
 			balance: null,
 		});
@@ -541,7 +612,7 @@ describe("site account credit through the quota service", () => {
 		const store = getProviderKeyStore();
 		const key = store.add(cfg.id, { apiKey: "disabled-inference-key" });
 		store.update(key.id, { disabled: true });
-		await replaceWithHttp(cfg, async () => Response.json(body));
+		await replaceWithSite(cfg, async () => Response.json(body));
 		expect(await providerBalanceCache.request(cfg.id)).toMatchObject({
 			status: "supported",
 			adapter: "new-api-user",
@@ -550,16 +621,38 @@ describe("site account credit through the quota service", () => {
 	});
 
 	test("rotating any site identity retires the previous account projection", async () => {
-		await replaceWithHttp(config(), async () => Response.json(body));
-		const before = await providerBalanceCache.request("relay-test");
+		await replaceWithSite(config(), async () => Response.json(body));
+		await providerBalanceCache.request(testProviderId);
+		const service = required(site).platform.providerSettingsService;
 		for (const change of [
-			{ quotaAccessToken: "replacement" },
-			{ quotaUserId: "99" },
-			{ quotaSiteUrl: "https://other-site.invalid" },
+			{ token: "replacement" },
+			{ userId: "99" },
+			{ siteUrl: "https://other-site.invalid" },
 		]) {
-			settings.customApiProviders = [{ ...config(), ...change }];
-			expect(providerBalanceCache.peek("relay-test")?.generation).not.toBe(before?.generation);
-			expect(providerBalanceCache.peek("relay-test")?.balance).toBeNull();
+			const before = providerBalanceCache.peek(testProviderId);
+			const extension = required(
+				(await service.list("custom-api", testProviderId)).find(
+					(item) => item.pluginId === required(site).pluginId,
+				),
+			);
+			const current = required(extension.config);
+			await service.save(required(site).pluginId, "site-account", "custom-api", testProviderId, {
+				schemaVersion: 1,
+				schemaFingerprint: current.schemaFingerprint,
+				expectedRevision: current.revision,
+				expectedBindingRevision: current.bindingRevision,
+				values: {
+					...current.values,
+					...("userId" in change ? { userId: change.userId } : {}),
+					...("siteUrl" in change ? { siteUrl: change.siteUrl } : {}),
+				},
+				// A destination or account change explicitly rebinds the same credential.
+				secrets: {
+					token: { operation: "set", value: "token" in change ? change.token : "replacement" },
+				},
+			});
+			expect(providerBalanceCache.peek(testProviderId)?.generation).not.toBe(before?.generation);
+			expect(providerBalanceCache.peek(testProviderId)?.balance).toBeNull();
 		}
 	});
 });
@@ -823,7 +916,7 @@ for (const [name, baseUrl, refreshAll] of [
 		void fixture.service.refresh("busy-a");
 		void fixture.service.refresh("busy-b");
 		expect(fixture.service.getDiagnostics()).toMatchObject({ active: 1, queued: 1 });
-		await expect(refreshAll({ manual: true })).rejects.toThrow("Quota refresh did not complete");
+		await expect(refreshAll({ manual: true })).rejects.toThrow("queue_full");
 		expect(fixture.query).toHaveBeenCalledTimes(1);
 		expect(fixture.service.peek("target")?.status).toBe("pending");
 	});

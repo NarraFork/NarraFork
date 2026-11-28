@@ -9,7 +9,15 @@ import {
 } from "../server/services/plugin-provider-rpc";
 import { LocalProcessRunner, PluginRuntime } from "../server/services/plugin-runtime";
 import { generateSpdxSbom, parseSbom } from "../server/services/plugin-sbom";
+import { ProviderSettingsConfigPolicy } from "../server/services/provider-settings-config-policy";
 import { quotaQueryResultSchema } from "../shared/provider-quota";
+import { providerSettingsFieldVisibility } from "../shared/provider-settings";
+import {
+	PROVIDER_SETTINGS_RPC_LIMITS,
+	providerSettingsActionResultSchema,
+	providerSettingsGetParamsSchema,
+} from "../shared/provider-settings-rpc";
+import type { ProviderSettingsValues } from "../shared/provider-settings-values";
 
 const RELEASE_OSES = ["linux", "darwin", "win32"] as const;
 const RELEASE_ARCHES = ["x64", "arm64"] as const;
@@ -46,6 +54,12 @@ export interface PluginReleaseRuntimeEvidence {
 	provider?: {
 		providerTypeId: string;
 		modelCount: number;
+	};
+	/** Offline action RPC using only this package's public fixture values. */
+	providerSettingsAction?: {
+		contributionId: string;
+		settingsReads: number;
+		text: string;
 	};
 	/** Offline protocol check with an invalid URL; never evidence of live upstream allowance. */
 	quotaQuery?: {
@@ -244,6 +258,10 @@ async function validateRuntime(
 		idleTimeoutMs: timeoutMs,
 		totalTimeoutMs: timeoutMs,
 	});
+	let actionBinding:
+		| { reference: string; values: ProviderSettingsValues; reads: number }
+		| undefined;
+	let hostRequests = 0;
 	const runtime = new PluginRuntime({
 		pluginId: manifest.pluginId,
 		pluginVersion: manifest.version,
@@ -255,6 +273,22 @@ async function validateRuntime(
 		grantedCapabilities: manifest.permissions.host,
 		supportedPluginToHostFeatures: manifest.engine.features,
 		activationReason: `release-validation:${mode}`,
+		requestHandler: (request, context) => {
+			hostRequests++;
+			context.signal.throwIfAborted();
+			const parsed = providerSettingsGetParamsSchema.safeParse(request.params);
+			if (
+				request.method !== "provider.settings.get" ||
+				!actionBinding ||
+				!parsed.success ||
+				parsed.data.reference !== actionBinding.reference ||
+				!manifest.permissions.host.includes("provider.settings.read_self") ||
+				++actionBinding.reads > PROVIDER_SETTINGS_RPC_LIMITS.requests
+			) {
+				throw new Error("Release validation denied an unbound host request");
+			}
+			return { revision: 1, values: structuredClone(actionBinding.values) };
+		},
 		env: {
 			NF_PLUGIN_PACKAGE_DIR: packageRoot,
 			NF_PLUGIN_DATA_DIR: dataPath,
@@ -305,6 +339,49 @@ async function validateRuntime(
 				};
 
 				if (mode === "ga") {
+					const settingsAction = manifest.contributes.providerSettings?.find((item) => item.action);
+					if (settingsAction) {
+						// Synthetic, public package defaults only; no saved host target or credentials.
+						const values: ProviderSettingsValues = {};
+						for (const [key, field] of Object.entries(settingsAction.configSchema.properties)) {
+							if (
+								providerSettingsFieldVisibility(field) === "public" &&
+								field.default !== undefined
+							)
+								values[key] = field.default;
+						}
+						const binding = { reference: crypto.randomUUID(), values, reads: 0 };
+						actionBinding = binding;
+						try {
+							const response = providerSettingsActionResultSchema.parse(
+								await runtime.request(
+									"providerSettings.action",
+									{
+										contributionId: settingsAction.id,
+										reference: binding.reference,
+										schemaVersion: settingsAction.schemaVersion,
+										schemaFingerprint: new ProviderSettingsConfigPolicy(settingsAction)
+											.schemaFingerprint,
+										target: { kind: settingsAction.targetKinds[0], id: "release-validation" },
+									},
+									{
+										signal: controller.signal,
+										timeoutMs,
+										maxResponseBytes: PROVIDER_SETTINGS_RPC_LIMITS.actionBytes,
+									},
+								),
+							);
+							if (binding.reads === 0)
+								throw new Error("providerSettings.action did not read its bound public settings");
+							result.providerSettingsAction = {
+								contributionId: settingsAction.id,
+								settingsReads: binding.reads,
+								text: response.text,
+							};
+						} finally {
+							actionBinding = undefined;
+						}
+					}
 					const quota = manifest.contributes.quotaSources[0];
 					if (quota) {
 						const response = quotaQueryResultSchema.parse(
@@ -333,9 +410,22 @@ async function validateRuntime(
 							contributionId: quota.id,
 							status: response.status,
 						};
-						if (quota.requests.some((request) => request.auth === "site-token")) {
-							// Explicit but incomplete saved-account intent must not become a successful
-							// zero balance, or fall back to an inference key. No credential/HTTP is used.
+						const settings = manifest.contributes.providerSettings?.find(
+							(item) => item.id === quota.settingsContribution,
+						);
+						const settingsAccount =
+							settings?.configSchema.properties.useSiteAccount?.type === "boolean" &&
+							settings.connections?.some(
+								(connection) =>
+									connection.destination === "extension" && connection.baseUrlField === "siteUrl",
+							);
+						if (
+							settingsAccount ||
+							quota.requests.some((request) => request.auth === "site-token")
+						) {
+							// Keep a valid inference target: incomplete account intent must fail before
+							// any host connection, without silently falling back to the inference key.
+							const requestsBefore = hostRequests;
 							const siteAccount = quotaQueryResultSchema.parse(
 								await runtime.request(
 									"quota.query",
@@ -344,13 +434,22 @@ async function validateRuntime(
 										contributionId: quota.id,
 										target: {
 											kind: "custom-api",
-											id: "custom-api/release-validation-key",
+											id: "custom-api/release-validation/keys/release-validation-key",
 											providerId: "release-validation",
 											keyId: "release-validation-key",
 											generation: "release-validation",
-											baseUrl: "invalid-url",
-											siteQuota: { root: null },
+											baseUrl: "https://release-validation.invalid/v1",
+											...(settingsAccount ? {} : { siteQuota: { root: null } }),
 										},
+										...(settingsAccount
+											? {
+													settings: {
+														reference: crypto.randomUUID(),
+														revision: 1,
+														values: { useSiteAccount: true },
+													},
+												}
+											: {}),
 										mode: "probe",
 										reference: "release-validation-site",
 										deadlineAt: Date.now() + timeoutMs,
@@ -358,6 +457,10 @@ async function validateRuntime(
 									{ signal: controller.signal, timeoutMs },
 								),
 							);
+							if (hostRequests !== requestsBefore)
+								throw new Error(
+									"quota.query attempted a host request for an incomplete site account",
+								);
 							if (siteAccount.status === "supported") {
 								throw new Error("quota.query invented support for an incomplete site account");
 							}

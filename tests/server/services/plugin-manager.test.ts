@@ -3294,10 +3294,20 @@ describe("PluginManager", () => {
 		if (!pending) throw new Error("expected a queued pending request");
 
 		await manager.approvePermissionRequest(pluginId, pending.requestId, "admin-approve");
-		await expect(
-			manager.denyPermissionRequest(pluginId, pending.requestId, { permanent: true }),
-		).rejects.toThrow();
+		// Bun's promise matcher can starve the reused DB read Worker. Settle the real
+		// operation first so cleanup cannot race a still-running authority lookup.
+		const rejection = await manager
+			.denyPermissionRequest(pluginId, pending.requestId, { permanent: true })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		expect(rejection).toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
 		expect(await manager.listPermanentDenials(pluginId)).toHaveLength(0);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+		expect((await manager.getPermissions(pluginId)).grants).toContainEqual(
+			expect.objectContaining({ capability: "query.read.projects", grantedBy: "admin-approve" }),
+		);
 	});
 
 	test("restores the stable UUID from the authority and retires legacy hash authorities on initialize", async () => {

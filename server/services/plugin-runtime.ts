@@ -1597,8 +1597,15 @@ export class PluginRuntime {
 		this.stoppedAt = undefined;
 		this.acceptingRequests = false;
 		this.negotiatedFeatures = [];
-		this.setState("starting");
+		// The caller owns cancellation only until activation finishes. The runner keeps
+		// its signal for the process lifetime, so do not hand it the request's signal:
+		// completing a quota/settings request must not kill the shared active runtime.
+		const startup = new AbortController();
+		const abortStartup = () => startup.abort(signal?.reason);
+		if (signal?.aborted) abortStartup();
+		else signal?.addEventListener("abort", abortStartup, { once: true });
 		try {
+			this.setState("starting");
 			this.handle = await this.runner.start({
 				command: this.options.command,
 				cwd: this.options.cwd,
@@ -1608,7 +1615,7 @@ export class PluginRuntime {
 					NF_PLUGIN_GENERATION: String(generation),
 					NF_PLUGIN_RPC_PROTOCOL: this.options.rpcProtocol ?? NARRAFORK_RPC_PROTOCOL,
 				},
-				signal,
+				signal: startup.signal,
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
 				totalTimeoutMs: this.options.totalTimeoutMs,
@@ -1776,6 +1783,8 @@ export class PluginRuntime {
 				);
 			}
 			throw runtimeError;
+		} finally {
+			signal?.removeEventListener("abort", abortStartup);
 		}
 	}
 

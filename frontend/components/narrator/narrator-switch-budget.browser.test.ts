@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { COMMUNICATION_LIMITS, type CommunicationCandidates } from "@shared/narrator-communication";
 import puppeteer, { type HTTPRequest, type Page } from "puppeteer-core";
 import { APP_VERSION, GIT_COMMIT } from "../../../server/lib/version";
@@ -128,7 +128,7 @@ async function assertMatchingFrontendBuild() {
 	const entry = index.match(/<script\b[^>]*\bsrc="\.\/([^"?]+\.js)"/)?.[1];
 	if (!entry) throw new Error("Frontend build has no module entry");
 	const entryPath = resolve(frontendDist, entry);
-	if (!entryPath.startsWith(`${resolve(frontendDist)}/`))
+	if (!entryPath.startsWith(`${resolve(frontendDist)}${sep}`))
 		throw new Error("Invalid frontend entry path");
 	const file = Bun.file(entryPath);
 	if (file.size > 8 * 1024 * 1024) throw new Error("Frontend entry exceeds bounded identity probe");

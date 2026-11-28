@@ -1,5 +1,6 @@
 import { mock, spyOn } from "bun:test";
 import {
+	type CustomApiQuotaTarget,
 	type ProviderQuotaData,
 	type ProviderQuotaSnapshot,
 	providerQuotaSourceSchema,
@@ -94,7 +95,7 @@ export function legacyQuotaFixture(
 	const query = mock(
 		async (
 			_source: ProviderQuotaSource,
-			_target: { providerId: string },
+			_target: CustomApiQuotaTarget,
 			_options: ProviderQuotaQueryOptions,
 		): Promise<QuotaQueryResult> => ({
 			status: "supported",
@@ -117,6 +118,32 @@ export function legacyQuotaFixture(
 	service.start();
 	settings.customApiProviders = providers;
 	service.sync();
+	bindLegacyQuotaService(service);
+	return {
+		service,
+		directory,
+		query,
+		source,
+		setEnabled(enabled: boolean) {
+			sources = enabled ? [source] : [];
+			service.invalidateSources();
+		},
+		advance(ms: number) {
+			now += ms;
+		},
+		revoke() {
+			sources = [];
+			service.invalidateSources();
+		},
+		dispose() {
+			service.dispose();
+			settings.customApiProviders = originalProviders;
+		},
+	};
+}
+
+/** Point compatibility views at a real isolated service, preserving its routing and lifecycle. */
+export function bindLegacyQuotaService(service: ProviderQuotaService) {
 	spyOn(providerQuotaService, "sync").mockImplementation(() => service.sync());
 	spyOn(providerQuotaService, "peek").mockImplementation((id) => service.peek(id));
 	spyOn(providerQuotaService, "peekGeneration").mockImplementation((id) =>
@@ -148,27 +175,6 @@ export function legacyQuotaFixture(
 		service.manualRetryAfterMs(id, keyId),
 	);
 	spyOn(providerQuotaService, "noteActivity").mockImplementation((id) => service.noteActivity(id));
-	return {
-		service,
-		directory,
-		query,
-		source,
-		setEnabled(enabled: boolean) {
-			sources = enabled ? [source] : [];
-			service.invalidateSources();
-		},
-		advance(ms: number) {
-			now += ms;
-		},
-		revoke() {
-			sources = [];
-			service.invalidateSources();
-		},
-		dispose() {
-			service.dispose();
-			settings.customApiProviders = originalProviders;
-		},
-	};
 }
 
 export function deferred<T>() {
@@ -290,8 +296,12 @@ export async function archivedQuotaFixture(
 		fetch?: typeof import("../net/outbound-fetch").outboundFetch;
 		requestTimeoutMs?: number;
 		approveSettings?: boolean;
+		now?: () => number;
+		persistence?: ProviderQuotaServiceOptions["persistence"];
 	} = {},
 ) {
+	// Build and host-module loading are independent; keep fixture setup within the normal test budget.
+	const builtPromise = quotaTestPackage();
 	const { createHash } = await import("node:crypto");
 	const { mkdtemp, readFile, realpath, rm } = await import("node:fs/promises");
 	const { z } = await import("zod");
@@ -326,10 +336,15 @@ export async function archivedQuotaFixture(
 	let providers: CustomApiProviderConfig[] = [];
 	const directory = new CustomApiQuotaTargetDirectory({
 		providers: () => providers.map(projectQuotaSettings),
-		globalProxy: () => ({ mode: "direct" }),
+		globalProxy: () => settings.proxy,
 		userAgent: () => "Quota-archived-test",
 	});
-	const service = new ProviderQuotaService({ directory, onChanged: () => {} });
+	const service = new ProviderQuotaService({
+		directory,
+		onChanged: () => {},
+		now: options.now,
+		persistence: options.persistence,
+	});
 	const { outboundFetch } = await import("../net/outbound-fetch");
 	let testHttp = options.fetch ?? outboundFetch;
 	const connectionOptions = {
@@ -394,11 +409,13 @@ export async function archivedQuotaFixture(
 		service.sync();
 	};
 	const prepareProviders = async (value: CustomApiProviderConfig[]) => {
+		// A reused real archive remains pinned after each test restores its other spies.
+		catalogLookup = spyOn(builtinPluginCatalog, "get").mockImplementation((id) => catalog.get(id));
 		setProviders(value);
 		await platform.providerSettingsService.prepareQuotaMigrations();
 		service.sync();
 	};
-	const built = await quotaTestPackage();
+	const built = await builtPromise;
 	const artifact = z
 		.object({
 			pluginId: z.literal(pluginId),
@@ -435,7 +452,7 @@ export async function archivedQuotaFixture(
 			},
 		],
 	});
-	const catalogLookup = spyOn(builtinPluginCatalog, "get").mockImplementation((id) =>
+	let catalogLookup = spyOn(builtinPluginCatalog, "get").mockImplementation((id) =>
 		catalog.get(id),
 	);
 	try {
@@ -465,6 +482,7 @@ export async function archivedQuotaFixture(
 		pluginId,
 		approveSettings,
 		setProviders,
+		prepareProviders,
 		setTestHttp(value?: typeof outboundFetch) {
 			testHttp = value ?? options.fetch ?? outboundFetch;
 		},

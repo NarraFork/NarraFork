@@ -15,7 +15,7 @@ import { createPluginPlatformServices } from "@server/services/plugin-platform-s
 import { RuntimeSupervisor } from "@server/services/plugin-runtime";
 import { PluginSecretVault } from "@server/services/plugin-secret-vault";
 import { PluginStateStore } from "@server/services/plugin-state-store";
-import { ProviderSettingsService } from "@server/services/provider-settings-service";
+import type { ProviderSettingsService } from "@server/services/provider-settings-service";
 import { Hono } from "hono";
 
 const exampleRoot = join(
@@ -159,14 +159,7 @@ async function createHarness() {
 		restorePluginLifecycle: platform.restorePlugin,
 		purgePluginSecrets: (pluginId) => platform.secretVault.deletePlugin(pluginId),
 	});
-	const service = new ProviderSettingsService({
-		registry: platform.contributionRegistry,
-		states: stateStore,
-		runtimes: supervisor,
-		host: platform.hostServices,
-		broker: platform.capabilityBroker,
-		bindings: platform.providerSettingsBindings,
-	});
+	const service = platform.providerSettingsService;
 	service.setActivationHandler((pluginId, options) =>
 		manager.activate(pluginId, { ...options, automatic: true }),
 	);
@@ -192,12 +185,20 @@ async function grantSettingsRead(harness: Harness, pluginId: string): Promise<vo
 }
 
 async function cleanupHarness(harness: Harness): Promise<void> {
+	const runtimes = [...installedPluginIds].flatMap((pluginId) => {
+		const runtime = harness.supervisor.get(pluginId);
+		return runtime ? [{ runtime, pid: runtime.pid }] : [];
+	});
 	for (const pluginId of installedPluginIds) {
 		await harness.manager.uninstall(pluginId).catch(() => undefined);
 	}
-	await harness.manager.shutdown().catch(() => undefined);
+	await harness.manager.shutdown();
+	for (const { runtime, pid } of runtimes) {
+		expect(runtime.getDiagnostics()).toMatchObject({ state: "stopped", inFlight: 0 });
+		if (pid) expect(() => process.kill(pid, 0)).toThrow();
+	}
+	expect(harness.manager.hasPendingShutdownWork()).toBe(false);
 	harness.service.close();
-	harness.platform.providerSettingsService.close();
 	harness.platform.providerSettingsBindings.close();
 	for (const pluginId of installedPluginIds) {
 		sqlite.run("DELETE FROM plugin_provider_settings WHERE plugin_id = ?", [pluginId]);
@@ -287,6 +288,13 @@ describe("provider-settings example over real plugin runtime", () => {
 				),
 			).toBe(false);
 
+			const baseRuntime = harness.supervisor.get(basePluginId);
+			if (!baseRuntime) throw new Error("Denied action did not activate the plugin runtime");
+			const { runtimeId, generation, pid } = baseRuntime.getDiagnostics();
+			expect(pid).toBeGreaterThan(0);
+			// Finishing the denied request must not cancel its now-shared lazy runtime.
+			expect(await baseRuntime.request("health")).toMatchObject({ healthy: true });
+
 			await grantSettingsRead(harness, basePluginId);
 			await grantSettingsRead(harness, peerPluginId);
 
@@ -294,24 +302,35 @@ describe("provider-settings example over real plugin runtime", () => {
 				`/api/provider-settings/${basePluginId}/settings/action?kind=custom-api&id=${targetId}`,
 				{ method: "POST" },
 			);
-			expect(baseAction.status).toBe(200);
-			expect(await responseJson(baseAction)).toEqual({
-				text: "provider-settings-reference:alpha:enabled:7",
+			const baseBody = await responseJson(baseAction);
+			expect({ status: baseAction.status, body: baseBody }).toEqual({
+				status: 200,
+				body: { text: "provider-settings-reference:alpha:enabled:7" },
+			});
+			expect(harness.supervisor.get(basePluginId)).toBe(baseRuntime);
+			expect(baseRuntime.getDiagnostics()).toMatchObject({
+				runtimeId,
+				generation,
+				pid,
+				state: "active",
 			});
 
 			const peerAction = await app.request(
 				`/api/provider-settings/${peerPluginId}/settings/action?kind=custom-api&id=${targetId}`,
 				{ method: "POST" },
 			);
-			expect(peerAction.status).toBe(200);
-			expect(await responseJson(peerAction)).toEqual({
-				text: "provider-settings-reference:beta:disabled:2",
+			const peerBody = await responseJson(peerAction);
+			expect({ status: peerAction.status, body: peerBody }).toEqual({
+				status: 200,
+				body: { text: "provider-settings-reference:beta:disabled:2" },
 			});
 
 			for (const pluginId of [basePluginId, peerPluginId]) {
 				const runtime = harness.supervisor.get(pluginId);
-				expect(runtime?.pid).toBeGreaterThan(0);
-				expect(runtime?.getDiagnostics().features).toContain("host_api.provider_settings");
+				if (!runtime) throw new Error(`Missing plugin runtime after action: ${pluginId}`);
+				expect(await runtime.request("health")).toMatchObject({ healthy: true });
+				expect(runtime.pid).toBeGreaterThan(0);
+				expect(runtime.getDiagnostics().features).toContain("host_api.provider_settings");
 				await eventuallyFile(
 					join(harness.storeRoot, "data", pluginId, "provider-settings-action.marker"),
 				);

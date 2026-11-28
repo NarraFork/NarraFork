@@ -1,9 +1,11 @@
 /* biome-ignore-all lint/style/noNonNullAssertion: beforeEach establishes these fixed settings and template fixtures. */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import fs from "node:fs";
+import type { ProviderQuotaData } from "@shared/provider-quota";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { pluginProviderRegistry } from "../../../services/plugin-provider-registry";
 import { tokenDanceQuotaIdentity } from "../../../services/tokendance-service";
+import { legacyQuotaFixture, required } from "../../__tests__/provider-quota-legacy-fixture";
 import { __setCodexManagerForTests } from "../../codex-manager";
 import type { CodexUsageResult } from "../../codex-usage";
 import { commandCodeQuotaIdentity, probeCommandCodeQuota } from "../../commandcode-usage";
@@ -110,9 +112,49 @@ const snapshot = (extra: Partial<QuotaSnapshot> = {}): QuotaSnapshot => ({
 const emptyWallet = snapshot({ balances: [{ unit: "USD", remaining: 0 }] });
 const fullWindow = (resetsAt: number | null) =>
 	snapshot({ windows: [{ kind: "5h", usedRatio: 1, resetsAt }] });
-function remember(id: string, identity: string, value: QuotaSnapshot, stream = false) {
+let fixture: ReturnType<typeof legacyQuotaFixture>;
+const quotaInputs = new Map<string, { data: ProviderQuotaData; error?: string }>();
+async function rememberQuota(id: string, identity: string, value: QuotaSnapshot, stream = false) {
 	quotaIds.add(id);
-	quotaStore.set(id, identity, value, false, stream ? STREAM_QUOTA_SOURCE : undefined);
+	const custom = configs.some((config) => config.id === store.get(id)?.providerId);
+	if (custom && !stream) {
+		// Drain automatic warmup for this key before publishing the next controlled observation.
+		await fixture.service.refreshKey(id);
+		const data: ProviderQuotaData = {
+			scope: value.scope,
+			unlimited: value.balances.some((balance) => balance.unlimited),
+			amounts: value.balances.map((balance, index) => ({
+				id: balance.id ?? `amount:${index}`,
+				unit: balance.unit,
+				remaining: balance.remaining,
+				quota: balance.quota ?? ("alternative" as const),
+				...(balance.unlimited !== undefined ? { unlimited: balance.unlimited } : {}),
+				...(balance.used !== undefined ? { used: balance.used } : {}),
+				...(balance.total !== undefined ? { total: balance.total } : {}),
+			})),
+			windows: value.windows.map((window) => ({
+				id: window.kind,
+				used: null,
+				limit: null,
+				remaining: null,
+				usedPercent: window.usedRatio === null ? null : window.usedRatio * 100,
+				resetAt: window.resetsAt === null ? null : new Date(window.resetsAt).toISOString(),
+			})),
+		};
+		quotaInputs.set(id, { data, ...(value.error ? { error: value.error } : {}) });
+		fixture.advance(10_000);
+		await fixture.service.refreshKey(id);
+		return;
+	}
+	quotaStore.set(
+		id,
+		identity,
+		custom && stream
+			? { ...value, detail: { generation: required(fixture.service.peekKey(id)).generation } }
+			: value,
+		false,
+		stream ? STREAM_QUOTA_SOURCE : undefined,
+	);
 }
 
 beforeEach(() => {
@@ -132,8 +174,23 @@ beforeEach(() => {
 		tokendance: { apiKey: "", generation: 0, disabled: false },
 		commandCode: { baseUrl: "https://cc.example", apiKey: "" },
 	});
+	quotaInputs.clear();
+	fixture = legacyQuotaFixture(settings.customApiProviders);
+	fixture.query.mockImplementation(async (_source, target) => {
+		const value = quotaInputs.get(target.keyId ?? target.providerId);
+		return value?.error
+			? { status: "error", data: null, error: "request_failed" }
+			: {
+					status: "supported",
+					error: null,
+					data: value?.data ?? { scope: "key", windows: [], amounts: [] },
+				};
+	});
+	fixture.advance(now - 1_000_000);
 });
 afterEach(() => {
+	fixture.dispose();
+	mock.restore();
 	for (const id of quotaIds) {
 		quotaStore.forget(id);
 		quotaStore.forget(id, STREAM_QUOTA_SOURCE);
@@ -256,7 +313,7 @@ describe("template auto routing", () => {
 		expect(autoSourceFacts(entry.prefix, now + 610_001).available).toBe(true);
 	});
 
-	test("balance policy distinguishes exhausted, unknown, errors, unlimited and multiple currencies", () => {
+	test("balance policy distinguishes exhausted, unknown, errors, unlimited and multiple currencies", async () => {
 		const entry = customSources[3]!;
 		const key = entry.add();
 		for (const [value, available] of [
@@ -276,20 +333,20 @@ describe("template auto routing", () => {
 				true,
 			],
 		] as const) {
-			remember(key.id, entry.identity(key), value);
+			await rememberQuota(key.id, entry.identity(key), value);
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(available);
 		}
 	});
 
 	for (const entry of walletSources) {
-		test(`${entry.prefix}: a real wallet identity blocks exhausted keys but not an unknown sibling`, () => {
+		test(`${entry.prefix}: a real wallet identity blocks exhausted keys but not an unknown sibling`, async () => {
 			const key = entry.add();
-			remember(key.id, entry.identity(key), emptyWallet);
+			await rememberQuota(key.id, entry.identity(key), emptyWallet);
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 			const second = entry.add("second");
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
 			expect(autoSourcePreview(entry.prefix, now)).toEqual({ label: "second" });
-			remember(second.id, entry.identity(second), emptyWallet);
+			await rememberQuota(second.id, entry.identity(second), emptyWallet);
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 			expect(autoSourcePreview(entry.prefix, now)).toEqual({ label: "first" });
 		});
@@ -320,7 +377,7 @@ describe("template auto routing", () => {
 					new AbortController().signal,
 				);
 				expect(result.balances[0]?.remaining).toBe(remaining);
-				remember(key.id, nugSource.identity(key), result);
+				await rememberQuota(key.id, nugSource.identity(key), result);
 				expect(autoSourceFacts(nugSource.prefix, now).available).toBe(
 					remaining === null || remaining > 0,
 				);
@@ -361,11 +418,11 @@ describe("template auto routing", () => {
 		}
 	});
 
-	test("quota windows choose the first key's latest reset, then the earliest key recovery; expired windows reopen", () => {
+	test("quota windows choose the first key's latest reset, then the earliest key recovery; expired windows reopen", async () => {
 		const entry = customSources[0]!;
 		const first = entry.add();
 		const second = entry.add("second");
-		remember(
+		await rememberQuota(
 			first.id,
 			entry.identity(first),
 			snapshot({
@@ -375,7 +432,7 @@ describe("template auto routing", () => {
 				],
 			}),
 		);
-		remember(second.id, entry.identity(second), fullWindow(now + 200));
+		await rememberQuota(second.id, entry.identity(second), fullWindow(now + 200));
 		expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 		expect(autoSourcePreview(entry.prefix, now)).toEqual({ label: "second", resetsAt: now + 200 });
 		expect(autoSourceFacts(entry.prefix, now + 200).available).toBe(true);
@@ -396,7 +453,7 @@ describe("template auto routing", () => {
 		}
 	});
 
-	test("Codex manager owns credit continuation and rotating preview; projection reads canonical usage separately", () => {
+	test("Codex manager owns credit continuation and rotating preview; projection reads canonical usage separately", async () => {
 		const usage: CodexUsageResult = {
 			plan_type: "plus",
 			queriedAt: new Date(now).toISOString(),
@@ -416,7 +473,7 @@ describe("template auto routing", () => {
 			dispose: () => {},
 		};
 		__setCodexManagerForTests(manager as never);
-		remember("codex-credit", "irrelevant", fullWindow(now + 1000));
+		await rememberQuota("codex-credit", "irrelevant", fullWindow(now + 1000));
 		expect(autoSourceFacts("codex", now)).toEqual({ available: true, subscription: true });
 		expect(autoSourcePreview("codex", now)).toEqual({ label: "credit account", rotating: true });
 		expect(manager.usageOf).not.toHaveBeenCalled();
@@ -440,7 +497,7 @@ describe("template auto routing", () => {
 		[customSources[3]!, "global-proxy"],
 		[nugSource, "endpoint"],
 	] as const) {
-		test(`${entry.prefix}: ${change} invalidates old probe and stream snapshots`, () => {
+		test(`${entry.prefix}: ${change} invalidates old probe and stream snapshots`, async () => {
 			const key = entry.add();
 			for (const stream of [false, true]) {
 				const oldIdentity =
@@ -449,7 +506,7 @@ describe("template auto routing", () => {
 						: customApiStreamQuotaIdentity(withProviderKey(customConfig(entry.id), key));
 				const exhausted =
 					entry.id === "route-go" && !stream ? fullWindow(now + 600_000) : emptyWallet;
-				remember(key.id, oldIdentity, exhausted, stream);
+				await rememberQuota(key.id, oldIdentity, exhausted, stream);
 				expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 				if (change === "key") store.update(key.id, { apiKey: `${key.apiKey}-rotated` });
 				else if (change === "endpoint") {
@@ -477,23 +534,34 @@ describe("template auto routing", () => {
 					});
 				}
 				expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
-				// Mismatched routing reads leave the old identity intact, without restoring it.
-				expect(
-					quotaStore.peekForIdentity(key.id, oldIdentity, stream ? STREAM_QUOTA_SOURCE : undefined),
-				).toEqual(exhausted);
-				quotaStore.forget(key.id, stream ? STREAM_QUOTA_SOURCE : undefined);
+				if (!stream && entry.id !== "route-nug") {
+					// Plugin-owned probes retire the old connection and never consult the host slot.
+					fixture.service.sync();
+					expect(fixture.service.peekKey(key.id)?.data).toBeNull();
+					expect(quotaStore.peek(key.id)).toBeUndefined();
+				} else {
+					// Read-only routing leaves an obsolete stream/platform record intact.
+					expect(
+						quotaStore.peekForIdentity(
+							key.id,
+							oldIdentity,
+							stream ? STREAM_QUOTA_SOURCE : undefined,
+						),
+					).toMatchObject(exhausted);
+					quotaStore.forget(key.id, stream ? STREAM_QUOTA_SOURCE : undefined);
+				}
 			}
 		});
 	}
 
-	test("singleton key rotation, TD generation and same-origin CC endpoint paths invalidate old quotas", () => {
+	test("singleton key rotation, TD generation and same-origin CC endpoint paths invalidate old quotas", async () => {
 		for (const entry of walletSources.slice(0, 2)) {
 			const key = entry.add();
-			remember(key.id, entry.identity(key), emptyWallet);
+			await rememberQuota(key.id, entry.identity(key), emptyWallet);
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 			store.update(key.id, { apiKey: `${key.apiKey}-rotated` });
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
-			remember(key.id, entry.identity(key), emptyWallet);
+			await rememberQuota(key.id, entry.identity(key), emptyWallet);
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 			if (entry.id === "tokendance")
 				saveSettings({
@@ -509,18 +577,18 @@ describe("template auto routing", () => {
 		}
 	});
 
-	test("probe and stream slots independently block without overwriting or reading another source", () => {
+	test("probe and stream slots independently block without overwriting or reading another source", async () => {
 		const entry = customSources[3]!;
 		const key = entry.add();
 		const probe = entry.identity(key);
 		const stream = customApiStreamQuotaIdentity(withProviderKey(customConfig(entry.id), key));
-		remember(key.id, probe, emptyWallet);
-		remember(key.id, stream, snapshot(), true);
+		await rememberQuota(key.id, probe, emptyWallet);
+		await rememberQuota(key.id, stream, snapshot(), true);
 		expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
-		remember(key.id, probe, snapshot());
-		remember(key.id, stream, emptyWallet, true);
+		await rememberQuota(key.id, probe, snapshot());
+		await rememberQuota(key.id, stream, emptyWallet, true);
 		expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
-		remember(key.id, `${stream}-stale`, emptyWallet, true);
+		await rememberQuota(key.id, `${stream}-stale`, emptyWallet, true);
 		expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
 	});
 

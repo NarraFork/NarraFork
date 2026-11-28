@@ -156,9 +156,14 @@ describe("IntegrationAuthorizationService", () => {
 			attempts++;
 			throw new Error("disk I/O error");
 		});
-		await expect(integrationAuthorizationService.authorize(request)).rejects.toThrow(
-			"disk I/O error",
+		// Let the real read Worker settle before invoking Bun's rejection matcher.
+		// Matching the live promise here can block its message delivery.
+		const error = await integrationAuthorizationService.authorize(request).then(
+			() => undefined,
+			(cause: unknown) => cause,
 		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toBe("disk I/O error");
 		// Not a lock conflict: no retry, and the decision was never cached as allowed.
 		expect(attempts).toBe(1);
 		mock.restore();

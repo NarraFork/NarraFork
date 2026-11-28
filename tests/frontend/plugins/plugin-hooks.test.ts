@@ -16,7 +16,11 @@ describe("plugin query invalidation", () => {
 			["plugins"],
 			["plugins", "ui-contributions"],
 			["plugins", "ui-health"],
+			["provider-settings"],
 			["provider-quotas"],
+			["quota-snapshots"],
+			["settings"],
+			["admin", "settings"],
 		]);
 	});
 

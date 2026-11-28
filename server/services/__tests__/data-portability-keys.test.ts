@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createWriteStream, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,9 +20,13 @@ resetProviderKeyStoreForTests();
 const { applyImport, clearData, exportData, getPreview, previewImport } = await import(
 	"../data-portability"
 );
-const { nugKeyOwner, nugOAuthKeyOwner, quotaKeyOwner } = await import(
+const { hydrateProviderKeys, nugKeyOwner, nugOAuthKeyOwner, quotaKeyOwner } = await import(
 	"../../lib/settings/provider-keys-projection"
 );
+// Rebuilding the store also replaces the change listener installed by settings/index.ts.
+// Keep the same production wiring so restored keys refresh settings before a later save.
+getProviderKeyStore().onChange(() => hydrateProviderKeys(settings));
+hydrateProviderKeys(settings);
 const { sealProviderKeys, SEALED_KEYS_ENTRY } = await import("../data-portability-keys");
 const archiver = (await import("archiver")).default;
 
@@ -419,6 +423,74 @@ describe("provider keys in a data export", () => {
 		expect(keysOf(nugOAuthKeyOwner("nug-id")).map((key) => key.apiKey)).toEqual(["oauth-secret"]);
 		expect(result.keysImported).toBe(7);
 		expect(result.keysFailed).toBe(0);
+	});
+
+	test("credential restore failures are counted while successful credentials remain usable", async () => {
+		const zip = await exportFromSource();
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "partial-credentials.zip");
+		const store = getProviderKeyStore();
+		const add = store.addGroupCredential.bind(store);
+		const restore = spyOn(store, "addGroupCredential").mockImplementation((id, template, input) => {
+			if (input.apiKey === "sk-second") throw new Error("credential write failed");
+			return add(id, template, input);
+		});
+		try {
+			const result = await applyImport(preview.token, {
+				conflictDefault: "skip",
+				passphrase: PASSPHRASE,
+			});
+			expect(restore).toHaveBeenCalledTimes(5);
+			expect(result.keysImported).toBe(6);
+			expect(result.keysFailed).toBe(1);
+			expect(keysOf("relay-id").map((key) => key.apiKey)).toEqual(["sk-first", "sk-third"]);
+			expect(settings.customApiProviders?.[0]?.apiKey).toBe("sk-first");
+			expect(settings.customApiProviders?.[0]?.quotaAccessToken).toBe("site-relay-secret");
+			expect(settings.nugProviders?.[0]?.apiKey).toBe("nug-secret");
+			expect(settings.tokendance?.apiKey).toBe("td-secret");
+			saveSettings(structuredClone(settings));
+			reloadSettings();
+			expect(keysOf("relay-id").map((key) => key.apiKey)).toEqual(["sk-first", "sk-third"]);
+		} finally {
+			restore.mockRestore();
+		}
+	});
+
+	test("SQL import failure rolls back sessions and never starts credential restoration", async () => {
+		setProviders({
+			customApiProviders: [
+				apiProvider("sql-relay", "sqlrelay", "sk-sql", "https://sql.example/v1"),
+			],
+		});
+		sqlite.run(
+			"INSERT INTO narrators(id,type,created_at,updated_at) VALUES ('sql-session','primary','now','now')",
+		);
+		sqlite.run(
+			"INSERT INTO narrator_messages(id,narrator_id,role,content_json,created_at) VALUES ('sql-message','sql-session','user','[]','now')",
+		);
+		const zip = await readFile(
+			(await exportData({ ...providersOnly, sessions: true }, { passphrase: PASSPHRASE })).zipPath,
+		);
+		await clearData("sessions");
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "sql-failure.zip");
+		const restore = spyOn(getProviderKeyStore(), "addGroupCredential");
+		sqlite.run(`CREATE TEMP TRIGGER fail_credential_import BEFORE INSERT ON narrator_messages
+			BEGIN SELECT RAISE(ABORT, 'message import failed'); END`);
+		try {
+			await expect(
+				applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE }),
+			).rejects.toThrow("message import failed");
+			expect(sqlite.query("SELECT id FROM narrators").all()).toEqual([]);
+			expect(sqlite.query("SELECT id FROM narrator_messages").all()).toEqual([]);
+			expect(settings.customApiProviders).toEqual([]);
+			expect(getProviderKeyStore().all()).toEqual([]);
+			expect(restore).not.toHaveBeenCalled();
+			expect(getPreview(preview.token).token).toBe(preview.token);
+		} finally {
+			sqlite.run("DROP TRIGGER fail_credential_import");
+			restore.mockRestore();
+		}
 	});
 
 	test("a site-only credential round-trips without creating an inference key", async () => {

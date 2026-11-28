@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { testEnvironment } from "../../../tests/preload";
 import { getTestDb } from "../../../tests/setup";
@@ -35,7 +37,21 @@ export function getNarratorWorkerTestDb() {
 			await ready.catch(() => {});
 			await shutdownDbWorkerPool();
 			sqlite.close();
-			rmSync(directory, { recursive: true, force: true });
+			for (let attempt = 0; ; attempt++) {
+				try {
+					await rm(directory, { recursive: true, force: true });
+					break;
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					if (
+						process.platform !== "win32" ||
+						attempt >= 4 ||
+						!["EBUSY", "EPERM"].includes(code ?? "")
+					)
+						throw error;
+					await delay(50 * (attempt + 1));
+				}
+			}
 		})();
 		return closing;
 	}

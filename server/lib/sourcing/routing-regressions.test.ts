@@ -146,6 +146,40 @@ describe("template routing review regressions", () => {
 		expect(f.query).toHaveBeenCalledTimes(2);
 	});
 
+	test("expired stream records are ignored while a live probe's subscription expiry still blocks", async () => {
+		const config = provider("review-expiry", "https://relay.example/v1");
+		saveSettings({ ...settings, customApiProviders: [config] });
+		const credential = keyFor(config);
+		const data: ProviderQuotaData = {
+			scope: "subscription",
+			windows: [],
+			amounts: [{ id: "wallet", unit: "USD", remaining: 10 }],
+		};
+		const f = pluginQuota(credential.config, data);
+		const probe = required(await f.service.refreshKey(credential.key.id));
+		quotaStore.set(
+			credential.key.id,
+			customApiStreamQuotaIdentity(credential.config),
+			quota({
+				balances: [{ unit: "USD", remaining: 0 }],
+				expiresAt: now + 100,
+				detail: { generation: probe.generation },
+			}),
+			false,
+			STREAM_QUOTA_SOURCE,
+		);
+		expect(autoSourceFacts(config.prefix, now).available).toBe(false);
+		expect(autoSourceFacts(config.prefix, now + 100).available).toBe(true);
+		f.advance(10_000);
+		f.query.mockResolvedValue({
+			status: "supported",
+			error: null,
+			data: { ...data, expiresAt: new Date(now - 1).toISOString() },
+		});
+		await f.service.refreshKey(credential.key.id);
+		expect(autoSourceFacts(config.prefix, now + 100).available).toBe(false);
+	});
+
 	for (const kind of ["custom", "nug"] as const) {
 		test(`disconnected TokenDance yields its legacy prefix to ${kind} for facts and preview`, () => {
 			const config = {

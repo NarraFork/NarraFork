@@ -310,16 +310,75 @@ describe("C1/C2 reference plugin lifecycle acceptance", () => {
 			);
 			expect(runtime.state).toBe("active");
 			expect(runtime.rpcConnection?.outboundPending.size).toBe(0);
-			await expect(runtime.request("health")).resolves.toMatchObject({ healthy: true });
+			expect(await runtime.request("health")).toMatchObject({ healthy: true });
 		} finally {
 			bridge.dispose();
-			if (outputPath) await unlink(outputPath);
+			const runtime = supervisor.get(manifest.pluginId);
+			const pid = runtime?.pid;
+			// Shutdown owns both process exit and queued state callbacks. New lifecycle
+			// operations are rejected once it starts, so verify the completed drain directly.
 			await manager.shutdown();
-			// An idempotent lifecycle operation also drains queued state callbacks before
-			// afterEach removes the package/state directory (shutdown only queues them).
-			if (supervisor.get(manifest.pluginId)) await manager.deactivate(manifest.pluginId);
+			if (runtime) {
+				expect(runtime.getDiagnostics()).toMatchObject({ state: "stopped", inFlight: 0 });
+				expect(runtime.rpcConnection?.outboundPending.size ?? 0).toBe(0);
+				expect((await manager.stateStore.getState(manifest.pluginId))?.runtimeState).toBe(
+					"inactive",
+				);
+			}
+			if (pid) expect(await waitForProcessExit(pid)).toBe(true);
+			if (outputPath) await unlink(outputPath);
 		}
 	}, 60_000);
+
+	test("a completed activation signal cannot terminate the shared runtime", async () => {
+		const packageRoot = await copyReferenceFixture();
+		const manifest = parseManifest(
+			JSON.parse(await readFile(join(packageRoot, "manifest.json"), "utf8")),
+		);
+		const runtime = createRuntime(packageRoot, manifest);
+		const activation = new AbortController();
+		let pid: number | undefined;
+		try {
+			await runtime.start(activation.signal);
+			pid = runtime.pid;
+			expect(pid).toBeGreaterThan(0);
+			// Provider settings actions abort their request scope in finally. Once start
+			// succeeds, the supervisor owns the process, independently of that request.
+			activation.abort(new Error("activation caller completed"));
+			expect(await runtime.request("health")).toMatchObject({ healthy: true });
+			expect(runtime.getDiagnostics()).toMatchObject({ pid, generation: 1, state: "active" });
+		} finally {
+			await runtime.shutdown();
+			expect(runtime.getDiagnostics()).toMatchObject({ state: "stopped", inFlight: 0 });
+			if (pid) expect(await waitForProcessExit(pid)).toBe(true);
+		}
+	}, 15_000);
+
+	test("cancelling activation during handshake still terminates the real process", async () => {
+		const packageRoot = await copyReferenceFixture();
+		const manifest = parseManifest(
+			JSON.parse(await readFile(join(packageRoot, "manifest.json"), "utf8")),
+		);
+		const activation = new AbortController();
+		let pid: number | undefined;
+		const runtime = createRuntime(packageRoot, manifest, (state) => {
+			if (state !== "handshaking") return;
+			pid = runtime.pid;
+			activation.abort(new Error("cancel activation during handshake"));
+		});
+		try {
+			const rejection = await runtime.start(activation.signal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(pid).toBeGreaterThan(0);
+			expect(rejection).toBeInstanceOf(Error);
+		} finally {
+			await runtime.shutdown();
+			expect(runtime.getDiagnostics()).toMatchObject({ state: "stopped", inFlight: 0 });
+			if (pid) expect(await waitForProcessExit(pid)).toBe(true);
+		}
+	}, 15_000);
 
 	test("runs hello → initialize → activate → health → tool → shutdown in a real child process", async () => {
 		const packageRoot = await copyReferenceFixture();
@@ -357,7 +416,12 @@ describe("C1/C2 reference plugin lifecycle acceptance", () => {
 			});
 			expect(result.title).toBe("Selection description");
 			expect(result.metadata.length).toBe(25);
-			await expect(runtime.request("reference.unknown")).rejects.toMatchObject({ code: "-32601" });
+			// Let native stdio callbacks settle before entering Bun's matcher.
+			const rejection = await runtime.request("reference.unknown").then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(rejection).toMatchObject({ code: "-32601" });
 		} finally {
 			const pid = runtime.pid;
 			await runtime.shutdown();

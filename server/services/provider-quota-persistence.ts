@@ -20,6 +20,8 @@ const persistedSchema = z
 		cursor: z.string().max(2048).optional(),
 		fetchedAt: z.number().finite().nonnegative(),
 		attemptedAt: z.number().finite().nonnegative(),
+		/** Host migration provenance; never part of the plugin result or public DTO. */
+		legacyDisplayOnly: z.literal(true).optional(),
 	})
 	.strict();
 export type PersistedProviderQuota = z.infer<typeof persistedSchema>;
@@ -300,7 +302,8 @@ export function createProviderQuotaPersistence(
 						)
 							value = { ...value, cursor: rawCursor.cursor };
 					}
-				} else value = parsePersistedProviderQuota(await legacyRead(key, identity));
+				} else
+					value = parsePersistedProviderQuota(await legacyRead(key, identity, undefined, context));
 				if (
 					!value ||
 					!matches(context, value) ||

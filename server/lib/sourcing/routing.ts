@@ -113,8 +113,11 @@ export function keyRouting<T extends KeyConfig>(
 				current && options.streamIdentity
 					? quotaStore.peekForIdentity(key.id, options.streamIdentity(current), STREAM_QUOTA_SOURCE)
 					: undefined;
+			// Stream expiry bounds cache validity; probe expiry can denote an expired subscription.
 			const stream =
-				cachedStream && options.streamCurrent?.(key.id, cachedStream) !== false
+				cachedStream &&
+				(cachedStream.expiresAt === undefined || cachedStream.expiresAt > now) &&
+				options.streamCurrent?.(key.id, cachedStream) !== false
 					? cachedStream
 					: undefined;
 			const probe =

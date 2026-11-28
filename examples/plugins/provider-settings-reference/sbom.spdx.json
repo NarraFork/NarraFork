@@ -1,0 +1,17 @@
+{
+	"spdxVersion": "SPDX-2.3",
+	"dataLicense": "CC0-1.0",
+	"SPDXID": "SPDXRef-DOCUMENT",
+	"name": "com.example.provider-settings.reference",
+	"documentNamespace": "https://narrafork.local/sbom/com.example.provider-settings.reference",
+	"packages": [
+		{
+			"SPDXID": "SPDXRef-provider-settings-reference",
+			"name": "com.example.provider-settings.reference",
+			"versionInfo": "1.0.0",
+			"licenseDeclared": "Apache-2.0",
+			"licenseConcluded": "Apache-2.0",
+			"supplier": "Organization: Example Team"
+		}
+	]
+}

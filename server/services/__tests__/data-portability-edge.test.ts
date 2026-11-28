@@ -56,18 +56,21 @@ function reset() {
 	saveSettings(next);
 }
 
+// Reuse compiled fixture statements, including their real schema triggers, across batch rows.
 function insertNarrator(id: string, title: string | null) {
-	sqlite.run(
-		`INSERT INTO narrators (id, type, title, created_at, updated_at) VALUES (?, 'primary', ?, ?, ?)`,
-		[id, title, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"],
-	);
+	sqlite
+		.query(
+			`INSERT INTO narrators (id, type, title, created_at, updated_at) VALUES (?, 'primary', ?, ?, ?)`,
+		)
+		.run(id, title, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z");
 }
 
 function insertMessage(id: string, narratorId: string, body: string) {
-	sqlite.run(
-		`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'user', ?, ?)`,
-		[id, narratorId, body, "2026-10-01T00:00:01Z"],
-	);
+	sqlite
+		.query(
+			`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'user', ?, ?)`,
+		)
+		.run(id, narratorId, body, "2026-10-01T00:00:01Z");
 }
 
 /** 造一个自定义 ZIP（文件名 → 内容），用来构造畸形包。 */

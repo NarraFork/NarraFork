@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { seedUnifiedCredentials } from "../../../../tests/unified-credentials";
+import { legacyQuotaFixture, required } from "../../__tests__/provider-quota-legacy-fixture";
 import { getCredentialStore } from "../../credential-store";
-import { providerBalanceQuotaIdentity } from "../../provider-balance-cache";
 import { getProviderKeyStore, resetProviderKeyStoreForTests } from "../../provider-keys";
 import { saveSettings, settings } from "../../settings";
 import { hydrateProviderKeys } from "../../settings/provider-keys-projection";
@@ -15,6 +15,7 @@ const now = 1_800_000_000_000;
 const promotedId = "unified-route-promoted";
 const nugId = "unified-route-nug";
 const groups = [promotedId, nugId, "tokendance", "CommandCode"];
+let fixture: ReturnType<typeof legacyQuotaFixture> | undefined;
 
 function rebuildStore() {
 	resetProviderKeyStoreForTests();
@@ -55,6 +56,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	fixture?.dispose();
+	fixture = undefined;
+	mock.restore();
 	const store = getProviderKeyStore();
 	for (const id of groups) {
 		quotaStore.forget(id);
@@ -98,28 +102,29 @@ for (const [id, template, projectedKey] of [
 	});
 }
 
-test("promoting a plain settings key retains its quota id across unified-store reconstruction", () => {
+test("promoting a plain settings key retains its quota id across unified-store reconstruction", async () => {
 	const config = settings.customApiProviders?.find((entry) => entry.id === promotedId);
 	if (!config) throw new Error("missing relay fixture");
 	// Legacy config-only routing names the provider itself as the credential id.
 	config.apiKey = "sk-promoted";
-	const identity = providerBalanceQuotaIdentity(config, settings.proxy);
-	quotaStore.set(
-		promotedId,
-		identity,
-		{
-			fetchedAt: now,
-			scope: "key",
-			windows: [],
-			balances: [{ unit: "USD", remaining: 0 }],
-		},
-		false,
-	);
+	fixture = legacyQuotaFixture(settings.customApiProviders, {
+		scope: "key",
+		windows: [],
+		amounts: [{ id: "wallet", unit: "USD", remaining: 0 }],
+	});
+	fixture.advance(now - 1_000_000);
+	await fixture.service.refresh(promotedId);
 	expect(getProviderKeyStore().listGroup(promotedId)).toHaveLength(0);
 	expect(autoSourceFacts(promotedId, now).available).toBe(false);
 	saveSettings({ ...settings });
+	// Promotion creates a credential target; query that target before rebuilding its storage facade.
+	fixture.advance(10_000);
+	await fixture.service.refreshKey(promotedId);
+	const generation = required(fixture.service.peekKey(promotedId)).generation;
 
 	const restarted = rebuildStore();
+	fixture.service.sync();
+	expect(fixture.service.peekKey(promotedId)?.generation).toBe(generation);
 	expect(getCredentialStore().unified).toBe(true);
 	expect(restarted.listGroup(promotedId)).toMatchObject([
 		{ id: promotedId, apiKey: "sk-promoted" },

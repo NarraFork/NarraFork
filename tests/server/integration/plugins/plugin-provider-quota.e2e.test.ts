@@ -12,6 +12,10 @@ import type { outboundFetch } from "@server/lib/net/outbound-fetch";
 import { parseManifest } from "@server/lib/plugins/manifest";
 import { type CustomApiProviderConfig, settings } from "@server/lib/settings";
 import { createPluginRoutes } from "@server/routes/plugins";
+import {
+	BuiltinPluginCatalog,
+	builtinPluginCatalog,
+} from "@server/services/builtin-plugin-catalog";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginManager, type PluginManagerStatus } from "@server/services/plugin-manager";
 import { PluginPackageStore } from "@server/services/plugin-package-store";
@@ -39,6 +43,7 @@ import {
 	quotaQueryParamsSchema,
 } from "@shared/provider-quota";
 import archiver from "archiver";
+import { z } from "zod";
 import {
 	type BuildProviderQuotaResult,
 	buildProviderQuotaPlugin,
@@ -52,6 +57,7 @@ const FIXTURE_GRANTOR = "provider-quota-e2e";
 let buildRoot: string | undefined;
 let artifact: BuildProviderQuotaResult | undefined;
 let upgradeArchive: string | undefined;
+let quotaCatalog: BuiltinPluginCatalog;
 
 function required<T>(value: T | null | undefined, label: string): T {
 	if (value === undefined || value === null) throw new Error(`Missing ${label}`);
@@ -301,7 +307,10 @@ async function harness() {
 			],
 		});
 	};
-	const restores: Array<() => void> = [];
+	const catalogLookup = spyOn(builtinPluginCatalog, "get").mockImplementation((id) =>
+		quotaCatalog.get(id),
+	);
+	const restores: Array<() => void> = [() => catalogLookup.mockRestore()];
 	const hostRequestSpy = spyOn(connection, "request");
 	restores.push(() => hostRequestSpy.mockRestore());
 	return {
@@ -328,12 +337,13 @@ async function harness() {
 						.map(([, params]) => params),
 			};
 		},
-		setProviders(ids = allProviders.map(({ id }) => id)) {
+		async setProviders(ids = allProviders.map(({ id }) => id)) {
 			providers = allProviders.filter(({ id }) => ids.includes(id));
 			settings.customApiProviders = providers;
+			await platform.providerSettingsService.prepareQuotaMigrations();
 			quota.sync();
 		},
-		freshTransportGeneration() {
+		async freshTransportGeneration() {
 			// Use a real transport-identity change, not fake clocks or private scheduler mutation.
 			// This also keeps Registry, ConnectionService and the child process on the same clock.
 			transportRevision++;
@@ -341,6 +351,8 @@ async function harness() {
 				...provider,
 				extraHeaders: { "x-quota-e2e-revision": String(transportRevision) },
 			}));
+			settings.customApiProviders = providers;
+			await platform.providerSettingsService.prepareQuotaMigrations();
 			quota.sync();
 		},
 		setRelayBalance(value: number) {
@@ -604,6 +616,41 @@ beforeAll(async () => {
 	artifact = await buildProviderQuotaPlugin({ outDir: join(buildRoot, "original") });
 	expect((await stat(artifact.archivePath)).size).toBeGreaterThan(0);
 	expect((await stat(artifact.archivePath)).size).toBeLessThanOrEqual(16 * 1024 * 1024);
+	const identity = z
+		.object({
+			pluginId: z.literal(PLUGIN_ID),
+			version: z.literal(quotaManifest.version),
+			size: z
+				.number()
+				.int()
+				.positive()
+				.max(16 * 1024 * 1024),
+			sha256: z.string().regex(/^[a-f0-9]{64}$/),
+			packageHash: z.string().regex(/^[a-f0-9]{64}$/),
+		})
+		.parse(
+			JSON.parse(await readFile(join(buildRoot, "original/provider-quota.asset.json"), "utf8")),
+		);
+	const bytes = await readFile(artifact.archivePath);
+	expect(bytes.byteLength).toBe(identity.size);
+	expect(createHash("sha256").update(bytes).digest("hex")).toBe(identity.sha256);
+	// Trust only this exact test build; migration still compares the installed package hash.
+	quotaCatalog = new BuiltinPluginCatalog({
+		descriptors: [
+			{
+				pluginId: PLUGIN_ID,
+				version: identity.version,
+				load: async (signal) => {
+					signal?.throwIfAborted();
+					return {
+						bytes: new Uint8Array(bytes),
+						sha256: identity.sha256,
+						packageHash: identity.packageHash,
+					};
+				},
+			},
+		],
+	});
 	upgradeArchive = await makeUpgradeArchive(artifact, buildRoot);
 }, 60_000);
 
@@ -647,7 +694,7 @@ test("bundled quota waits for explicit settings grants before querying and stays
 		await f.approveSettings();
 		const runtime = required(f.supervisor.get(PLUGIN_ID), "bundled runtime");
 		const trace = f.trace(runtime);
-		f.setProviders();
+		await f.setProviders();
 		f.quota.start();
 		const snapshots = await queryAll(f);
 		if (snapshots.some((snapshot) => snapshot.status !== "supported"))
@@ -684,7 +731,7 @@ test.each([
 		relay.quotaSiteUrl = "https://provider-quota-e2e.invalid/team";
 		relay.quotaUserId = "fixture-user";
 		relay.quotaAccessToken = "fixture-site-secret";
-		f.setProviders(["relay"]);
+		await f.setProviders(["relay"]);
 		if (version === "1.0.4") await f.installAndActivate();
 		else {
 			await f.manager.install(
@@ -739,7 +786,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 					.map(({ id }) => id)
 					.sort(),
 			).toEqual(["relay", "deepseek", "kimi", "opencode"].map((id) => `${PLUGIN_ID}/${id}`).sort());
-			f.setProviders();
+			await f.setProviders();
 			f.quota.start();
 			const snapshots = await queryAll(f);
 			const byId = Object.fromEntries(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
@@ -784,7 +831,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 			expect(f.platform.quotaRegistry.listSources()).toEqual([]);
 			await bounded(f.manager.enable(PLUGIN_ID), "re-enable archived plugin");
 			await bounded(f.manager.activate(PLUGIN_ID), "reactivate archived plugin");
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			const recovered = await queryAll(f);
 			expect(recovered.every(({ status }) => status === "supported")).toBe(true);
 			expect(f.calls.length).toBeGreaterThan(count);
@@ -810,7 +857,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 		const f = await harness();
 		try {
 			await f.installAndActivate();
-			f.setProviders(["relay"]);
+			await f.setProviders(["relay"]);
 			f.quota.start();
 			await bounded(f.quota.refresh("relay"), "initial relay query");
 			await f.idle();
@@ -820,7 +867,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 				"connection grant",
 			);
 			const held = f.holdNext();
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			const pending = f.quota.refresh("relay");
 			const http = await held.entered();
 			expect(f.connection.activeReferences).toBe(1);
@@ -851,7 +898,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 			await bounded(f.manager.enable(PLUGIN_ID), "enable without connection grant");
 			await bounded(f.manager.activate(PLUGIN_ID), "activate without connection grant");
 			const deniedCount = f.calls.length;
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			expect(await f.quota.refresh("relay")).toMatchObject({ status: "unavailable", data: null });
 			expect(f.calls).toHaveLength(deniedCount);
 			expect(f.connection.activeReferences).toBe(0);
@@ -885,7 +932,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 			await bounded(f.manager.disable(PLUGIN_ID), "restart after explicit grant");
 			await bounded(f.manager.enable(PLUGIN_ID), "enable explicit grant");
 			await bounded(f.manager.activate(PLUGIN_ID), "activate explicit grant");
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			expect(await bounded(f.quota.refresh("relay"), "re-authorized quota query")).toMatchObject({
 				status: "supported",
 				data: { amounts: [{ remaining: 12.5 }] },
@@ -901,7 +948,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 		const f = await harness();
 		try {
 			const oldRuntime = await f.installAndActivate();
-			f.setProviders(["relay"]);
+			await f.setProviders(["relay"]);
 			f.quota.start();
 			await bounded(f.quota.refresh("relay"), "v1 relay query");
 			await f.idle();
@@ -938,7 +985,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 				},
 			});
 			const held = f.holdNext();
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			const oldQuery = f.quota.refresh("relay");
 			const oldHttp = await held.entered();
 			f.setRelayBalance(77);
@@ -966,7 +1013,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 				"upgraded source",
 			).revision;
 			expect(newRevision).not.toBe(oldRevision);
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			expect(await bounded(f.quota.refresh("relay"), "upgraded relay query")).toMatchObject({
 				status: "supported",
 				data: { amounts: [{ remaining: 77 }] },
@@ -999,7 +1046,7 @@ describe("real archived Provider Quota plugin lifecycle", () => {
 					"rolled-back source",
 				).revision,
 			).not.toBe(newRevision);
-			f.freshTransportGeneration();
+			await f.freshTransportGeneration();
 			expect(await bounded(f.quota.refresh("relay"), "rolled-back real quota query")).toMatchObject(
 				{ status: "supported", data: { amounts: [{ remaining: 77 }] } },
 			);
@@ -1074,7 +1121,7 @@ test("real multipart routes install and activate the archived quota plugin witho
 		await bounded(f.manager.activate(PLUGIN_ID), "uploaded quota activate");
 		const runtime = required(f.supervisor.get(PLUGIN_ID), "uploaded quota runtime");
 		expect(runtime.pid).toBeGreaterThan(0);
-		f.setProviders();
+		await f.setProviders();
 		f.quota.start();
 		const snapshots = await queryAll(f);
 		expect(snapshots.every((snapshot) => snapshot.status === "supported")).toBe(true);

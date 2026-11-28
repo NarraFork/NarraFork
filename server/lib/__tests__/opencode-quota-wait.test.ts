@@ -409,6 +409,58 @@ describe("resolveOpencodeQuotaTarget / resolveProviderQuotaWait", () => {
 		await refresh;
 	});
 
+	test("legacy display windows cannot park a turn; only a live supported refresh restores their authority", async () => {
+		fixture.dispose();
+		mock.restore();
+		const data: ProviderQuotaData = {
+			amounts: [],
+			windows: [
+				{
+					id: "rolling",
+					used: null,
+					limit: null,
+					remaining: null,
+					usedPercent: 100,
+					resetAt: new Date(NOW + 3_600_000).toISOString(),
+					status: "rate-limited",
+				},
+			],
+		};
+		fixture = legacyQuotaFixture([provider()], data, {
+			persistence: {
+				restore: () => ({
+					sourceId: "test-quota/legacy",
+					sourceRevision: "revision-1",
+					status: "supported",
+					data,
+					fetchedAt: NOW,
+					attemptedAt: NOW,
+					legacyDisplayOnly: true,
+				}),
+				save() {},
+				remove() {},
+				async flush() {},
+			},
+		});
+		fixture.advance(NOW - 1_000_000);
+		fixture.query.mockResolvedValue({ status: "error", data: null, error: "request_failed" });
+		expect(fixture.service.peek("ocg")).toMatchObject({ stale: true, fetchedAt: NOW, data });
+		expect(fixture.service.peek("ocg")).not.toHaveProperty("legacyDisplayOnly");
+		expect(fixture.service.peekKeyForSelection("ocg")).toBeNull();
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toEqual({ bucket: "other" });
+		expect(fixture.query).toHaveBeenCalledTimes(1);
+		expect(fixture.service.peek("ocg")?.data).toEqual(data);
+		fixture.advance(10_000);
+		fixture.query.mockResolvedValue({ status: "supported", data, error: null });
+		expect(
+			await resolveOpencodeQuotaTarget("ocg", "Go usage limit exceeded", undefined, NOW),
+		).toMatchObject({ bucket: "fiveHour", source: "usage", resetAt: NOW + 3_600_000 });
+		expect(fixture.query).toHaveBeenCalledTimes(2);
+		expect(fixture.service.peekKeyForSelection("ocg")?.data).toEqual(data);
+	});
+
 	test("revoked sources cannot supply an old reset or reactivate an upstream reader", async () => {
 		usageBody = {
 			amounts: [],

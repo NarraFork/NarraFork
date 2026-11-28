@@ -171,7 +171,7 @@ describe("quota panel view", () => {
 		});
 		window.resetCaptionKey = "quotaPanel.expiryCaption";
 		expect(formatQuotaSummaryLines(view({ windows: [window] }), 0, t)).toEqual([
-			"W: quotaPanel.remainingPercent[90] · quotaPanel.expiryCaption[quotaPanel.countdownM[2]]",
+			"W: quotaPanel.remainingPercent[90] · quotaPanel.usedOfLimit[1,10] · quotaPanel.expiryCaption[quotaPanel.countdownM[2]]",
 		]);
 	});
 

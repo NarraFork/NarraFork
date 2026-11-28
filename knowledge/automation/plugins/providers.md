@@ -17,7 +17,9 @@ anchors:
   - server/lib/agent/remote-provider-adapter.ts
   - server/services/plugin-provider-model-source.ts
   - server/services/plugin-provider-rpc.ts
-  - shared/apikey-quota-plugin.ts
+  - shared/provider-quota.ts
+  - shared/provider-settings.ts
+  - server/services/plugin-quota-registry.ts
 keywords:
   - executable-plugin
   - provider.describe
@@ -52,7 +54,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 - 管理接口（均要求管理员）：`GET/PUT /:pluginId/providers/config`、`POST .../catalog/refresh`（校验提供商确属该插件）、`PUT .../proxy`、`PUT .../prefix`（`routes/plugins.ts`）。
 
 - 命令返回的 `configWrites`（`plugin-command-config-writes.ts`）：键同为 `provider.<贡献id>.<字段>` 且属本插件；字段必须在该贡献的 `configSchema` 里声明，**声明为密钥的字段被拒绝**（两条通道必须不相交，否则凭证会进明文配置并经 `config.get` 回显）；单值序列化后 ≤16KiB（`MAX_COMMAND_CONFIG_VALUE_BYTES`）；写入是合并到已存配置之上再整体走同一套 schema 校验，不是替换。
-- 模型来源与 RPC：`plugin-provider-model-source.ts` 让模型目录能枚举插件提供商而不让通用代码依赖插件平台；`plugin-provider-rpc.ts` 是调用 `provider.*` 的传输封装；`lib/agent/remote-provider-adapter.ts` 是宿主侧的聊天适配器，`shared/apikey-quota-plugin.ts` 是内置 `apikey-quota` 插件与前端共享的类型。
+- 模型来源与 RPC：`plugin-provider-model-source.ts` 让模型目录能枚举插件提供商而不让通用代码依赖插件平台；`plugin-provider-rpc.ts` 是调用 `provider.*` 的传输封装；`lib/agent/remote-provider-adapter.ts` 是宿主侧的聊天适配器，额度贡献使用 `shared/provider-quota.ts` 与 `plugin-quota-registry.ts`，独立额度包不注册模型提供商。`contributes.providerSettings` 通过 `shared/provider-settings.ts` 为已保存的目标追加受控配置和连接；这与模型 provider 自己的配置/RPC 分开。
 - 就绪检查的实现在 `plugin-provider-readiness.ts`；凭证合并在 `plugin-provider-credential-resolver.ts`（每次请求现解，不缓存）。
 
 ## 从哪读起

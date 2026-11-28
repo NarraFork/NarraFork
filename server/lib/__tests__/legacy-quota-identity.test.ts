@@ -1,5 +1,10 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { readFile, writeFile } from "node:fs/promises";
 import type { CredentialNetwork } from "@shared/credential-network";
+import { readLegacyQuotaCache } from "../../services/provider-quota-legacy-cache";
+import { createProviderQuotaPersistence } from "../../services/provider-quota-persistence";
+import { ProviderQuotaService, toQuotaSnapshot } from "../../services/provider-quota-service";
+import { getNarraforkPath } from "../narrafork-home";
 import { createPersistedCredentialCache } from "../persisted-credential-cache";
 import {
 	getProviderKeyStore,
@@ -8,10 +13,29 @@ import {
 	withProviderKey,
 } from "../provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../settings";
-import * as quotaStoreModule from "../sourcing/quota-store";
 import { quotaStore } from "../sourcing/quota-store";
+import { WorkerHandle } from "../worker-runtime/lifecycle";
+import {
+	archivedQuotaFixture,
+	closeQuotaTestPackage,
+	deferred,
+	required,
+} from "./provider-quota-legacy-fixture";
 
 const originalFetch = globalThis.fetch;
+let archive: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+beforeAll(async () => {
+	archive = await archivedQuotaFixture({
+		fetch: async () => {
+			throw new Error("legacy reads must stay offline");
+		},
+	});
+	archive.service.stop();
+});
+afterAll(async () => {
+	await archive?.close();
+	await closeQuotaTestPackage();
+});
 const owned: Array<{ providerId: string; keyId: string }> = [];
 afterEach(async () => {
 	globalThis.fetch = originalFetch;
@@ -59,7 +83,7 @@ for (const source of ["opencode", "deepseek"] as const) {
 		for (const change of changes) {
 			test(change.name, async () => {
 				settings.proxy = { mode: "direct" };
-				const id = `${source}-legacy-${crypto.randomUUID()}`;
+				const id = `${source}-legacy-${crypto.randomUUID().slice(0, 16)}`;
 				const requested: CustomApiProviderConfig = {
 					id,
 					name: id,
@@ -78,6 +102,8 @@ for (const source of ["opencode", "deepseek"] as const) {
 				const configured = settings.customApiProviders?.find((p) => p.id === id);
 				if (!configured) throw new Error("legacy provider was not saved");
 				const config = structuredClone(configured);
+				await archive.prepareProviders([config]);
+				await archive.platform.providerSettingsService.list("custom-api", id);
 				const keyStore = getProviderKeyStore();
 				const initial = keyStore.list(id)[0] ?? keyStore.add(id, { id, apiKey: config.apiKey });
 				const key = keyStore.update(initial.id, {
@@ -139,42 +165,197 @@ for (const source of ["opencode", "deepseek"] as const) {
 				if (change.changedGlobal) {
 					settings.proxy = { mode: "custom", url: "http://new-global-proxy.example:8080" };
 				}
-				const effective = withProviderKey(config, key);
+				if (change.compatible) expect(legacy.restore(id, legacyIdentity)).toEqual(value);
+				archive.directory.sync();
+				const connection = required(archive.directory.getKey(key.id));
+				const currentSource = required(
+					archive.platform.quotaRegistry
+						.listSources()
+						.find((item) => item.contributionId === source),
+				);
+				const context = {
+					pluginId: currentSource.pluginId,
+					installationId: required(currentSource.installationId),
+					sourceId: currentSource.id,
+					sourceRevision: currentSource.revision,
+					providerId: id,
+					credentialId: key.id,
+					isCurrent: () =>
+						archive.platform.quotaRegistry
+							.listSources()
+							.some(
+								(item) => item.id === currentSource.id && item.revision === currentSource.revision,
+							) && archive.directory.getKey(key.id)?.identity === connection.identity,
+				};
+				const path = getNarraforkPath(
+					source === "opencode" ? "opencode-usages.json" : "deepseek-balances.json",
+				);
+				const bytes = await readFile(path);
 				if (change.compatible) {
-					expect(legacy.restore(id, legacyIdentity)).toEqual(value);
-				}
-				const migrate = spyOn(quotaStoreModule, "importLegacyQuotaCache");
-				let identity: string;
-				if (source === "opencode") {
-					const cache = (await import(
-						`../opencode-usage-cache.ts?legacy=${id}`
-					)) as typeof import("../opencode-usage-cache");
-					cache.syncOpencodeUsageCache();
-					identity = cache.opencodeQuotaIdentity(effective);
-				} else {
-					const cache = (await import(
-						`../deepseek-balance-cache.ts?legacy=${id}`
-					)) as typeof import("../deepseek-balance-cache");
-					cache.syncDeepSeekBalanceCache();
-					identity = cache.deepSeekQuotaIdentity(effective);
-				}
-				const migratedItems = migrate.mock.calls[0]?.[2];
-				migrate.mockRestore();
-				const snapshot = quotaStore.peekForIdentity(key.id, identity);
-				if (change.compatible) {
-					expect(migratedItems).toEqual([
-						{ legacyKey: id, id: key.id, identity: legacyIdentity, storeIdentity: identity },
+					expect(currentSource.revision).toMatch(
+						/^[^:]+:[a-f0-9]{64}:(opencode|deepseek):[a-f0-9]{64}\/[^/]+\/\d+$/,
+					);
+					const fields = JSON.parse(connection.identity);
+					expect(fields.length).toBe(17);
+					expect([fields[8], fields[9], fields[10], fields[11], fields[12], fields[13]]).toEqual([
+						"claude-code",
+						null,
+						[],
+						null,
+						null,
+						null,
 					]);
-					expect(snapshot).toBeDefined();
-					expect(
-						source === "opencode"
-							? snapshot?.windows[0]?.usedRatio
-							: snapshot?.balances[0]?.remaining,
-					).toBe(source === "opencode" ? 1 : 3.25);
-				} else {
-					expect(snapshot).toBeUndefined();
 				}
-				await quotaStore.flush();
+				const persistence = createProviderQuotaPersistence();
+				const loaded = await persistence.load(connection.cacheId, connection.identity, context);
+				await persistence.flush();
+				const coldPersistence = createProviderQuotaPersistence();
+				expect(
+					await coldPersistence.load(connection.cacheId, connection.identity, context),
+				).toEqual(loaded);
+				await coldPersistence.flush();
+				const service = new ProviderQuotaService({
+					directory: archive.directory,
+					persistence: coldPersistence,
+					driver: {
+						listSources: () => archive.platform.quotaRegistry.listSources(),
+						query: async () => {
+							throw new Error("unexpected probe");
+						},
+					},
+					onChanged: () => {},
+				});
+				service.start();
+				try {
+					await coldPersistence.flush();
+					const restored = service.peekKey(key.id);
+					const snapshot = toQuotaSnapshot(restored);
+					if (change.compatible) {
+						expect(loaded).toMatchObject({ legacyDisplayOnly: true, fetchedAt: value.fetchedAt });
+						expect(restored).toMatchObject({ stale: true, fetchedAt: value.fetchedAt });
+						expect(
+							source === "opencode"
+								? snapshot?.windows[0]?.usedRatio
+								: snapshot?.balances[0]?.remaining,
+						).toBe(source === "opencode" ? 1 : 3.25);
+					} else {
+						expect(loaded).toBeUndefined();
+						expect(snapshot).toBeUndefined();
+					}
+					expect(service.peekKeyForSelection(key.id)).toBeNull();
+					expect(quotaStore.peek(key.id)).toBeUndefined();
+				} finally {
+					service.dispose();
+					await coldPersistence.flush();
+				}
+				expect(await readFile(path)).toEqual(bytes);
+				if (change.name === "original connection") {
+					const late = deferred<typeof loaded>();
+					const live = new ProviderQuotaService({
+						directory: archive.directory,
+						driver: {
+							listSources: () => [currentSource],
+							query: async () => ({
+								status: "supported",
+								error: null,
+								data: {
+									scope: "wallet",
+									windows: [],
+									amounts: [{ id: "live", unit: "USD", remaining: 7 }],
+								},
+							}),
+						},
+						persistence: {
+							restore: () => undefined,
+							load: () => late.promise,
+							save() {},
+							remove() {},
+							async flush() {},
+						},
+						onChanged: () => {},
+					});
+					try {
+						live.start();
+						await live.refreshKey(key.id);
+						late.resolve(loaded);
+						await new Promise<void>((resolve) => setImmediate(resolve));
+						expect(live.peekKey(key.id)).toMatchObject({
+							stale: false,
+							data: { amounts: [{ remaining: 7 }] },
+						});
+						expect(live.peekKeyForSelection(key.id)?.data?.amounts[0]?.remaining).toBe(7);
+					} finally {
+						live.dispose();
+					}
+					for (const denied of [
+						{ ...context, pluginId: "third.party", sourceId: `third.party/${source}` },
+						{ ...context, sourceId: `${context.pluginId}/relay` },
+						{
+							...context,
+							sourceRevision: context.sourceRevision.replace(
+								/:[a-f0-9]{64}:/,
+								`:${"0".repeat(64)}:`,
+							),
+						},
+						{ ...context, installationId: "different-installation" },
+						{ ...context, isCurrent: () => false },
+						{ ...context, isCurrent: undefined },
+					])
+						expect(
+							await readLegacyQuotaCache(
+								connection.cacheId,
+								connection.identity,
+								undefined,
+								denied,
+							),
+						).toBeFalsy();
+					await expect(
+						readLegacyQuotaCache(
+							connection.cacheId,
+							connection.identity,
+							AbortSignal.abort(),
+							context,
+						),
+					).rejects.toThrow();
+					const worker = spyOn(WorkerHandle, "thread").mockImplementation(() => {
+						throw new Error("worker unavailable");
+					});
+					try {
+						await expect(
+							readLegacyQuotaCache(connection.cacheId, connection.identity, undefined, context),
+						).rejects.toThrow("worker unavailable");
+					} finally {
+						worker.mockRestore();
+					}
+					try {
+						for (const bad of ["{broken", " ".repeat(1024 * 1024 + 1)]) {
+							await writeFile(path, bad);
+							expect(
+								await readLegacyQuotaCache(
+									connection.cacheId,
+									connection.identity,
+									undefined,
+									context,
+								),
+							).toBeNull();
+							expect(await readFile(path, "utf8")).toBe(bad);
+						}
+						const oversized = JSON.parse(bytes.toString());
+						oversized.entries[id].value.extra = "x".repeat(16 * 1024);
+						await writeFile(path, JSON.stringify(oversized));
+						expect(
+							await readLegacyQuotaCache(
+								connection.cacheId,
+								connection.identity,
+								undefined,
+								context,
+							),
+						).toBeNull();
+					} finally {
+						await writeFile(path, bytes);
+					}
+					expect(await readFile(path)).toEqual(bytes);
+				}
 			});
 		}
 	});

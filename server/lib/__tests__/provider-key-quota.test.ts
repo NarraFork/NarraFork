@@ -3,7 +3,12 @@
  * status bar keeps reporting the provider's first usable key, and the key pool skips
  * a key whose window the cache has seen used up.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+	archivedQuotaFixture,
+	bindLegacyQuotaService,
+	closeQuotaTestPackage,
+} from "./provider-quota-legacy-fixture";
 
 const actualOutbound = { ...(await import("../net/outbound-fetch")) };
 const RESET = new Date(Date.now() + 2 * 60 * 60_000).toISOString();
@@ -37,7 +42,14 @@ const { keyCooldown, resetProviderKeyRuntimeForTests, selectProviderKey } = awai
 	"../agent/pooled-provider"
 );
 
-afterAll(() => {
+let fixture: Awaited<ReturnType<typeof archivedQuotaFixture>>;
+beforeAll(async () => {
+	fixture = await archivedQuotaFixture();
+	bindLegacyQuotaService(fixture.service);
+});
+afterAll(async () => {
+	await fixture?.close();
+	await closeQuotaTestPackage();
 	mock.module("../net/outbound-fetch", () => actualOutbound);
 	mock.restore();
 });
@@ -73,6 +85,7 @@ afterEach(() => {
 describe("usage per key", () => {
 	test("each key has its own usage; the provider reports its first key", async () => {
 		const second = getProviderKeyStore().add(PROVIDER, { apiKey: "sk-kimi-2" });
+		await fixture.prepareProviders(settings.customApiProviders ?? []);
 		await refreshAllKimiUsages();
 		const perKey = getKimiKeyUsages();
 		expect(perKey[PROVIDER]?.fiveHour?.used).toBe(100);
@@ -86,6 +99,7 @@ describe("usage per key", () => {
 
 	test("the pool rests a used-up key until its window resets", async () => {
 		const second = getProviderKeyStore().add(PROVIDER, { apiKey: "sk-kimi-2" });
+		await fixture.prepareProviders(settings.customApiProviders ?? []);
 		await refreshAllKimiUsages();
 		expect(keyCooldown(PROVIDER)).toEqual({ until: Date.parse(RESET), reason: "quota" });
 		expect(keyCooldown(second.id)).toBeUndefined();

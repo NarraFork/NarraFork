@@ -60,12 +60,15 @@ async function isolatedSource() {
 	return { root, source };
 }
 
-function archivedPath(modules: Map<string, string>): string {
+function archivedPath(modules: Map<string, string>, sourceRoot: string): string {
 	const body = modules.get("embedded-bundled-plugins.ts");
 	if (!body) throw new Error("Missing archive module; an empty builtin list is not acceptance");
 	const match = body.match(/import providerQuotaArchive from ("(?:[^"\\]|\\.)*") with/);
 	if (!match) throw new Error("Missing opaque file import");
-	return JSON.parse(match[1]);
+	const specifier = JSON.parse(match[1]);
+	expect(specifier).toStartWith("../../.narrafork/bundled-plugin-build-assets/");
+	// File imports resolve against the generated module, not the test runner's cwd.
+	return resolve(sourceRoot, "server/generated", specifier);
 }
 
 test("quota has one pinned installable archive identity and no catalog-only builtin roots", async () => {
@@ -107,7 +110,7 @@ test("immutable generation embeds a real nonempty archive without mutating gener
 	expect(body).toContain(`pluginId: "${ID}"`);
 	expect(body).toContain(`version: "${VERSION}"`);
 	expect(body).not.toMatch(/^import.*(?:src\/index|server\/index\.js)/m);
-	const archive = archivedPath(modules);
+	const archive = archivedPath(modules, source);
 	const bytes = await readFile(archive);
 	expect(bytes.length).toBeGreaterThan(0);
 	expect(bytes.length).toBeLessThanOrEqual(16 * 1024 * 1024);
@@ -116,7 +119,7 @@ test("immutable generation embeds a real nonempty archive without mutating gener
 	expect(body).toContain(`size: ${bytes.length}`);
 	expect(body).toContain(`sha256: "${sha256}"`);
 	const second = await collectPluginBuildModules(source);
-	expect(archivedPath(second)).toBe(archive);
+	expect(archivedPath(second, source)).toBe(archive);
 	expect(second.get("embedded-bundled-plugins.ts")).toBe(body);
 	expect(await readFile(generated, "utf8")).toBe(before);
 }, 45_000);
@@ -124,7 +127,7 @@ test("immutable generation embeds a real nonempty archive without mutating gener
 test("real in-memory compiled archive survives source deletion and materializes through the ordinary PackageStore/catalog", async () => {
 	const { root, source } = await isolatedSource();
 	const modules = await collectPluginBuildModules(source);
-	const original = await readFile(archivedPath(modules));
+	const original = await readFile(archivedPath(modules, source));
 	const entry = join(source, "server/probe.ts");
 	await writeFile(
 		entry,
@@ -209,7 +212,7 @@ console.log("RESULT " + JSON.stringify({ compiled: isCompiledRuntime(), pluginId
 test("ordinary PackageStore materialization keeps a single compatible non-builtin immutable quota package", async () => {
 	const { root, source } = await isolatedSource();
 	const modules = await collectPluginBuildModules(source);
-	const bytes = await readFile(archivedPath(modules));
+	const bytes = await readFile(archivedPath(modules, source));
 	const storeRoot = join(root, "ordinary-store");
 	const store = new PluginPackageStore({ root: storeRoot });
 	const installed = await store.install(bytes);
