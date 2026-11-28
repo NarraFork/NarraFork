@@ -415,6 +415,43 @@
 			"operationFailed": "Plugin operation failed."
 		}
 	},
+	"providerSettings": {
+		"title": "Provider extensions",
+		"description": "Saved plugin settings for this provider. Opening this area does not start a plugin.",
+		"unsavedCore": "Save the provider changes before editing its extensions.",
+		"unsavedExtension": "Save these settings before running the action.",
+		"loadError": "Failed to load provider extensions.",
+		"saveError": "Failed to save provider extension settings.",
+		"deleteError": "Failed to delete provider extension settings.",
+		"actionError": "The provider extension action failed.",
+		"rebindError": "Failed to rebind the retained provider extension settings.",
+		"unavailable": "This extension is unavailable. The saved configuration was kept.",
+		"readOnly": "This extension is currently read-only. Existing settings were kept.",
+		"schemaMismatch": "The extension schema changed. Saving or rebinding is unavailable until it is migrated.",
+		"bindingChanged": "The provider binding changed. Reload before saving.",
+		"dormant": "This configuration is retained from an earlier installation. Rebinding requires confirmation and does not grant permissions.",
+		"reload": "Reload",
+		"managePlugin": "Manage plugin",
+		"runAction": "Run",
+		"delete": "Delete",
+		"deleteTitle": "Delete provider extension settings",
+		"deleteMessage": "Delete this extension's saved values and secrets? This cannot be undone.",
+		"rebind": "Rebind",
+		"retained": "Find settings from a previous provider",
+		"retainedSelect": "Previous saved provider",
+		"retainedEmpty": "No retained settings on this page",
+		"retainedNext": "Next page",
+		"moveMessage": "Move saved values and secrets from {{source}} to {{target}}? The previous configuration will be deleted. Existing destination settings are never overwritten, and permissions are not restored.",
+		"rebindTitle": "Rebind retained provider extension settings",
+		"rebindMessage": "Attach the retained values and secrets to the current plugin installation? This does not restore permissions.",
+		"status": {
+			"ready": "Ready",
+			"incomplete": "Incomplete",
+			"schema-mismatch": "Schema changed",
+			"binding-changed": "Binding changed",
+			"dormant": "Dormant"
+		}
+	},
 	"overlayHiddenNotice": "Plugin overlays hidden for you. Turn them back on in Settings → Appearance.",
 	"overlaySettings": {
 		"title": "Plugin overlays",

@@ -169,6 +169,29 @@ export function verifyReplacementGrants(oldSet: Row, nextSet: Row) {
 	);
 }
 
+export function verifyRetainedGrants(oldSet: Row, nextSet: Row) {
+	insist(
+		oldSet.installationId === nextSet.installationId,
+		"Existing installation identity changed",
+	);
+	insist(oldSet.revision === nextSet.revision, "Existing grant revision changed");
+	const normalize = (value: Row) =>
+		rows(value.grants)
+			.map((grant) => ({
+				grantId: grant.grantId,
+				capability: grant.capability,
+				scope: grant.scope,
+				constraints: grant.constraints,
+				grantedBy: grant.grantedBy,
+				revision: grant.revision,
+			}))
+			.sort((a, b) => String(a.grantId).localeCompare(String(b.grantId)));
+	insist(
+		JSON.stringify(normalize(oldSet)) === JSON.stringify(normalize(nextSet)),
+		"Existing grants were replaced or widened",
+	);
+}
+
 // Read the public shell outside the browser; the evidence tab keeps its original cache and session untouched.
 async function servedEntry(c: QuotaSmokeContext): Promise<string> {
 	const signal = AbortSignal.any([c.signal, AbortSignal.timeout(15_000)]);
@@ -298,6 +321,175 @@ async function snapshot(c: QuotaSmokeContext, provider: string) {
 	).find((v) => v.providerId === provider);
 }
 
+async function verifyReinstallAndEdits(
+	c: QuotaSmokeContext,
+	site: ReturnType<typeof createSiteQuotaFixture>,
+	siteRoot: string,
+	account: string,
+	page?: Page,
+) {
+	const restartReady = async () => {
+		await stopOwned(c);
+		await c.start();
+		await c.wait("restarted candidate ready", async () => {
+			const health = await json(c, "/api/health");
+			return health.status === "ok" && (!health.readiness || health.readiness === "ready")
+				? true
+				: undefined;
+		});
+	};
+	c.stage = "explicit reinstall requires new permissions and preserved binding";
+	const previous = await c.plugin();
+	if (previous) await json(c, `/api/plugins/${QUOTA}/uninstall`, "POST");
+	insist((await c.upload("explicit latest quota reinstall")).ok, "Explicit reinstall failed");
+	const plugin = await json(c, `/api/plugins/${QUOTA}`);
+	insist(row(plugin.current).version === "1.0.4", "Reinstall archive is not 1.0.4");
+	let grants = await json(c, `/api/plugins/${QUOTA}/grants`);
+	insist(
+		rows(grants.grants).every((g) => !String(g.capability).startsWith("provider.settings.")),
+		"Install granted a new settings capability",
+	);
+	const query = `kind=custom-api&id=${SITE}`;
+	const endpoint = `/api/provider-settings/${QUOTA}/site-account?${query}`;
+	const readView = async () =>
+		c.wait("saved extension after plugin initialization", async () => {
+			const extension = rows((await json(c, `/api/provider-settings?${query}`)).extensions).find(
+				(v) => v.pluginId === QUOTA && v.contributionId === "site-account",
+			);
+			return extension?.config ? row(extension.config) : undefined;
+		});
+	let view = await readView();
+	const confirmation = () => ({
+		expectedRevision: view.revision,
+		schemaFingerprint: view.schemaFingerprint,
+		expectedBindingRevision: view.bindingRevision,
+	});
+	if (view.status === "dormant") {
+		await json(
+			c,
+			`/api/provider-settings/${QUOTA}/site-account/rebind?${query}`,
+			"POST",
+			confirmation(),
+		);
+		view = await readView();
+	}
+	insist(
+		row(row(view.secrets).token).isSet === true &&
+			row(view.values).siteUrl === siteRoot &&
+			row(view.values).userId === "424242",
+		"Reinstall lost site credentials or account identity",
+	);
+	verifyRetainedGrants(grants, await json(c, `/api/plugins/${QUOTA}/grants`));
+	await json(c, `/api/plugins/${QUOTA}/enable`, "POST");
+	await json(c, `/api/plugins/${QUOTA}/activate`, "POST");
+	verifyRetainedGrants(grants, await json(c, `/api/plugins/${QUOTA}/grants`));
+	const blocked = await snapshot(c, SITE);
+	insist(!blocked?.data, "Unapproved new settings capability exposed quota");
+	const requests = site.evidence().requests;
+	await json(c, `/api/plugins/${QUOTA}/grants`, "PUT", {
+		expectedRevision: grants.revision,
+		grants: [
+			...rows(grants.grants).map((g) => ({
+				capability: g.capability,
+				scope: g.scope,
+				constraints: g.constraints,
+				expiresAt: g.expiresAt,
+				grantId: g.grantId,
+			})),
+			...["provider.settings.read_self", "provider.settings.connection.use"].map((capability) => ({
+				capability,
+				scope: { type: "global" },
+			})),
+		],
+	});
+	grants = await json(c, `/api/plugins/${QUOTA}/grants`);
+	await json(c, `/api/plugins/${QUOTA}/activate`, "POST");
+	const refresh = async (balance: number) => {
+		const result = await c.http(`/api/provider-quotas/${SITE}/refresh`, { method: "POST" });
+		insist(result.ok || result.status === 429, "Explicit account refresh rejected");
+		await c.wait("fresh site quota after explicit reinstall or edit", async () => {
+			const value = await snapshot(c, SITE);
+			return value?.status === "supported" &&
+				value.stale === false &&
+				value.data &&
+				rows(row(value.data).amounts).some((a) => a.remaining === balance)
+				? true
+				: undefined;
+		});
+	};
+	await refresh(42.56);
+	insist(site.evidence().requests > requests, "Reinstall only returned old cached data");
+	assertSiteCredentialIsolation(site.evidence().records);
+	c.check(c.stage, { explicitNewGrants: true, preservedCredentialWithoutReentry: true });
+	if (page) {
+		await page.reload({ waitUntil: "domcontentloaded" });
+		await page.waitForSelector('[data-testid="provider-settings-site-account"]');
+		await page.$eval('[data-testid="provider-settings-site-account"]', (element) =>
+			element.scrollIntoView({ block: "center" }),
+		);
+		await screenshot(page, c, "05-reinstalled-extension", null, [
+			"供应商扩展",
+			QUOTA.toUpperCase(),
+		]);
+	}
+	c.stage = "post-migration edits preserve explicit secret intent";
+	view = await readView();
+	const save = async (values: Row, operation: "keep" | "clear") => {
+		view = await json(c, endpoint, "PUT", {
+			schemaVersion: 1,
+			...confirmation(),
+			values,
+			secrets: { token: { operation } },
+		});
+	};
+	const changedAccount = await c.http(endpoint, {
+		method: "PUT",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			schemaVersion: 1,
+			...confirmation(),
+			values: { ...row(view.values), userId: "different-account" },
+			secrets: { token: { operation: "keep" } },
+		}),
+	});
+	insist(
+		changedAccount.status === 409,
+		"Account change retained an old secret without confirmation",
+	);
+	const originalValues = row(view.values);
+	site.setRemaining(43.21);
+	await save({ ...originalValues, useSiteAccount: false }, "keep");
+	await save(originalValues, "keep");
+	await refresh(43.21);
+	await restartReady();
+	insist(
+		(await json(c, "/api/auth/me")).id === account,
+		"Original login no longer works after edits",
+	);
+	verifyRetainedGrants(grants, await json(c, `/api/plugins/${QUOTA}/grants`));
+	view = await readView();
+	insist(row(row(view.secrets).token).isSet === true, "Edited secret disappeared after restart");
+	await refresh(43.21);
+	c.check(c.stage);
+	c.stage = "explicit clear and deletion survive restart without legacy resurrection";
+	await save(row(view.values), "clear");
+	insist(row(row(view.secrets).token).isSet === false, "Secret clear was not persisted");
+	const clearedRequests = site.evidence().requests;
+	await json(c, endpoint, "DELETE", { expectedRevision: view.revision });
+	await restartReady();
+	view = await readView();
+	insist(
+		row(row(view.secrets).token).isSet === false,
+		"Deleted secret resurrected from legacy files",
+	);
+	insist(
+		site.evidence().requests === clearedRequests,
+		"Deleted site credentials produced requests after restart",
+	);
+	insist((await json(c, "/api/auth/me")).id === account, "Original login lost after deletion");
+	c.check(c.stage);
+}
+
 async function exercise(
 	c: QuotaSmokeContext,
 	choice: Choice,
@@ -308,24 +500,44 @@ async function exercise(
 	c.report.artifacts.original = old;
 	c.report.artifacts.candidate = next;
 	c.report.artifacts.choice = choice;
-	c.stage = "original binary and original builtin";
+	c.report.expectedVersion = "1.0.4";
+	const legacyBaseline = old.commit.startsWith("7a77c8306");
+	const baselineId = legacyBaseline ? LEGACY : QUOTA;
+	c.report.artifacts.baselinePlugin = baselineId;
+	c.stage = "original binary and original bundled plugin";
 	await buildIdentity(c, old);
-	const p = await json(c, `/api/plugins/${LEGACY}`);
-	insist(
-		p.builtin === true &&
-			p.desiredState === "enabled" &&
-			(p.version === "1.0.0" || (p.current && row(p.current).version === "1.0.0")),
-		"Missing real original directory builtin",
+	const p = await c.wait(
+		"original bundled plugin initialized",
+		async () => {
+			const response = await c.http(`/api/plugins/${baselineId}`);
+			if (response.status === 404) return undefined;
+			insist(response.ok, "Original plugin status failed");
+			const plugin = row(response.body);
+			return plugin.desiredState === "enabled" &&
+				(legacyBaseline ? plugin.builtin === true : plugin.runtimeState === "active")
+				? plugin
+				: undefined;
+		},
+		90000,
 	);
 	insist(
-		(await c.http(`/api/plugins/${QUOTA}`)).status === 404,
-		"Baseline already contains replacement",
+		p.desiredState === "enabled" &&
+			(p.version === (legacyBaseline ? "1.0.0" : "1.0.3") ||
+				(p.current && row(p.current).version === (legacyBaseline ? "1.0.0" : "1.0.3"))),
+		"Missing baseline bundled plugin",
 	);
-	const oldGrants = await json(c, `/api/plugins/${LEGACY}/grants`);
+	if (legacyBaseline)
+		insist(
+			(await c.http(`/api/plugins/${QUOTA}`)).status === 404,
+			"Baseline already contains replacement",
+		);
+	const oldGrants = await json(c, `/api/plugins/${baselineId}/grants`);
 	insist(
 		rows(oldGrants.grants)
 			.map((g) => g.capability)
-			.join(",") === "provider.use",
+			.sort()
+			.join(",") ===
+			(legacyBaseline ? "provider.use" : "provider.connection.request,quota.provide"),
 		"Unexpected original grant set",
 	);
 	c.check(c.stage);
@@ -429,34 +641,36 @@ async function exercise(
 	assertSiteCredentialIsolation(site.evidence().records);
 	c.check(c.stage);
 	if (choice === "disabled") {
-		await json(c, `/api/plugins/${LEGACY}/disable`, "POST");
+		await json(c, `/api/plugins/${baselineId}/disable`, "POST");
 		insist(
-			(await json(c, `/api/plugins/${LEGACY}`)).desiredState === "disabled",
+			(await json(c, `/api/plugins/${baselineId}`)).desiredState === "disabled",
 			"Legacy disable was not persisted",
 		);
 	}
 	if (choice === "revoked") {
-		await json(c, `/api/plugins/${LEGACY}/grants/revoke`, "POST", {
+		await json(c, `/api/plugins/${baselineId}/grants/revoke`, "POST", {
 			expectedRevision: oldGrants.revision,
 			grantIds: rows(oldGrants.grants).map((g) => g.grantId),
 		});
 		insist(
-			rows((await json(c, `/api/plugins/${LEGACY}/grants`)).grants).length === 0,
+			rows((await json(c, `/api/plugins/${baselineId}/grants`)).grants).length === 0,
 			"Legacy grant not revoked",
 		);
 	}
 	if (choice === "removed") {
-		await json(c, `/api/plugins/${LEGACY}/uninstall`, "POST");
+		await json(c, `/api/plugins/${baselineId}/uninstall`, "POST");
 		const state = row(
 			JSON.parse(
 				await readReleaseText(join(c.env.NARRAFORK_HOME, "plugins", "state.json"), 4 * 1024 ** 2),
 			),
 		);
 		insist(
-			row(state.plugins)[LEGACY] === undefined,
+			row(state.plugins)[baselineId] === undefined,
 			"Original uninstall left installed state behind",
 		);
 	}
+	const handoffGrants =
+		choice === "removed" ? undefined : await json(c, `/api/plugins/${baselineId}/grants`);
 	let page: Page | undefined;
 	if (choice === "enabled") {
 		c.stage = "original browser session";
@@ -468,7 +682,7 @@ async function exercise(
 		await seed.waitForFunction(
 			(id) => document.body.innerText.includes(id),
 			{ polling: 100 },
-			LEGACY,
+			baselineId,
 		);
 		page = await browser.newPage("zh-CN", { seedSession: false });
 		await seed.close();
@@ -480,7 +694,7 @@ async function exercise(
 					tr.querySelector("td")?.innerText.includes(id),
 				),
 			{ polling: 100 },
-			LEGACY,
+			baselineId,
 		);
 		const element = legacyRow.asElement();
 		insist(element, "Legacy plugin row was not rendered for the signed-in session");
@@ -488,9 +702,12 @@ async function exercise(
 		await page.waitForFunction(
 			(id) => location.pathname === `/settings/plugins/${id}`,
 			{ polling: 100 },
-			LEGACY,
+			baselineId,
 		);
-		await screenshot(page, c, "01-original-plugin", null, [LEGACY, "1.0.0"]);
+		await screenshot(page, c, "01-original-plugin", null, [
+			baselineId,
+			legacyBaseline ? "1.0.0" : "1.0.3",
+		]);
 		await screenshot(page, c, "01-original-wallet", `/settings/providers?provider=${SITE}`, [
 			"Upgrade wallet",
 			"USD 31.27",
@@ -535,7 +752,8 @@ async function exercise(
 					: undefined;
 			});
 			const g = await json(c, `/api/plugins/${QUOTA}/grants`);
-			verifyReplacementGrants(oldGrants, g);
+			if (legacyBaseline) verifyReplacementGrants(oldGrants, g);
+			else verifyRetainedGrants(oldGrants, g);
 			for (const [pid, value] of [
 				[RELAY, 23.45],
 				[SITE, 42.56],
@@ -576,36 +794,56 @@ async function exercise(
 			assertSiteCredentialIsolation(site.evidence().records);
 			return text(g.installationId);
 		}
-		// A missing runtime alone is not evidence: wait for the new host to have completed and recorded its migration.
-		await c.wait("persisted refusal decision", async () => {
-			const path = join(c.env.NARRAFORK_HOME, "plugins", "state.json");
-			const state = row(JSON.parse(await readReleaseText(path, 4 * 1024 ** 2)));
-			// Original uninstall predates the new tombstone: its revoked installation authority preserves the refusal.
-			const mark = state.bundledBootstrap && row(state.bundledBootstrap)[QUOTA];
-			if (!mark) return undefined;
-			const m = row(mark);
+		if (!legacyBaseline && choice !== "removed") {
+			const retained = await json(c, `/api/plugins/${QUOTA}`);
 			insist(
-				m.status === "removed" &&
-					m.inheritedFrom === LEGACY &&
-					m.defaultChoice === (choice === "removed" ? "revoked" : choice),
-				"Incorrect inherited refusal",
+				retained.desiredState === (choice === "disabled" ? "disabled" : "enabled"),
+				"Saved lifecycle choice changed",
 			);
-			return true;
-		});
-		insist((await c.plugin()) === null, "Suppressed plugin was installed");
-		const catalog = rows((await json(c, "/api/plugins/builtins")).builtins).find(
-			(v) => v.pluginId === QUOTA,
-		);
-		insist(
-			catalog?.installed === false && catalog.canInstall === true,
-			"Operator cannot explicitly reinstall",
-		);
+			insist(handoffGrants, "Missing handoff authority");
+			verifyRetainedGrants(handoffGrants, await json(c, `/api/plugins/${QUOTA}/grants`));
+		} else {
+			// A missing runtime alone is not evidence: wait for the new host to have completed and recorded its migration.
+			await c.wait("persisted refusal decision", async () => {
+				const path = join(c.env.NARRAFORK_HOME, "plugins", "state.json");
+				const state = row(JSON.parse(await readReleaseText(path, 4 * 1024 ** 2)));
+				// Original uninstall predates the new tombstone: its revoked installation authority preserves the refusal.
+				const mark = state.bundledBootstrap && row(state.bundledBootstrap)[QUOTA];
+				if (!mark) return undefined;
+				const m = row(mark);
+				insist(
+					m.status === "removed" &&
+						(!legacyBaseline ||
+							(m.inheritedFrom === LEGACY &&
+								m.defaultChoice === (choice === "removed" ? "revoked" : choice))),
+					"Incorrect inherited refusal",
+				);
+				return true;
+			});
+			insist((await c.plugin()) === null, "Suppressed plugin was installed");
+			const catalog = rows((await json(c, "/api/plugins/builtins")).builtins).find(
+				(v) => v.pluginId === QUOTA,
+			);
+			insist(
+				catalog?.installed === false && catalog.canInstall === true,
+				"Operator cannot explicitly reinstall",
+			);
+		}
 		for (const id of [RELAY, SITE]) {
-			const value = await snapshot(c, id);
-			insist(
-				value?.status === "unavailable" && value.data === null && value.sourceId === null,
-				"A refused source exposed old quota values",
-			);
+			await c.wait("refused quota scheduler initialized", async () => {
+				const value = await snapshot(c, id);
+				if (!value) return undefined;
+				insist(
+					value.data === null && value.sourceId === null,
+					"A refused source exposed old quota values",
+				);
+				insist(
+					(relay.evidence().counts["/api/usage/token/"] ?? 0) === oldCounts.key &&
+						site.evidence().requests === oldCounts.wallet,
+					"A refused source performed quota requests during startup",
+				);
+				return value.status === "unavailable" ? true : undefined;
+			});
 		}
 		insist(
 			(relay.evidence().counts["/api/usage/token/"] ?? 0) === oldCounts.key &&
@@ -619,25 +857,61 @@ async function exercise(
 	c.check(c.stage, { sameDatabase: true, originalSessionAccepted: true, choice });
 	if (page) {
 		c.stage = "upgraded browser without logging in again";
+		if (old.commit === next.commit) {
+			await page.evaluate(async () => {
+				for (const registration of await navigator.serviceWorker.getRegistrations()) {
+					await registration.update();
+					const worker = registration.installing ?? registration.waiting;
+					if (worker && worker.state !== "activated")
+						await new Promise<void>((resolve, reject) => {
+							const timer = setTimeout(() => {
+								worker.removeEventListener("statechange", check);
+								reject(Error("Updated service worker activation timed out"));
+							}, 20000);
+							const check = () => {
+								if (worker.state === "activated" || worker.state === "redundant") {
+									clearTimeout(timer);
+									worker.removeEventListener("statechange", check);
+									worker.state === "activated"
+										? resolve()
+										: reject(Error("Updated service worker became redundant"));
+								}
+							};
+							worker.addEventListener("statechange", check);
+							check();
+						});
+				}
+			});
+			await page.reload({ waitUntil: "domcontentloaded" });
+			c.check("same-commit frontend refreshed through normal service worker update", {
+				sessionStorageUnchanged: true,
+			});
+		}
 		await screenshot(page, c, "02-upgraded-plugin", `/settings/plugins/${QUOTA}`, [QUOTA, "1.0.3"]);
 		await screenshot(page, c, "03-upgraded-wallet", `/settings/providers?provider=${SITE}`, [
 			"USD 42.56",
 		]);
+		await page.waitForSelector('[data-testid="provider-settings-site-account"]');
+		await page.$eval('[data-testid="provider-settings-site-account"]', (element) =>
+			element.scrollIntoView({ block: "center" }),
+		);
+		await screenshot(page, c, "04-upgraded-extension", null, ["供应商扩展", QUOTA.toUpperCase()]);
 		c.check(c.stage);
-		await page.close();
 	}
 	c.stage = "second candidate boot is idempotent";
 	await stopOwned(c);
 	await c.start();
 	insist((await verify()) === installed, "Fresh boot created a different installation identity");
 	c.check(c.stage, { choice });
+	await verifyReinstallAndEdits(c, site, site.origin, account, page);
+	await page?.close();
 	await stopOwned(c);
 	insist(
 		(await hashReleaseFile(c.executable, MAX_EXE, c.signal)).sha256 === next.sha256 &&
 			(await hashReleaseFile(candidate, MAX_EXE, c.signal)).sha256 === next.sha256,
 		"Candidate changed after boot",
 	);
-	c.check("all three owned server processes closed cleanly");
+	c.check("all owned server processes closed cleanly");
 }
 
 export async function smokeQuotaUpgrade(args: readonly string[]) {
@@ -645,8 +919,9 @@ export async function smokeQuotaUpgrade(args: readonly string[]) {
 	const old = await artifact(options.binary),
 		next = await artifact(candidate);
 	insist(
-		old.sha256 !== next.sha256 && old.commit !== next.commit,
-		"Same artifact or source identity is not an upgrade",
+		old.sha256 !== next.sha256 &&
+			(old.commit.startsWith("7a77c8306") || old.commit.startsWith("cfd067361")),
+		"Expected one of the two unmodified baseline builds and a distinct candidate binary",
 	);
 	const { mkdir } = await import("node:fs/promises");
 	await mkdir(options.out, { mode: 0o700 });

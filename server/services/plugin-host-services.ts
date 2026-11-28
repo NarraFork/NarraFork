@@ -22,6 +22,11 @@ import {
 	providerConnectionRequestSchema,
 	QUOTA_MAX_REQUEST_MS,
 } from "@shared/provider-quota";
+import {
+	PROVIDER_SETTINGS_RPC_LIMITS,
+	providerSettingsConnectionParamsSchema,
+	providerSettingsGetParamsSchema,
+} from "@shared/provider-settings-rpc";
 import { z } from "zod";
 import {
 	type CapabilityBroker,
@@ -65,6 +70,7 @@ import {
 	type PluginStorageScopeType,
 	resolvePluginStorage,
 } from "./plugin-storage";
+import type { ProviderSettingsBindings } from "./provider-settings-bindings";
 
 const MAX_AUDIT_ENTRIES = 256;
 const MAX_DIAGNOSTIC_ITEMS = 32;
@@ -246,6 +252,7 @@ export interface PluginHostServicesOptions {
 	secretDeleter?: (pluginId: string, key: string) => Promise<boolean> | boolean;
 	/** Backend-only connection leases, always called with host-bound runtime identity. */
 	providerConnectionService?: Pick<PluginProviderConnectionService, "request" | "revokePlugin">;
+	providerSettingsBindings?: ProviderSettingsBindings;
 	now?: () => Date;
 }
 
@@ -436,6 +443,7 @@ export class PluginHostServices {
 	readonly eventGateway?: PluginEventGateway;
 	readonly storageFactory: PluginStorageFactoryLike;
 	readonly providerConnectionService?: PluginHostServicesOptions["providerConnectionService"];
+	readonly providerSettingsBindings?: ProviderSettingsBindings;
 	private readonly providerConfigReader?: PluginHostServicesOptions["providerConfigReader"];
 	private readonly secretKeyLister?: PluginHostServicesOptions["secretKeyLister"];
 	private readonly secretReader?: PluginHostServicesOptions["secretReader"];
@@ -455,6 +463,7 @@ export class PluginHostServices {
 		this.capabilityBroker = options.capabilityBroker ?? defaultCapabilityBroker;
 		this.permissionStore = options.permissionStore;
 		this.providerConnectionService = options.providerConnectionService;
+		this.providerSettingsBindings = options.providerSettingsBindings;
 		this.publicApi = options.publicApi;
 		this.eventGateway = options.eventGateway;
 		this.storageFactory =
@@ -572,6 +581,7 @@ export class PluginHostServices {
 
 	revokeRuntime(pluginId: string, runtimeId?: string, runtimeGeneration?: number): number {
 		this.providerConnectionService?.revokePlugin(pluginId);
+		this.providerSettingsBindings?.revokePlugin(pluginId);
 		let revoked = 0;
 		if (runtimeId) {
 			const key = bindingKey(pluginId, runtimeId);
@@ -604,6 +614,7 @@ export class PluginHostServices {
 
 	clearRuntimeBinding(pluginId: string, runtimeId: string): boolean {
 		this.providerConnectionService?.revokePlugin(pluginId);
+		this.providerSettingsBindings?.revokePlugin(pluginId);
 		const key = bindingKey(pluginId, runtimeId);
 		const deleted = this.bindings.delete(key);
 		this.runtimeInputs.delete(key);
@@ -649,6 +660,28 @@ export class PluginHostServices {
 			// worst-case escaped upstream body allowance; inbound requests are unchanged.
 			maxResponseBytes: PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
 			methods: {
+				"provider.settings.get": {
+					method: "provider.settings.get",
+					paramsSchema: providerSettingsGetParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "provider.settings.read_self",
+					maxRequestBytes: 1024,
+					maxResponseBytes: 64 * 1024,
+					timeoutMs: 5000,
+					maxConcurrency: 4,
+					handler: (params, context) => this.providerSettingsCall("get", params, context),
+				},
+				"provider.settings.connection.request": {
+					method: "provider.settings.connection.request",
+					paramsSchema: providerSettingsConnectionParamsSchema,
+					resultSchema: jsonValueSchema,
+					capability: "provider.settings.connection.use",
+					maxRequestBytes: 2048,
+					maxResponseBytes: PROVIDER_CONNECTION_RESPONSE_FRAME_MAX_BYTES,
+					timeoutMs: PROVIDER_SETTINGS_RPC_LIMITS.requestMs,
+					maxConcurrency: 4,
+					handler: (params, context) => this.providerSettingsCall("request", params, context),
+				},
 				[PROVIDER_CONNECTION_METHOD]: {
 					method: PROVIDER_CONNECTION_METHOD,
 					paramsSchema: providerConnectionRequestSchema,
@@ -891,6 +924,27 @@ export class PluginHostServices {
 		input: PluginHostResolverInput,
 	): Promise<PluginHostAuthorizationDecision> {
 		try {
+			if (
+				input.method === "provider.settings.get" ||
+				input.method === "provider.settings.connection.request"
+			) {
+				if (!this.providerSettingsBindings)
+					return {
+						allowed: false,
+						code: "HOST_UNAVAILABLE",
+						message: "Provider settings service is unavailable",
+					};
+				const reference = isRecord(input.params) ? input.params.reference : undefined;
+				await this.providerSettingsBindings.authorize(
+					reference,
+					input.context.plugin,
+					input.method === "provider.settings.get"
+						? "provider.settings.read_self"
+						: "provider.settings.connection.use",
+					input.context.signal,
+				);
+				return { allowed: true };
+			}
 			if (input.method === PROVIDER_CONNECTION_METHOD) {
 				const principal = input.context.plugin;
 				const binding = this.getRuntimeBinding(principal.pluginId, principal.runtimeId);
@@ -903,7 +957,7 @@ export class PluginHostServices {
 				}
 				const set = await this.permissionStore.getSet(principal.pluginId, principal.installationId);
 				if (
-					set.revision !== binding.grantRevision ||
+					(set.authorityRevision ?? set.revision) !== binding.grantRevision ||
 					!["quota.provide", "provider.connection.request"].every((capability) =>
 						this.permissionStore?.hasCachedUnrestrictedGlobalGrant(
 							principal.pluginId,
@@ -1308,6 +1362,28 @@ export class PluginHostServices {
 		}
 	}
 
+	private async providerSettingsCall(
+		method: "get" | "request",
+		params: unknown,
+		context: PluginHostCallContext,
+	): Promise<JsonValue> {
+		this.runtimeInput(context);
+		if (!this.providerSettingsBindings)
+			throw new PluginHostDispatcherError(
+				"HOST_UNAVAILABLE",
+				"Provider settings service is unavailable",
+			);
+		try {
+			return toJsonValue(
+				await this.providerSettingsBindings[method](params, context.plugin, context.signal),
+			);
+		} catch {
+			throw new PluginHostDispatcherError(
+				"PERMISSION_DENIED",
+				"Provider settings operation was not completed",
+			);
+		}
+	}
 	private async requestProviderConnection(
 		params: ProviderConnectionRequest,
 		context: PluginHostCallContext,

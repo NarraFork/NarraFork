@@ -23,11 +23,16 @@
 | `snapshot.db` | 固定表清单的原生快照。当前是 `api_requests`、`narrators`、`narrator_messages`、`narrator_message_refs`、`narrator_tool_calls`、`narrator_blocks`、`narrator_text_snapshots`、`folder_git_identity_bindings`。**新增的表不会自动包含** |
 | `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`autoExcludedProviders`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`。**不含 Key**：所有 `apiKey` 都是空的 |
 | `provider-keys.sealed.json` | 只在导出供应商时出现。导出的每个供应商的**全部** Key（自定义 API 的多 Key 连同标签、开关、网络身份；NUG、TokenDance、Command Code 各一个），按导出方的归属 id 分组，用导出时设置的口令封装（与凭据迁移同一格式：scrypt + AES-256-GCM，口令至少 10 个字符），见 `server/services/data-portability-keys.ts` |
-| `manifest.json` | `{ version, exportedAt, counts }`。有 `provider-keys.sealed.json` 时 `version` 是 2，否则是 1；导入时校验 `version <= 2` |
+| `provider-settings.sealed.json` | 仅导出供应商且扩展设置含秘密时出现，使用同一导出口令独立密封；包含扩展秘密及与普通配置的认证绑定，不含本机私钥 |
+| `manifest.json` | `{ version, exportedAt, counts }`。含插件供应商扩展记录时为 3，另有 `providerSettings: {count, sealed, targets: [{kind, id}]}`（目标清单仅含稳定 ID）；否则含 `provider-keys.sealed.json` 时为 2，纯请求/会话或无凭据旧格式为 1；导入支持 1–3 |
 
 **导出供应商需要核验**：勾选「供应商」时，要先通过密码 + 两步验证（step-up 用途 `storage.export.providers`），并设置口令。流式导出走 `POST /api/storage/export`，授权和口令都在请求体里；没有文件选择器的浏览器走票据，签发票据时消费 step-up，口令只存在内存里的票据记录中，不进 URL。`GET /api/storage/export?providers=1` 会被拒绝。没有第二因素的账号不能导出供应商，请求和会话照常可以导出。Codex 账号不在数据导出里，只能用凭据迁移搬。
 
-**版本号**：只有带密文的包是 `version: 2`。只含请求和会话的包仍是 1，旧版实例照常能导入；带密文的包在旧版实例上会被拒绝，因为旧版不认识密文，导入只会得到没有 Key 的供应商。
+**版本号**：含供应商扩展记录的包使用 `version: 3`，即使扩展没有秘密也不能由只支持 v1/v2 的宿主忽略后宣称成功。没有扩展记录时维持既有 v1/v2 格式；仅供应商且没有扩展数据时仍不生成 snapshot.db。
+
+选择供应商时，`SNAPSHOT_TABLES.providers` 把全部持久化的 `plugin_provider_settings` 纳入快照，包含 `custom-api`、`nug`、`platform`、`executable-plugin` 四类、孤立目标、休眠记录和删除墓碑；不按当前核心供应商清单过滤。Codex 的 `codex:credential:<id>` / `codex:pool`、仅通过 CLI 登录的 `commandcode:singleton` 和可执行插件实例的扩展也会保留，凭据账号、插件包和授权本体仍不随扩展搬运。`manifest.providerSettings.targets` 按稳定 `{kind,id}` 去重列出实际快照目标；旧 v3 未带清单时仍以快照为准。
+
+导出进程先解密验证并口令封装秘密，再从快照移除 `secrets_envelope`/`key_id`，压实后归档。普通配置和仅宿主可见字段保留，原始秘密、本机密钥和授权不随快照进入。单次最多512项，普通配置和秘密合计4MiB，密封文件最多8MiB；超限明确失败。没有密码不能导出含秘密的扩展。扫描、解密、封装和导入暂存均在受限子进程执行，创建/超时/取消失败无主线程回退。
 
 ## 三、导入的合并语义
 
@@ -48,6 +53,8 @@
 | 文件夹 Git 身份绑定 `folder_git_identity_bindings` | 随会话数据按主键 `INSERT OR IGNORE` 合并；旧包缺表时跳过。目标库必须已有对应用户和身份，缺失引用的入站绑定会被跳过；身份的 `user_id` 还必须与绑定一致，避免跨用户串联。用户与身份本体不在快照里 |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则跳过 |
 | 供应商 Key | 包里有密文且勾选了供应商时必须给口令，否则报 `IMPORT_PASSPHRASE_REQUIRED`；只导请求或会话时不需要。① 在导入事务**之前**解密（scrypt 是异步的，事务是同步的），口令错误报 `BUNDLE_PASSPHRASE`，什么都不写。② 把每个供应商的第一个 Key 放回导入的配置里，所以"同 apiKey + 同 baseUrl 视为同一供应商"的去重照常成立，保存设置时第一个 Key 经投影写进 Key 存储。③ 事务**提交成功之后**，给新加入的自定义 API 供应商写入其余的 Key（按导入后的本地 id，前缀改名后同样正确），并补上第一个 Key 的标签、开关和网络身份。与本地供应商合并的、被跳过的保留本地 Key，不覆盖。Key 存储是事务之外的文件，单个 Key 写入失败只记日志，结果里 `keysFailed` 计数，其余照常写入 |
+| 供应商扩展 `plugin_provider_settings`（v3） | 校验记录数、稳定目标清单、字段格式及密封绑定；独立进程按目标机密钥重新加密后暂存，事务中用 `copyTable` 合并。Custom API/NUG 按实际新增或同端点复用的本地供应商 ID 映射；已配置的单例也可补入缺失的扩展。没有核心目标映射的记录保留原稳定 targetId，不生成供应商，也不按显示名称自动匹配。普通记录以新的 `import-UUID` 安装身份和 `dormant` 状态保存，旧安装墓碑保持 `deleted`；休眠配置后续由管理员确认映射到当前目标并重绑。已有本地配置或墓碑始终优先；多条来源映射到同一扩展地址时，按快照 ID 顺序保留首条，其余计为冲突。结果返回 `providerSettingsImported`、`providerSettingsSkipped` 和 `providerSettingsConflicts`，每条来源均计入导入或跳过，预算只增加实际插入数。旧授权不恢复，未知 schema 不按默认值覆盖；Codex 凭据和插件 provider 实例本体仍不由这个供应商包创建。 |
+| 插件资源、迁移回执、资源预算 | 不作为可移植用户配置导出；缓存和运行代次不跨机生效，预算按导入配置重建增量。宿主迁移/清空回执只能由目标宿主建立，不能信任导入包来解除门禁。 |
 | 旧版包（`version: 1`） | `providers.json` 里的明文 Key 照旧导入，不要求口令 |
 | 平台实例 | 同按前缀避让：本地已有同平台同前缀时跳过，前缀被占用则改名后追加 |
 | 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的自定义参数（`modelCatalog.overrides`，存于 `~/.narrafork/model-catalog/overrides.json`）按键合并、导入优先，旧包里的内联本地层按同样规则转成自定义参数；自动更新偏好不随导入改变。供应商前缀被改名，或同一端点因已存在而跳过但两边前缀不同时，`prefix:model` 的第一段改到新前缀（`openai` 不会误改 `openai-2`） |
@@ -70,13 +77,14 @@
   team 记录的 worktree 目录和分支**不会被删**，只是不再有记录，需要时由人手工清理）、
   `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
   **不清模型自定义参数**（`overrides.json`），那里是用户手写的数据）。
+- 清空供应商还会通过独立进程分批清除扩展配置/密文及 provider/credential 资源值，保留递增 revision 的删除标记，防止旧 create-only 迁移复活数据；每批最多50项并同步资源预算。核心文件清空与扩展分批清空不属于同一个数据库事务；扩展失败返回错误，已完成部分保留，重新清空可继续，不能把失败报成全量成功。
 - 全量：以上全部。
 - 会话清空仅释放快照的消息/块引用，不直接清空共享 `narrator_text_snapshots`，不误删非会话数据。
   不再可达的内容由既有 GC 在宽限期后回收；孤儿 manifest 的 children 可能再保留一轮。
   因此「清空会话」**不等于立即物理擦除文本快照**。
 - **安全**：前端先「确认弹窗」，再「输入当前登录密码」；后端复用登录密码校验
   （`authSessionStore.findPasswordHash` + `Bun.password.verify`），密码错误拒绝执行。
-- 所有操作都在管理员权限（`requireAdmin`）下，导入/清空在单事务里完成，失败整体回滚。
+- 所有操作都在管理员权限（`requireAdmin`）下。会话/请求及暂存扩展表的 SQL 合并在事务中完成；供应商文件和 Key 存储在事务外部，不能声称文件与 SQL 跨介质整体回滚。扩展导入前完成解密与校验，并在提交前复查核心设置 revision；扩展导入/清空失败会明确返回并保留恢复依据。
 
 ## 五、修改数据库结构时必须同步的事项（重要）
 
@@ -110,7 +118,7 @@
 - 旧导出包若已带 prefix hash、却未携带其文本快照，导入兼容不代表能凭 hash 重建丢失内容；
   应从仍保留快照的原实例重新导出。本修补不伪造或静默重建旧前缀。
 - 快照是**单文件**：导入期间快照被 ATTACH 使用，预览 token 30 分钟过期后自动清理临时文件。
-- 供应商配置里的凭据（API key）是**明文**导出，导出文件请按敏感文件保管。
+- v2/v3 包的供应商凭据使用口令密封；旧 v1 包可能包含明文 Key。没有口令不能导入所选供应商的密封凭据；仍可只导入请求或会话。
 - **下载不进页面内存。** 支持 File System Access API 的浏览器先选保存位置，再把
   `GET /api/storage/export` 的响应体直接写入该文件。其它浏览器由已登录管理员
   `POST /api/storage/export/ticket` 换一张两分钟、一次有效的票据，再用普通链接请求

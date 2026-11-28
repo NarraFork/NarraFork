@@ -163,12 +163,22 @@ const schema: SchemaNode = {
 async function renderForm(
 	view: ConfigViewInput,
 	onSubmit: (config: Record<string, JsonValue>) => void = () => {},
-	overrides: { schema?: SchemaNode } = {},
+	overrides: {
+		schema?: SchemaNode;
+		submitError?: string;
+		resetKey?: string | number;
+		onDirtyChange?: (dirty: boolean) => void;
+	} = {},
 ) {
 	await act(async () => {
 		root?.render(
 			<MantineProvider>
-				<PluginConfigForm schema={overrides.schema ?? schema} view={view} onSubmit={onSubmit} />
+				<PluginConfigForm
+					{...overrides}
+					schema={overrides.schema ?? schema}
+					view={view}
+					onSubmit={onSubmit}
+				/>
 			</MantineProvider>,
 		);
 	});
@@ -307,4 +317,47 @@ describe("PluginConfigForm rendering", () => {
 		expect(inputs().some((input) => input.value === "second")).toBe(true);
 		expect(saveButton().disabled).toBe(true);
 	});
+});
+
+test("dirty notifications preserve failed drafts and clear after a successful server view", async () => {
+	const states: boolean[] = [];
+	const onDirtyChange = (dirty: boolean) => states.push(dirty);
+	const view: ConfigViewInput = {
+		config: { apiMode: "fast", label: "first" },
+		secretFields: ["apiKey"],
+		secretsSet: [],
+	};
+	await renderForm(view, () => {}, { onDirtyChange });
+	expect(states.at(-1)).toBe(false);
+	const field = inputByLabel("label");
+	if (!field) throw Error("label missing");
+	await typeInto(field, "unsaved");
+	expect(states.at(-1)).toBe(true);
+	await renderForm(view, () => {}, { onDirtyChange, submitError: "fixture conflict" });
+	expect(inputByLabel("label")?.value).toBe("unsaved");
+	expect(states.at(-1)).toBe(true);
+	expect(saveButton().disabled).toBe(false);
+	await renderForm({ ...view, config: { apiMode: "fast", label: "unsaved" } }, () => {}, {
+		onDirtyChange,
+	});
+	expect(states.at(-1)).toBe(false);
+	expect(saveButton().disabled).toBe(true);
+});
+
+test("a new saved revision clears a secret-only draft even when the masked view is identical", async () => {
+	const states: boolean[] = [];
+	const onDirtyChange = (dirty: boolean) => states.push(dirty);
+	const view: ConfigViewInput = {
+		config: { apiMode: "fast", apiKey: SECRET_PLACEHOLDER },
+		secretFields: ["apiKey"],
+		secretsSet: ["apiKey"],
+	};
+	await renderForm(view, () => {}, { onDirtyChange, resetKey: 1 });
+	const password = inputs().find((input) => input.type === "password");
+	if (!password) throw Error("password missing");
+	await typeInto(password, "fictional-replacement");
+	expect(states.at(-1)).toBe(true);
+	await renderForm(view, () => {}, { onDirtyChange, resetKey: 2 });
+	expect(inputs().find((input) => input.type === "password")?.value).toBe(SECRET_PLACEHOLDER);
+	expect(states.at(-1)).toBe(false);
 });

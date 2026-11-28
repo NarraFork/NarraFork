@@ -79,7 +79,10 @@ function bind(
 }
 
 describe("PluginHostServices", () => {
-	test("backend connection requests use the bound principal, live grants and escaped-response budget", async () => {
+	test.each([
+		false,
+		true,
+	])("backend connection requests use bound principal, live grants and response budget (authority projection=%s)", async (projected) => {
 		const root = await mkdtemp(join(tmpdir(), "narrafork-quota-host-services-"));
 		tempRoots.push(root);
 		const permissionStore = new PluginPermissionStore({ root });
@@ -87,6 +90,16 @@ describe("PluginHostServices", () => {
 			{ capability: "quota.provide", scope: { type: "global" } },
 			{ capability: "provider.connection.request", scope: { type: "global" } },
 		]);
+		if (projected) {
+			await permissionStore.mirrorAuthorityGrants(
+				pluginId,
+				installationId,
+				async () => mutation.set,
+			);
+			const mirror = await permissionStore.getSet(pluginId, installationId);
+			expect(mirror.revision).toBeGreaterThan(mutation.set.revision);
+			expect(mirror.authorityRevision).toBe(mutation.set.revision);
+		}
 		const principals: unknown[] = [];
 		const calls: unknown[] = [];
 		const host = new PluginHostServices({

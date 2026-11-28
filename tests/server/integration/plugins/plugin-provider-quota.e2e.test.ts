@@ -6,11 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { db } from "@server/db";
+import { db, sqlite } from "@server/db";
 import { users } from "@server/db/schema";
 import type { outboundFetch } from "@server/lib/net/outbound-fetch";
 import { parseManifest } from "@server/lib/plugins/manifest";
-import type { CustomApiProviderConfig } from "@server/lib/settings";
+import { type CustomApiProviderConfig, settings } from "@server/lib/settings";
 import { createPluginRoutes } from "@server/routes/plugins";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginManager, type PluginManagerStatus } from "@server/services/plugin-manager";
@@ -27,7 +27,12 @@ import { PluginSecretVault } from "@server/services/plugin-secret-vault";
 import { PluginStateStore } from "@server/services/plugin-state-store";
 import { PluginUpgradeCoordinator } from "@server/services/plugin-upgrade-coordinator";
 import { ProviderQuotaService } from "@server/services/provider-quota-service";
+import {
+	forgetQuotaSettingsProjection,
+	projectQuotaSettings,
+} from "@server/services/provider-quota-settings-projection";
 import { CustomApiQuotaTargetDirectory } from "@server/services/provider-quota-targets";
+import { ProviderSettingsBindings } from "@server/services/provider-settings-bindings";
 import {
 	type ProviderQuotaSnapshot,
 	QUOTA_QUERY_METHOD,
@@ -40,7 +45,7 @@ import {
 } from "../../../../plugins/provider-quota/build";
 import quotaManifest from "../../../../plugins/provider-quota/manifest.json";
 
-const UPGRADE_VERSION = "1.0.4";
+const UPGRADE_VERSION = "1.0.5";
 const PLUGIN_ID = "io.narrafork.provider-quota";
 const CALL_BUDGET_MS = 30_000;
 const FIXTURE_GRANTOR = "provider-quota-e2e";
@@ -197,8 +202,9 @@ interface HttpCall {
 /** All control-plane services and stdio RPC are real; only the final upstream HTTP is fake. */
 async function harness() {
 	// Windows TEMP may use an 8.3 alias; Catalog compares canonical package paths.
-	const root = await realpath(await mkdtemp(join(tmpdir(), "narrafork-provider-quota-e2e-")));
+	const root = await realpath(await mkdtemp(join(tmpdir(), "q-")));
 	const storeRoot = join(root, "installed");
+	const savedProviders = structuredClone(settings.customApiProviders);
 	const allProviders = providersForTest();
 	let providers: CustomApiProviderConfig[] = [];
 	let transportRevision = 0;
@@ -213,7 +219,7 @@ async function harness() {
 		  }
 		| undefined;
 	const directory = new CustomApiQuotaTargetDirectory({
-		providers: () => providers,
+		providers: () => providers.map(projectQuotaSettings),
 		globalProxy: () => ({ mode: "direct" }),
 		userAgent: () => "ProviderQuotaE2E/1.0",
 	});
@@ -242,6 +248,8 @@ async function harness() {
 			// Deliberately ignore cancellation so the host must consume a genuinely late response.
 			return held.response.promise;
 		}
+		if (url.pathname === "/team/api/user/self")
+			return Response.json({ success: true, data: { quota: 21 * 500000, used_quota: 2 * 500000 } });
 		return responseFor(provider.id, relayBalance);
 	};
 	const connection = new PluginProviderConnectionService({ directory, fetch: fetcher });
@@ -257,6 +265,7 @@ async function harness() {
 		providerRegistry: new PluginProviderRegistry(),
 		quotaService: quota,
 		providerConnectionService: connection,
+		providerSettingsBindings: new ProviderSettingsBindings({ fetch: fetcher }),
 		storageRoot: join(root, "storage"),
 		secretVault: new PluginSecretVault({ root: join(root, "secrets") }),
 	});
@@ -275,6 +284,23 @@ async function harness() {
 		purgePluginSecrets: (pluginId) => platform.secretVault.deletePlugin(pluginId),
 		// Intentionally no runtimeOptionsFactory, fake runtime, authority override or RPC stub.
 	});
+	const approveSettings = async () => {
+		const before = await manager.getPermissions(PLUGIN_ID);
+		await manager.replacePermissions(PLUGIN_ID, {
+			expectedRevision: before.revision,
+			grantedBy: FIXTURE_GRANTOR,
+			grants: [
+				...before.grants.map(permissionGrantPayload),
+				...(["provider.settings.read_self", "provider.settings.connection.use"] as const)
+					.filter((capability) => !before.grants.some((grant) => grant.capability === capability))
+					.map((capability) => ({
+						capability,
+						scope: { type: "global" as const },
+						grantedBy: FIXTURE_GRANTOR,
+					})),
+			],
+		});
+	};
 	const restores: Array<() => void> = [];
 	const hostRequestSpy = spyOn(connection, "request");
 	restores.push(() => hostRequestSpy.mockRestore());
@@ -288,6 +314,7 @@ async function harness() {
 		connection,
 		calls,
 		allProviders,
+		approveSettings,
 		hostParams: () => hostRequestSpy.mock.calls.map(([params]) => params),
 		trace(runtime: PluginRuntime) {
 			// Bun spies call through unchanged: this observes the actual stdio request parameters.
@@ -303,6 +330,7 @@ async function harness() {
 		},
 		setProviders(ids = allProviders.map(({ id }) => id)) {
 			providers = allProviders.filter(({ id }) => ids.includes(id));
+			settings.customApiProviders = providers;
 			quota.sync();
 		},
 		freshTransportGeneration() {
@@ -343,6 +371,7 @@ async function harness() {
 				expect(installed.contributions.filter(({ kind }) => kind === "quotaSource")).toHaveLength(
 					4,
 				);
+				await approveSettings();
 				phase = "enable";
 				const enabled = await bounded(manager.enable(PLUGIN_ID), "plugin enable");
 				expect(enabled.compatibility).toBe("compatible");
@@ -444,6 +473,15 @@ async function harness() {
 				for (const restore of restores) restore();
 				quota.dispose();
 				connection.dispose();
+				platform.providerSettingsService.close();
+				settings.customApiProviders = savedProviders;
+				for (const provider of allProviders) forgetQuotaSettingsProjection(provider.id);
+				for (const table of [
+					"plugin_provider_settings",
+					"plugin_resource_entries",
+					"plugin_resource_budgets",
+				])
+					sqlite.run(`DELETE FROM ${table} WHERE plugin_id=?`, [PLUGIN_ID]);
 				await rm(root, { recursive: true, force: true });
 			}
 		},
@@ -453,6 +491,7 @@ async function harness() {
 type Harness = Awaited<ReturnType<typeof harness>>;
 
 async function queryAll(f: Harness): Promise<ProviderQuotaSnapshot[]> {
+	await f.platform.providerSettingsService.prepareQuotaMigrations();
 	const snapshots: ProviderQuotaSnapshot[] = [];
 	for (const { id } of f.allProviders)
 		snapshots.push(
@@ -572,7 +611,7 @@ afterAll(async () => {
 	if (buildRoot) await rm(buildRoot, { recursive: true, force: true });
 });
 
-test("bundled quota installs before any user exists, runs all sources and stays removed", async () => {
+test("bundled quota waits for explicit settings grants before querying and stays removed", async () => {
 	const f = await harness();
 	try {
 		expect(await db.select({ id: users.id }).from(users).limit(1).get()).toBeUndefined();
@@ -605,11 +644,16 @@ test("bundled quota installs before any user exists, runs all sources and stays 
 				(grant) => grant.grantedBy === "system" && grant.scope.type === "global",
 			),
 		).toBe(true);
+		await f.approveSettings();
 		const runtime = required(f.supervisor.get(PLUGIN_ID), "bundled runtime");
 		const trace = f.trace(runtime);
 		f.setProviders();
 		f.quota.start();
 		const snapshots = await queryAll(f);
+		if (snapshots.some((snapshot) => snapshot.status !== "supported"))
+			throw Error(
+				`Quota post-approval diagnostic ${JSON.stringify(snapshots.map(({ providerId, status, error }) => ({ providerId, status, error })))}`,
+			);
 		expect(snapshots.map((snapshot) => snapshot.status)).toEqual([
 			"supported",
 			"supported",
@@ -627,6 +671,59 @@ test("bundled quota installs before any user exists, runs all sources and stays 
 		await f.close();
 	}
 }, 60_000);
+test.each([
+	"1.0.3",
+	"1.0.4",
+])("real %s site-account query uses migrated SQL secrets without exposing them over stdio", async (version) => {
+	const f = await harness();
+	try {
+		const relay = required(
+			f.allProviders.find((p) => p.id === "relay"),
+			"relay fixture",
+		);
+		relay.quotaSiteUrl = "https://provider-quota-e2e.invalid/team";
+		relay.quotaUserId = "fixture-user";
+		relay.quotaAccessToken = "fixture-site-secret";
+		f.setProviders(["relay"]);
+		if (version === "1.0.4") await f.installAndActivate();
+		else {
+			await f.manager.install(
+				join(import.meta.dir, "../../../fixtures/provider-quota-1.0.3.nfplugin"),
+			);
+			await f.manager.enable(PLUGIN_ID);
+			await f.manager.activate(PLUGIN_ID);
+		}
+		await f.platform.providerSettingsService.prepareQuotaMigrations();
+		const runtime = required(f.supervisor.get(PLUGIN_ID), "quota runtime"),
+			trace = f.trace(runtime);
+		f.quota.start();
+		const snapshot = await f.quota.refresh("relay");
+		expect(snapshot?.status).toBe("supported");
+		expect(snapshot?.data?.amounts[0]?.remaining).toBe(21);
+		const calls = f.calls.filter((call) => new URL(call.url).pathname === "/team/api/user/self");
+		expect(calls.length).toBeGreaterThan(0);
+		for (const call of calls) {
+			expect(call.headers.get("authorization")).toBe("Bearer fixture-site-secret");
+			expect(call.headers.get("new-api-user")).toBe("fixture-user");
+			expect(call.headers.get("authorization")).not.toContain(relay.apiKey);
+		}
+		const payload = JSON.stringify(trace.queryParams());
+		expect(payload).not.toContain("fixture-site-secret");
+		expect(payload).not.toContain("fixture-user");
+		expect(payload).not.toContain(relay.apiKey);
+		if (version === "1.0.3")
+			for (const params of trace.queryParams()) expect(params).not.toHaveProperty("settings");
+		else
+			expect(
+				trace
+					.queryParams()
+					.some((params) => typeof params === "object" && params !== null && "settings" in params),
+			).toBe(true);
+	} finally {
+		await f.close();
+	}
+}, 60000);
+
 describe("real archived Provider Quota plugin lifecycle", () => {
 	test("installs, runs credential-free RPC for all four sources, disables, re-enables and uninstalls", async () => {
 		const f = await harness();
@@ -971,6 +1068,8 @@ test("real multipart routes install and activate the archived quota plugin witho
 				compatibility: "compatible",
 			});
 		}
+		expect(f.platform.quotaRegistry.listSources()).toEqual([]);
+		await f.approveSettings();
 		await bounded(f.manager.enable(PLUGIN_ID), "uploaded quota enable");
 		await bounded(f.manager.activate(PLUGIN_ID), "uploaded quota activate");
 		const runtime = required(f.supervisor.get(PLUGIN_ID), "uploaded quota runtime");

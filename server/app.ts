@@ -79,8 +79,8 @@ import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
 import { providerKeyRoutes } from "./routes/provider-keys";
-
 import { providerQuotaRoutes } from "./routes/provider-quotas";
+import { providerSettingsRoutes } from "./routes/provider-settings";
 
 import {
 	publicNarratorShareManagementRoutes,
@@ -476,6 +476,7 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginUpdateRoutes);
 app.route("/api/plugins", pluginRoutes);
+app.route("/api/provider-settings", providerSettingsRoutes);
 app.route("/api/uploads", uploadRoutes);
 // Streaming attachment staging. Deliberately outside /api/narrators: the narrator
 // router's body limit and work-admission middleware describe buffered request

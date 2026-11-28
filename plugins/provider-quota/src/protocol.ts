@@ -10,6 +10,7 @@ export const FEATURES = [
 	"host_api.requests",
 	"rpc.cancel",
 	"host_api.provider_connection",
+	"host_api.provider_settings",
 ] as const;
 export const MAX_SNAPSHOT_BYTES = 16 * 1024;
 export const ERROR_CODES = [
@@ -133,6 +134,19 @@ export const queryParamsSchema = z
 					.optional(),
 			})
 			.strict(),
+		settings: z
+			.object({
+				reference: z.string().uuid(),
+				revision: z.number().int().nonnegative().safe(),
+				values: z
+					.record(
+						z.string().min(1).max(128),
+						z.union([z.string().max(4096), z.number().finite(), z.boolean()]),
+					)
+					.refine((values) => Object.keys(values).length <= 32),
+			})
+			.strict()
+			.optional(),
 		mode: z.enum(["probe", "refresh"]),
 		reference: id,
 		deadlineAt: z.number().int().positive(),
@@ -160,16 +174,34 @@ export interface ConnectionRequest {
 	query?: Record<string, string>;
 	headers?: Partial<Record<"accept" | "user-agent", string>>;
 }
+export interface SettingsConnectionRequest {
+	reference: string;
+	connectionId: string;
+}
+export type HostRequestMethod =
+	| "provider.connection.request"
+	| "provider.settings.connection.request";
 export interface ConnectionResponse {
 	status: number;
 	contentType: string | null;
 	body: string;
 	bytes: number;
 }
-export type HostRequest = (
-	params: ConnectionRequest,
-	signal: AbortSignal,
-) => Promise<ConnectionResponse>;
+export interface HostRequest {
+	/** Legacy provider request call shape. */
+	(params: ConnectionRequest, signal: AbortSignal): Promise<ConnectionResponse>;
+	/** Negotiated method-aware call shape for provider and saved-settings connections. */
+	(
+		method: "provider.connection.request",
+		params: ConnectionRequest,
+		signal: AbortSignal,
+	): Promise<ConnectionResponse>;
+	(
+		method: "provider.settings.connection.request",
+		params: SettingsConnectionRequest,
+		signal: AbortSignal,
+	): Promise<ConnectionResponse>;
+}
 
 export function record(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

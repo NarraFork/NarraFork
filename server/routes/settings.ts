@@ -94,7 +94,6 @@ import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
-
 import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
@@ -108,6 +107,11 @@ import {
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
 import { providerQuotaService } from "../services/provider-quota-service";
+import {
+	beginQuotaCompatibilitySave,
+	projectQuotaSettingsInto,
+	quotaCompatibilityTokenIntents,
+} from "../services/provider-quota-settings-compat-save";
 import {
 	hasSiteQuotaConfig,
 	sameSiteQuotaRoot,
@@ -984,6 +988,11 @@ async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
+	source = {
+		...source,
+		customApiProviders: source.customApiProviders.map((provider) => ({ ...provider })),
+	};
+	await projectQuotaSettingsInto(source);
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
@@ -1507,7 +1516,9 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			throw new ValidationError(parsed.error.message);
 		}
 
+		const quotaTokenIntents = quotaCompatibilityTokenIntents(parsed.data.customApiProviders);
 		const current = structuredClone(settings);
+		await projectQuotaSettingsInto(current, true);
 		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
 		// Check inside the same lock as the save; a preceding GET cannot prevent races.
 		if (
@@ -1673,11 +1684,22 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				normalizeCustomApiProvider(p),
 			);
 			for (const p of normalizedCustomApiProviders) {
+				const tokenOmitted = !Object.hasOwn(p, "quotaAccessToken");
+				const old = savedCustomApiById.get(p.id);
+				if (old) {
+					for (const key of ["quotaSiteUrl", "quotaUserId", "quotaAccessToken"] as const)
+						if (!Object.hasOwn(p, key)) p[key] = old[key];
+				}
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
 				// A mask refers to the saved account, not just to a provider row with the same id.
-				if (p.quotaAccessToken?.startsWith("*")) {
+				if (
+					p.quotaAccessToken?.startsWith("*") ||
+					(tokenOmitted &&
+						old &&
+						(!sameSiteQuotaRoot(old, p) || old.quotaUserId?.trim() !== p.quotaUserId?.trim()))
+				) {
 					const saved = savedCustomApiById.get(p.id);
 					const userId = saved?.quotaUserId?.trim();
 					p.quotaAccessToken =
@@ -1861,8 +1883,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				changes: prefixChanges,
 			});
 		}
-		// This also removes stale settings references; the final save below persists them.
-		purgeRemovedProviderCaches(current, merged);
 		const prefixPlan = await planProviderPrefixNarratorMigration(prefixChanges);
 
 		const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
@@ -1870,13 +1890,23 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		let migratedNarrators: Awaited<
 			ReturnType<typeof planProviderPrefixNarratorMigration>
 		>["narrators"] = [];
+		const finishQuotaSettings = await beginQuotaCompatibilitySave(
+			current,
+			merged,
+			quotaTokenIntents,
+		);
 		const persistStartedAt = performance.now();
-		if (prefixChanges.length > 0) {
-			migratedNarrators = await commitProviderPrefixMigration(current, merged, prefixPlan);
-		} else {
-			saveSettings(merged);
+		try {
+			// This also writes provider keys, so validate quota intent before purging anything.
+			purgeRemovedProviderCaches(current, merged);
+			if (prefixChanges.length > 0) {
+				migratedNarrators = await commitProviderPrefixMigration(current, merged, prefixPlan);
+			} else saveSettings(merged);
+			await finishQuotaSettings();
+		} finally {
+			finishQuotaSettings.abort();
 		}
-		// Reconcile the sole Custom API quota identity only after the settings save succeeds.
+		// Reconcile the sole Custom API quota identity only after both persisted states agree.
 		providerQuotaService.sync();
 		if (validated.customApiProviders || validated.proxy) {
 			void providerQuotaService.refreshStale().catch(() => {});

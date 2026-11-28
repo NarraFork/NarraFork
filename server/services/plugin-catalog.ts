@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { PluginSource, PluginSourceDiagnostic } from "@shared/plugin-source";
+import type { ProviderSettingsContribution } from "@shared/provider-settings";
 import { formatZodError } from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
@@ -9,7 +10,7 @@ import { type Manifest, safeParseManifest, type ViewSurface } from "../lib/plugi
 import { NARRAFORK_RPC_PROTOCOL } from "../lib/plugins/protocol";
 import { readPluginSourceMetadata } from "../lib/plugins/source-metadata";
 import { compileThemeContribution } from "../lib/plugins/theme-compiler";
-import { builtinPluginCatalog } from "./builtin-plugin-catalog";
+import { builtinPluginCatalog, PROVIDER_QUOTA_BUILTIN_ID } from "./builtin-plugin-catalog";
 import {
 	type CurrentPackagePointer,
 	type CurrentPointerFile,
@@ -17,6 +18,10 @@ import {
 	pluginPackageVersionPattern,
 	readPluginCurrentPointer,
 } from "./plugin-package-store";
+import {
+	LEGACY_QUOTA_PACKAGE_HASH,
+	LEGACY_QUOTA_SETTINGS_DECLARATION,
+} from "./provider-quota-settings-compat";
 
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_FILES_PER_PACKAGE = 10_000;
@@ -64,7 +69,20 @@ export interface PluginContributionSummary {
 	hash: string;
 	id: string;
 	fullId: string;
-	kind: "provider" | "quotaSource" | "tool" | "command" | "event" | "view" | "theme";
+	kind:
+		| "provider"
+		| "providerSettings"
+		| "quotaSource"
+		| "tool"
+		| "command"
+		| "event"
+		| "view"
+		| "theme";
+	/**
+	 * Static, value-free saved-provider settings declaration, only for providerSettings.
+	 * No stored settings, credential references or runtime result is ever added here.
+	 */
+	providerSettings?: ProviderSettingsContribution;
 	/** Surfaces a view contribution may mount on; absent for non-view kinds. */
 	surfaces?: PluginViewSurface[];
 	title?: string;
@@ -297,6 +315,29 @@ function contributionSummaries(
 		}
 	};
 	add("provider", manifest.contributes.providers as unknown as Array<Record<string, unknown>>);
+	// A settings contribution extends saved host providers; it is never a provider/tool/view.
+	// Copy only the validated declaration, without importing or asking the plugin for values.
+	const settingsDeclarations =
+		manifest.contributes.providerSettings ??
+		(manifest.pluginId === PROVIDER_QUOTA_BUILTIN_ID &&
+		version === "1.0.3" &&
+		hash === LEGACY_QUOTA_PACKAGE_HASH
+			? [LEGACY_QUOTA_SETTINGS_DECLARATION]
+			: []);
+	for (const providerSettings of settingsDeclarations) {
+		result.push({
+			pluginId: manifest.pluginId,
+			version,
+			hash,
+			id: providerSettings.id,
+			fullId: `${manifest.pluginId}/${providerSettings.id}`,
+			kind: "providerSettings",
+			title: providerSettings.title,
+			description: providerSettings.description?.slice(0, 500),
+			providerSettings: structuredClone(providerSettings),
+			hasSchema: true,
+		});
+	}
 	add(
 		"quotaSource",
 		manifest.contributes.quotaSources as unknown as Array<Record<string, unknown>>,

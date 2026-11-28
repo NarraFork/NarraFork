@@ -85,6 +85,7 @@ export const PLUGIN_TO_HOST_FEATURES = [
 	"host_api.requests",
 	"host_api.notifications",
 	"host_api.provider_connection",
+	"host_api.provider_settings",
 	"rpc.cancel",
 	"stream.credit",
 	"events.poll",
@@ -121,7 +122,11 @@ export const PLUGIN_SHARED_HOST_REQUEST_METHODS = [
 	"diagnostics.getOwn",
 ] as const;
 /** This extension is intentionally unavailable to iframe/UI callers. */
-export const PLUGIN_BACKEND_HOST_REQUEST_METHODS = ["provider.connection.request"] as const;
+export const PLUGIN_BACKEND_HOST_REQUEST_METHODS = [
+	"provider.connection.request",
+	"provider.settings.get",
+	"provider.settings.connection.request",
+] as const;
 export const PLUGIN_TO_HOST_REQUEST_METHODS = [
 	...PLUGIN_SHARED_HOST_REQUEST_METHODS,
 	...PLUGIN_BACKEND_HOST_REQUEST_METHODS,
@@ -488,6 +493,8 @@ export const PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES = {
 	"secrets.list": ["host_api.requests"],
 	"diagnostics.getOwn": ["host_api.requests"],
 	"provider.connection.request": ["host_api.requests", "host_api.provider_connection"],
+	"provider.settings.get": ["host_api.requests", "host_api.provider_settings"],
+	"provider.settings.connection.request": ["host_api.requests", "host_api.provider_settings"],
 } as const satisfies Record<PluginToHostRequestMethod, readonly PluginToHostFeature[]>;
 
 export function isPluginToHostRequestMethod(method: string): method is PluginToHostRequestMethod {

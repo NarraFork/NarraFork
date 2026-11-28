@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { createWriteStream, mkdtempSync, rmSync } from "node:fs";
+import { createWriteStream, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +11,11 @@ process.env.NARRAFORK_HOME = testHome;
 
 const { sqlite } = await import("../../db");
 const { reloadSettings, saveSettings, settings } = await import("../../lib/settings");
-const { getProviderKeyStore } = await import("../../lib/provider-keys");
+const { getProviderKeyStore, resetProviderKeyStoreForTests } = await import(
+	"../../lib/provider-keys"
+);
+// This file changes HOME after the global preload; cached file owners must follow it.
+resetProviderKeyStoreForTests();
 const { applyImport, clearData, exportData, getPreview, previewImport } = await import(
 	"../data-portability"
 );
@@ -22,6 +26,7 @@ const { sealProviderKeys, SEALED_KEYS_ENTRY } = await import("../data-portabilit
 const archiver = (await import("archiver")).default;
 
 afterAll(() => {
+	resetProviderKeyStoreForTests();
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	try {
@@ -104,6 +109,7 @@ async function exportFromSource(): Promise<Buffer> {
 	const second = store.add("relay-id", { apiKey: "sk-second", label: "backup" });
 	store.add("relay-id", { apiKey: "sk-third" });
 	store.update(second.id, { disabled: true, disabledReason: "manual" });
+	expect(existsSync(join(testHome, "provider-keys.json"))).toBe(true);
 	return readFile((await exportData(providersOnly, { passphrase: PASSPHRASE })).zipPath);
 }
 

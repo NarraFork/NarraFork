@@ -8,6 +8,10 @@ import {
 import { type CustomApiProviderConfig, settings } from "@server/lib/settings";
 import { getHttpUserAgent } from "@server/lib/user-agent";
 import { type CustomApiQuotaTarget, customApiQuotaTargetId } from "@shared/provider-quota";
+import {
+	projectQuotaSettings,
+	quotaSettingsGeneration,
+} from "./provider-quota-settings-projection";
 import { hasSiteQuotaConfig, resolveSiteQuotaConfig, siteQuotaRoot } from "./provider-quota-sites";
 
 export interface CustomApiQuotaConnection {
@@ -24,6 +28,7 @@ export interface CustomApiQuotaTargetDirectoryOptions {
 	providers: () => readonly CustomApiProviderConfig[];
 	globalProxy: () => unknown;
 	userAgent?: () => string;
+	settingsGeneration?: (providerId: string) => string;
 	keyStore?: () => QuotaKeyStore;
 	selectKey?: (providerId: string) => ProviderKey | undefined;
 }
@@ -89,6 +94,7 @@ export class CustomApiQuotaTargetDirectory {
 			config.quotaUserId,
 			this.options.globalProxy(),
 			this.options.userAgent?.() ?? getHttpUserAgent(),
+			this.options.settingsGeneration?.(config.id),
 		]);
 	}
 	private reconcile(
@@ -256,6 +262,7 @@ export class CustomApiQuotaTargetDirectory {
 	}
 }
 export const customApiQuotaTargets = new CustomApiQuotaTargetDirectory({
-	providers: () => settings.customApiProviders ?? [],
+	providers: () => (settings.customApiProviders ?? []).map(projectQuotaSettings),
+	settingsGeneration: quotaSettingsGeneration,
 	globalProxy: () => settings.proxy,
 });

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import type { Manifest } from "@server/lib/plugins/manifest";
 import { ProviderQuotaError, quotaAbortable } from "@server/lib/provider-quota-async";
@@ -10,6 +11,7 @@ import {
 	QUOTA_QUERY_METHOD,
 	type QuotaQueryResult,
 } from "@shared/provider-quota";
+import { PROVIDER_QUOTA_BUILTIN_ID } from "./builtin-plugin-catalog";
 import type { CapabilityBroker, PluginPrincipal } from "./plugin-capability-broker";
 import type { PluginHostServices } from "./plugin-host-services";
 import type { PluginPermissionStore } from "./plugin-permission-store";
@@ -21,6 +23,11 @@ import type {
 	ProviderQuotaQueryOptions,
 	ProviderQuotaSource,
 } from "./provider-quota-service";
+import {
+	LEGACY_QUOTA_PACKAGE_HASH,
+	QUOTA_SETTINGS_CONTRIBUTION_ID,
+} from "./provider-quota-settings-compat";
+import type { ProviderSettingsService } from "./provider-settings-service";
 
 function quotaFailureDetails(error: unknown): {
 	errorType: string;
@@ -51,6 +58,7 @@ export interface PluginQuotaRegistryOptions {
 	hostServices: Pick<PluginHostServices, "getRuntimeBinding">;
 	capabilityBroker: Pick<CapabilityBroker, "authorize">;
 	providerConnectionService: Pick<PluginProviderConnectionService, "issue" | "revokePlugin">;
+	providerSettingsService?: Pick<ProviderSettingsService, "bindQuery">;
 	resolveRuntime: (pluginId: string) => PluginQuotaRuntime | undefined;
 	activate?: (
 		pluginId: string,
@@ -210,7 +218,11 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 		for (const entry of this.entries.values()) {
 			const state = this.liveState(entry);
 			if (!state) continue;
-			sources.push({ ...structuredClone(entry.source), revision: this.revision(entry, state) });
+			sources.push({
+				...structuredClone(entry.source),
+				installationId: installationId(state),
+				revision: this.revision(entry, state),
+			});
 		}
 		return sources.sort((a, b) => a.id.localeCompare(b.id));
 	}
@@ -246,6 +258,7 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 			Math.max(1, deadlineAt - this.now()),
 		);
 		this.active.add(call);
+		let settingsBinding: Awaited<ReturnType<ProviderSettingsService["bindQuery"]>> | undefined;
 		let phase = "permission-read";
 		let reference:
 			| ReturnType<PluginQuotaRegistryOptions["providerConnectionService"]["issue"]>
@@ -315,7 +328,8 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 						source.pluginId,
 						principal.installationId,
 					);
-					if (grants.revision !== grantRevision || signal.aborted) return false;
+					if ((grants.authorityRevision ?? grants.revision) !== grantRevision || signal.aborted)
+						return false;
 					for (const capability of REQUIRED_CAPABILITIES) {
 						const decision = await this.options.capabilityBroker.authorize({
 							context: {
@@ -369,6 +383,30 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 			phase = "authority-check";
 			if (!(await quotaAbortable(isCurrent(), signal)))
 				throw new ProviderQuotaError("permission_denied");
+			const legacySettings =
+				source.pluginId === PROVIDER_QUOTA_BUILTIN_ID &&
+				entry.packageGeneration === `1.0.3:${LEGACY_QUOTA_PACKAGE_HASH}`;
+			if (entry.source.declaration.settingsContribution || legacySettings) {
+				if (
+					(!legacySettings && !diagnostics.features?.includes("host_api.provider_settings")) ||
+					!this.options.providerSettingsService
+				)
+					throw new ProviderQuotaError("unavailable");
+				settingsBinding = await quotaAbortable(
+					this.options.providerSettingsService.bindQuery({
+						legacyCompatibility: legacySettings,
+						plugin: principal,
+						contributionId:
+							entry.source.declaration.settingsContribution ?? QUOTA_SETTINGS_CONTRIBUTION_ID,
+						target: { kind: "custom-api", id: target.providerId },
+						deadlineAt,
+						signal,
+						isCurrent,
+					}),
+					signal,
+					(late) => late.release(),
+				);
+			}
 			phase = "connection-lease";
 			reference = this.options.providerConnectionService.issue({
 				principal,
@@ -377,6 +415,16 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 				deadlineAt,
 				signal,
 				isCurrent,
+				...(settingsBinding?.requestLegacy &&
+				settingsBinding.settings.values.useSiteAccount === true &&
+				typeof settingsBinding.settings.values.siteUrl === "string"
+					? {
+							legacySiteRequest: {
+								root: settingsBinding.settings.values.siteUrl,
+								request: settingsBinding.requestLegacy,
+							},
+						}
+					: {}),
 			});
 			phase = "quota-rpc";
 			const { keyId: _boundKeyId, ...wireTarget } = target;
@@ -388,14 +436,23 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 					target: { ...wireTarget, id: `custom-api/${target.providerId}` },
 					mode: options.mode,
 					reference: reference.reference,
+					...(settingsBinding && !legacySettings ? { settings: settingsBinding.settings } : {}),
 					deadlineAt,
 					...(options.cursor === undefined ? {} : { cursor: options.cursor }),
 				},
 				{ signal, timeoutMs: Math.max(1, deadlineAt - this.now()) },
 			);
-			if (!(await quotaAbortable(isCurrent(), signal))) throw new ProviderQuotaError("unavailable");
+			if (
+				!(await quotaAbortable(isCurrent(), signal)) ||
+				(settingsBinding && !(await quotaAbortable(settingsBinding.isCurrent(), signal)))
+			)
+				throw new ProviderQuotaError("unavailable");
 			return result;
 		} catch (error) {
+			if (error instanceof AppError) {
+				if (error.statusCode === 403) throw new ProviderQuotaError("permission_denied");
+				if (error.statusCode === 409) throw new ProviderQuotaError("invalid_configuration");
+			}
 			if (!(error instanceof ProviderQuotaError))
 				logger.warn("Quota query failed", { phase, ...quotaFailureDetails(error) });
 			throw signal.aborted && signal.reason instanceof ProviderQuotaError
@@ -404,6 +461,7 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 					? error
 					: new ProviderQuotaError("request_failed");
 		} finally {
+			settingsBinding?.release();
 			reference?.release();
 			clearTimeout(timer);
 			options.signal.removeEventListener("abort", abort);
@@ -430,7 +488,12 @@ export class PluginQuotaRegistry implements ProviderQuotaDriver {
 		)
 			return undefined;
 		if (
-			!REQUIRED_CAPABILITIES.every((capability) =>
+			![
+				...REQUIRED_CAPABILITIES,
+				...(entry.source.declaration.settingsContribution
+					? ["provider.settings.read_self", "provider.settings.connection.use"]
+					: []),
+			].every((capability) =>
 				this.options.permissionStore.hasCachedUnrestrictedGlobalGrant(
 					pluginId,
 					installation,

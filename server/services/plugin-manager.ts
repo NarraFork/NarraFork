@@ -10,7 +10,10 @@ import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateShortId } from "@server/lib/id";
-import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
+import {
+	adaptPluginCapability,
+	requiresFreshPluginGrant,
+} from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
@@ -38,7 +41,10 @@ import {
 	pluginSourceSchema,
 } from "@shared/plugin-source";
 import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
-import type { BundledPluginDescriptor } from "./bundled-plugin-assets";
+import {
+	type BundledPluginDescriptor,
+	legacyQuotaUpgradeDescriptor,
+} from "./bundled-plugin-assets";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import type { PluginPermissionRequestInput, PluginPrincipal } from "./plugin-capability-broker";
 import {
@@ -400,10 +406,12 @@ export function seedGrantsFromManifest(
 ): PluginGrantSummary {
 	const declared = [...new Set(manifestRequested)];
 	if (declared.length === 0) return summary;
-	const capabilities = declared.filter((capability) => adaptPluginCapability(capability));
-	const ignored = declared.filter((capability) => !adaptPluginCapability(capability));
+	const eligible = (capability: string) =>
+		adaptPluginCapability(capability) && !requiresFreshPluginGrant(capability);
+	const capabilities = declared.filter(eligible);
+	const ignored = declared.filter((capability) => !eligible(capability));
 	if (ignored.length > 0) {
-		logger.warn("Ignoring plugin capabilities with no canonical adapter while seeding grants", {
+		logger.warn("Plugin capabilities require explicit grants or have no canonical adapter", {
 			pluginId: context?.pluginId,
 			ignored,
 			seeded: capabilities.length,
@@ -681,6 +689,14 @@ export class PluginManager {
 			// Injected-dependency mode has no platform default; catalog refresh is opt-in.
 			this.providerCatalogRefresher = options.providerCatalogRefresher;
 		}
+		if (
+			this.hostServices === pluginPlatformServices.hostServices &&
+			this.runtimeSupervisor === pluginPlatformServices.runtimeSupervisor
+		) {
+			pluginPlatformServices.providerSettingsService.setActivationHandler((pluginId, options) =>
+				this.activate(pluginId, { ...options, automatic: true }),
+			);
+		}
 		this.quotaRegistry.setActivationHandler((pluginId, activationOptions) =>
 			this.activate(pluginId, { ...activationOptions, automatic: true }),
 		);
@@ -957,6 +973,13 @@ export class PluginManager {
 			if (pluginId === QUOTA_PLUGIN_ID && (await this.inheritLegacyQuotaRefusal(descriptor))) {
 				return null;
 			}
+			if (
+				pluginId === QUOTA_PLUGIN_ID &&
+				descriptor.version === "1.0.4" &&
+				(await this.stateStore.getBundledBootstrap(LEGACY_QUOTA_PLUGIN_ID))?.defaultChoice ===
+					"enabled"
+			)
+				descriptor = legacyQuotaUpgradeDescriptor;
 			const controller = new AbortController();
 			const stop = () => controller.abort(this.bundledBootstrapAbort.signal.reason);
 			this.bundledBootstrapAbort.signal.addEventListener("abort", stop, { once: true });
@@ -1890,7 +1913,7 @@ export class PluginManager {
 				status: "granted",
 			});
 
-			const permissions = await this.permissionStore.getSet(pluginId, installationId);
+			const permissions = await this.integrationAuthorityService.get(pluginId, installationId);
 			return {
 				status: await this.requireStatus(pluginId),
 				permissions,
@@ -4588,7 +4611,7 @@ export async function initializePluginServices(
 	manager: Pick<PluginManager, "initialize" | "bootstrapBundledPlugin" | "isShuttingDown">,
 	descriptors: readonly BundledPluginDescriptor[],
 	options: {
-		startQuota: () => void;
+		startQuota: () => void | Promise<void>;
 		onBootstrapError: (descriptor: BundledPluginDescriptor, error: unknown) => void;
 	},
 ): Promise<boolean> {
@@ -4604,7 +4627,7 @@ export async function initializePluginServices(
 		}
 	}
 	if (manager.isShuttingDown()) return false;
-	options.startQuota();
+	await options.startQuota();
 	return true;
 }
 

@@ -43,6 +43,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/document-preview/worker.ts",
 	"lib/modeltrace/worker.ts",
 	"services/plugin-package-stage-worker.ts",
+	"services/provider-settings-migration-worker.ts",
 	"services/editor-document-worker.ts",
 	"services/editor-document-stream-worker.ts",
 	"services/outline/edit-text-worker.ts",

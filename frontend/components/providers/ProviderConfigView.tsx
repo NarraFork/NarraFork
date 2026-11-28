@@ -2,6 +2,8 @@ import { ActionIcon, Box, Group, ScrollArea, Stack, Text, Title } from "@mantine
 import { IconArrowLeft } from "@tabler/icons-react";
 import React from "react";
 import { useTranslation } from "react-i18next";
+import type { ProviderSettingsExtensionsProps } from "./ProviderSettingsExtensions";
+import { ProviderSettingsExtensions } from "./ProviderSettingsExtensions";
 
 export interface ProviderConfigViewProps {
 	providerLabel: string;
@@ -9,6 +11,7 @@ export interface ProviderConfigViewProps {
 	/** Settings every provider shares, shown above its own sections (e.g. "join auto"). */
 	header?: React.ReactNode;
 	children: React.ReactNode;
+	providerSettings?: ProviderSettingsExtensionsProps;
 }
 
 export const ProviderConfigView = React.memo(function ProviderConfigView({
@@ -16,6 +19,7 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 	onClose,
 	header,
 	children,
+	providerSettings,
 }: ProviderConfigViewProps) {
 	const { t } = useTranslation("settings");
 
@@ -36,6 +40,7 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 				<Box pb="xl" pr="sm">
 					{header && <Box mb="md">{header}</Box>}
 					{children}
+					{providerSettings ? <ProviderSettingsExtensions {...providerSettings} /> : null}
 				</Box>
 			</ScrollArea>
 		</Stack>

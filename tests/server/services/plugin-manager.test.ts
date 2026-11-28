@@ -1284,9 +1284,10 @@ describe("PluginManager", () => {
 		// replacePermissions already lazily migrated the identity to a stable UUID.
 		const migratedUuid = granted.permissions.installationId;
 		expect(migratedUuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+		const mirrorBeforeEdit = await permissionStore.getSet(pluginId, migratedUuid);
+		expect(mirrorBeforeEdit.authorityRevision).toBe(2);
 		await permissionStore.replace(pluginId, migratedUuid, [], {
-			expectedRevision: 2,
-			targetRevision: 3,
+			expectedRevision: mirrorBeforeEdit.revision,
 			grantedBy: "legacy-file-editor",
 		});
 		expect((await permissionStore.getSet(pluginId, migratedUuid)).grants).toEqual([]);

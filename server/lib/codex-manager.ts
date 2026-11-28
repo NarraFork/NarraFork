@@ -88,6 +88,10 @@ const USAGE_HISTORY_RETENTION_MS = CODEX_USAGE_FORECAST_HISTORY_MS * 2;
 const MAX_USAGE_HISTORY_ENTRIES_PER_CREDENTIAL = 240;
 const USAGE_HISTORY_DEDUPE_WINDOW_MS = 60_000;
 
+/** Identity-only reads remain bounded even if the credential store is malformed/oversized. */
+export const MAX_CODEX_PROVIDER_SETTINGS_SCAN = 4_096;
+export const MAX_CODEX_PROVIDER_SETTINGS_PAGE_SIZE = 200;
+
 // === Types ===
 
 export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted" | "banned";
@@ -167,6 +171,27 @@ export interface CodexCredential {
 	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
 	usageHistory?: CodexUsageHistoryEntry[];
 }
+
+/** Credential-free identity projection for saved-provider settings extensions. */
+export type CodexProviderSettingsIdentity = Readonly<
+	Pick<CodexCredential, "id" | "displayName" | "disabled" | "archivedAt">
+>;
+
+export type CodexProviderSettingsIdentityLookup =
+	| { readonly status: "found"; readonly identity: CodexProviderSettingsIdentity }
+	| { readonly status: "not-found" | "ambiguous" | "invalid" | "limit-exceeded" };
+
+export type CodexProviderSettingsIdentityPage =
+	| {
+			readonly status: "ok";
+			readonly identities: readonly CodexProviderSettingsIdentity[];
+			readonly nextOffset: number | null;
+	  }
+	| { readonly status: "invalid" | "limit-exceeded" };
+
+export type CodexProviderSettingsPoolIdentity =
+	| { readonly status: "ok"; readonly exists: boolean; readonly available: boolean }
+	| { readonly status: "invalid" | "ambiguous" | "limit-exceeded" };
 
 /** Archived credentials are retired from the pool but keep all of their data. */
 export function isArchivedCodexCredential(cred: Pick<CodexCredential, "archivedAt">): boolean {
@@ -731,8 +756,60 @@ function createCredentialFromImport(
 
 // === CodexManager ===
 
+function validProviderSettingsCredentialId(id: unknown): id is string {
+	return (
+		typeof id === "string" &&
+		id.length > 0 &&
+		id.length <= 50 &&
+		/^[A-Za-z0-9_-]+$/.test(id) &&
+		id !== "__proto__" &&
+		id !== "prototype" &&
+		id !== "constructor"
+	);
+}
+
+function providerSettingsIdentityDisplayName(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const bounded = value.slice(0, 160);
+	const trimmed = bounded.trim();
+	if (trimmed.startsWith("{") || trimmed.startsWith("[")) return undefined;
+	for (const char of bounded) {
+		const code = char.charCodeAt(0);
+		if (code < 32 || (code >= 127 && code <= 159)) return undefined;
+	}
+	return safeCredentialDisplayName(bounded);
+}
+
+function providerSettingsCredentialIdentity(
+	credential: CodexCredential,
+): CodexProviderSettingsIdentity | undefined {
+	if (
+		!validProviderSettingsCredentialId(credential.id) ||
+		typeof credential.disabled !== "boolean"
+	) {
+		return undefined;
+	}
+	const archivedAt = credential.archivedAt;
+	if (
+		archivedAt !== undefined &&
+		(typeof archivedAt !== "number" || !Number.isFinite(archivedAt) || archivedAt < 0)
+	) {
+		return undefined;
+	}
+	// Do not expose legacy serialized token labels, account IDs or emails as a fallback.
+	const displayName = providerSettingsIdentityDisplayName(credential.displayName);
+	return Object.freeze({
+		id: credential.id,
+		...(displayName ? { displayName } : {}),
+		disabled: credential.disabled,
+		...(archivedAt !== undefined ? { archivedAt } : {}),
+	});
+}
+
 export class CodexManager {
 	private entries: CodexCredential[];
+	/** true = persisted ID; false = stored legacy row whose ID exists only in memory. */
+	private providerSettingsSavedCredentials = new WeakMap<CodexCredential, boolean>();
 	private stats: Map<string, CredentialStats>;
 	private currentId: string;
 	private loadBalancingMode: LoadBalancingMode;
@@ -854,6 +931,92 @@ export class CodexManager {
 			!isArchivedCodexCredential(credential) &&
 			this.entries.includes(credential)
 		);
+	}
+
+	/**
+	 * Exact saved credential identity lookup. No token refresh, quota self-heal, stats,
+	 * filesystem access, adapter construction or mutation; duplicate IDs fail closed.
+	 */
+	getProviderSettingsIdentity(credentialId: string): CodexProviderSettingsIdentityLookup {
+		if (!validProviderSettingsCredentialId(credentialId)) return { status: "invalid" };
+		if (this.entries.length > MAX_CODEX_PROVIDER_SETTINGS_SCAN) {
+			return { status: "limit-exceeded" };
+		}
+		let match: CodexCredential | undefined;
+		for (const entry of this.entries) {
+			if (entry.id !== credentialId) continue;
+			if (match) return { status: "ambiguous" };
+			match = entry;
+		}
+		if (!match || this.providerSettingsSavedCredentials.get(match) !== true) {
+			return { status: "not-found" };
+		}
+		const identity = providerSettingsCredentialIdentity(match);
+		return identity ? { status: "found", identity } : { status: "invalid" };
+	}
+
+	/** Bounded identity-only page. Offset is a transient cursor, never a target identity. */
+	listProviderSettingsIdentities(
+		options: { offset?: number; limit?: number } = {},
+	): CodexProviderSettingsIdentityPage {
+		const offset = options.offset ?? 0;
+		const limit = options.limit ?? 100;
+		if (
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			offset > MAX_CODEX_PROVIDER_SETTINGS_SCAN ||
+			!Number.isSafeInteger(limit) ||
+			limit < 1 ||
+			limit > MAX_CODEX_PROVIDER_SETTINGS_PAGE_SIZE
+		) {
+			return { status: "invalid" };
+		}
+		if (this.entries.length > MAX_CODEX_PROVIDER_SETTINGS_SCAN) {
+			return { status: "limit-exceeded" };
+		}
+		const page = this.entries.slice(offset, offset + limit + 1);
+		const identities: CodexProviderSettingsIdentity[] = [];
+		for (const entry of page.slice(0, limit)) {
+			if (this.providerSettingsSavedCredentials.get(entry) !== true) return { status: "invalid" };
+			const identity = providerSettingsCredentialIdentity(entry);
+			if (!identity) return { status: "invalid" };
+			identities.push(identity);
+		}
+		return Object.freeze({
+			status: "ok",
+			identities: Object.freeze(identities),
+			nextOffset: page.length > limit ? offset + limit : null,
+		});
+	}
+
+	/** The default pool is a singleton slot, not an alias for its current credential. */
+	getProviderSettingsPoolIdentity(): CodexProviderSettingsPoolIdentity {
+		if (this.entries.length > MAX_CODEX_PROVIDER_SETTINGS_SCAN) {
+			return { status: "limit-exceeded" };
+		}
+		const ids = new Set<string>();
+		let exists = false;
+		let available = false;
+		for (const entry of this.entries) {
+			if (!this.providerSettingsSavedCredentials.has(entry)) return { status: "invalid" };
+			if (!validProviderSettingsCredentialId(entry.id) || typeof entry.disabled !== "boolean") {
+				return { status: "invalid" };
+			}
+			if (ids.has(entry.id)) return { status: "ambiguous" };
+			ids.add(entry.id);
+			if (
+				entry.archivedAt !== undefined &&
+				(typeof entry.archivedAt !== "number" ||
+					!Number.isFinite(entry.archivedAt) ||
+					entry.archivedAt < 0)
+			) {
+				return { status: "invalid" };
+			}
+			if (isArchivedCodexCredential(entry)) continue;
+			exists = true;
+			if (!entry.disabled) available = true;
+		}
+		return Object.freeze({ status: "ok", exists, available });
 	}
 
 	/** Credentials that are still part of the live pool (i.e. not archived). */
@@ -2451,7 +2614,9 @@ export class CodexManager {
 				if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;
 				for (const key of keys) seen.add(key);
 
+				const hasSavedId = typeof credential.id === "string" && credential.id.length > 0;
 				if (!credential.id) credential.id = generateShortId();
+				this.providerSettingsSavedCredentials.set(credential, hasSavedId);
 				if (credential.priority === undefined) credential.priority = this.entries.length;
 				if (credential.disabled === undefined) credential.disabled = false;
 
@@ -2476,6 +2641,11 @@ export class CodexManager {
 		try {
 			const baseDir = this.options?.homeDir;
 			writeSecretJSON(getCredentialsPath(baseDir), this.entries);
+			// Publish identities only AFTER the existing save actually succeeds. Identity reads
+			// never persist a missing legacy ID or a newly-created unsaved credential themselves.
+			const saved = new WeakMap<CodexCredential, boolean>();
+			for (const entry of this.entries) saved.set(entry, true);
+			this.providerSettingsSavedCredentials = saved;
 		} catch (err) {
 			logger.warn("Failed to save Codex credentials", {
 				error: err instanceof Error ? err.message : String(err),

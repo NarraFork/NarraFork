@@ -74,8 +74,11 @@ export function runStdioQuotaPlugin(): void {
 		}
 		pending.clear();
 	}
-	const hostRequest: HostRequest = (params, signal) =>
-		new Promise((resolve, rejectPromise) => {
+	const hostRequest = ((first: unknown, second: unknown, third?: AbortSignal) => {
+		const method = typeof first === "string" ? first : "provider.connection.request";
+		const params = typeof first === "string" ? second : first;
+		const signal = (typeof first === "string" ? third : second) as AbortSignal;
+		return new Promise<ConnectionResponse>((resolve, rejectPromise) => {
 			if (!active || shuttingDown || signal.aborted) {
 				rejectPromise(new QuotaQueryError("unavailable"));
 				return;
@@ -103,8 +106,9 @@ export function runStdioQuotaPlugin(): void {
 				abort();
 				return;
 			}
-			send({ jsonrpc: "2.0", id, method: "provider.connection.request", params });
+			send({ jsonrpc: "2.0", id, method, params });
 		});
+	}) as HostRequest;
 	function acceptResponse(message: Record<string, unknown>) {
 		if (!validId(message.id)) return;
 		const item = pending.get(message.id);
@@ -229,6 +233,8 @@ export function runStdioQuotaPlugin(): void {
 					respond(id, { status: "error", data: null, error: "permission_denied" });
 					return;
 				}
+				// Initialize capabilities are a snapshot. New settings grants may be approved while
+				// this process is active; each host-issued settings reference is authorized live by the host.
 				if (queries.has(id)) {
 					reject(id, -32006, "Duplicate query ID");
 					return;

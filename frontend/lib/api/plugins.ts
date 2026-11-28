@@ -6,6 +6,7 @@ import type {
 	PluginUpdateJob,
 	PluginUpdateView,
 } from "@shared/plugin-source";
+import type { ProviderSettingsContribution } from "@shared/provider-settings";
 import type { PluginViewSurface } from "../../components/plugins/types";
 import {
 	ApiError,
@@ -54,6 +55,8 @@ export interface PluginContributionSummary {
 	id?: string;
 	fullId?: string;
 	kind?: string;
+	/** Static form metadata only; never saved provider values or credential references. */
+	providerSettings?: ProviderSettingsContribution;
 	title?: string;
 	/** Surfaces a view contribution may mount on; absent for other kinds. */
 	surfaces?: PluginViewSurface[];

@@ -130,7 +130,7 @@ async function initialize(child: Awaited<ReturnType<typeof program>>) {
 	const hello = await child.wait((message) => message.method === "hello");
 	expect(hello.params).toMatchObject({
 		pluginId: PLUGIN_ID,
-		version: "1.0.3",
+		version: "1.0.4",
 		rpcProtocol: "narrafork.rpc/1",
 		features: [...FEATURES],
 	});

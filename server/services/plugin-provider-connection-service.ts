@@ -40,6 +40,11 @@ export interface QuotaConnectionIssue {
 	 * Either way the request fails closed.
 	 */
 	isCurrent: () => boolean | Promise<boolean>;
+	/** Host-verified legacy protocol adapter; never supplied on the RPC wire. */
+	legacySiteRequest?: {
+		root: string;
+		request: (signal: AbortSignal) => Promise<ProviderConnectionResponse>;
+	};
 }
 
 interface Lease extends QuotaConnectionIssue {
@@ -279,6 +284,17 @@ export class PluginProviderConnectionService {
 		let byteLength = 0;
 		try {
 			await this.assertLive(lease, signal);
+			if (site && lease.legacySiteRequest) {
+				if (
+					Object.keys(params.query ?? {}).length ||
+					params.path !==
+						new URL(`${lease.legacySiteRequest.root.replace(/\/+$/, "")}/api/user/self`).pathname
+				)
+					throw new ProviderQuotaError("permission_denied");
+				const result = await lease.legacySiteRequest.request(signal);
+				await this.assertLive(lease, signal);
+				return result;
+			}
 			const connection = this.directory.getTarget(lease.target);
 			if (!connection?.valid) throw new ProviderQuotaError("unavailable");
 			const root = site ? connection.target.siteQuota?.root : connection.target.baseUrl;

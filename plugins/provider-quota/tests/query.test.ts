@@ -65,10 +65,17 @@ const deepseek = {
 };
 
 describe("independent quota contributions", () => {
-	test("actual manifest has four bounded sources and both live grants", () => {
+	test("manifest binds four bounded sources to explicitly granted provider settings", () => {
 		expect(manifest.pluginId).toBe("io.narrafork.provider-quota");
 		expect(manifest.engine.hostApi).toBe(">=1.0 <2");
-		expect(manifest.permissions.host).toEqual(["quota.provide", "provider.connection.request"]);
+		expect(manifest.permissions.host).toEqual([
+			"quota.provide",
+			"provider.connection.request",
+			"provider.settings.read_self",
+			"provider.settings.connection.use",
+		]);
+		expect(manifest.engine.features).toContain("host_api.provider_settings");
+		expect(manifest.contributes.providerSettings[0]?.id).toBe("site-account");
 		expect(manifest.contributes.quotaSources.map((source) => source.id)).toEqual([
 			"relay",
 			"deepseek",

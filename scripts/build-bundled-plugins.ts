@@ -3,10 +3,11 @@ import { constants } from "node:fs";
 import { copyFile, link, lstat, mkdir, open, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { computePackageHash, PluginPackageStore } from "../server/services/plugin-package-store";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PROVIDER_QUOTA_ID = "io.narrafork.provider-quota";
-const PROVIDER_QUOTA_VERSION = "1.0.3";
+const PROVIDER_QUOTA_VERSION = "1.0.4";
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 
@@ -19,6 +20,7 @@ export interface BundledPluginBuildAsset {
 	metadataPath: string;
 	size: number;
 	sha256: string;
+	packageHash?: string;
 }
 
 export interface BuildBundledPluginsOptions {
@@ -168,7 +170,7 @@ async function freezeMetadata(path: string, content: string): Promise<void> {
 }
 
 export function renderBundledPluginModule(
-	asset: Pick<BundledPluginBuildAsset, "pluginId" | "version" | "size" | "sha256">,
+	asset: Pick<BundledPluginBuildAsset, "pluginId" | "version" | "size" | "sha256" | "packageHash">,
 	archiveImport: string,
 ): string {
 	if (
@@ -192,6 +194,7 @@ export const embeddedBundledPluginAssets = Object.freeze([
 		archivePath: providerQuotaArchive,
 		size: ${asset.size},
 		sha256: ${JSON.stringify(asset.sha256)},
+		${asset.packageHash ? `packageHash: ${JSON.stringify(asset.packageHash)},` : ""}
 	}),
 ]);
 `;
@@ -231,7 +234,14 @@ export async function buildBundledPlugins(
 		}) => Promise<{ archivePath: string; packageRoot: string }>;
 	};
 	let metadata:
-		| { schemaVersion: 1; pluginId: string; version: string; size: number; sha256: string }
+		| {
+				schemaVersion: 1;
+				pluginId: string;
+				version: string;
+				size: number;
+				sha256: string;
+				packageHash: string;
+		  }
 		| undefined;
 	let archivePath = "";
 	let metadataPath = "";
@@ -242,11 +252,16 @@ export async function buildBundledPlugins(
 		async preparePublication(staged) {
 			await readManifest(join(staged.packageRoot, "manifest.json"));
 			const identity = await bundledPluginArchiveIdentity(staged.archivePath);
+			const packageHash = await computePackageHash(
+				staged.packageRoot,
+				new PluginPackageStore(cacheDir).limits,
+			);
 			metadata = {
 				schemaVersion: 1,
 				pluginId: PROVIDER_QUOTA_ID,
 				version: PROVIDER_QUOTA_VERSION,
 				...identity,
+				packageHash,
 			};
 			archivePath = join(cacheDir, `${metadata.sha256}.nfplugin`);
 			metadataPath = join(cacheDir, `${metadata.sha256}.asset.json`);

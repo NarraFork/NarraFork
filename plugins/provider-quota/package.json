@@ -1,6 +1,6 @@
 {
 	"name": "@narrafork/provider-quota-plugin",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"type": "module",
 	"private": true,
 	"license": "MPL-2.0",

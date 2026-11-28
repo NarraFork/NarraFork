@@ -179,6 +179,16 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "provider.connection.request",
 		visibility: "integration",
 	},
+	// Deliberately distinct, reversible IDs: legacy config/provider grants cannot imply these.
+	// This catalog describes capability intent, not implemented Host RPC methods.
+	"provider.settings.read_self": {
+		descriptorId: "provider.settings.read_self",
+		visibility: "integration",
+	},
+	"provider.settings.connection.use": {
+		descriptorId: "provider.settings.connection.use",
+		visibility: "integration",
+	},
 	"config.read_self": { descriptorId: "config.read", visibility: "integration" },
 	"config.write_self": { descriptorId: "config.write", visibility: "integration" },
 	"secret.use_self": { descriptorId: "secret.use", visibility: "integration" },
@@ -231,4 +241,12 @@ export function adaptPluginCapability(capability: string): AdaptedCapabilityDesc
 		| CapabilityAdapterEntry
 		| undefined;
 	return entry ? adapt("plugin", capability, entry) : undefined;
+}
+
+/** These new bindings require a current explicit grant, never an older declaration/mirror becoming effective after an upgrade. */
+export function requiresFreshPluginGrant(capability: string): boolean {
+	return (
+		capability === "provider.settings.read_self" ||
+		capability === "provider.settings.connection.use"
+	);
 }

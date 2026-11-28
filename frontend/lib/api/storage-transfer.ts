@@ -35,6 +35,7 @@ export interface ImportPreviewResult {
 	version?: number;
 	/** Present when the archive carries sealed provider keys; importing providers needs the passphrase. */
 	providerKeys?: { sealed: true; count: number };
+	providerSettings?: { sealed: boolean; count: number };
 }
 
 export type ConflictDecision = "overwrite" | "skip";
@@ -51,6 +52,9 @@ export interface ImportResult {
 	/** Provider keys restored from the sealed file; absent from older servers. */
 	keysImported?: number;
 	keysFailed?: number;
+	providerSettingsImported?: number;
+	providerSettingsSkipped?: number;
+	providerSettingsConflicts?: number;
 }
 
 /**

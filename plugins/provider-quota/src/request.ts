@@ -6,6 +6,7 @@ import {
 	type HostRequest,
 	type QuotaQueryParams,
 	record,
+	type SettingsConnectionRequest,
 } from "./protocol";
 import type { BalanceRequest } from "./relay";
 
@@ -19,7 +20,7 @@ export function parseConnectionJson(
 	maxResponseBytes = BALANCE_MAX_RESPONSE_BYTES,
 	auth: import("./relay").BalanceAuth = "provider-key",
 ): unknown {
-	const site = auth === "site-token";
+	const site = auth === "site-token" || auth === "settings-account";
 	if (
 		!record(response) ||
 		!Number.isInteger(response.status) ||
@@ -173,6 +174,74 @@ export function createJsonConnectionRequest(
 				response,
 				limits.maxResponseBytes ?? BALANCE_MAX_RESPONSE_BYTES,
 				destination === "site-account" ? "site-token" : "provider-key",
+			);
+		} catch (error) {
+			if (error instanceof BalanceProbeRequestError) throw error;
+			if (error instanceof QuotaQueryError)
+				throw new BalanceProbeRequestError(
+					error.code === "auth_failed"
+						? "auth"
+						: error.code === "invalid_configuration"
+							? "invalid_configuration"
+							: error.code === "invalid_response"
+								? "invalid_response"
+								: "transient",
+					error.code,
+				);
+			throw new BalanceProbeRequestError("transient");
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+}
+
+/** Settings connections resolve the saved URL and credentials entirely inside the host. */
+export function createSettingsConnectionRequest(
+	params: QuotaQueryParams,
+	hostRequest: HostRequest,
+	roundSignal: AbortSignal,
+	limits: JsonRequestLimits = {},
+) {
+	let count = 0;
+	return async (connectionId: string): Promise<unknown> => {
+		if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(connectionId))
+			throw new BalanceProbeRequestError("invalid_configuration");
+		const settings = params.settings;
+		if (!settings) throw new BalanceProbeRequestError("invalid_configuration");
+		if (roundSignal.aborted) throw cancelledError(roundSignal);
+		const requestDeadlineAt = params.deadlineAt;
+		if (Date.now() >= requestDeadlineAt) throw new BalanceProbeRequestError("transient", "timeout");
+		if (++count > (limits.maxRequests ?? 8))
+			throw new BalanceProbeRequestError("transient", "queue_full");
+		const controller = new AbortController();
+		const signal = AbortSignal.any([roundSignal, controller.signal]);
+		const timer = setTimeout(
+			() => controller.abort(new QuotaQueryError("timeout")),
+			Math.max(
+				1,
+				Math.min(
+					limits.requestTimeoutMs ?? BALANCE_REQUEST_TIMEOUT_MS,
+					requestDeadlineAt - Date.now(),
+				),
+			),
+		);
+		try {
+			const request: SettingsConnectionRequest = {
+				reference: settings.reference,
+				connectionId,
+			};
+			const response = await abortableRequest(
+				Promise.resolve().then(() => {
+					if (signal.aborted) throw cancelledError(signal);
+					return hostRequest("provider.settings.connection.request", request, signal);
+				}),
+				signal,
+			);
+			if (signal.aborted) throw cancelledError(signal);
+			return parseConnectionJson(
+				response,
+				limits.maxResponseBytes ?? BALANCE_MAX_RESPONSE_BYTES,
+				"settings-account",
 			);
 		} catch (error) {
 			if (error instanceof BalanceProbeRequestError) throw error;

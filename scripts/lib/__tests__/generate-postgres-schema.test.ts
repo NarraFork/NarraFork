@@ -384,3 +384,14 @@ export const other = sqliteTable("other", { quotaBytes: integer("quota_bytes") }
 	);
 	expect(coverage.tables[1].columns[0].pgType).toBe("integer");
 });
+
+test("plugin settings and resource revisions use safe 64-bit counters without widening unrelated integers", () => {
+	const { coverage } = generatePostgresSchema(`${HEAD}
+export const settings = sqliteTable("plugin_provider_settings", { revision: integer("revision").notNull(), schemaVersion: integer("schema_version").notNull() });
+export const resources = sqliteTable("plugin_resource_entries", { revision: integer("revision").notNull(), bytes: integer("bytes").notNull() });
+`);
+	for (const table of coverage.tables) {
+		expect(table.columns[0].pgType).toBe("bigint");
+		expect(table.columns[1].pgType).toBe("integer");
+	}
+});

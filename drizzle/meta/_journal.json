@@ -1835,6 +1835,13 @@
       "when": 1795283627583,
       "tag": "0261_friendly_spencer_smythe",
       "breakpoints": true
+    },
+    {
+      "idx": 262,
+      "version": "6",
+      "when": 1795779172631,
+      "tag": "0262_plugin_provider_settings",
+      "breakpoints": true
     }
   ]
 }

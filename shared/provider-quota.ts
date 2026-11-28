@@ -1,4 +1,9 @@
 import { z } from "zod";
+import { providerSettingsFieldNameSchema } from "./provider-settings";
+import {
+	providerSettingsRevisionSchema,
+	providerSettingsValueStringSchema,
+} from "./provider-settings-values";
 
 /** Public quota DTOs. No host settings, credentials or provider implementation imports. */
 export const QUOTA_PROTOCOL_VERSION = "1.0" as const;
@@ -176,6 +181,13 @@ export const providerQuotaSourceSchema = z
 			.max(128)
 			.regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
 		title: text(200).min(1),
+		/** Optional reference to this plugin's saved-provider settings contribution. */
+		settingsContribution: z
+			.string()
+			.min(1)
+			.max(128)
+			.regex(/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/)
+			.optional(),
 		/** Hosts OR within the array, AND with optional path prefixes. No provider enums. */
 		match: z
 			.object({
@@ -240,6 +252,16 @@ export const quotaQueryParamsSchema = z
 		deadlineAt: z.number().int().positive(),
 		/** Bounded adapter state; never credentials or an upstream response. */
 		cursor: text(2_048).optional(),
+		settings: z
+			.strictObject({
+				reference: z.string().uuid(),
+				revision: providerSettingsRevisionSchema,
+				values: z.record(
+					providerSettingsFieldNameSchema,
+					z.union([providerSettingsValueStringSchema, z.boolean(), z.number()]),
+				),
+			})
+			.optional(),
 	})
 	.strict();
 export const quotaQueryResultSchema = z

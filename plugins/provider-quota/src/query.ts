@@ -32,14 +32,20 @@ import {
 } from "./protocol";
 import {
 	buildBalanceRoots,
+	normalizeBalanceRoot,
 	type ProviderBalanceAdapter,
+	parseNewApiUserQuota,
 	probeProviderBalance,
 	probeSiteQuota,
 	refreshProviderBalance,
 	refreshSiteQuota,
 	relayQuotaData,
 } from "./relay";
-import { createJsonConnectionRequest, createRelayRequest } from "./request";
+import {
+	createJsonConnectionRequest,
+	createRelayRequest,
+	createSettingsConnectionRequest,
+} from "./request";
 
 export const QUOTA_SOURCES = manifest.contributes.quotaSources;
 const unsupported = (): QuotaQueryResult => ({ status: "unsupported", data: null, error: null });
@@ -53,9 +59,16 @@ function safeResult(data: QuotaData | null, cursor?: string): QuotaQueryResult {
 	});
 	return result.success ? result.data : { status: "error", data: null, error: "invalid_response" };
 }
+type RelayCursorConnection =
+	| string
+	| QuotaQueryParams["target"]
+	| {
+			siteUrl: string;
+	  };
+
 export function parseRelayCursor(
 	cursor: string,
-	connection: string | QuotaQueryParams["target"],
+	connection: RelayCursorConnection,
 ): { adapter: ProviderBalanceAdapter; root: string } {
 	if (cursor.length > 2048 || !plainText(cursor))
 		throw new QuotaQueryError("invalid_configuration");
@@ -65,18 +78,31 @@ export function parseRelayCursor(
 	} catch {
 		throw new QuotaQueryError("invalid_configuration");
 	}
-	const site = typeof connection !== "string" && connection.siteQuota;
-	const roots = site
-		? site.root
-			? [site.root]
-			: []
-		: buildBalanceRoots(typeof connection === "string" ? connection : connection.baseUrl);
+	const settingsSiteUrl =
+		typeof connection !== "string" && "siteUrl" in connection ? connection.siteUrl : undefined;
+	const site =
+		typeof connection !== "string" && "baseUrl" in connection ? connection.siteQuota : undefined;
+	let roots: string[];
+	try {
+		roots = settingsSiteUrl
+			? [normalizeBalanceRoot(settingsSiteUrl)]
+			: site
+				? site.root
+					? [site.root]
+					: []
+				: typeof connection === "string" || "baseUrl" in connection
+					? buildBalanceRoots(typeof connection === "string" ? connection : connection.baseUrl)
+					: [];
+	} catch {
+		throw new QuotaQueryError("invalid_configuration");
+	}
+	const accountCursor = settingsSiteUrl !== undefined || site !== undefined;
 	if (
 		!record(value) ||
 		Object.keys(value).length !== 2 ||
 		typeof value.root !== "string" ||
 		!roots.includes(value.root) ||
-		(site
+		(accountCursor
 			? value.adapter !== "new-api-user"
 			: value.adapter !== "sub2api" && value.adapter !== "new-api")
 	) {
@@ -92,10 +118,35 @@ async function querySource(
 ): Promise<QuotaQueryResult> {
 	const source = QUOTA_SOURCES.find((source) => source.id === id);
 	if (!source) return unsupported();
-	if (params.target.siteQuota) {
+	const useSiteAccount = params.settings?.values.useSiteAccount === true;
+	if (params.settings && useSiteAccount) {
+		if (id !== "relay") return unsupported();
+		const siteUrl = params.settings.values.siteUrl;
+		if (typeof siteUrl !== "string" || !siteUrl) throw new QuotaQueryError("invalid_configuration");
+		const settingsRequest = createSettingsConnectionRequest(
+			params,
+			hostRequest,
+			signal,
+			source.limits,
+		);
+		const parseAccount = async () => {
+			const body = await settingsRequest("balance");
+			const balance = parseNewApiUserQuota(body);
+			if (!balance) throw new BalanceProbeRequestError("invalid_response");
+			return balance;
+		};
+		if (params.mode === "refresh" && params.cursor) {
+			parseRelayCursor(params.cursor, { siteUrl });
+			return safeResult(relayQuotaData(await parseAccount(), "new-api-user"), params.cursor);
+		}
+		const balance = await parseAccount();
+		const root = normalizeBalanceRoot(siteUrl);
+		const cursor = JSON.stringify({ adapter: "new-api-user", root });
+		return safeResult(relayQuotaData(balance, "new-api-user"), cursor);
+	}
+	if (!params.settings && params.target.siteQuota) {
 		const root = params.target.siteQuota.root;
 		if (!root) throw new QuotaQueryError("invalid_configuration");
-		if (!source.requests.some((rule) => rule.auth === "site-token")) return unsupported();
 		const request = createRelayRequest(params, hostRequest, signal, source.limits);
 		if (params.mode === "refresh" && params.cursor) {
 			const cursor = parseRelayCursor(params.cursor, params.target);
@@ -173,7 +224,17 @@ export async function queryQuota(
 	const source = QUOTA_SOURCES.find((source) => source.id === id);
 	if (!source) return unsupported();
 	try {
-		buildBalanceRoots(params.target.siteQuota?.root ?? params.target.baseUrl);
+		if (params.settings?.values.useSiteAccount === true) {
+			const siteUrl = params.settings.values.siteUrl;
+			if (typeof siteUrl !== "string" || !siteUrl) throw new Error("Missing site URL");
+			normalizeBalanceRoot(siteUrl);
+		} else {
+			buildBalanceRoots(
+				params.settings
+					? params.target.baseUrl
+					: (params.target.siteQuota?.root ?? params.target.baseUrl),
+			);
+		}
 	} catch {
 		return { status: "error", data: null, error: "invalid_configuration" };
 	}

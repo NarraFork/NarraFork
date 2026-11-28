@@ -272,6 +272,29 @@ describe("PluginQuotaRegistry", () => {
 		expect(f.released).toBe(1);
 	});
 
+	test("quota bindings use the projected authority revision independently of file CAS", async () => {
+		const f = fixture();
+		let authorityRevision = f.binding.grantRevision;
+		f.options.permissionStore.getSet = async () => ({
+			pluginId,
+			installationId: f.binding.plugin.installationId,
+			revision: 50,
+			authorityRevision,
+			grants: [],
+			updatedAt: f.state.updatedAt,
+		});
+		f.setResponse(async () => {
+			const guard = f.issued[0]?.isCurrent;
+			expect(await guard?.()).toBe(true);
+			authorityRevision++;
+			expect(await guard?.()).toBe(false);
+			return supported;
+		});
+		await expect(query(f)).rejects.toMatchObject({ name: "ProviderQuotaError" });
+		expect(f.calls).toHaveLength(1);
+		expect(f.released).toBe(1);
+	});
+
 	test("source and parent deadlines bound activation, even when it ignores cancellation", async () => {
 		const f = fixture();
 		const started = deferred<void>();
@@ -430,4 +453,46 @@ test("pooled key identity stays in the host lease and the actual RPC envelope co
 			params,
 		}).success,
 	).toBe(true);
+});
+
+test("settings-backed quota sources require both explicit settings grants", () => {
+	const f = fixture();
+	const enhanced = parseManifest({
+		...manifest,
+		engine: { ...manifest.engine, features: ["host_api.requests", "host_api.provider_settings"] },
+		contributes: {
+			...manifest.contributes,
+			providerSettings: [
+				{
+					id: "account",
+					schemaVersion: 1,
+					title: "Account",
+					targetKinds: ["custom-api"],
+					configSchema: { type: "object", additionalProperties: false, properties: {} },
+				},
+			],
+			quotaSources: manifest.contributes.quotaSources.map((source) => ({
+				...source,
+				settingsContribution: "account",
+			})),
+		},
+		permissions: {
+			host: [
+				...manifest.permissions.host,
+				"provider.settings.read_self",
+				"provider.settings.connection.use",
+			],
+		},
+	});
+	f.registry.replaceManifest(enhanced, `1.0.0:${hash}`);
+	expect(f.registry.listSources()).toEqual([]);
+	f.grants.add("provider.settings.read_self");
+	expect(f.registry.listSources()).toEqual([]);
+	f.grants.add("provider.settings.connection.use");
+	expect(f.registry.listSources()).toHaveLength(1);
+	for (const capability of ["provider.settings.read_self", "provider.settings.connection.use"]) {
+		f.grants.delete(capability);
+		expect(f.registry.listSources()).toEqual([]);
+		f.grants.add(capability);
+	}
 });

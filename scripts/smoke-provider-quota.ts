@@ -42,6 +42,8 @@ export interface QuotaSmokeOptions {
 	archive: string;
 	out: string;
 	browser?: string;
+	/** Optional owned parent for isolated HOME/DB; executable still runs outside the source tree. */
+	dataParent?: string;
 	baseline: boolean;
 	timeoutMs: number;
 }
@@ -65,7 +67,15 @@ export interface QuotaSmokeReport {
 
 export function parseQuotaSmokeArgs(args: readonly string[]): QuotaSmokeOptions {
 	const values = new Map<string, string>();
-	const allowed = new Set(["binary", "archive", "out", "browser", "baseline", "timeout-ms"]);
+	const allowed = new Set([
+		"binary",
+		"archive",
+		"out",
+		"browser",
+		"baseline",
+		"timeout-ms",
+		"data-parent",
+	]);
 	for (let index = 0; index < args.length; index++) {
 		const argument = args[index] ?? "";
 		const match = /^--([a-z-]+)(?:=(.*))?$/.exec(argument);
@@ -90,6 +100,7 @@ export function parseQuotaSmokeArgs(args: readonly string[]): QuotaSmokeOptions 
 		archive: resolve(values.get("archive") ?? ""),
 		out: resolve(values.get("out") ?? ""),
 		...(values.get("browser") ? { browser: resolve(values.get("browser") ?? "") } : {}),
+		...(values.get("data-parent") ? { dataParent: resolve(values.get("data-parent") ?? "") } : {}),
 		baseline: baseline === "true",
 		timeoutMs,
 	};
@@ -294,8 +305,9 @@ export class QuotaSmokeContext {
 		readonly options: QuotaSmokeOptions,
 		readonly root: string,
 		signal?: AbortSignal,
+		dataRoot = root,
 	) {
-		this.env = quotaSmokeEnvironment(root);
+		this.env = quotaSmokeEnvironment(dataRoot);
 		this.cwd = join(root, "run");
 		this.executable = join(this.cwd, process.platform === "win32" ? "narrafork.exe" : "narrafork");
 		this.endAt = performance.now() + options.timeoutMs;
@@ -2298,6 +2310,7 @@ export async function smokeProviderQuota(
 		`--baseline=${options.baseline}`,
 		`--timeout-ms=${options.timeoutMs}`,
 		...(options.browser ? [`--browser=${options.browser}`] : []),
+		...(options.dataParent ? [`--data-parent=${options.dataParent}`] : []),
 	]);
 	for (const [path, maximum] of [
 		[options.binary, MAX_BINARY_BYTES],
@@ -2312,7 +2325,8 @@ export async function smokeProviderQuota(
 	await mkdir(options.out, { mode: 0o700 });
 	const root = await mkdtemp(join(tmpdir(), "narrafork-quota-native-"));
 	await chmod(root, 0o700);
-	const context = new QuotaSmokeContext(options, root, signal);
+	const dataRoot = options.dataParent ? await mkdtemp(join(options.dataParent, "n-")) : root;
+	const context = new QuotaSmokeContext(options, root, signal, dataRoot);
 	const onCancel = () => context.controller.abort(new Error("Quota smoke cancelled"));
 	process.once("SIGINT", onCancel);
 	process.once("SIGTERM", onCancel);
@@ -2459,6 +2473,7 @@ export async function smokeProviderQuota(
 			.catch((error) => errors.push(error));
 		try {
 			await removeSmokeDirectory(root);
+			if (dataRoot !== root) await removeSmokeDirectory(dataRoot);
 		} catch (error) {
 			errors.push(error);
 		}

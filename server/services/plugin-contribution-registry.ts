@@ -1,5 +1,9 @@
 import { providerQuotaSourceSchema } from "@shared/provider-quota";
 import {
+	type ProviderSettingsContribution,
+	providerSettingsContributionSchema,
+} from "@shared/provider-settings";
+import {
 	getContributionFullId,
 	isContributionId,
 	isPluginId,
@@ -129,10 +133,23 @@ function cloneDiagnostic(
 	return pluginId ? { ...diagnostic, pluginId } : { ...diagnostic };
 }
 
+function freezeStaticMetadata(value: unknown): void {
+	if (value === null || typeof value !== "object") return;
+	for (const child of Object.values(value)) freezeStaticMetadata(child);
+	Object.freeze(value);
+}
+
 function freezeDescriptor(
 	descriptor: PluginContributionSummary,
 ): Readonly<PluginContributionSummary> {
-	return Object.freeze({ ...descriptor });
+	const providerSettings = descriptor.providerSettings
+		? structuredClone(descriptor.providerSettings)
+		: undefined;
+	if (providerSettings) freezeStaticMetadata(providerSettings);
+	return Object.freeze({
+		...descriptor,
+		...(providerSettings ? { providerSettings } : {}),
+	});
 }
 
 function freezeRegistryEntry(
@@ -150,11 +167,14 @@ function contributionIdentityIsValid(
 	packageSummary: PluginPackageSummary,
 	contribution: PluginContributionSummary,
 ): boolean {
+	let validId = isContributionId(contribution.id);
+	if (contribution.kind === "quotaSource")
+		validId = providerQuotaSourceSchema.shape.id.safeParse(contribution.id).success;
+	if (contribution.kind === "providerSettings")
+		validId = providerSettingsContributionSchema.shape.id.safeParse(contribution.id).success;
 	return (
 		isPluginId(contribution.pluginId) &&
-		(contribution.kind === "quotaSource"
-			? providerQuotaSourceSchema.shape.id.safeParse(contribution.id).success
-			: isContributionId(contribution.id)) &&
+		validId &&
 		contribution.pluginId === plugin.pluginId &&
 		contribution.version === packageSummary.version &&
 		contribution.hash === packageSummary.hash &&
@@ -327,6 +347,22 @@ export class PluginContributionRegistry {
 
 	listByKind(kind: PluginContributionKind): PluginContributionRegistryEntry[] {
 		return this.list().filter((entry) => entry.kind === kind);
+	}
+
+	/**
+	 * Read static declarations without activating a plugin or reading any saved values.
+	 * Unavailable entries remain discoverable; this is never an execution/permission gate.
+	 * Return a detached copy so a host form cannot change future discovery results.
+	 */
+	getProviderSettingsDescriptor(fullId: string): ProviderSettingsContribution | undefined {
+		const entry = this.entries.get(fullId);
+		if (
+			entry?.kind !== "providerSettings" ||
+			!entry.descriptor.providerSettings ||
+			entry.descriptor.providerSettings.id !== entry.contributionId
+		)
+			return undefined;
+		return structuredClone(entry.descriptor.providerSettings);
 	}
 
 	markUnavailable(fullIdOrPluginId: string, reason: string): boolean;

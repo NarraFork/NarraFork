@@ -461,6 +461,57 @@ com.example.review/provider/main
 com.example.review/openReviewDashboard
 ```
 
+### 3.5.9 `providerSettings`（为已保存供应商追加设置）
+
+**[候选实现，双基线升级已验证，整合检查仍有未通过项]** `contributes.providerSettings` 是可选数组，最多 32 项。Manifest、catalog 和贡献 registry 在不执行插件入口的情况下发现其声明；候选已接通独立表单保存、管理员 action 与后端受控连接。它与 `surface: "provider-settings"` 不同：后者配置插件自己注册的 provider，本贡献按目标种类为宿主已有供应商追加独立配置。
+
+```json
+{
+  "id": "display-preferences",
+  "schemaVersion": 1,
+  "title": "Display preferences",
+  "targetKinds": ["custom-api", "nug", "platform", "executable-plugin"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "compact": { "type": "boolean", "default": false },
+      "weight": { "type": "integer", "minimum": 0, "maximum": 10, "default": 2 }
+    }
+  }
+}
+```
+
+目标身份包含 kind：Custom API/NUG 使用各自持久 ID，可执行插件 provider 使用实际注册的 `providerInstanceId`，平台使用持久账户 ID 或固定连接槽位。名称和前缀变化不创建新身份；未保存、重复、不可用和禁用目标分别处理。Codex 默认池与具体账户是不同目标，仅在内存生成的旧账户 ID 不能用于建立设置记录。解析输出只有 `{kind,id,name,disabled,available}`，不携带凭据或完整配置。
+
+`configSchema` 仅支持一层对象及 string/boolean/integer/number 字段，最多 32 个字段；原始声明预算为 256 节点、深度 8、32 KiB UTF-8。可用约束为受限长度、数值范围、枚举、默认值及纯文本标题/描述，支持 `en`/`zh-CN` 文案；字段 minLength/maxLength 按 Unicode code point 计数。禁止额外属性、嵌套对象/数组、`$ref`、`pattern`、脚本格式、原型键和访问器。字符串的 `writeOnly`、`format: "password"` 或 `x-narrafork-secret` 表示秘密；`x-narrafork-host-only` 字段不进入插件公开配置。私有字段不能声明默认值或枚举。
+
+可选 `action` 只声明标题、描述和翻译；宿主入口负责绑定已保存目标，声明不能指定任意目标、owner、安装或处理器。只有 action 或非空 connections 才要求 server entry；静态表单或空 connections 不要求后端。
+
+可选 `connections` 最多 8 项，声明 literal GET 路径后缀。`destination: "provider"` 仅允许 `none` 或 `provider-key`，后者仅绑定原供应商保存的根；`destination: "extension"` 通过同贡献的 URI 字段选择根，只使用本贡献的秘密字段作 bearer 或 `x-api-key`/`api-key`，不允许选择推理 Key。可声明根缺失时 `unavailable` 或 `provider-root`。身份头最多 8 个，仅接受受限的小写 user/account/tenant 名称并引用已保存非秘密字符串字段；不允许代理或路由头。路径不能包含 URL、query、fragment、编码分隔符或 `.`/`..` 跳转。声明本身不授予网络权限。
+
+规范来源为 `shared/provider-settings.ts`；JSON Schema companion 保留同形结构，跨字段引用、去重、预算和一致性约束由 canonical parser 进一步校验。新能力的显式授权规则见 [11-capability-policy.md](11-capability-policy.md) §3.11。
+
+#### 字段值与独立保存契约
+
+**[当前事实：纯校验层]** `shared/provider-settings-values.ts` 定义保存载荷与只含秘密存在状态的读取 DTO；`ProviderSettingsConfigPolicy` 实现值校验和宿主内部保存准备，不执行授权、目标查询、文件/SQL 写入或 HTTP 请求。管理员 HTTP 入口为 `/api/provider-settings`，以下是存储/UI 共用契约；普通用户和 OAuth 只读取公开字段摘要。
+
+保存载荷包含 `schemaVersion: 1`、`schemaFingerprint`、`expectedRevision`、`expectedBindingRevision`、`values` 和 `secrets`。`values` 完整替换本扩展的非秘密字段（含仅宿主可见字段）；省略可选普通字段即移除，不能把秘密塞进 values。`secrets` 按字段分别使用 `{operation:"set",value:"…"}`、`{operation:"keep"}`、`{operation:"clear"}`，省略某项表示保留现值；空字符串不等同 clear，占位串不等同 keep。字段必填规则针对合并后的配置执行，初始缺少必填项的读取状态为 `incomplete`，不能作为已配置值运行。默认值仅用于没有记录时初始化表单，不在读取已保存配置或移除字段后重新填入。
+
+`schemaFingerprint` 覆盖字段约束、目标种类与连接用途，文案变化不改变它；即使 `schemaVersion` 仍为 1，字段或连接变化也会使旧记录进入 `schema-mismatch`，在专门迁移或显式重新配置前拒绝覆盖。配置 revision 处理并发保存；绑定 revision 由宿主当前保存的目标、安装、账户/根地址身份生成，客户端不能提交 owner、pluginId 或任意凭据归属。
+
+秘密的绑定还包含该秘密被用于的规范根、租户路径、请求路径及身份头字段。跨 origin、同源换租户路径、换账户或核心绑定变化时，隐式/显式 keep 都返回 `PROVIDER_SETTINGS_SECRET_REBIND_REQUIRED`；管理员必须明确 set 或 clear。根缺失时声明的 provider-root 回退同样参与绑定。URI 仅接受有界 HTTP(S) 根，拒绝 URL 凭据、query、fragment、控制字符、点路径和编码 ASCII 分隔符；支持合法 Unicode 路径，规范化后再次检查长度，保留租户与 API 路径，不猜测或剥除 `/v1`。旧额度路径的兼容转换由可信迁移处理，先在 Worker 准备密文，再提交小型 CAS 事务和宿主回执；Worker 失败不回退主线程。
+
+每个值最多 4096 个 Unicode 字符；普通值与保留/新增秘密的 UTF-8 数据合计最多 32 KiB，保存请求整体最多 48 KiB、256 节点、深度 6。普通值只允许 string/number/integer/boolean，integer 字段限定安全整数；禁止非有限数、未知字段、数组、嵌套对象、原型键、访问器与序列化钩子。连接身份头另限 128 个可打印 ASCII 字符，凭据头禁止空白/控制字符。
+
+管理员 DTO 回传非秘密值与 `{isSet:boolean}`，不回传秘密、密文或秘密绑定材料；插件值投影还移除 host-only 字段。`dormant`、`schema-mismatch`、`binding-changed` 与损坏记录不能当作空配置重新保存。纯层产出的 `secretWrites` 仅供宿主加密后与配置一起 CAS 提交，绝不可返回 UI 或插件。
+
+**[候选接线]** 核心供应商草稿与扩展独立保存；核心账户/地址有未保存编辑时，UI 禁止扩展写入和 action 并提示先保存，扩展自身草稿未保存也禁止 action，保存失败保留草稿。停用、撤权、卸载和未安装状态由宿主生命周期层明确展示，不因不可执行而清空配置。存储必须再次验证目标、安装和 revision，并在同一事务提交配置与密文；纯函数校验本身不构成事务或授权。
+
+管理员可在同贡献下通过 `/retained` 分页读取旧目标的摘要（每页最多50项、只含旧稳定ID/revision/更新时间），然后在 `/rebind` 确认中附 `source:{targetId,expectedRevision}`。顶层 `expectedRevision` 比较目的记录，`schemaFingerprint` 与 `expectedBindingRevision` 比较当前声明和目标。源目标必须已不存在，目的不能已有活动配置；在一个有界事务中写入重新加密的新归属并留下源删除标记。跨安装或导入的删除标记可由当前安装以匹配revision显式创建全新配置，不继承旧秘密。
+
+后端 action 收到宿主派生的目标摘要、schema版本/指纹和短期 reference；公开值通过该引用读取。插件用 `provider.settings.get({reference})` 读取公开值，用 `provider.settings.connection.request({reference,connectionId})` 发送声明连接；不能指定owner、URL、认证头或目标。引用最多128个、30秒有效、最多16次请求；单请求20秒、响应256KiB，停用/撤权/目标变化/runtime退出立即失效。真实 stdio 例子位于 `examples/plugins/provider-settings-reference`，不依赖额度业务。
+
 ## 4. 配置、secret 与依赖声明
 
 ### 4.1 配置

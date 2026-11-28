@@ -43,6 +43,8 @@ export interface PluginProviderModelGroup {
 	 * view needs the stable contribution id.
 	 */
 	contributionId?: string;
+	/** Saved executable instance identity for settings extensions, never inferred from prefix. */
+	providerInstanceId: string;
 }
 
 function isPluginProvider(entry: ProviderRegistryEntry): boolean {
@@ -113,6 +115,7 @@ export function listPluginProviderModelGroups(
 		// pending discovery rather than looking like it failed to install.
 		groups.push({
 			prefix: entry.providerPrefix,
+			providerInstanceId: entry.providerInstanceId,
 			name: entry.displayName || entry.providerPrefix,
 			models,
 			catalogStale: entry.catalogStale,

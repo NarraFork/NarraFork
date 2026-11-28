@@ -13,6 +13,7 @@ import {
 	upgradeBuildReady,
 	upgradeOptions,
 	verifyReplacementGrants,
+	verifyRetainedGrants,
 } from "../../scripts/smoke-provider-quota-upgrade";
 
 const args = ["--binary=original.exe", "--archive=quota.nfplugin", "--out=evidence"];
@@ -135,4 +136,28 @@ describe("original-host upgrade acceptance", () => {
 			expect(() => verifyReplacementGrants(legacy, next)).toThrow();
 		}
 	});
+});
+
+test("same-plugin upgrade preserves installation, grant IDs, constraints and revision", () => {
+	const original = { ...current(), revision: 9 };
+	expect(() => verifyRetainedGrants(original, structuredClone(original))).not.toThrow();
+	for (const change of ["installation", "grant", "capability", "revision"]) {
+		const next = structuredClone(original);
+		if (change === "installation") next.installationId = "other-installation";
+		if (change === "grant") next.grants[0].grantId = "new-grant";
+		if (change === "capability") next.grants[0].capability = "provider.settings.read_self";
+		if (change === "revision") next.revision++;
+		expect(() => verifyRetainedGrants(original, next)).toThrow();
+	}
+});
+
+test("upgrade may keep HOME and DB under an owned parent without moving the isolated executable", () => {
+	const options = upgradeOptions([...args, "--candidate=next.exe", "--data-parent=t"]);
+	const runtimeRoot = resolve("isolated-runtime"),
+		dataRoot = resolve("t/owned-data");
+	const context = new QuotaSmokeContext(options, runtimeRoot, undefined, dataRoot);
+	expect(options.dataParent).toBe(resolve("t"));
+	expect(context.cwd).toBe(join(runtimeRoot, "run"));
+	expect(context.env.NARRAFORK_HOME).toBe(join(dataRoot, "data"));
+	expect(context.env.HOME).toBe(join(dataRoot, "home"));
 });

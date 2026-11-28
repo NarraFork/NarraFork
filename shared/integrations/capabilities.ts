@@ -317,6 +317,26 @@ export const CANONICAL_CAPABILITY_DESCRIPTORS = {
 		true,
 		{ allowedSubjects: ["plugin_installation"], defaultRedaction: "secrets" },
 	),
+	/** Bound saved-provider settings, not an alias for config.read or provider.use. */
+	"provider.settings.read_self": capability(
+		"provider.settings.read_self",
+		"provider",
+		"read",
+		"medium",
+		true,
+		false,
+		{ allowedSubjects: ["plugin_installation"], defaultRedaction: "secrets" },
+	),
+	/** Connection-use intent only; the host-owned binding gate must authorize each use. */
+	"provider.settings.connection.use": capability(
+		"provider.settings.connection.use",
+		"provider",
+		"execute",
+		"high",
+		false,
+		true,
+		{ allowedSubjects: ["plugin_installation"], defaultRedaction: "secrets" },
+	),
 	"config.read": capability("config.read", "config", "read", "low", true),
 	"config.write": capability("config.write", "config", "write", "medium", true),
 	"secret.use": capability("secret.use", "secret", "execute", "critical", true),

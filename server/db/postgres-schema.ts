@@ -4116,6 +4116,129 @@ export const oauthClients = pgTable(
 	],
 );
 
+export const pluginProviderSettings = pgTable(
+	"plugin_provider_settings",
+	{
+		id: text("id").primaryKey().notNull(),
+		pluginId: text("plugin_id").notNull(),
+		contributionId: text("contribution_id").notNull(),
+		targetKind: text("target_kind").notNull(),
+		targetId: text("target_id").notNull(),
+		installationId: text("installation_id").notNull(),
+		state: text("state").notNull().default("active"),
+		schemaVersion: integer("schema_version").notNull(),
+		schemaFingerprint: text("schema_fingerprint").notNull(),
+		bindingFingerprint: text("binding_fingerprint").notNull(),
+		revision: bigint("revision", { mode: "number" }).notNull().default(1),
+		configText: text("config_text").notNull(),
+		secretsEnvelope: text("secrets_envelope"),
+		keyId: text("key_id"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_plugin_provider_settings_target").on(
+			table.pluginId,
+			table.contributionId,
+			table.targetKind,
+			table.targetId,
+		),
+		index("idx_plugin_provider_settings_list").on(table.pluginId, table.id),
+		index("idx_plugin_provider_settings_provider").on(table.targetKind, table.targetId, table.id),
+		check(
+			"ck_plugin_provider_settings_revision",
+			sql.raw('"revision" >= 1 and "revision" <= 9007199254740990'),
+		),
+		check("ck_plugin_provider_settings_version", sql.raw('"schema_version" >= 1')),
+		check(
+			"ck_plugin_provider_settings_state",
+			sql.raw("\"state\" in ('active','dormant','deleted','blocked')"),
+		),
+		check(
+			"ck_plugin_provider_settings_bytes",
+			sql.raw(
+				'octet_length("config_text") + coalesce(octet_length("secrets_envelope"), 0) <= 65536',
+			),
+		),
+		check(
+			"ck_plugin_provider_settings_secret_key",
+			sql.raw(
+				'("secrets_envelope" is null and "key_id" is null) or ("secrets_envelope" is not null and "key_id" is not null)',
+			),
+		),
+	],
+);
+
+export const pluginResourceEntries = pgTable(
+	"plugin_resource_entries",
+	{
+		id: text("id").primaryKey().notNull(),
+		pluginId: text("plugin_id").notNull(),
+		ownerKind: text("owner_kind").notNull(),
+		scopeType: text("scope_type").notNull(),
+		scopeId: text("scope_id").notNull(),
+		key: text("key").notNull(),
+		installationId: text("installation_id").notNull(),
+		bindingFingerprint: text("binding_fingerprint").notNull(),
+		revision: bigint("revision", { mode: "number" }).notNull().default(1),
+		state: text("state").notNull().default("active"),
+		valueText: text("value_text").notNull(),
+		bytes: integer("bytes").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_plugin_resource_identity").on(
+			table.pluginId,
+			table.ownerKind,
+			table.scopeType,
+			table.scopeId,
+			table.key,
+		),
+		index("idx_plugin_resource_list").on(
+			table.pluginId,
+			table.ownerKind,
+			table.scopeType,
+			table.scopeId,
+			table.id,
+		),
+		check(
+			"ck_plugin_resource_revision",
+			sql.raw('"revision" >= 1 and "revision" <= 9007199254740990'),
+		),
+		check("ck_plugin_resource_state", sql.raw("\"state\" in ('active','deleted')")),
+		check(
+			"ck_plugin_resource_bytes",
+			sql.raw('"bytes" >= 0 and "bytes" <= 65536 and octet_length("value_text") = "bytes"'),
+		),
+	],
+);
+
+export const pluginResourceBudgets = pgTable(
+	"plugin_resource_budgets",
+	{
+		pluginId: text("plugin_id").primaryKey().notNull(),
+		resourceBytes: integer("resource_bytes").notNull().default(0),
+		resourceCount: integer("resource_count").notNull().default(0),
+		settingsCount: integer("settings_count").notNull().default(0),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		check(
+			"ck_plugin_budget_bytes",
+			sql.raw('"resource_bytes" >= 0 and "resource_bytes" <= 8388608'),
+		),
+		check(
+			"ck_plugin_budget_resources",
+			sql.raw('"resource_count" >= 0 and "resource_count" <= 4096'),
+		),
+		check(
+			"ck_plugin_budget_settings",
+			sql.raw('"settings_count" >= 0 and "settings_count" <= 4096'),
+		),
+	],
+);
+
 export const integrationAuthorities = pgTable(
 	"integration_authorities",
 	{
@@ -4598,8 +4721,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 147,
-  "columnCount": 1960,
+  "tableCount": 150,
+  "columnCount": 1995,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -28321,6 +28444,483 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "pluginProviderSettings",
+      "name": "plugin_provider_settings",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "pluginId",
+          "name": "plugin_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contributionId",
+          "name": "contribution_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "targetKind",
+          "name": "target_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "targetId",
+          "name": "target_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "installationId",
+          "name": "installation_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"active\"",
+          "defaultExpression": "\"active\""
+        },
+        {
+          "property": "schemaVersion",
+          "name": "schema_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "schemaFingerprint",
+          "name": "schema_fingerprint",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bindingFingerprint",
+          "name": "binding_fingerprint",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "configText",
+          "name": "config_text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "secretsEnvelope",
+          "name": "secrets_envelope",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "keyId",
+          "name": "key_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_plugin_provider_settings_target",
+          "columns": [
+            "pluginId",
+            "contributionId",
+            "targetKind",
+            "targetId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_plugin_provider_settings_list",
+          "columns": [
+            "pluginId",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_plugin_provider_settings_provider",
+          "columns": [
+            "targetKind",
+            "targetId",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_plugin_provider_settings_revision",
+        "ck_plugin_provider_settings_version",
+        "ck_plugin_provider_settings_state",
+        "ck_plugin_provider_settings_bytes",
+        "ck_plugin_provider_settings_secret_key"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_plugin_provider_settings_revision",
+          "expression": "\"revision\" >= 1 and \"revision\" <= 9007199254740990"
+        },
+        {
+          "name": "ck_plugin_provider_settings_version",
+          "expression": "\"schema_version\" >= 1"
+        },
+        {
+          "name": "ck_plugin_provider_settings_state",
+          "expression": "\"state\" in ('active','dormant','deleted','blocked')"
+        },
+        {
+          "name": "ck_plugin_provider_settings_bytes",
+          "expression": "octet_length(\"config_text\") + coalesce(octet_length(\"secrets_envelope\"), 0) <= 65536"
+        },
+        {
+          "name": "ck_plugin_provider_settings_secret_key",
+          "expression": "(\"secrets_envelope\" is null and \"key_id\" is null) or (\"secrets_envelope\" is not null and \"key_id\" is not null)"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "pluginResourceEntries",
+      "name": "plugin_resource_entries",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "pluginId",
+          "name": "plugin_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "ownerKind",
+          "name": "owner_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeType",
+          "name": "scope_type",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeId",
+          "name": "scope_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "key",
+          "name": "key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "installationId",
+          "name": "installation_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bindingFingerprint",
+          "name": "binding_fingerprint",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"active\"",
+          "defaultExpression": "\"active\""
+        },
+        {
+          "property": "valueText",
+          "name": "value_text",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bytes",
+          "name": "bytes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_plugin_resource_identity",
+          "columns": [
+            "pluginId",
+            "ownerKind",
+            "scopeType",
+            "scopeId",
+            "key"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_plugin_resource_list",
+          "columns": [
+            "pluginId",
+            "ownerKind",
+            "scopeType",
+            "scopeId",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_plugin_resource_revision",
+        "ck_plugin_resource_state",
+        "ck_plugin_resource_bytes"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_plugin_resource_revision",
+          "expression": "\"revision\" >= 1 and \"revision\" <= 9007199254740990"
+        },
+        {
+          "name": "ck_plugin_resource_state",
+          "expression": "\"state\" in ('active','deleted')"
+        },
+        {
+          "name": "ck_plugin_resource_bytes",
+          "expression": "\"bytes\" >= 0 and \"bytes\" <= 65536 and octet_length(\"value_text\") = \"bytes\""
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "pluginResourceBudgets",
+      "name": "plugin_resource_budgets",
+      "columns": [
+        {
+          "property": "pluginId",
+          "name": "plugin_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "resourceBytes",
+          "name": "resource_bytes",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "resourceCount",
+          "name": "resource_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "settingsCount",
+          "name": "settings_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [
+        "ck_plugin_budget_bytes",
+        "ck_plugin_budget_resources",
+        "ck_plugin_budget_settings"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_plugin_budget_bytes",
+          "expression": "\"resource_bytes\" >= 0 and \"resource_bytes\" <= 8388608"
+        },
+        {
+          "name": "ck_plugin_budget_resources",
+          "expression": "\"resource_count\" >= 0 and \"resource_count\" <= 4096"
+        },
+        {
+          "name": "ck_plugin_budget_settings",
+          "expression": "\"settings_count\" >= 0 and \"settings_count\" <= 4096"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

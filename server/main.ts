@@ -1113,7 +1113,10 @@ mcpManager.initialize().catch((err) => {
 // Initialize the plugin control plane after core services are available. Plugin
 // activation is feature-flagged and must never prevent the core server from starting.
 initializePluginServices(pluginManager, getBundledPluginDescriptors(), {
-	startQuota: () => providerQuotaService.start(),
+	startQuota: async () => {
+		await pluginPlatformServices.providerSettingsService.prepareQuotaMigrations();
+		if (!pluginManager.isShuttingDown()) providerQuotaService.start();
+	},
 	onBootstrapError: (descriptor, error) => {
 		logger.warn("Bundled plugin initialization failed", {
 			pluginId: descriptor.pluginId,
@@ -2130,6 +2133,26 @@ async function performGracefulShutdown(
 		await step(
 			"pluginManager.shutdown",
 			() => pluginManager.shutdown({ timeoutMs: budget.businessRemaining() }),
+			budget.businessRemaining(),
+			true,
+		);
+		await step(
+			"providerSettingsMigrations.drain",
+			() =>
+				import("./services/provider-settings-migration-client").then((owner) =>
+					owner.closeProviderSettingsMigrations(),
+				),
+			budget.businessRemaining(),
+			true,
+		);
+		await step(
+			"providerQuotaPersistence.drain",
+			async () => {
+				await import("./services/provider-quota-legacy-cache").then((owner) =>
+					owner.closeLegacyQuotaReaders(),
+				);
+				await providerQuotaService.flushPersistence();
+			},
 			budget.businessRemaining(),
 			true,
 		);

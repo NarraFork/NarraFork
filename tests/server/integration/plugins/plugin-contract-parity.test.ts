@@ -93,7 +93,21 @@ const frontendErrorParity = expectedSharedBusinessErrors.every(
 describe("C1/C2 cross-end plugin contract parity", () => {
 	test("keeps shared/iframe methods exact and strictly accounts for the backend-only extension", () => {
 		expect([...PLUGIN_SHARED_HOST_REQUEST_METHODS]).toEqual([...expectedSharedMethods]);
-		expect([...PLUGIN_BACKEND_HOST_REQUEST_METHODS]).toEqual(["provider.connection.request"]);
+		expect([...PLUGIN_BACKEND_HOST_REQUEST_METHODS]).toEqual([
+			"provider.connection.request",
+			"provider.settings.get",
+			"provider.settings.connection.request",
+		]);
+		for (const method of [
+			"provider.settings.get",
+			"provider.settings.connection.request",
+		] as const) {
+			expect(PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES[method]).toEqual([
+				"host_api.requests",
+				"host_api.provider_settings",
+			]);
+			expect(PLUGIN_UI_BACKEND_METHODS as readonly string[]).not.toContain(method);
+		}
 		expect([...PLUGIN_TO_HOST_REQUEST_METHODS]).toEqual([
 			...expectedSharedMethods,
 			...PLUGIN_BACKEND_HOST_REQUEST_METHODS,

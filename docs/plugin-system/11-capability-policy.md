@@ -94,8 +94,8 @@ B 类不是不信任插件，是**保护宿主不被一个写错的插件搞死*
 原因码作为**诊断**，供 admin UI 解释「为什么某能力不在生效集合里」。
 
 **默认放行落在哪里**：`seedGrantsFromManifest()`（`plugin-manager.ts`），在**安装/首次绑定**时
-把 manifest 声明的能力写成 grant——**但只写有 canonical adapter 的那些**（见 §3.1 的注记）。无
-adapter 的声明被跳过并记 warn，不产生 grant，也不阻断安装。
+把 manifest 声明且有 canonical adapter 的能力写成 grant，但显式授权能力除外（见 §3.11）。无
+adapter 或要求显式授权的声明被跳过并记 warn，不产生 grant，也不阻断安装。
 
 **为什么不能落在 `authorize()` 里做兜底** —— 这是本次实现中最容易搞错的一处，且已被测试证实：
 broker 把 grant 列表当作**活状态**读取。`revoke()` 标记 grantId，
@@ -280,6 +280,14 @@ seed 成 grant、能在 admin UI 显示。
 可信 local 身份只能来自 host-owned `BuiltinPluginCatalog`，不能从包自报的 builtin 标记注册新身份。latest 始终是当前 NF descriptor；大小/归档 SHA-256 经延迟 load 校验，不扫描任意磁盘 archive，也不导入插件 JS 在宿主执行。
 
 `origin: "builtin"` 仅说明已知 NF 发行身份。普通归档仍 `packageKind: "installed"`、`canUninstall: true`；旧目录包的 `builtin: true` 只读语义不复用于它。明确重装走正常安装/授权/启用事务，不调用 bootstrap 强行恢复卸载或撤权决定。无主页不自动添加链接；来源绑定、自动更新和更宽权限均不能由新包提示代替用户选择。
+
+### 3.11 `provider.settings.*`：显式授权边界
+
+**[候选实现]** `provider.settings.read_self` 与 `provider.settings.connection.use` 分别有同名 canonical descriptor，只用于 `plugin_installation` 身份。它们不映射到 `provider.use`、`config.read_self` 或旧额度连接权限。后端 `provider.settings.get` 和 `provider.settings.connection.request` 要求协商 `host_api.requests` 与 `host_api.provider_settings`；iframe 方法集合未扩大。前者只读公开值，后者由宿主注入当前安装、目标和配置对应的秘密/身份头。
+
+这两项要求当前明确授权：首次安装、enable 与 manifest seed 不自动授予；从旧摘要或兼容文件首次建立权威记录、修复空权威记录时也不导入这两个 token。旧版本曾接受但无法执行的同名字符串不能因增加 adapter 而变成已批准能力。现有数据库中的当前显式授权仍可保留、撤销，并受安装生命周期和调用时授权门禁约束。
+
+数据库保存规范授权状态。权限文件的插件级 CAS revision 保持单调，另用每安装的 `authorityRevision` 标识投影来自哪个规范授权版本；不能通过降低文件 revision 来追平数据库。宿主专用投影在文件锁内重新读取当前权威快照，保留 scope、constraints、expiry、grant identity、待审批和永久拒绝；普通插件/UI 无投影写入口。连接绑定、权限响应与摘要使用规范授权 revision，文件 revision 只用于文件写入的并发检查。
 
 ## 4. 保留的限制（不要在未读本节前撤销）
 

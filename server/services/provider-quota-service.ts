@@ -17,6 +17,8 @@ import {
 import {
 	createProviderQuotaPersistence,
 	type PersistedProviderQuota,
+	type ProviderQuotaPersistence,
+	type ProviderQuotaPersistenceContext,
 } from "./provider-quota-persistence";
 import {
 	type CustomApiQuotaConnection,
@@ -28,6 +30,7 @@ export interface ProviderQuotaSource {
 	id: string;
 	pluginId: string;
 	contributionId: string;
+	installationId?: string;
 	revision: string;
 	declaration: ProviderQuotaSourceDeclaration;
 }
@@ -50,7 +53,8 @@ export interface ProviderQuotaDriver {
 export interface ProviderQuotaServiceOptions {
 	directory?: CustomApiQuotaTargetDirectory;
 	driver?: ProviderQuotaDriver;
-	persistence?: PersistedCredentialCache<PersistedProviderQuota>;
+	persistence?: PersistedCredentialCache<PersistedProviderQuota> &
+		Partial<Pick<ProviderQuotaPersistence, "load">>;
 	now?: () => number;
 	roundTimeoutMs?: number;
 	maxConcurrent?: number;
@@ -104,6 +108,7 @@ function deterministicError(code: ProviderQuotaSnapshot["error"]): boolean {
 function sourceScore(source: ProviderQuotaSource, target: CustomApiQuotaTarget): number | null {
 	if (
 		target.siteQuota &&
+		!source.declaration.settingsContribution &&
 		!source.declaration.requests.some((request) => request.auth === "site-token")
 	)
 		return null;
@@ -240,6 +245,68 @@ export class ProviderQuotaService {
 		this.replace(entry, { data: null, sourceId: null, fetchedAt: 0, stale: true });
 	}
 
+	private persistenceContext(
+		entry: Entry,
+		source: ProviderQuotaSource,
+	): ProviderQuotaPersistenceContext | undefined {
+		if (!source.installationId) return undefined;
+		return {
+			pluginId: source.pluginId,
+			installationId: source.installationId,
+			sourceId: source.id,
+			sourceRevision: source.revision,
+			providerId: entry.connection.target.providerId,
+			credentialId: entry.connection.target.keyId,
+			isCurrent: () =>
+				this.entries.get(connectionId(entry.connection)) === entry &&
+				this.directory.getTarget(entry.connection.target)?.identity === entry.connection.identity &&
+				this.sources().some(
+					(candidate) =>
+						candidate.id === source.id &&
+						candidate.revision === source.revision &&
+						candidate.installationId === source.installationId,
+				),
+		};
+	}
+	private warmPersistence(entry: Entry, sources: ProviderQuotaSource[]): void {
+		const cache = this.options.persistence;
+		if (!cache?.load) return;
+		const version = entry.snapshot.version;
+		void (async () => {
+			for (const source of sources) {
+				const context = this.persistenceContext(entry, source);
+				if (!context) continue;
+				const cached = await cache.load?.(
+					connectionId(entry.connection),
+					entry.connection.identity,
+					context,
+				);
+				if (
+					this.entries.get(connectionId(entry.connection)) !== entry ||
+					entry.snapshot.version !== version ||
+					entry.task
+				)
+					return;
+				if (!cached || !context.isCurrent?.()) continue;
+				entry.cursor = cached.cursor;
+				entry.sourceRevision = cached.sourceRevision;
+				entry.nextAllowedAt = 0;
+				entry.needsWarmup = true;
+				this.replace(entry, {
+					sourceId: cached.sourceId,
+					status: cached.status,
+					data: cached.data,
+					fetchedAt: cached.fetchedAt,
+					attemptedAt: cached.attemptedAt,
+					stale: true,
+				});
+				return;
+			}
+		})().catch(() => {});
+	}
+	async flushPersistence(): Promise<void> {
+		await this.options.persistence?.flush();
+	}
 	sync(): void {
 		const connections = this.directory.list();
 		const ids = new Set(connections.map(connectionId));
@@ -371,6 +438,7 @@ export class ProviderQuotaService {
 				lastResetAttemptAt: 0,
 			};
 			this.entries.set(id, entry);
+			if (available && !restoredSource) this.warmPersistence(entry, selected);
 			added = true;
 			this.markChanged(entry.snapshot.providerId);
 		}
@@ -794,15 +862,21 @@ export class ProviderQuotaService {
 					? selected.declaration.refresh.unsupportedMs
 					: selected.declaration.refresh.staleMs);
 			this.replace(entry, snapshot);
-			this.options.persistence?.save(connectionId(entry.connection), entry.connection.identity, {
-				sourceId: selected.id,
-				sourceRevision: selected.revision,
-				status: result.status,
-				data: result.data,
-				...(result.cursor ? { cursor: result.cursor } : {}),
-				fetchedAt: entry.snapshot.fetchedAt,
-				attemptedAt: entry.snapshot.attemptedAt,
-			});
+			const cache = this.options.persistence as ProviderQuotaPersistence | undefined;
+			cache?.save(
+				connectionId(entry.connection),
+				entry.connection.identity,
+				{
+					sourceId: selected.id,
+					sourceRevision: selected.revision,
+					status: result.status,
+					data: result.data,
+					...(result.cursor ? { cursor: result.cursor } : {}),
+					fetchedAt: entry.snapshot.fetchedAt,
+					attemptedAt: entry.snapshot.attemptedAt,
+				},
+				this.persistenceContext(entry, selected),
+			);
 			this.trimSnapshots();
 		} catch (error) {
 			if (this.current(task)) {
@@ -973,6 +1047,7 @@ const quotaOwner = hotSafe("narrafork.providerQuotaService.owner", () => ({
 			eventBus.emit({ type: "provider:quota_changed", providerIds, version }),
 	}),
 	removeProbe: undefined as (() => void) | undefined,
+	removeSettingsListener: undefined as (() => void) | undefined,
 }));
 export const providerQuotaService = quotaOwner.service;
 
@@ -995,3 +1070,14 @@ quotaOwner.removeProbe = registerKeyQuotaProbe((keyId, now) => {
 	});
 	return until.length ? Math.max(...until) : undefined;
 });
+
+quotaOwner.removeSettingsListener?.();
+const settingsChanged = (event: { targetKind: string; targetId: string }) => {
+	if (event.targetKind !== "custom-api") return;
+	providerQuotaService.sync();
+	if (providerQuotaService.getDiagnostics().running)
+		void providerQuotaService.refresh(event.targetId).catch(() => {});
+};
+eventBus.on("provider:settings_changed", settingsChanged);
+quotaOwner.removeSettingsListener = () =>
+	eventBus.off("provider:settings_changed", settingsChanged);

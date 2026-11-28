@@ -1,8 +1,11 @@
 import { resolve } from "node:path";
+import legacyQuotaArchive from "../../tests/fixtures/provider-quota-1.0.3.nfplugin" with {
+	type: "file",
+};
 import { isCompiledModuleUrl, isCompiledRuntime } from "../lib/runtime-target";
 
 const PROVIDER_QUOTA_ID = "io.narrafork.provider-quota";
-const PROVIDER_QUOTA_VERSION = "1.0.3";
+const PROVIDER_QUOTA_VERSION = "1.0.4";
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
 const MAX_METADATA_BYTES = 64 * 1024;
 const READ_TIMEOUT_MS = 10_000;
@@ -13,7 +16,9 @@ const SLOW_LOAD_MS = 1_000;
 export interface BundledPluginDescriptor {
 	pluginId: string;
 	version: string;
-	load: (signal?: AbortSignal) => Promise<{ bytes: Uint8Array; sha256: string }>;
+	load: (
+		signal?: AbortSignal,
+	) => Promise<{ bytes: Uint8Array; sha256: string; packageHash?: string }>;
 }
 
 interface AssetIdentity {
@@ -21,6 +26,7 @@ interface AssetIdentity {
 	version: string;
 	size: number;
 	sha256: string;
+	packageHash?: string;
 }
 
 type LoadedAsset = Awaited<ReturnType<BundledPluginDescriptor["load"]>>;
@@ -52,6 +58,11 @@ function validateIdentity(value: unknown): AssetIdentity {
 	if (typeof asset.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(asset.sha256)) {
 		throw new Error("Invalid bundled plugin SHA-256 metadata");
 	}
+	if (
+		asset.packageHash !== undefined &&
+		(typeof asset.packageHash !== "string" || !/^[a-f0-9]{64}$/.test(asset.packageHash))
+	)
+		throw new Error("Invalid bundled plugin content identity");
 	return asset as AssetIdentity;
 }
 
@@ -118,7 +129,7 @@ async function loadArchive(
 	checkCancelled(signal);
 	const sha256 = Buffer.from(digest).toString("hex");
 	if (sha256 !== identity.sha256) throw new Error("Bundled plugin archive SHA-256 mismatch");
-	return { bytes, sha256 };
+	return { bytes, sha256, ...(identity.packageHash ? { packageHash: identity.packageHash } : {}) };
 }
 
 async function loadCompiledAsset(signal: AbortSignal): Promise<LoadedAsset> {
@@ -259,3 +270,23 @@ const descriptors: readonly BundledPluginDescriptor[] = Object.freeze([
 export function getBundledPluginDescriptors(): readonly BundledPluginDescriptor[] {
 	return descriptors;
 }
+
+/** Only an inherited enabled legacy quota choice selects this frozen compatibility package.
+ * It carries the already supported capability set; upgrades to the new package are explicit.
+ */
+export const legacyQuotaUpgradeDescriptor: BundledPluginDescriptor = Object.freeze({
+	pluginId: PROVIDER_QUOTA_ID,
+	version: "1.0.3",
+	load: (signal?: AbortSignal) =>
+		loadArchive(
+			legacyQuotaArchive,
+			{
+				pluginId: PROVIDER_QUOTA_ID,
+				version: "1.0.3",
+				size: 75527,
+				sha256: "5491feaad8e0d35a92b9f49edfc24eb02c618d0fc6710fdca3a235c486c7a24f",
+				packageHash: "e5385806c109df55e62a6f6a52cd4e067c5b13646fe6a0e10af9dc219a212f59",
+			},
+			signal ?? AbortSignal.timeout(READ_TIMEOUT_MS),
+		),
+});

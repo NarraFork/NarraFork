@@ -415,6 +415,43 @@
 			"operationFailed": "插件操作失败。"
 		}
 	},
+	"providerSettings": {
+		"title": "供应商扩展",
+		"description": "此供应商的已保存插件设置。打开此区域不会启动插件。",
+		"unsavedCore": "请先保存供应商改动，再编辑扩展设置。",
+		"unsavedExtension": "请先保存这些设置，再运行操作。",
+		"loadError": "加载供应商扩展失败。",
+		"saveError": "保存供应商扩展设置失败。",
+		"deleteError": "删除供应商扩展设置失败。",
+		"actionError": "供应商扩展操作失败。",
+		"rebindError": "重新绑定保留的供应商扩展设置失败。",
+		"unavailable": "此扩展当前不可用，已保存配置仍被保留。",
+		"readOnly": "此扩展当前只读，已有设置仍被保留。",
+		"schemaMismatch": "扩展 schema 已变化，迁移前不能保存或重新绑定。",
+		"bindingChanged": "供应商绑定已变化，请重新加载后再保存。",
+		"dormant": "此配置来自较早的插件安装。重新绑定需要确认，且不会恢复权限。",
+		"reload": "重新加载",
+		"managePlugin": "管理插件",
+		"runAction": "运行",
+		"delete": "删除",
+		"deleteTitle": "删除供应商扩展设置",
+		"deleteMessage": "删除此扩展保存的值和密钥？此操作无法撤销。",
+		"rebind": "重新绑定",
+		"retained": "查找旧供应商保留的设置",
+		"retainedSelect": "原已保存供应商",
+		"retainedEmpty": "此页没有保留的设置",
+		"retainedNext": "下一页",
+		"moveMessage": "将 {{source}} 保存的值和密钥移至 {{target}}？原配置会标记为删除，不会覆盖目标已有的配置，也不会恢复权限。",
+		"rebindTitle": "重新绑定保留的供应商扩展设置",
+		"rebindMessage": "将保留的值和密钥附加到当前插件安装？这不会恢复权限。",
+		"status": {
+			"ready": "就绪",
+			"incomplete": "未完成",
+			"schema-mismatch": "Schema 已变化",
+			"binding-changed": "绑定已变化",
+			"dormant": "休眠"
+		}
+	},
 	"overlayHiddenNotice": "已为你隐藏插件浮层，可在 设置 → 外观 中重新打开。",
 	"overlaySettings": {
 		"title": "插件浮层",

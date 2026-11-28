@@ -112,7 +112,7 @@ test.each([
 	["user", "en"],
 	["admin", "zh-CN"],
 	["user", "zh-CN"],
-] as const)("quota row and site fields share capability without erasing the draft (%s, %s)", (role, locale) => {
+] as const)("quota row follows capability while site settings belong only to the shared extension form (%s, %s)", (role, locale) => {
 	const translate = instances[locale].getFixedT(locale, "settings");
 	const labels = [
 		"customApiQuotaTitle",
@@ -129,10 +129,9 @@ test.each([
 	expect(disabled).toContain(translate("customApiKey"));
 	for (const enabled of [true, undefined]) {
 		const restored = render(role, enabled, locale);
-		for (const key of labels) expect(restored).toContain(translate(key));
-		expect(restored).toContain("https://draft-site.example");
-		expect(restored).toContain("draft-site-test-token");
-		expect(restored).toContain("12345");
+		for (const key of labels) expect(restored).not.toContain(translate(key));
+		expect(restored).not.toContain("https://draft-site.example");
+		expect(restored).not.toContain("draft-site-test-token");
 		expect(restored).toContain("USD 19.5");
 		expect(restored).toContain("Saved site group");
 	}

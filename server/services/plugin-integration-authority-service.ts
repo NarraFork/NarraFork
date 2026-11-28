@@ -3,12 +3,12 @@ import { generateShortId } from "@server/lib/id";
 import {
 	adaptPluginCapability,
 	PLUGIN_CAPABILITY_ADAPTER,
+	requiresFreshPluginGrant,
 } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import {
 	type Capability,
 	type PermissionConstraints,
-	type PermissionGrant,
 	type PermissionScope,
 	permissionGrantSchema,
 } from "@server/lib/plugins/permissions";
@@ -257,18 +257,22 @@ export class PluginIntegrationAuthorityService {
 				if (set.grants.length === 0) {
 					try {
 						const mirror = await this.permissionStore.getSet(pluginId, targetInstallationId);
-						if (mirror.grants.length > 0) {
+						// A pre-feature mirror is not proof that a new, explicitly bound capability was approved.
+						const restorable = mirror.grants.filter(
+							(grant) => !requiresFreshPluginGrant(grant.capability),
+						);
+						if (restorable.length > 0) {
 							logger.warn("Rebuilding empty plugin authority from compatibility mirror", {
 								pluginId,
 								installationId: targetInstallationId,
 								authorityRevision: set.revision,
 								mirrorRevision: mirror.revision,
-								restored: mirror.grants.length,
+								restored: restorable.length,
 							});
 							const repaired = await this.replace(
 								pluginId,
 								targetInstallationId,
-								mirror.grants.map(
+								restorable.map(
 									(grant): PermissionGrantInput => ({
 										capability: grant.capability,
 										scope: grant.scope,
@@ -298,6 +302,7 @@ export class PluginIntegrationAuthorityService {
 				// install path withholds those capabilities and raises pending approval
 				// requests instead (plugin-manager
 				// `requestUndeclaredManifestCapabilities`).
+				await this.mirrorPermissionSet(set);
 				return set;
 			}
 		}
@@ -324,7 +329,12 @@ export class PluginIntegrationAuthorityService {
 				integrationId: pluginId,
 				metadataJson: authorityMetadata(targetInstallationId),
 				initialRevision,
-				grants: this.toAuthorityGrants(authorityId, initialRevision, legacy.grants, "migration"),
+				grants: this.toAuthorityGrants(
+					authorityId,
+					initialRevision,
+					legacy.grants.filter((grant) => !requiresFreshPluginGrant(grant.capability)),
+					"migration",
+				),
 			});
 			const created = await this.authorityService.requireSnapshot(authorityId, {
 				includeExpired: true,
@@ -402,11 +412,11 @@ export class PluginIntegrationAuthorityService {
 			authorities,
 			mirror: {
 				installationId: mirror?.installationId,
-				revision: mirror?.revision ?? 0,
+				revision: mirror?.authorityRevision ?? mirror?.revision ?? 0,
 				grants: mirrorGrants.map((grant) => grant.capability),
 			},
 			drift: {
-				mirrorRevision: mirror?.revision ?? 0,
+				mirrorRevision: mirror?.authorityRevision ?? mirror?.revision ?? 0,
 				authorityRevision: canonical?.revision ?? 0,
 				mirrorOnlyGrants: mirrorGrants
 					.filter((grant) => !authorityCapabilities.has(grant.capability))
@@ -765,31 +775,17 @@ export class PluginIntegrationAuthorityService {
 
 	private async mirrorPermissionSet(set: PluginPermissionSet): Promise<void> {
 		try {
-			const current = await this.permissionStore.getSet(set.pluginId, set.installationId);
-			if (grantsFingerprint(current.grants) === grantsFingerprint(set.grants)) return;
-			// The DB authority is the single source of truth. The compatibility
-			// mirror is rebuilt from it unconditionally — even when the mirror's
-			// stale revision is numerically higher (e.g. grants that were written
-			// only to the mirror by an older buggy approval path). Those grants
-			// never existed in the authority and are not enforceable, so the
-			// mirror must converge onto the authority instead of the reverse.
-			await this.permissionStore.replace(
+			// Capture only identity. Reload the authority inside the mirror's write lock;
+			// the caller's earlier set may already precede a concurrent grant/revocation.
+			await this.permissionStore.mirrorAuthorityGrants(
 				set.pluginId,
 				set.installationId,
-				set.grants.map(
-					(grant): PermissionGrant => ({
-						capability: grant.capability,
-						scope: grant.scope,
-						constraints: grant.constraints,
-						expiresAt: grant.expiresAt,
-						grantId: grant.grantId,
-						grantedBy: grant.grantedBy,
-					}),
-				),
-				{
-					expectedRevision: current.revision,
-					targetRevision: set.revision,
-					grantedBy: "integration-authority-mirror",
+				async () => {
+					const latest = await this.authorityService.requireSnapshot(
+						pluginInstallationAuthorityId(set.pluginId, set.installationId),
+						{ includeExpired: true },
+					);
+					return this.toPermissionSet(latest, set.pluginId, set.installationId);
 				},
 			);
 		} catch (error) {

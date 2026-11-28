@@ -28,7 +28,7 @@ test("actual independent .nfplugin installs in an isolated store and passes rele
 		expect(
 			sbom.components.map((component) => [component.name, component.version, component.license]),
 		).toEqual([
-			["io.narrafork.provider-quota", "1.0.3", "MPL-2.0"],
+			["io.narrafork.provider-quota", "1.0.4", "MPL-2.0"],
 			["zod", "4.3.6", "MIT"],
 		]);
 		for (const file of rawSbom.files) {
@@ -86,7 +86,7 @@ test("same source/version produces identical ZIP bytes and content hash without 
 		const firstBytes = await readFile(first.archivePath);
 		const store = new PluginPackageStore({ root: join(root, "store") });
 		const firstInstalled = await store.install(first.archivePath);
-		expect(firstInstalled.version).toBe("1.0.3");
+		expect(firstInstalled.version).toBe("1.0.4");
 		// Deliberately vary existing output stats; a subsequent build must not package them.
 		await chmod(join(first.packageRoot, "LICENSE"), 0o600);
 		await utimes(

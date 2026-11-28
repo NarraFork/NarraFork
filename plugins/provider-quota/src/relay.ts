@@ -28,7 +28,7 @@ export interface ProviderBalanceData {
 	planName?: string;
 	expiresAt?: string;
 }
-export type BalanceAuth = "none" | "provider-key" | "site-token";
+export type BalanceAuth = "none" | "provider-key" | "site-token" | "settings-account";
 export type BalanceRequest = (url: string, auth?: BalanceAuth | boolean) => Promise<unknown>;
 export interface BalanceProbeResult {
 	adapter: ProviderBalanceAdapter;
@@ -212,7 +212,7 @@ export function parseNewApiBalance(body: unknown, status?: unknown): ProviderBal
 		amounts: [{ unit: conversion.unit, remaining: values[0], used: values[1], total: values[2] }],
 	};
 }
-function normalizeRoot(baseUrl: string): string {
+export function normalizeBalanceRoot(baseUrl: string): string {
 	if (typeof baseUrl !== "string" || baseUrl.length > 2048 || /[?#\\\s]/u.test(baseUrl))
 		throw new Error("Invalid balance URL");
 	let url: URL;
@@ -226,7 +226,7 @@ function normalizeRoot(baseUrl: string): string {
 	return url.origin + url.pathname.replace(/\/+$/, "");
 }
 export function buildBalanceRoots(baseUrl: string): string[] {
-	const original = normalizeRoot(baseUrl);
+	const original = normalizeBalanceRoot(baseUrl);
 	const stripped = original.replace(/\/(?:v1|v1beta|anthropic)$/, "");
 	return stripped === original ? [original] : [stripped, original];
 }
@@ -268,7 +268,7 @@ export async function refreshProviderBalance(
 	request: BalanceRequest,
 ): Promise<ProviderBalanceData> {
 	if (adapter === "new-api-user") return refreshSiteQuota(root, request);
-	const normalized = normalizeRoot(root);
+	const normalized = normalizeBalanceRoot(root);
 	try {
 		const path = adapter === "sub2api" ? "/v1/usage" : "/api/usage/token/";
 		const body = await request(normalized + path, "provider-key");

@@ -1,4 +1,8 @@
 import { providerQuotaSourceSchema } from "@shared/provider-quota";
+import {
+	type ProviderSettingsContribution,
+	providerSettingsContributionSchema,
+} from "@shared/provider-settings";
 import { z } from "zod";
 import {
 	capabilitySchema,
@@ -961,6 +965,8 @@ const configurationSchema = z
 const contributesSchema = z
 	.object({
 		providers: z.array(providerContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
+		// Optional even after parsing: older normalized manifests and typed fixtures omit it.
+		providerSettings: z.array(providerSettingsContributionSchema).max(32).optional(),
 		searchProviders: z.array(searchProviderContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
 		quotaSources: z.array(providerQuotaSourceSchema).max(MAX_CONTRIBUTIONS).default([]),
 		tools: z.array(toolContributionSchema).max(MAX_CONTRIBUTIONS).default([]),
@@ -1093,6 +1099,7 @@ function getContributionMap(manifest: {
 		providers: Array<{ id: string }>;
 		searchProviders: Array<{ id: string }>;
 		quotaSources: Array<{ id: string }>;
+		providerSettings?: Array<{ id: string }>;
 		tools: Array<{ id: string }>;
 		commands: Array<{ id: string }>;
 		events: Array<{ id: string; topic: string }>;
@@ -1101,19 +1108,37 @@ function getContributionMap(manifest: {
 }): Map<
 	string,
 	{
-		kind: "provider" | "searchProvider" | "quotaSource" | "tool" | "command" | "event" | "view";
+		kind:
+			| "provider"
+			| "providerSettings"
+			| "searchProvider"
+			| "quotaSource"
+			| "tool"
+			| "command"
+			| "event"
+			| "view";
 		topic?: string;
 	}
 > {
 	const contributions = new Map<
 		string,
 		{
-			kind: "provider" | "searchProvider" | "quotaSource" | "tool" | "command" | "event" | "view";
+			kind:
+				| "provider"
+				| "providerSettings"
+				| "searchProvider"
+				| "quotaSource"
+				| "tool"
+				| "command"
+				| "event"
+				| "view";
 			topic?: string;
 		}
 	>();
 	for (const provider of manifest.contributes.providers)
 		contributions.set(provider.id, { kind: "provider" });
+	for (const settings of manifest.contributes.providerSettings ?? [])
+		contributions.set(settings.id, { kind: "providerSettings" });
 	for (const search of manifest.contributes.searchProviders)
 		contributions.set(search.id, { kind: "searchProvider" });
 	for (const source of manifest.contributes.quotaSources)
@@ -1135,6 +1160,7 @@ function validateActivationEvents(
 			providers: Array<{ id: string }>;
 			searchProviders: Array<{ id: string }>;
 			quotaSources: Array<{ id: string }>;
+			providerSettings?: Array<{ id: string }>;
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string }>;
 			events: Array<{ id: string; topic: string }>;
@@ -1224,6 +1250,7 @@ function validateContributionReferences(
 			providers: Array<{ id: string }>;
 			searchProviders: Array<{ id: string; providerId: string }>;
 			quotaSources: Array<{ id: string }>;
+			providerSettings?: Array<{ id: string }>;
 			tools: Array<{ id: string }>;
 			commands: Array<{ id: string; inputSchema?: unknown }>;
 			events: Array<{ id: string; topic: string }>;
@@ -1242,6 +1269,7 @@ function validateContributionReferences(
 	const seen = new Map<string, string>();
 	const groups = [
 		["providers", manifest.contributes.providers],
+		["providerSettings", manifest.contributes.providerSettings ?? []],
 		["searchProviders", manifest.contributes.searchProviders],
 		["quotaSources", manifest.contributes.quotaSources],
 		["tools", manifest.contributes.tools],
@@ -1340,8 +1368,9 @@ function validateManifestCrossFields(
 		ui?: unknown;
 		contributes: {
 			providers: unknown[];
+			providerSettings?: ProviderSettingsContribution[];
 			searchProviders: unknown[];
-			quotaSources: unknown[];
+			quotaSources: Array<{ settingsContribution?: string }>;
 			tools: unknown[];
 			commands: unknown[];
 			events: unknown[];
@@ -1351,8 +1380,32 @@ function validateManifestCrossFields(
 	},
 	ctx: z.RefinementCtx,
 ): void {
+	for (const [index, source] of manifest.contributes.quotaSources.entries()) {
+		if (source.settingsContribution) {
+			const declaration = manifest.contributes.providerSettings?.find(
+				(item) => item.id === source.settingsContribution,
+			);
+			if (
+				!declaration ||
+				!declaration.targetKinds.includes("custom-api") ||
+				!manifest.engine.features?.includes("host_api.provider_settings")
+			)
+				ctx.addIssue({
+					code: "custom",
+					path: ["contributes", "quotaSources", index, "settingsContribution"],
+					message:
+						"Quota settings must reference this plugin's Custom API settings and negotiate provider settings",
+				});
+		}
+	}
 	const hasServerContributions =
 		manifest.contributes.providers.length > 0 ||
+		// Host-generated static forms need no server. Only explicit actions or connection use
+		// need one; declaring/opening a settings form never introduces an activation event.
+		(manifest.contributes.providerSettings ?? []).some(
+			(contribution) =>
+				contribution.action !== undefined || (contribution.connections?.length ?? 0) > 0,
+		) ||
 		// Search sources are served over `provider.search`, so they need a backend too.
 		manifest.contributes.searchProviders.length > 0 ||
 		manifest.contributes.quotaSources.length > 0 ||
@@ -1588,6 +1641,7 @@ export const safeParseManifestV1 = safeParseManifest;
 export function getContributionIds(manifest: Manifest): string[] {
 	return [
 		...manifest.contributes.providers,
+		...(manifest.contributes.providerSettings ?? []),
 		...manifest.contributes.searchProviders,
 		...manifest.contributes.quotaSources,
 		...manifest.contributes.tools,

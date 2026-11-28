@@ -1,5 +1,6 @@
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { outboundFetch } from "@server/lib/net/outbound-fetch";
 import { getOutboundProxy, resolveOverride } from "@server/lib/net/proxy";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import { registerExtraSearchChannelSource } from "@server/lib/search/plugin-source";
@@ -78,6 +79,8 @@ import {
 	type PluginUiSessionService,
 } from "./plugin-ui-session";
 import { type ProviderQuotaService, providerQuotaService } from "./provider-quota-service";
+import { ProviderSettingsBindings } from "./provider-settings-bindings";
+import { ProviderSettingsService } from "./provider-settings-service";
 
 export interface PluginPlatformServices {
 	runtimeSupervisor: RuntimeSupervisor;
@@ -102,6 +105,8 @@ export interface PluginPlatformServices {
 	quotaRegistry: PluginQuotaRegistry;
 	quotaService: ProviderQuotaService;
 	providerConnectionService: PluginProviderConnectionService;
+	providerSettingsBindings: ProviderSettingsBindings;
+	providerSettingsService: ProviderSettingsService;
 	providerClientPool: PluginProviderClientPool;
 	providerCatalogRefresher: PluginProviderCatalogRefresher;
 	providerConfigService: PluginProviderConfigService;
@@ -139,6 +144,7 @@ export interface PluginPlatformServicesOptions {
 	quotaRegistry?: PluginQuotaRegistry;
 	quotaService?: ProviderQuotaService;
 	providerConnectionService?: PluginProviderConnectionService;
+	providerSettingsBindings?: ProviderSettingsBindings;
 	/** Registry of `contributes.searchProviders` sources. */
 	searchRegistry?: PluginSearchRegistry;
 	providerClientPool?: PluginProviderClientPool;
@@ -520,6 +526,10 @@ export function createPluginPlatformServices(
 	const secretVault = options.secretVault ?? pluginSecretVault;
 	const providerConnectionService =
 		options.providerConnectionService ?? pluginProviderConnectionService;
+	const providerSettingsBindings =
+		options.providerSettingsBindings ??
+		options.hostServices?.providerSettingsBindings ??
+		new ProviderSettingsBindings({ fetch: outboundFetch });
 	const quotaService = options.quotaService ?? providerQuotaService;
 	const hostServices =
 		options.hostServices ??
@@ -527,6 +537,7 @@ export function createPluginPlatformServices(
 			capabilityBroker,
 			permissionStore,
 			providerConnectionService,
+			providerSettingsBindings,
 			publicApi,
 			eventGateway,
 			storageFactory,
@@ -885,6 +896,14 @@ export function createPluginPlatformServices(
 	// instead of reporting every credentialed channel as unconfigured.
 	void secretVault.warm().catch(() => undefined);
 	registerExtraSearchChannelSource("plugins", pluginSearchChannelSource(searchRegistry));
+	const providerSettingsService = new ProviderSettingsService({
+		registry: contributionRegistry,
+		states: stateStore,
+		runtimes: runtimeSupervisor,
+		host: hostServices,
+		broker: capabilityBroker,
+		bindings: providerSettingsBindings,
+	});
 	const quotaRegistry =
 		options.quotaRegistry ??
 		new PluginQuotaRegistry({
@@ -893,6 +912,7 @@ export function createPluginPlatformServices(
 			hostServices,
 			capabilityBroker,
 			providerConnectionService,
+			providerSettingsService,
 			resolveRuntime: (pluginId) => runtimeSupervisor.get(pluginId),
 		});
 	quotaService.configureDriver(quotaRegistry);
@@ -948,6 +968,7 @@ export function createPluginPlatformServices(
 		});
 
 	const services = {
+		providerSettingsService,
 		runtimeSupervisor,
 		uiSession,
 		uiHost,
@@ -970,6 +991,7 @@ export function createPluginPlatformServices(
 		quotaRegistry,
 		quotaService,
 		providerConnectionService,
+		providerSettingsBindings,
 		providerClientPool,
 		providerCatalogRefresher,
 		providerConfigService,
@@ -993,6 +1015,8 @@ export const pluginPlatformServices = hotSafe("narrafork.pluginPlatformServices.
 
 /** Main calls this before manager shutdown: stop schedule producers, without clearing durable state. */
 export function stopPluginPlatformProducers(): void {
+	pluginPlatformServices.providerSettingsService.close();
+	pluginPlatformServices.providerSettingsBindings.close();
 	pluginPlatformServices.scheduler.close();
 	pluginPlatformServices.runtimeSupervisor.stopProducers();
 }

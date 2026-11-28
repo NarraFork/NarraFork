@@ -110,7 +110,13 @@ describe("quota contribution contract", () => {
 	});
 
 	test("strictly separates the backend extension from shared iframe methods", () => {
-		expect(PLUGIN_BACKEND_HOST_REQUEST_METHODS).toEqual(["provider.connection.request"]);
+		expect(PLUGIN_BACKEND_HOST_REQUEST_METHODS).toEqual([
+			"provider.connection.request",
+			"provider.settings.get",
+			"provider.settings.connection.request",
+		]);
+		for (const method of PLUGIN_BACKEND_HOST_REQUEST_METHODS)
+			expect(PLUGIN_SHARED_HOST_REQUEST_METHODS as readonly string[]).not.toContain(method);
 		expect(PLUGIN_SHARED_HOST_REQUEST_METHODS).not.toContain("provider.connection.request");
 		expect(PLUGIN_TO_HOST_REQUEST_METHODS).toEqual([
 			...PLUGIN_SHARED_HOST_REQUEST_METHODS,

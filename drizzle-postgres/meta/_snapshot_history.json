@@ -632,6 +632,14 @@
 			"prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
 			"version": "7",
 			"snapshotDigest": "4b71044913fb107713df639dd40c55de46a62aabfd731cb38bbe3e95431f7eea"
+		},
+		{
+			"idx": 79,
+			"tag": "0079_plugin_provider_settings",
+			"id": "d4989aaf-a7ac-4dd6-8226-e5f0447f5ac6",
+			"prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
+			"version": "7",
+			"snapshotDigest": "1f62533c3e5fb7f2f1b0faac67152b105c5fc7da4ebb8e803b68d29ccfb4a2ed"
 		}
 	]
 }

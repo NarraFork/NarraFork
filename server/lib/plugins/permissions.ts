@@ -217,6 +217,10 @@ export const CAPABILITY_TAXONOMY = {
 		"provider.use",
 		"provider.refresh_catalog",
 		"provider.connection.request",
+		// Saved-provider settings are separate from provider execution and legacy config access.
+		// Documentation only: these names neither advertise an RPC nor grant access.
+		"provider.settings.read_self",
+		"provider.settings.connection.use",
 	],
 	/** Quota sources require live grants; no provider contribution or binding is implied. */
 	quota: ["quota.provide"],
